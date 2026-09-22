@@ -13,6 +13,7 @@ public actor TransferHub: SessionProvider {
     /// `root` defaults to `~/Library/Application Support/Transfer`.
     public init(root: URL? = nil) throws {
         store = try Store(root: root)
+        SSHConnection.removeLoginScratch(in: store.root)
         config = ConfigLoader.load(root: store.root)
         live = LiveSync(store: store)
         for path in store.localTemps() {

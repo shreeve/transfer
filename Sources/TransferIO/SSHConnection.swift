@@ -10,8 +10,10 @@ public actor SSHConnection: RemoteSession {
     private var promptSink: (any PromptSink)?
     private var master: Process?
     private var socketPath = ""
-    private var askDirectory: URL?
-    private var onceKnownHosts: URL?
+    /// Per-login folders under the library root, removed on disconnect. Lists, not single values:
+    /// two windows can start a login on one connection at once, and neither may orphan the other's.
+    private var askDirectories: [URL] = []
+    private var onceKnownHosts: [URL] = []
     private var startPath: RemotePath?
     private var browse: SFTPLink?
     private var interactive: SFTPLink?
@@ -65,8 +67,14 @@ public actor SSHConnection: RemoteSession {
             try? FileManager.default.removeItem(atPath: socketPath)
         }
         let hostKeyArguments = try await resolveHostKey(prompts)
-        let ask = try prepareAskpass()
-        askDirectory = ask
+        let ask: URL
+        do {
+            ask = try prepareAskpass()
+        } catch {
+            await disconnect()
+            throw error
+        }
+        askDirectories.append(ask)
         let poller = Task { await self.servePrompts(prompts, directory: ask) }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
@@ -80,6 +88,7 @@ public actor SSHConnection: RemoteSession {
             try process.run()
         } catch {
             poller.cancel()
+            await disconnect()
             throw TransferError.failed("Could not start ssh")
         }
         master = process
@@ -140,10 +149,10 @@ public actor SSHConnection: RemoteSession {
         }
         master = nil
         if !socketPath.isEmpty { try? FileManager.default.removeItem(atPath: socketPath) }
-        if let onceKnownHosts { try? FileManager.default.removeItem(at: onceKnownHosts.deletingLastPathComponent()) }
-        onceKnownHosts = nil
-        if let askDirectory { try? FileManager.default.removeItem(at: askDirectory) }
-        askDirectory = nil
+        for file in onceKnownHosts { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+        onceKnownHosts.removeAll()
+        for folder in askDirectories { try? FileManager.default.removeItem(at: folder) }
+        askDirectories.removeAll()
         performance = false
         startPath = nil
     }
@@ -953,20 +962,26 @@ public actor SSHConnection: RemoteSession {
         let files = KnownHosts.files(sshConfigOutput: config.stdout)
         let probeDirectory = store.root.appendingPathComponent("hostkey-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: probeDirectory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: probeDirectory.path)
         let probeFile = probeDirectory.appendingPathComponent("known_hosts")
-        let probe = try await run(arguments: Self.quotedOption("UserKnownHostsFile", probeFile.path) + [
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "HashKnownHosts=no",
-            "-o", "BatchMode=yes",
-            "-o", "PasswordAuthentication=no",
-            "-o", "PubkeyAuthentication=no",
-            "-o", "KbdInteractiveAuthentication=no",
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",
-            "-o", "Compression=no",
-            "-o", "ConnectTimeout=15",
-        ] + destinationArguments + [connection.destination, "true"], timeout: 30)
+        let probe: CommandResult
+        do {
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: probeDirectory.path)
+            probe = try await run(arguments: Self.quotedOption("UserKnownHostsFile", probeFile.path) + [
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "HashKnownHosts=no",
+                "-o", "BatchMode=yes",
+                "-o", "PasswordAuthentication=no",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no",
+                "-o", "ControlMaster=no",
+                "-o", "ControlPath=none",
+                "-o", "Compression=no",
+                "-o", "ConnectTimeout=15",
+            ] + destinationArguments + [connection.destination, "true"], timeout: 30)
+        } catch {
+            try? FileManager.default.removeItem(at: probeDirectory)
+            throw error
+        }
         let text = (try? String(contentsOf: probeFile, encoding: .utf8)) ?? ""
         let offered = text.split(separator: "\n").compactMap { HostKeyLine(line: String($0)) }.first
         guard let offered else {
@@ -991,7 +1006,7 @@ public actor SSHConnection: RemoteSession {
             try? FileManager.default.removeItem(at: probeDirectory)
             throw TransferError.hostKeyRejected
         case .trustOnce:
-            onceKnownHosts = probeFile
+            onceKnownHosts.append(probeFile)
             return Self.quotedOption("UserKnownHostsFile", probeFile.path)
         case .alwaysTrust, .replace:
             try? FileManager.default.removeItem(at: probeDirectory)
@@ -1029,9 +1044,33 @@ public actor SSHConnection: RemoteSession {
 
     // MARK: Askpass
 
+    /// Prefixes of the per-login files and folders under the library root: askpass folders, host-key
+    /// probes, and fingerprint scratch files.
+    static let loginScratchPrefixes = ["ask-", "hostkey-", "key-"]
+
+    /// Removes per-login scratch left under `root` by a session that never disconnected: the app
+    /// crashed or was force-quit. The hub calls this at launch, before any session exists; the app
+    /// runs as a single instance, so nothing found here is in use.
+    static func removeLoginScratch(in root: URL) {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+        for name in names where loginScratchPrefixes.contains(where: { name.hasPrefix($0) }) {
+            try? FileManager.default.removeItem(at: root.appendingPathComponent(name))
+        }
+    }
+
     private func prepareAskpass() throws -> URL {
         let directory = store.root.appendingPathComponent("ask-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            try writeAskpass(in: directory)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        return directory
+    }
+
+    private func writeAskpass(in directory: URL) throws {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         let script = directory.appendingPathComponent("askpass.sh")
         let source = """
@@ -1050,7 +1089,6 @@ public actor SSHConnection: RemoteSession {
         """
         try source.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
-        return directory
     }
 
     private func askEnvironment(_ directory: URL) -> [String: String] {

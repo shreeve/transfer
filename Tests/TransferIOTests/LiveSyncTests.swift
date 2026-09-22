@@ -20,8 +20,7 @@ struct LiveSyncTests {
     }
 
     private static func harness(_ name: String) throws -> Harness {
-        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TransferTests/livesync-\(name)-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        let base = TestCaches.fresh("livesync-\(name)")
         let root = base.appendingPathComponent("library", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let store = try Store(root: root)

@@ -37,7 +37,7 @@ Two protocols in Core are the seam. `SessionProvider` is the library: saved serv
 eval "$(Scripts/local-sshd.sh)" && swift test; kill $TRANSFER_TEST_SSHD
 ```
 
-The script starts an unprivileged `sshd` on 127.0.0.1:2222 with its own keys and never touches the system's Remote Login. The tests use Trust Once, so the user's `known_hosts` is never written. Their library roots live under `~/Library/Caches/TransferTests` and are removed afterwards.
+The script starts an unprivileged `sshd` on 127.0.0.1:2222 with its own keys and never touches the system's Remote Login. The tests use Trust Once, so the user's `known_hosts` is never written. Their library roots live under `~/Library/Caches/TransferTests`. Each test awaits its own cleanup through `withHarness`, which runs on a throw too; a `defer { Task { … } }` cleanup never runs before the test process exits and left hundreds of folders behind. Folders there older than an hour, from a run that crashed or was killed, are removed by the next run (`TestCaches`); younger ones may belong to a suite running now.
 
 ## Window chrome
 
@@ -47,7 +47,7 @@ The list view is `ListTable.swift`, an `NSTableView` with 22-point rows, header 
 
 ## Working
 
-- Login, askpass sheets, Keychain opt-in, one probe, browse, interactive, walker, and up to seven data channels. A reserved passenger that dies is reopened once. The master's death emits `.disconnected`.
+- Login, askpass sheets, Keychain opt-in, one probe, browse, interactive, walker, and up to seven data channels. Each login's askpass folder and host-key probe (`ask-*`, `hostkey-*`, `key-*` under the library root) are removed on disconnect and on every failed login; what a crash or force-quit leaves is removed when the hub starts. A reserved passenger that dies is reopened once. The master's death emits `.disconnected`.
 - Host keys: the offered key is learned with a no-auth `ssh` run into a temporary known-hosts file, which honors `~/.ssh/config`, aliases, and `ProxyJump`. It is compared against the files `ssh -G` reports with `ssh-keygen -F`. Always Trust and Replace write only the first user file `ssh -G` names. Trust Once keeps the temporary file for that master and deletes it on disconnect.
 - Listing keeps four `READDIR` requests in flight and streams pages; the model publishes at most every 80 ms in every view and shows a cached listing first on revisit. Icon, list, and column views share one path and selection. Selecting a folder in column view makes it the current location and keeps it selected.
 - Sorting: directories first and case-insensitive names are global switches in Settings > General; column and direction persist per connection. View mode and hidden files persist globally.
