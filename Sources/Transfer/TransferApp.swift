@@ -223,6 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        WindowFrames.launchFinished()
         let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String ?? ""
         if !key.isEmpty { updater.startUpdater() }
     }
