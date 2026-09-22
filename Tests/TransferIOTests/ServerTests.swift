@@ -171,6 +171,9 @@ struct ServerTests {
         let box = ProgressBox()
         try await h.session.copyDirectory(fromLocal: tree, to: up) { box.last = $0 }
         #expect(box.last.itemsCompleted == 4)
+        // Uploading the same tree again merges into it; the link already there is kept.
+        try await h.session.copyDirectory(fromLocal: tree, to: up) { _ in }
+        #expect(h.prompts.collisions == 0)
         let upURL = h.remote.appendingPathComponent("tree-up")
         #expect(try Data(contentsOf: upURL.appendingPathComponent("a/b/deep.txt")) == Data("deep".utf8))
         #expect(try FileManager.default.destinationOfSymbolicLink(atPath: upURL.appendingPathComponent("link").path) == "one.txt")
@@ -189,6 +192,60 @@ struct ServerTests {
 
         try await h.session.remove(up)
         #expect(!FileManager.default.fileExists(atPath: upURL.path))
+        await h.session.disconnect()
+    }
+
+    @Test func serverCopyMergesTreesAndWalksThem() async throws {
+        guard let h = try harness("paste") else { return }
+        defer { Task { await h.cleanUp() } }
+        _ = try await h.session.connect(prompts: h.prompts)
+        let tree = h.remote.appendingPathComponent("site", isDirectory: true)
+        try FileManager.default.createDirectory(at: tree.appendingPathComponent("a/b"), withIntermediateDirectories: true)
+        try Data("one".utf8).write(to: tree.appendingPathComponent("one.txt"))
+        let big = randomData(2_500_000)
+        try big.write(to: tree.appendingPathComponent("a/big.bin"))
+        try Data("deep".utf8).write(to: tree.appendingPathComponent("a/b/deep.txt"))
+        try FileManager.default.createSymbolicLink(atPath: tree.appendingPathComponent("link").path, withDestinationPath: "one.txt")
+        let site = h.remotePath.appending(name: Array("site".utf8))
+
+        let entries = TreeBox()
+        try await h.session.walkTree(site) { key, entry in entries.add(key, entry) }
+        #expect(entries.all == ["": .directory, "one.txt": .file(size: 3), "a": .directory, "a/big.bin": .file(size: UInt64(big.count)),
+                                "a/b": .directory, "a/b/deep.txt": .file(size: 4), "link": .link])
+
+        // The Mac's own sftp-server offers copy-data, so this copy never leaves the server.
+        let copy = h.remotePath.appending(name: Array("site copy".utf8))
+        let box = ProgressBox()
+        try await h.session.copy(site, to: copy) { box.last = $0 }
+        #expect(box.last.itemsCompleted == 4)
+        let copyURL = h.remote.appendingPathComponent("site copy")
+        #expect(try Data(contentsOf: copyURL.appendingPathComponent("a/big.bin")) == big)
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: copyURL.appendingPathComponent("link").path) == "one.txt")
+        let copied = TreeBox()
+        try await h.session.walkTree(copy) { key, entry in copied.add(key, entry) }
+        #expect(TreeCheck.missing(source: entries.all, destination: copied.all).isEmpty)
+        let sourceTime = try FileManager.default.attributesOfItem(atPath: tree.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
+        let copyTime = try FileManager.default.attributesOfItem(atPath: copyURL.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
+        #expect(sourceTime.map { Int($0.timeIntervalSince1970) } == copyTime.map { Int($0.timeIntervalSince1970) })
+        let leftovers = try FileManager.default.subpathsOfDirectory(atPath: copyURL.path).filter { $0.contains(".transfer-") }
+        #expect(leftovers.isEmpty)
+
+        // Pasting again merges: every file matches in size and time, so nothing is asked.
+        try await h.session.copy(site, to: copy) { _ in }
+        #expect(h.prompts.collisions == 0)
+        // A changed file collides and the prompt's Replace wins.
+        try Data("changed".utf8).write(to: copyURL.appendingPathComponent("one.txt"))
+        try await h.session.copy(site, to: copy) { _ in }
+        #expect(h.prompts.collisions == 1)
+        #expect(try Data(contentsOf: copyURL.appendingPathComponent("one.txt")) == Data("one".utf8))
+
+        // A single file, and a folder into itself.
+        let file = site.appending(name: Array("one.txt".utf8))
+        try await h.session.copy(file, to: h.remotePath.appending(name: Array("one copy.txt".utf8))) { _ in }
+        #expect(try Data(contentsOf: h.remote.appendingPathComponent("one copy.txt")) == Data("one".utf8))
+        await #expect(throws: TransferError.self) {
+            try await h.session.copy(site, to: site.appending(name: Array("a".utf8)).appending(name: Array("site".utf8))) { _ in }
+        }
         await h.session.disconnect()
     }
 
@@ -225,7 +282,8 @@ struct ServerTests {
         try Data("remote-edit".utf8).write(to: remoteFile)
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)], ofItemAtPath: remoteFile.path)
         try Data("third".utf8).write(to: local)
-        let conflicted = await waitUntil { await h.session.liveFiles().first?.conflict == true }
+        // The event reaches the log through its own task, a moment after the flag is set.
+        let conflicted = await waitUntil { await h.session.liveFiles().first?.conflict == true && events.conflicts.contains(path) }
         #expect(conflicted)
         #expect(try Data(contentsOf: remoteFile) == Data("remote-edit".utf8))
         #expect(events.conflicts.contains(path))
@@ -301,5 +359,22 @@ private final class EventLog: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return events.compactMap { if case .conflict(let path, _) = $0 { path } else { nil } }
+    }
+}
+
+private final class TreeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String: TreeEntry] = [:]
+
+    func add(_ key: String, _ entry: TreeEntry) {
+        lock.lock()
+        entries[key] = entry
+        lock.unlock()
+    }
+
+    var all: [String: TreeEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
     }
 }

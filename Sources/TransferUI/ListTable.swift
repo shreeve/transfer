@@ -261,12 +261,14 @@ struct ListTable: NSViewRepresentable {
                 add("Duplicate", enabled: item.kind == .file) { Task { await model.duplicateSelection() } }
                 add("Rename") { model.beginRename() }
                 add(model.isStarred(item.path) ? "Unstar" : "Star") { Task { await model.setStarred(item.path, !model.isStarred(item.path)) } }
+                add("Copy") { model.copySelection() }
                 add("Copy Remote URL") { model.copyRemoteURL() }
                 menu.addItem(.separator())
                 add("Delete…") { model.askToDelete() }
             } else {
                 add("New Folder") { Task { await model.mkdir() } }
                 add("Upload…") { Task { await model.uploadFromPanel() } }
+                add("Paste", enabled: model.canPaste) { Task { await model.paste(moving: false) } }
                 add("Copy Remote URL") { model.copyRemoteURL() }
             }
             return menu

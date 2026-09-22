@@ -6,11 +6,15 @@ public actor TransferHub: SessionProvider {
     private let store: Store
     private var config: TransferConfig
     private var sessions: [ConnectionID: SSHConnection] = [:]
+    /// Every Live file, for every server. One per app: a connection that is replaced keeps its
+    /// files, and one watcher covers them all.
+    private let live: LiveSync
 
     /// `root` defaults to `~/Library/Application Support/Transfer`.
     public init(root: URL? = nil) throws {
         store = try Store(root: root)
         config = ConfigLoader.load(root: store.root)
+        live = LiveSync(store: store)
         for path in store.localTemps() {
             if FileManager.default.fileExists(atPath: path) {
                 try? FileManager.default.removeItem(atPath: path)
@@ -31,10 +35,11 @@ public actor TransferHub: SessionProvider {
     }
 
     public func removeConnection(_ id: ConnectionID) async throws {
-        let unsynced = store.dirtyLiveCount(connection: id)
+        let unsynced = await live.unsyncedCount(on: id)
         if unsynced > 0 { throw TransferError.liveUnsynced(unsynced) }
         await sessions[id]?.disconnect()
         sessions[id] = nil
+        await live.close(id)
         store.remove(id)
         KeychainStore.delete(account: id.rawValue.uuidString)
         let live = store.root.appendingPathComponent("Live/\(id.rawValue.uuidString)", isDirectory: true)
@@ -46,15 +51,15 @@ public actor TransferHub: SessionProvider {
         if let existing = sessions[id] {
             if await existing.isConnected || existing.connection == saved { return existing }
         }
-        let session = SSHConnection(connection: saved, store: store, editableExtensions: config.extensionSet)
+        let session = SSHConnection(connection: saved, store: store, editableExtensions: config.extensionSet, live: live)
         sessions[id] = session
         return session
     }
 
-    public var unsyncedLiveCount: Int { store.dirtyLiveCount() }
+    public var unsyncedLiveCount: Int { get async { await live.unsyncedCount() } }
 
     public func unsyncedLiveCount(for id: ConnectionID) async -> Int {
-        store.dirtyLiveCount(connection: id)
+        await live.unsyncedCount(on: id)
     }
 
     public func disconnectAll() async {

@@ -11,6 +11,17 @@ struct LiveRow: Sendable {
     var baseMtime: UInt32?
     var localPath: String
     var dirty: Bool
+    var paused = false
+    /// "changed", "removed", or "notAFile" while a conflict is unresolved; the server file's
+    /// fingerprint when it was raised, for "changed".
+    var conflict: String?
+    var conflictSize: UInt64?
+    var conflictMtime: UInt32?
+    /// The working copy at the last sync: size, exact mtime (seconds since the reference date),
+    /// and a SHA-256 of its bytes.
+    var syncedSize: UInt64?
+    var syncedMtime: Double?
+    var syncedDigest: String?
 }
 
 final class Store: @unchecked Sendable {
@@ -50,6 +61,10 @@ final class Store: @unchecked Sendable {
         // Columns added after the first schema. SQLite has no ADD COLUMN IF NOT EXISTS.
         _ = sqlite3_exec(db, "ALTER TABLE live_files ADD COLUMN dirty INTEGER DEFAULT 0", nil, nil, nil)
         _ = sqlite3_exec(db, "ALTER TABLE temps ADD COLUMN connection_id TEXT", nil, nil, nil)
+        for column in ["paused INTEGER DEFAULT 0", "conflict TEXT", "conflict_size INTEGER", "conflict_mtime INTEGER",
+                       "synced_size INTEGER", "synced_mtime REAL", "synced_digest TEXT"] {
+            _ = sqlite3_exec(db, "ALTER TABLE live_files ADD COLUMN \(column)", nil, nil, nil)
+        }
     }
 
     // MARK: Connections
@@ -144,26 +159,40 @@ final class Store: @unchecked Sendable {
 
     // MARK: Live files
 
-    func liveFiles(connection: ConnectionID) -> [LiveRow] {
+    private static let liveColumns = "id, connection_id, path, base_size, base_mtime, local_path, dirty, paused, conflict, conflict_size, conflict_mtime, synced_size, synced_mtime, synced_digest"
+
+    /// Every Live row, or one connection's.
+    func liveFiles(connection: ConnectionID? = nil) -> [LiveRow] {
         queue.sync {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
-            let sql = "SELECT id, connection_id, path, base_size, base_mtime, local_path, dirty FROM live_files WHERE connection_id = ?"
+            let sql = "SELECT \(Self.liveColumns) FROM live_files" + (connection == nil ? "" : " WHERE connection_id = ?")
             guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
-            bindText(statement, 1, connection.rawValue.uuidString)
+            if let connection { bindText(statement, 1, connection.rawValue.uuidString) }
             var rows: [LiveRow] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                guard let id = UUID(uuidString: text(statement, 0)) else { continue }
-                let hasSize = sqlite3_column_type(statement, 3) != SQLITE_NULL
-                let hasTime = sqlite3_column_type(statement, 4) != SQLITE_NULL
+                guard let id = UUID(uuidString: text(statement, 0)), let owner = UUID(uuidString: text(statement, 1)) else { continue }
+                func int(_ column: Int32) -> Int64? {
+                    sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : sqlite3_column_int64(statement, column)
+                }
+                func string(_ column: Int32) -> String? {
+                    sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : text(statement, column)
+                }
                 rows.append(LiveRow(
                     id: LiveFileID(rawValue: id),
-                    connection: connection,
+                    connection: ConnectionID(rawValue: owner),
                     path: RemotePath(bytes: Array(text(statement, 2).utf8)),
-                    baseSize: hasSize ? UInt64(sqlite3_column_int64(statement, 3)) : nil,
-                    baseMtime: hasTime ? UInt32(truncatingIfNeeded: sqlite3_column_int64(statement, 4)) : nil,
+                    baseSize: int(3).map { UInt64(bitPattern: $0) },
+                    baseMtime: int(4).map { UInt32(truncatingIfNeeded: $0) },
                     localPath: text(statement, 5),
-                    dirty: sqlite3_column_int(statement, 6) != 0
+                    dirty: sqlite3_column_int(statement, 6) != 0,
+                    paused: sqlite3_column_int(statement, 7) != 0,
+                    conflict: string(8),
+                    conflictSize: int(9).map { UInt64(bitPattern: $0) },
+                    conflictMtime: int(10).map { UInt32(truncatingIfNeeded: $0) },
+                    syncedSize: int(11).map { UInt64(bitPattern: $0) },
+                    syncedMtime: sqlite3_column_type(statement, 12) == SQLITE_NULL ? nil : sqlite3_column_double(statement, 12),
+                    syncedDigest: string(13)
                 ))
             }
             return rows
@@ -174,15 +203,28 @@ final class Store: @unchecked Sendable {
         queue.sync {
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
-            let sql = "INSERT OR REPLACE INTO live_files (id, connection_id, path, base_size, base_mtime, local_path, dirty) VALUES (?,?,?,?,?,?,?)"
+            let sql = "INSERT OR REPLACE INTO live_files (\(Self.liveColumns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+            func int(_ column: Int32, _ value: Int64?) {
+                if let value { sqlite3_bind_int64(statement, column, value) } else { sqlite3_bind_null(statement, column) }
+            }
+            func string(_ column: Int32, _ value: String?) {
+                if let value { bindText(statement, column, value) } else { sqlite3_bind_null(statement, column) }
+            }
             bindText(statement, 1, row.id.rawValue.uuidString)
             bindText(statement, 2, row.connection.rawValue.uuidString)
             bindText(statement, 3, row.path.display)
-            if let size = row.baseSize { sqlite3_bind_int64(statement, 4, Int64(bitPattern: size)) } else { sqlite3_bind_null(statement, 4) }
-            if let time = row.baseMtime { sqlite3_bind_int64(statement, 5, Int64(time)) } else { sqlite3_bind_null(statement, 5) }
+            int(4, row.baseSize.map { Int64(bitPattern: $0) })
+            int(5, row.baseMtime.map { Int64($0) })
             bindText(statement, 6, row.localPath)
             sqlite3_bind_int(statement, 7, row.dirty ? 1 : 0)
+            sqlite3_bind_int(statement, 8, row.paused ? 1 : 0)
+            string(9, row.conflict)
+            int(10, row.conflictSize.map { Int64(bitPattern: $0) })
+            int(11, row.conflictMtime.map { Int64($0) })
+            int(12, row.syncedSize.map { Int64(bitPattern: $0) })
+            if let mtime = row.syncedMtime { sqlite3_bind_double(statement, 13, mtime) } else { sqlite3_bind_null(statement, 13) }
+            string(14, row.syncedDigest)
             sqlite3_step(statement)
         }
     }

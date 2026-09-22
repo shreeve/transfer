@@ -22,6 +22,9 @@ PubkeyAuthentication yes
 AuthorizedKeysFile $dir/authorized_keys
 StrictModes no
 Subsystem sftp /usr/libexec/sftp-server
+# Each login's host-key probe connects without authenticating; repeated test runs would trip
+# OpenSSH's per-source penalty and have every connection dropped for 15 s or more.
+PerSourcePenalties no
 CONF
 /usr/sbin/sshd -f "$dir/sshd_config" -D -e > "$dir/sshd.log" 2>&1 &
 echo "export TRANSFER_TEST_PORT=$port"

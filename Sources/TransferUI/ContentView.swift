@@ -82,6 +82,9 @@ struct SidebarColumn: View {
                         .help(liveHelp(live))
                         .tag(SidebarItem.live(live.path))
                         .contextMenu {
+                            if live.paused {
+                                Button("Resume Syncing") { Task { await model.resumeLive(live.path) } }
+                            }
                             Button("Discard Live File") { Task { await model.discardLive(live.path) } }
                                 .disabled(live.uploading)
                             Button("Forget All Synced Live Files") { Task { await model.forgetSyncedLive() } }
@@ -134,6 +137,7 @@ struct DetailColumn: View {
         VStack(spacing: 0) {
             if model.renaming { RenameBar(model: model) }
             browser
+            if model.snapshot.connectionID != nil, let clip = Clipboard.shared.clip { ClipBar(clip: clip) }
             if model.showsShelf { shelf }
         }
         .sheet(item: $model.sheet) { sheet in sheetView(sheet) }
@@ -179,7 +183,11 @@ struct DetailColumn: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .contentShape(Rectangle())
-        .onTapGesture { model.snapshot.selection = [] }
+        // The grid's tap also sees clicks on an item, after the item has selected itself on mouse
+        // down; only a click on the background clears the selection.
+        .onTapGesture {
+            if ProcessInfo.processInfo.systemUptime - model.itemClickTime > 0.5 { model.snapshot.selection = [] }
+        }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in dropFiles(providers) }
         .focusable()
         .focusEffectDisabled()
@@ -227,6 +235,10 @@ struct DetailColumn: View {
             model.beginRename()
         }
         Button(model.isStarred(item.path) ? "Unstar" : "Star") { Task { await model.setStarred(item.path, !model.isStarred(item.path)) } }
+        Button("Copy") {
+            if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
+            model.copySelection()
+        }
         Button("Copy Remote URL") {
             model.snapshot.selection = [item.path]
             model.copyRemoteURL()
@@ -668,6 +680,60 @@ struct ConnectionForm: View {
 }
 
 /// The rename field. Focus state has to live inside the hosted detail subtree, so this is its own view.
+/// What the clipboard holds, over the shelf in every window until it is cleared, replaced, or
+/// pasted with a move. Items copied in Transfer are made ready for Finder in the background.
+private struct ClipBar: View {
+    let clip: Clipboard.Clip
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "doc.on.clipboard")
+                .foregroundStyle(.yellow)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Copied \(ClipText.summary(clip.tally, name: clip.name))")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 8)
+            Button {
+                Clipboard.shared.clear()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Clear the clipboard (Escape)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.yellow.opacity(0.14))
+        .overlay(alignment: .leading) { Rectangle().fill(Color.yellow).frame(width: 3) }
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private var detail: String {
+        var parts: [String] = []
+        switch clip.source {
+        case .remote(_, let place, _): parts.append("from \(place)")
+        case .finder: parts.append("from Finder")
+        }
+        parts.append("⌘V pastes, ⌥⌘V moves, Esc clears")
+        switch clip.finder {
+        case .notNeeded: break
+        case .preparing(let fraction): parts.append("getting ready for Finder \(Int(fraction * 100))%")
+        case .ready: parts.append("Finder can paste it too")
+        case .tooLarge: parts.append("too large to paste in Finder")
+        case .failed(let text): parts.append("Finder cannot paste it: \(text)")
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
 private struct RenameBar: View {
     @Bindable var model: TransferModel
     @FocusState private var focused: Bool
