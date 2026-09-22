@@ -46,6 +46,12 @@ The script starts an unprivileged `sshd` on 127.0.0.1:2222 with its own keys and
 - Open in Terminal joins the same master with `-S` and is disabled without a connection or a terminal app.
 - Quit asks Cancel or Quit Anyway through the app delegate whenever any server has unsynced Live work, and disconnects every master on the way out.
 
+## Updates
+
+Sparkle 2 is a SwiftPM dependency of the app target. `Scripts/package-app.sh` copies the framework into the bundle, adds the rpath, and signs the inner pieces before the app. `Check for Updates…` sits in the app menu. The updater starts only when `SUPublicEDKey` in `Support/Info.plist` is non-empty, so a build without a key runs quietly.
+
+To turn updates on: run `.build/artifacts/sparkle/Sparkle/bin/generate_keys` once, which keeps the private key in the login keychain and prints the public key; paste that into `SUPublicEDKey`. Each release is a zip of the signed, notarized app plus `appcast.xml` from `bin/generate_appcast`, attached to a GitHub release. The feed URL points at the latest release's `appcast.xml`. Ad-hoc signed builds cannot install an update over themselves; that needs Developer ID via `SIGN="Developer ID Application: …" Scripts/package-app.sh`.
+
 ## Still open
 
 - Small files do not share a data channel; every file takes a channel from the pool of seven.

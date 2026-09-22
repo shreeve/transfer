@@ -2,7 +2,7 @@
 
 Status: Locked for a one-pass build  
 Target: macOS 27 and later, Apple silicon  
-Bundle identifier for this pass: `com.example.Transfer`  
+Bundle identifier: `com.github.shreeve.transfer`  
 Language: Swift  
 UI: SwiftUI, with AppKit only for `NSBrowser`, `NSFilePromiseProvider`, Quick Look, and `NSWorkspace`  
 Project: the existing Swift package. No Xcode project. Three libraries, one app: `TransferCore` (values), `TransferIO` (the machine), `TransferUI` (views). The `Transfer` executable only connects them.
@@ -38,12 +38,13 @@ An editable file is one whose filename UTI conforms to `public.plain-text` or `p
 - Directory copy on the SFTP channels.
 - Live open, view open, conflicts, and Open in Terminal.
 - A performance-mode probe and a `DirectoryCopyEngine` seam. The fast engine is a stub.
+- Updates through Sparkle: `Check for Updates…` in the app menu, an appcast on GitHub Releases, EdDSA-signed archives.
 
 ### 1.3 What this pass does not build
 
 Do not add disabled controls for these. They are absent.
 
-Gallery, a permissions editor, trash, a background helper or login item, File Provider, any protocol other than SFTP, remote-to-remote copy, sync roots, iCloud, a CLI, remote search, git decorations, an editor, an embedded terminal, a diff viewer, spring-loaded folders, block checksums, byte-range resume, Keep Downloaded, AppleDouble or resource forks, onboarding, a help book, telemetry, and an updater.
+Gallery, a permissions editor, trash, a background helper or login item, File Provider, any protocol other than SFTP, remote-to-remote copy, sync roots, iCloud, a CLI, remote search, git decorations, an editor, an embedded terminal, a diff viewer, spring-loaded folders, block checksums, byte-range resume, Keep Downloaded, AppleDouble or resource forks, onboarding, a help book, and telemetry.
 
 `rsync` is not called. The fast directory copy is the later program that replaces `Tools/performance-version`. This pass only reserves that slot.
 

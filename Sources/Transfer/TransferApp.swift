@@ -1,4 +1,5 @@
 import AppKit
+import Sparkle
 import SwiftUI
 import TransferCore
 import TransferIO
@@ -20,6 +21,9 @@ struct TransferApp: App {
         }
         .defaultSize(width: 960, height: 640)
         .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesButton(updater: delegate.updater.updater)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Connection…") { model?.newConnection() }
                     .keyboardShortcut("k")
@@ -128,12 +132,52 @@ struct BrowserWindow: View {
     }
 }
 
+/// "Check for Updates…" is enabled only while Sparkle can check.
+struct CheckForUpdatesButton: View {
+    @State private var state: UpdaterState
+
+    init(updater: SPUUpdater) {
+        _state = State(initialValue: UpdaterState(updater: updater))
+    }
+
+    var body: some View {
+        Button("Check for Updates…") { state.updater.checkForUpdates() }
+            .disabled(!state.canCheck)
+    }
+}
+
+@MainActor
+@Observable
+final class UpdaterState {
+    let updater: SPUUpdater
+    private(set) var canCheck = false
+    @ObservationIgnored private var observation: NSKeyValueObservation?
+
+    init(updater: SPUUpdater) {
+        self.updater = updater
+        observation = updater.observe(\.canCheckForUpdates, options: [.initial, .new]) { [weak self] _, change in
+            let value = change.newValue ?? false
+            Task { @MainActor in self?.canCheck = value }
+        }
+    }
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let provider: TransferHub?
+    /// Sparkle reads SUFeedURL and SUPublicEDKey from Info.plist and checks on its own schedule.
+    /// Until a public key is in the plist the updater stays off, so a development build never
+    /// shows Sparkle's "not configured" alert at launch.
+    let updater = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
 
     override init() {
         provider = try? TransferHub()
         super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String ?? ""
+        if !key.isEmpty { updater.startUpdater() }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

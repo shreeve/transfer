@@ -10,6 +10,9 @@ let package = Package(
     products: [
         .executable(name: "Transfer", targets: ["Transfer"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.10.0")
+    ],
     targets: [
         .target(name: "TransferCore"),
         .target(
@@ -20,7 +23,7 @@ let package = Package(
         .target(name: "TransferUI", dependencies: ["TransferCore"]),
         .executableTarget(
             name: "Transfer",
-            dependencies: ["TransferUI", "TransferIO"]
+            dependencies: ["TransferUI", "TransferIO", .product(name: "Sparkle", package: "Sparkle")]
         ),
         .testTarget(name: "TransferCoreTests", dependencies: ["TransferCore"]),
         .testTarget(name: "TransferIOTests", dependencies: ["TransferIO"]),
