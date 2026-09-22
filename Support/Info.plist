@@ -8,6 +8,8 @@
 	<string>Transfer</string>
 	<key>CFBundleExecutable</key>
 	<string>Transfer</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.example.Transfer</string>
 	<key>CFBundleInfoDictionaryVersion</key>
