@@ -12,7 +12,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
     var sidebarCollapsed: Bool
     var inspectorShown: Bool
     var searchTick: Int
-    var showsAppIcon: Bool
     var sidebar: Sidebar
     var detail: Detail
     var inspector: Inspector
@@ -29,7 +28,10 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         )
         context.coordinator.controller = controller
         controller.sidebarToggled = { [weak coordinator = context.coordinator] collapsed in
-            coordinator?.model.sidebarCollapsed = collapsed
+            if coordinator?.model.sidebarCollapsed != collapsed { coordinator?.model.sidebarCollapsed = collapsed }
+        }
+        controller.inspectorToggled = { [weak coordinator = context.coordinator] shown in
+            if coordinator?.model.showsInspector != shown { coordinator?.model.showsInspector = shown }
         }
         let container = ChromeContainer(controller: controller)
         apply(to: controller, context: context)
@@ -54,10 +56,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         controller.setTitle(title, subtitle: subtitle)
         controller.setSidebarCollapsed(sidebarCollapsed)
         controller.setInspectorShown(inspectorShown)
-        // List view's column header draws its own line, so Finder shows no hover line there.
-        controller.hoverLineEnabled = viewMode != .list
         context.coordinator.selectViewMode(viewMode)
-        context.coordinator.setShowsAppIcon(showsAppIcon)
         if context.coordinator.searchTick != searchTick {
             context.coordinator.searchTick = searchTick
             context.coordinator.beginSearch()
@@ -76,30 +75,12 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         init(model: TransferModel) { self.model = model }
 
 
-        var showsAppIcon = Preferences.showsAppIconValue()
-
         func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-            var identifiers: [NSToolbarItem.Identifier] = [.toggleSidebar]
-            if showsAppIcon { identifiers.append(ChromeItem.appIcon) }
-            identifiers += [.sidebarTrackingSeparator, ChromeItem.backForward, .flexibleSpace, ChromeItem.viewMode, ChromeItem.transfers, ChromeItem.search]
-            return identifiers
-        }
-
-        /// Inserts or removes the icon item to match the preference, without rebuilding the toolbar.
-        func setShowsAppIcon(_ shows: Bool) {
-            showsAppIcon = shows
-            guard let toolbar = controller?.view.window?.toolbar else { return }
-            let index = toolbar.items.firstIndex { $0.itemIdentifier == ChromeItem.appIcon }
-            if shows, index == nil {
-                let after = toolbar.items.firstIndex { $0.itemIdentifier == .toggleSidebar } ?? -1
-                toolbar.insertItem(withItemIdentifier: ChromeItem.appIcon, at: after + 1)
-            } else if !shows, let index {
-                toolbar.removeItem(at: index)
-            }
+            [.toggleSidebar, .sidebarTrackingSeparator, ChromeItem.backForward, .flexibleSpace, ChromeItem.viewMode, ChromeItem.transfers, ChromeItem.search]
         }
 
         func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-            toolbarDefaultItemIdentifiers(toolbar) + [ChromeItem.appIcon]
+            toolbarDefaultItemIdentifiers(toolbar)
         }
 
         func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
@@ -107,24 +88,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             case .sidebarTrackingSeparator:
                 guard let splitView = controller?.splitView else { return nil }
                 return NSTrackingSeparatorToolbarItem(identifier: identifier, splitView: splitView, dividerIndex: 0)
-            case ChromeItem.appIcon:
-                // The app's icon, so a Transfer window is told apart from Finder at a glance.
-                let item = NSToolbarItem(itemIdentifier: identifier)
-                let icon = (NSApp.applicationIconImage.copy() as? NSImage) ?? NSImage()
-                icon.size = NSSize(width: 36, height: 36)
-                let image = NSImageView(image: icon)
-                image.imageScaling = .scaleProportionallyDown
-                image.translatesAutoresizingMaskIntoConstraints = false
-                NSLayoutConstraint.activate([
-                    image.widthAnchor.constraint(equalToConstant: 36),
-                    image.heightAnchor.constraint(equalToConstant: 36),
-                ])
-                image.toolTip = "Transfer"
-                image.setAccessibilityLabel("Transfer")
-                item.view = image
-                item.label = "Transfer"
-                item.isBordered = false
-                return item
             case ChromeItem.backForward:
                 let group = NSToolbarItemGroup(
                     itemIdentifier: identifier,
@@ -248,7 +211,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
 }
 
 enum ChromeItem {
-    static let appIcon = NSToolbarItem.Identifier("transfer.appIcon")
     static let backForward = NSToolbarItem.Identifier("transfer.backForward")
     static let viewMode = NSToolbarItem.Identifier("transfer.viewMode")
     static let transfers = NSToolbarItem.Identifier("transfer.transfers")
@@ -283,69 +245,23 @@ final class ChromeController: NSSplitViewController {
         // Finder draws no line under the title bar over the sidebar, and over the content only
         // on hover, which the hover line handles. The built-in separators stay off.
         sidebarItem.titlebarSeparatorStyle = .none
-        let detailItem = NSSplitViewItem(viewController: detail)
+        // Finder's content column starts below the toolbar; only the sidebar runs behind the title
+        // bar. Content under the toolbar would keep the system's scroll-pocket edge showing at rest.
+        detail.safeAreaRegions = []
+        inspector.safeAreaRegions = []
+        let detailItem = NSSplitViewItem(viewController: BelowToolbarController(hosting: detail))
         detailItem.minimumThickness = 420
         detailItem.titlebarSeparatorStyle = .none
-        let inspectorItem = NSSplitViewItem(inspectorWithViewController: inspector)
+        let inspectorItem = NSSplitViewItem(inspectorWithViewController: BelowToolbarController(hosting: inspector))
         inspectorItem.minimumThickness = 240
         inspectorItem.maximumThickness = 320
         inspectorItem.canCollapse = true
         inspectorItem.isCollapsed = true
+        inspectorItem.titlebarSeparatorStyle = .none
         addSplitViewItem(sidebarItem)
         addSplitViewItem(detailItem)
         addSplitViewItem(inspectorItem)
         splitView.autosaveName = "Transfer.Split"
-    }
-
-    /// Finder shows a faint line under the toolbar, over the content column, while the pointer
-    /// is in the toolbar. This view is that line; the tracking area covers the toolbar's height.
-    private let hoverLine = NSView()
-    private var hoverTracking: NSTrackingArea?
-    var hoverLineEnabled = true {
-        didSet { if !hoverLineEnabled { hoverLine.alphaValue = 0 } }
-    }
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        hoverLine.wantsLayer = true
-        hoverLine.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        hoverLine.alphaValue = 0
-        view.addSubview(hoverLine, positioned: .above, relativeTo: nil)
-    }
-
-    override func viewDidLayout() {
-        super.viewDidLayout()
-        let top = view.window?.contentView?.safeAreaInsets.top ?? 0
-        let detail = splitViewItems[1].viewController.view
-        let x = detail.convert(detail.bounds, to: view).minX
-        hoverLine.frame = NSRect(x: x, y: view.bounds.height - top - 1, width: view.bounds.width - x, height: 1)
-        if let hoverTracking { view.removeTrackingArea(hoverTracking) }
-        let area = NSTrackingArea(
-            rect: NSRect(x: 0, y: view.bounds.height - top, width: view.bounds.width, height: top),
-            options: [.mouseEnteredAndExited, .activeInKeyWindow],
-            owner: self,
-            userInfo: nil
-        )
-        view.addTrackingArea(area)
-        hoverTracking = area
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        guard event.trackingArea === hoverTracking else { return super.mouseEntered(with: event) }
-        guard hoverLineEnabled else { return }
-        hoverLine.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.2
-            hoverLine.animator().alphaValue = 1
-        }
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        guard event.trackingArea === hoverTracking else { return super.mouseExited(with: event) }
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.35
-            hoverLine.animator().alphaValue = 0
-        }
     }
 
     override func viewDidAppear() {
@@ -355,6 +271,10 @@ final class ChromeController: NSSplitViewController {
         window.setFrameAutosaveName("Transfer.Browser")
         window.tabbingMode = .preferred
         window.titlebarSeparatorStyle = .none
+        // The opaque title bar over the content column draws its own bottom edge regardless of
+        // the separator style; a transparent title bar has no edge, and the sidebar is already
+        // full height, so nothing changes visually except the line going away.
+        window.titlebarAppearsTransparent = true
         window.toolbarStyle = .unified
         // Full-height sidebar: the content extends under the title bar, as in Finder.
         window.styleMask.insert(.fullSizeContentView)
@@ -363,7 +283,6 @@ final class ChromeController: NSSplitViewController {
         toolbar.delegate = coordinator
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
-        toolbar.showsBaselineSeparator = false
         window.toolbar = toolbar
         window.title = pendingTitle
         window.subtitle = pendingSubtitle
@@ -392,8 +311,17 @@ final class ChromeController: NSSplitViewController {
         if item.isCollapsed == shown { item.animator().isCollapsed = !shown }
     }
 
-    /// Set by the coordinator so the model follows the toolbar's sidebar toggle.
+    /// Set by the coordinator so the model follows the toolbar's sidebar toggle and divider drags.
     var sidebarToggled: ((Bool) -> Void)?
+    var inspectorToggled: ((Bool) -> Void)?
+
+    /// A divider drag can collapse or reveal a column without any toggle; the model is told.
+    override func splitViewDidResizeSubviews(_ notification: Notification) {
+        super.splitViewDidResizeSubviews(notification)
+        guard !toggling, splitViewItems.count == 3 else { return }
+        sidebarToggled?(splitViewItems[0].isCollapsed)
+        inspectorToggled?(!splitViewItems[2].isCollapsed)
+    }
 
     /// The toolbar's sidebar toggle sends this through the responder chain. The model is told,
     /// and its echo is ignored until AppKit's animation has finished.
@@ -450,5 +378,49 @@ final class ChromeContainer: NSView {
     override func layout() {
         super.layout()
         layoutSubtreeIfNeeded()
+    }
+}
+
+/// Holds a hosted column below the window's toolbar, leaving the title bar area empty.
+@MainActor
+final class BelowToolbarController: NSViewController {
+    let hosting: NSViewController
+
+    init(hosting: NSViewController) {
+        self.hosting = hosting
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func loadView() {
+        view = BelowToolbarView(hosted: hosting.view)
+        addChild(hosting)
+    }
+}
+
+final class BelowToolbarView: NSView {
+    let hosted: NSView
+
+    init(hosted: NSView) {
+        self.hosted = hosted
+        super.init(frame: .zero)
+        hosted.translatesAutoresizingMaskIntoConstraints = true
+        hosted.autoresizingMask = [.width, .height]
+        addSubview(hosted)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func layout() {
+        super.layout()
+        let inset = window?.contentView?.safeAreaInsets.top ?? 0
+        let frame = NSRect(x: 0, y: 0, width: bounds.width, height: max(bounds.height - inset, 0))
+        if hosted.frame != frame { hosted.frame = frame }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        needsLayout = true
     }
 }

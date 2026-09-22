@@ -10,12 +10,6 @@ import UniformTypeIdentifiers
 public enum Preferences {
     public static let caseInsensitiveSort = "transfer.sortCaseInsensitive"
     public static let foldersFirst = "transfer.foldersFirst"
-    public static let showsAppIcon = "transfer.showsAppIcon"
-
-    /// On unless the user turned it off.
-    public static func showsAppIconValue(_ defaults: UserDefaults = .standard) -> Bool {
-        defaults.object(forKey: showsAppIcon) == nil ? true : defaults.bool(forKey: showsAppIcon)
-    }
 
     /// On unless the user turned it off; a missing default reads as true.
     public static func foldersFirstValue(_ defaults: UserDefaults = .standard) -> Bool {
@@ -59,7 +53,6 @@ public final class TransferModel {
     public var status = "Not connected"
     public var showsInspector = false
     public var sidebarCollapsed = false
-    public var showsAppIcon = Preferences.showsAppIconValue()
 
     public func toggleSidebar() {
         sidebarCollapsed.toggle()
@@ -109,9 +102,15 @@ public final class TransferModel {
         snapshot.sort.caseInsensitive = UserDefaults.standard.bool(forKey: Preferences.caseInsensitiveSort)
         snapshot.sort.foldersFirst = Preferences.foldersFirstValue()
         Task { await reloadConnections() }
-        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
+        defaultsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
             Task { @MainActor in self?.applyPreferences() }
         }
+    }
+
+    @ObservationIgnored nonisolated(unsafe) private var defaultsObserver: (any NSObjectProtocol)?
+
+    deinit {
+        if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
     }
 
     /// Picks up changes made in Settings while the window is open.
@@ -131,8 +130,6 @@ public final class TransferModel {
             for (path, list) in columns { columns[path] = ListingSort.apply(list, sort: snapshot.sort) }
             changed = true
         }
-        let icon = Preferences.showsAppIconValue(defaults)
-        if icon != showsAppIcon { showsAppIcon = icon }
         if let stored = defaults.string(forKey: "transfer.viewMode"), let mode = ViewMode(rawValue: stored), mode != snapshot.viewMode {
             snapshot.viewMode = mode
             if mode == .columns { columnRoot = snapshot.path }

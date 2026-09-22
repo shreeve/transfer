@@ -5,7 +5,6 @@ import UniformTypeIdentifiers
 
 public struct ContentView: View {
     @Bindable var model: TransferModel
-    @FocusState private var renameFocused: Bool
 
     public init(model: TransferModel) {
         self.model = model
@@ -20,7 +19,6 @@ public struct ContentView: View {
             sidebarCollapsed: model.sidebarCollapsed,
             inspectorShown: model.showsInspector,
             searchTick: model.filterFocusTick,
-            showsAppIcon: model.showsAppIcon,
             sidebar: sidebar,
             detail: detail,
             inspector: inspector
@@ -28,10 +26,8 @@ public struct ContentView: View {
         .ignoresSafeArea()
         .focusedSceneValue(\.transferModel, model)
         .onChange(of: model.snapshot.selection) { model.selectionChanged() }
-        .onChange(of: renameFocused) { model.textEditing = renameFocused }
-        .onChange(of: model.renaming) { if model.renaming { renameFocused = true } }
         .onChange(of: model.sidebarSelection) { _, item in Task { await model.sidebarSelected(item) } }
-        .frame(minWidth: 880, idealWidth: 960, minHeight: 480, idealHeight: 640)
+        .frame(minWidth: 640, idealWidth: 960, minHeight: 400, idealHeight: 640)
     }
 
     private var detail: some View {
@@ -111,7 +107,7 @@ public struct ContentView: View {
             }
         }
         .listStyle(.sidebar)
-        .modifier(SidebarExp())
+        .scrollEdgeEffectHidden(true, for: .top)
     }
 
     private func folderName(_ path: RemotePath) -> String {
@@ -128,17 +124,7 @@ public struct ContentView: View {
     // MARK: Browser
 
     private var renameBar: some View {
-        HStack {
-            TextField("Name", text: $model.renameText)
-                .textFieldStyle(.roundedBorder)
-                .focused($renameFocused)
-                .onSubmit { Task { await model.renameSelection(to: model.renameText) } }
-                .onExitCommand { model.renaming = false }
-            Button("Rename") { Task { await model.renameSelection(to: model.renameText) } }
-                .keyboardShortcut(.defaultAction)
-            Button("Cancel") { model.renaming = false }
-        }
-        .padding(8)
+        RenameBar(model: model)
     }
 
     @ViewBuilder private var browser: some View {
@@ -591,17 +577,25 @@ struct ConnectionForm: View {
     }
 }
 
+/// The rename field. Focus state has to live inside the hosted detail subtree, so this is its own view.
+private struct RenameBar: View {
+    @Bindable var model: TransferModel
+    @FocusState private var focused: Bool
 
-// EXPERIMENT
-struct SidebarExp: ViewModifier {
-    func body(content: Content) -> some View {
-        switch ProcessInfo.processInfo.environment["TRANSFER_EXP_SIDEBAR"] ?? "hidden" {
-        case "soft": content.scrollEdgeEffectStyle(.soft, for: .top)
-        case "hard": content.scrollEdgeEffectStyle(.hard, for: .top)
-        case "none": content
-        case "hiddenall": content.scrollEdgeEffectHidden(true, for: .all)
-        case "ignoresafe": content.scrollEdgeEffectHidden(true, for: .top).ignoresSafeArea(edges: .top)
-        default: content.scrollEdgeEffectHidden(true, for: .top)
+    var body: some View {
+        HStack {
+            TextField("Name", text: $model.renameText)
+                .textFieldStyle(.roundedBorder)
+                .focused($focused)
+                .onSubmit { Task { await model.renameSelection(to: model.renameText) } }
+                .onExitCommand { model.renaming = false }
+            Button("Rename") { Task { await model.renameSelection(to: model.renameText) } }
+                .keyboardShortcut(.defaultAction)
+            Button("Cancel") { model.renaming = false }
         }
+        .padding(8)
+        .onAppear { focused = true }
+        .onChange(of: focused) { model.textEditing = focused }
+        .onDisappear { model.textEditing = false }
     }
 }

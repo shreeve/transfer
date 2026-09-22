@@ -7,7 +7,6 @@ public struct GeneralSettings: View {
     @AppStorage(Preferences.foldersFirst) private var foldersFirst = true
     @AppStorage(Preferences.showsHidden) private var showsHidden = false
     @AppStorage(Preferences.viewMode) private var viewMode = ViewMode.list.rawValue
-    @AppStorage(Preferences.showsAppIcon) private var showsAppIcon = true
 
     public init() {}
 
@@ -25,9 +24,7 @@ public struct GeneralSettings: View {
                     Text("Columns").tag(ViewMode.columns.rawValue)
                 }
             }
-            Section("Window") {
-                Toggle("Show the Transfer icon in the toolbar", isOn: $showsAppIcon)
-            }
+
         }
         .formStyle(.grouped)
     }

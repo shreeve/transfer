@@ -119,7 +119,9 @@ struct ColumnBrowser: NSViewRepresentable {
 
         private func children(_ path: RemotePath) -> [RemoteItem] {
             if let cached = model.columns[path] { return model.visible(cached) }
-            model.loadColumn(path)
+            // Called from inside SwiftUI's update pass; the listing starts on the next turn.
+            let model = model
+            Task { @MainActor in model.loadColumn(path) }
             return []
         }
 
@@ -151,7 +153,8 @@ struct ColumnBrowser: NSViewRepresentable {
 
         func browser(_ browser: NSBrowser, pasteboardWriterForRow row: Int, column: Int) -> (any NSPasteboardWriting)? {
             guard let session = model.session, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return nil }
-            return RemoteItemPromise.providers(for: [item], session: session).first
+            let roots = model.dragItems(including: item)
+            return RemoteItemPromise.providers(for: roots, session: session).first { $0.itemPath == item.path }
         }
 
         // MARK: Drop in

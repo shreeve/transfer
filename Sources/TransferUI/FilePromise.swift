@@ -24,6 +24,8 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
     private let session: any RemoteSession
     private let payload: Data
 
+    var itemPath: RemotePath { item.path }
+
     init(item: RemoteItem, session: any RemoteSession, payload: Data) {
         self.item = item
         self.session = session
@@ -141,21 +143,6 @@ final class PromiseText: NSTextField, NSDraggingSource {
     private var down: NSPoint = .zero
 
     override var acceptsFirstResponder: Bool { false }
-
-    /// The list table keeps AppKit's default 2-point row spacing, which SwiftUI does not expose.
-    /// Zeroing it brings the row pitch to 22, matching the column view.
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard alignment != .center else { return }
-        var view: NSView? = superview
-        while let current = view, !(current is NSTableView) { view = current.superview }
-        if let table = view as? NSTableView {
-            if table.intercellSpacing.height != 0 {
-                table.intercellSpacing = NSSize(width: table.intercellSpacing.width, height: 0)
-            }
-            if table.rowHeight != 22 { table.rowHeight = 22 }
-        }
-    }
 
     func apply(item: RemoteItem, model: TransferModel, centered: Bool) {
         stringValue = item.name
