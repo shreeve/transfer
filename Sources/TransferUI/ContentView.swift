@@ -4,7 +4,7 @@ import TransferCore
 import UniformTypeIdentifiers
 
 public struct ContentView: View {
-    @Bindable var model: TransferModel
+    let model: TransferModel
 
     public init(model: TransferModel) {
         self.model = model
@@ -53,23 +53,18 @@ struct SidebarColumn: View {
                 Button("Add Server…") { model.newConnection() }
                     .buttonStyle(.link)
             }
-            if !model.recents.isEmpty {
-                Section("Recents") {
-                    ForEach(model.recents, id: \.self) { path in
-                        Label(folderName(path), systemImage: "clock")
-                            .help(path.display)
-                            .tag(SidebarItem.recent(path))
-                    }
-                }
-            }
             if !model.pins.isEmpty {
-                Section("Saved Locations") {
+                Section("Starred") {
                     ForEach(model.pins, id: \.self) { path in
-                        Label(folderName(path), systemImage: "folder")
+                        Label(folderName(path), systemImage: model.starredIsFolder(path) ? "star" : "star.fill")
                             .help(path.display)
                             .tag(SidebarItem.pin(path))
+                            // A double-click opens the item the way the browser would: Live or view for a
+                            // file, after revealing it, and its listing for a folder.
+                            .onTapGesture(count: 2) { Task { await model.openStarred(path) } }
                             .contextMenu {
-                                Button("Remove from Saved Locations") { Task { await model.unpin(path) } }
+                                Button("Open") { Task { await model.openStarred(path) } }
+                                Button("Unstar") { Task { await model.setStarred(path, false) } }
                             }
                     }
                 }
@@ -78,15 +73,17 @@ struct SidebarColumn: View {
                 Section("Live Files") {
                     ForEach(model.liveFiles) { live in
                         Label {
-                            Text(String(decoding: live.path.nameBytes, as: UTF8.self))
+                            Text(live.path.name)
                         } icon: {
                             Image(systemName: liveSymbol(live))
                         }
-                        .help(live.path.display)
+                        .help(liveHelp(live))
                         .tag(SidebarItem.live(live.path))
                         .contextMenu {
                             Button("Discard Live File") { Task { await model.discardLive(live.path) } }
                                 .disabled(live.uploading)
+                            Button("Forget All Synced Live Files") { Task { await model.forgetSyncedLive() } }
+                                .disabled(!model.liveFiles.contains { !$0.dirty && !$0.uploading && !$0.conflict })
                         }
                     }
                 }
@@ -94,7 +91,7 @@ struct SidebarColumn: View {
             if !model.conflicts.isEmpty {
                 Section("Conflicts") {
                     ForEach(model.conflicts, id: \.self) { path in
-                        Label(String(decoding: path.nameBytes, as: UTF8.self), systemImage: "exclamationmark.triangle")
+                        Label(path.name, systemImage: "exclamationmark.triangle")
                             .help(path.display)
                             .tag(SidebarItem.conflict(path))
                     }
@@ -106,14 +103,24 @@ struct SidebarColumn: View {
     }
 
     private func folderName(_ path: RemotePath) -> String {
-        path.isRoot ? "/" : String(decoding: path.nameBytes, as: UTF8.self)
+        path.isRoot ? "/" : path.name
     }
 
     private func liveSymbol(_ live: LiveFile) -> String {
-        if live.conflict { return "exclamationmark.triangle" }
-        if live.uploading { return "arrow.up.circle" }
+        if live.conflict { return "exclamationmark.triangle.fill" }
+        if live.uploading { return "arrow.up.circle.fill" }
         if live.paused { return "pause.circle" }
-        return live.dirty ? "circle.fill" : "circle"
+        return live.dirty ? "pencil.circle.fill" : "checkmark.circle"
+    }
+
+    private func liveHelp(_ live: LiveFile) -> String {
+        let state: String
+        if live.conflict { state = "Changed on the server; needs a decision" }
+        else if live.uploading { state = "Uploading" }
+        else if live.paused { state = "Paused" }
+        else if live.dirty { state = "Edited here, not yet uploaded" }
+        else { state = "Synced; saves in the editor upload" }
+        return "\(live.path.display)\n\(state)"
     }
 }
 
@@ -123,7 +130,7 @@ struct DetailColumn: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.renaming { renameBar }
+            if model.renaming { RenameBar(model: model) }
             browser
             if model.showsShelf { shelf }
         }
@@ -132,10 +139,6 @@ struct DetailColumn: View {
     }
 
     // MARK: Browser
-
-    private var renameBar: some View {
-        RenameBar(model: model)
-    }
 
     @ViewBuilder private var browser: some View {
         if model.snapshot.connectionID == nil {
@@ -149,7 +152,7 @@ struct DetailColumn: View {
         } else {
             switch model.snapshot.viewMode {
             case .icon: iconView
-            case .list: listView
+            case .list: ListTable(model: model)
             case .columns: ColumnBrowser(model: model)
             }
         }
@@ -163,7 +166,7 @@ struct DetailColumn: View {
                         Image(nsImage: ItemIcon.image(for: item))
                             .resizable()
                             .frame(width: 48, height: 48)
-                        FilePromiseLabel(item: item, model: model, centered: true)
+                        FilePromiseLabel(item: item, model: model)
                             .frame(height: 18)
                     }
                     .frame(width: 96)
@@ -182,10 +185,6 @@ struct DetailColumn: View {
         .contentShape(Rectangle())
         .onTapGesture { model.snapshot.selection = [] }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in dropFiles(providers) }
-    }
-
-    private var listView: some View {
-        ListTable(model: model)
     }
 
     private func dropFiles(_ providers: [NSItemProvider]) -> Bool {
@@ -225,9 +224,7 @@ struct DetailColumn: View {
             model.snapshot.selection = [item.path]
             model.beginRename()
         }
-        if item.kind == .directory {
-            Button("Save Location") { Task { await model.session?.pin(item.path); await model.refresh() } }
-        }
+        Button(model.isStarred(item.path) ? "Unstar" : "Star") { Task { await model.setStarred(item.path, !model.isStarred(item.path)) } }
         Button("Copy Remote URL") {
             model.snapshot.selection = [item.path]
             model.copyRemoteURL()
@@ -239,9 +236,6 @@ struct DetailColumn: View {
         }
     }
 
-    private func status(_ item: RemoteItem) -> String {
-        model.statusText(for: item.path)
-    }
 
     // MARK: Shelf
 
@@ -319,6 +313,7 @@ struct DetailColumn: View {
             }
             .padding()
             .frame(width: 380)
+            .onExitCommand { model.finishPrompt(PromptReply(text: nil)) }
         case .hostKey(let event):
             VStack(alignment: .leading, spacing: 12) {
                 Text(event.situation == .changed ? "The host key changed" : "First time connecting to this server")
@@ -345,6 +340,7 @@ struct DetailColumn: View {
             }
             .padding()
             .frame(width: 460)
+            .onExitCommand { model.finishHost(.cancel) }
         case .delete:
             let count = model.snapshot.selection.count
             let unsynced = model.unsyncedInSelection
@@ -367,6 +363,7 @@ struct DetailColumn: View {
             }
             .padding()
             .frame(width: 400)
+            .onExitCommand { model.sheet = nil }
         case .collision(let name):
             VStack(alignment: .leading, spacing: 12) {
                 Text("“\(name)” already exists").font(.headline)
@@ -383,6 +380,7 @@ struct DetailColumn: View {
             }
             .padding()
             .frame(width: 400)
+            .onExitCommand { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
         case .conflict:
             conflictSheet
         case .goToFolder:
@@ -399,18 +397,7 @@ struct DetailColumn: View {
             }
             .padding()
             .frame(width: 420)
-        case .quit(let count):
-            VStack(alignment: .leading, spacing: 12) {
-                Text("\(count) Live file\(count == 1 ? " has" : "s have") unsynced edits").font(.headline)
-                Text("Uploads run only while Transfer is open.").foregroundStyle(.secondary)
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Quit Anyway") { NSApp.terminate(nil) }
-                }
-            }
-            .padding()
-            .frame(width: 400)
+            .onExitCommand { model.sheet = nil }
         case .removeServer(let connection):
             VStack(alignment: .leading, spacing: 12) {
                 Text("Remove “\(connection.displayName)”?").font(.headline)
@@ -424,9 +411,10 @@ struct DetailColumn: View {
             }
             .padding()
             .frame(width: 400)
+            .onExitCommand { model.sheet = nil }
         case .discardLive(let path):
             VStack(alignment: .leading, spacing: 12) {
-                Text("Discard unsynced edits to “\(String(decoding: path.nameBytes, as: UTF8.self))”?").font(.headline)
+                Text("Discard unsynced edits to “\(path.name)”?").font(.headline)
                 Text("The working copy has changes that were not uploaded.").foregroundStyle(.secondary)
                 HStack {
                     Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
@@ -439,12 +427,13 @@ struct DetailColumn: View {
             }
             .padding()
             .frame(width: 420)
+            .onExitCommand { model.sheet = nil }
         }
     }
 
     private var conflictSheet: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("“\(model.conflictPath.map { String(decoding: $0.nameBytes, as: UTF8.self) } ?? "")” changed on the server")
+            Text("“\(model.conflictPath?.name ?? "")” changed on the server")
                 .font(.headline)
             Text("Neither version has been overwritten.").foregroundStyle(.secondary)
             if let confirm = model.conflictConfirm {
@@ -473,6 +462,7 @@ struct DetailColumn: View {
         }
         .padding()
         .frame(width: 520)
+        .onExitCommand { model.sheet = nil; model.conflictConfirm = nil }
     }
 
     private func goToFolder() {
@@ -482,14 +472,11 @@ struct DetailColumn: View {
     }
 
 
-    private func date(_ mtime: UInt32) -> String {
-        Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .abbreviated, time: .shortened)
-    }
 }
 
 /// The inspector column.
 struct InspectorColumn: View {
-    @Bindable var model: TransferModel
+    let model: TransferModel
 
     // MARK: Inspector
 
@@ -512,7 +499,7 @@ struct InspectorColumn: View {
                 if let group = item.group { LabeledContent("Group", value: group) }
                 if item.kind == .symlink { LabeledContent("Target", value: model.inspectorLinkTarget ?? "…") }
                 if model.liveFile(for: item.path) != nil { LabeledContent("Live", value: model.statusText(for: item.path)) }
-                if let operation = model.operations.first(where: { $0.livePath == item.path || $0.title.hasSuffix(item.name) }) {
+                if let operation = model.operation(for: item.path) {
                     LabeledContent("Transfer", value: operation.message ?? operation.state.rawValue.capitalized)
                 }
                 Section {

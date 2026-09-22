@@ -54,6 +54,8 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         controller.setTitle(title, subtitle: subtitle)
         controller.setSidebarCollapsed(sidebarCollapsed)
         controller.setInspectorShown(inspectorShown)
+        // List view's column header has its own line, so Finder shows no hover line there.
+        controller.hoverLineEnabled = viewMode != .list
         context.coordinator.selectViewMode(viewMode)
         if context.coordinator.searchTick != searchTick {
             context.coordinator.searchTick = searchTick
@@ -129,8 +131,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 item.resignsFirstResponderWithCancel = true
                 item.searchField.placeholderString = "Search"
                 item.searchField.delegate = self
-                item.searchField.target = self
-                item.searchField.action = #selector(searchChanged(_:))
                 item.searchField.sendsSearchStringImmediately = true
                 searchItem = item
                 return item
@@ -144,11 +144,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         }
 
         private func index(of mode: ViewMode) -> Int {
-            switch mode {
-            case .icon: 0
-            case .list: 1
-            case .columns: 2
-            }
+            ViewMode.allCases.firstIndex(of: mode) ?? 0
         }
 
         func selectViewMode(_ mode: ViewMode) {
@@ -166,19 +162,12 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         }
 
         @objc private func changeViewMode(_ sender: NSToolbarItemGroup) {
-            switch sender.selectedIndex {
-            case 0: model.setViewMode(.icon)
-            case 1: model.setViewMode(.list)
-            default: model.setViewMode(.columns)
-            }
+            let modes = ViewMode.allCases
+            model.setViewMode(modes[min(max(sender.selectedIndex, 0), modes.count - 1)])
         }
 
         @objc private func toggleShelf(_ sender: Any?) {
             model.showsShelf.toggle()
-        }
-
-        @objc private func searchChanged(_ sender: NSSearchField) {
-            model.filter = sender.stringValue
         }
 
         func controlTextDidChange(_ notification: Notification) {
@@ -203,7 +192,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             model.filter = ""
         }
 
-        func controlTextDidBeginEditing(_ notification: Notification) { model.textEditing = true }
         func controlTextDidEndEditing(_ notification: Notification) { model.textEditing = false }
     }
 }
@@ -220,17 +208,11 @@ enum ChromeItem {
 @MainActor
 final class ChromeController: NSSplitViewController {
     weak var coordinator: (any NSToolbarDelegate)?
-    private(set) var sidebarHost: NSHostingController<AnyView>?
-    private(set) var detailHost: NSHostingController<AnyView>?
-    private(set) var inspectorHost: NSHostingController<AnyView>?
     private var toolbarInstalled = false
     private var pendingTitle = ""
     private var pendingSubtitle = ""
 
     func install(sidebar: NSHostingController<AnyView>, detail: NSHostingController<AnyView>, inspector: NSHostingController<AnyView>) {
-        sidebarHost = sidebar
-        detailHost = detail
-        inspectorHost = inspector
         // The split view decides the columns' sizes; the hosted SwiftUI content reports none.
         for host in [sidebar, detail, inspector] {
             host.sizingOptions = []
@@ -260,6 +242,67 @@ final class ChromeController: NSSplitViewController {
         addSplitViewItem(detailItem)
         addSplitViewItem(inspectorItem)
         splitView.autosaveName = "Transfer.Split"
+    }
+
+    /// Finder shows a faint line under the toolbar, over the content column only, while the
+    /// pointer is in the toolbar. This is that line.
+    private let hoverLine = NSView()
+    private var hoverTracking: NSTrackingArea?
+    var hoverLineEnabled = true {
+        didSet { if !hoverLineEnabled { hoverLine.alphaValue = 0 } }
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        hoverLine.wantsLayer = true
+        hoverLine.alphaValue = 0
+        view.addSubview(hoverLine, positioned: .above, relativeTo: nil)
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        let top = view.window?.contentView?.safeAreaInsets.top ?? 0
+        let content = splitViewItems[1].viewController.view
+        let x = content.convert(content.bounds, to: view).minX
+        hoverLine.frame = NSRect(x: x, y: view.bounds.height - top - 1, width: view.bounds.width - x, height: 1)
+        let strip = NSRect(x: 0, y: view.bounds.height - top, width: view.bounds.width, height: top)
+        if hoverTracking?.rect != strip {
+            if let hoverTracking { view.removeTrackingArea(hoverTracking) }
+            let area = NSTrackingArea(rect: strip, options: [.mouseEnteredAndExited, .activeInKeyWindow], owner: self, userInfo: nil)
+            view.addTrackingArea(area)
+            hoverTracking = area
+            // A new tracking area drops the pending exit event; follow the pointer's real position.
+            setHoverLine(visible: pointerInToolbar(), animated: false)
+        }
+    }
+
+    private func pointerInToolbar() -> Bool {
+        guard let window = view.window, window.isKeyWindow, let rect = hoverTracking?.rect else { return false }
+        return rect.contains(view.convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+
+    private func setHoverLine(visible: Bool, animated: Bool) {
+        let target: CGFloat = visible && hoverLineEnabled ? 1 : 0
+        guard hoverLine.alphaValue != target else { return }
+        hoverLine.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        guard animated else {
+            hoverLine.alphaValue = target
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = visible ? 0.2 : 0.35
+            hoverLine.animator().alphaValue = target
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard event.trackingArea === hoverTracking else { return super.mouseEntered(with: event) }
+        setHoverLine(visible: true, animated: true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard event.trackingArea === hoverTracking else { return super.mouseExited(with: event) }
+        setHoverLine(visible: false, animated: true)
     }
 
     override func viewDidAppear() {

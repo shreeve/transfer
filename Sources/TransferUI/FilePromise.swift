@@ -24,8 +24,6 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
     private let session: any RemoteSession
     private let payload: Data
 
-    var itemPath: RemotePath { item.path }
-
     init(item: RemoteItem, session: any RemoteSession, payload: Data) {
         self.item = item
         self.session = session
@@ -79,9 +77,18 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
     }
 
     static func providers(for items: [RemoteItem], session: any RemoteSession) -> [RemoteItemPromise] {
-        let payload = RemoteDragPayload(connection: session.connection.id.rawValue, paths: items.map(\.path.bytes))
-        let data = (try? JSONEncoder().encode(payload)) ?? Data()
+        let data = payload(for: items, session: session)
         return items.map { RemoteItemPromise(item: $0, session: session, payload: data) }
+    }
+
+    /// One provider for `item`, whose payload names every item in `roots`, for row-based drags.
+    static func provider(for item: RemoteItem, among roots: [RemoteItem], session: any RemoteSession) -> RemoteItemPromise {
+        RemoteItemPromise(item: item, session: session, payload: payload(for: roots, session: session))
+    }
+
+    private static func payload(for items: [RemoteItem], session: any RemoteSession) -> Data {
+        let payload = RemoteDragPayload(connection: session.connection.id.rawValue, paths: items.map(\.path.bytes))
+        return (try? JSONEncoder().encode(payload)) ?? Data()
     }
 }
 
@@ -94,6 +101,12 @@ private final class PromiseFinish: @unchecked Sendable {
 enum DropAction {
     case uploadFiles([URL], into: RemotePath)
     case moveRemote([RemotePath], into: RemotePath)
+
+    /// Files from outside copy in; remote items move.
+    var operation: NSDragOperation {
+        if case .uploadFiles = self { return .copy }
+        return .move
+    }
 }
 
 /// Decides a drop onto `folder` from the pasteboard. Nil when nothing usable is there.
@@ -110,30 +123,19 @@ func dropAction(from pasteboard: NSPasteboard, onto folder: RemotePath, connecti
     return urls.isEmpty ? nil : .uploadFiles(urls, into: folder)
 }
 
-extension RemotePath {
-    /// True when this path is `ancestor` or lies under it.
-    func isInside(_ ancestor: RemotePath) -> Bool {
-        if bytes == ancestor.bytes { return true }
-        let head = ancestor.isRoot ? ancestor.bytes : ancestor.bytes + [0x2F]
-        return bytes.count > head.count && Array(bytes[..<head.count]) == head
-    }
-}
-
-/// The name cell of a row in icon and list view. It starts drags out and takes drops onto folder rows.
+/// The name under an icon in icon view. It starts drags out and takes drops onto folder tiles.
 struct FilePromiseLabel: NSViewRepresentable {
     var item: RemoteItem
     var model: TransferModel
-    /// Centered under an icon; leading in a table row.
-    var centered = false
 
     func makeNSView(context: Context) -> PromiseText {
         let view = PromiseText()
-        view.apply(item: item, model: model, centered: centered)
+        view.apply(item: item, model: model)
         return view
     }
 
     func updateNSView(_ view: PromiseText, context: Context) {
-        view.apply(item: item, model: model, centered: centered)
+        view.apply(item: item, model: model)
     }
 }
 
@@ -144,11 +146,9 @@ final class PromiseText: NSTextField, NSDraggingSource {
 
     override var acceptsFirstResponder: Bool { false }
 
-    func apply(item: RemoteItem, model: TransferModel, centered: Bool) {
-        stringValue = item.name
-        self.item = item
-        self.model = model
-        alignment = centered ? .center : .natural
+    init() {
+        super.init(frame: .zero)
+        alignment = .center
         isBordered = false
         isEditable = false
         isSelectable = false
@@ -156,6 +156,14 @@ final class PromiseText: NSTextField, NSDraggingSource {
         lineBreakMode = .byTruncatingMiddle
         font = .systemFont(ofSize: NSFont.systemFontSize)
         textColor = .labelColor
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func apply(item: RemoteItem, model: TransferModel) {
+        stringValue = item.name
+        self.item = item
+        self.model = model
         if item.kind == .directory {
             registerForDraggedTypes([.fileURL, remoteDragType])
         } else {
@@ -201,11 +209,7 @@ final class PromiseText: NSTextField, NSDraggingSource {
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
         guard item.kind == .directory, let model, let connection = model.snapshot.connectionID else { return [] }
-        switch dropAction(from: sender.draggingPasteboard, onto: item.path, connection: connection) {
-        case .uploadFiles: return .copy
-        case .moveRemote: return .move
-        case nil: return []
-        }
+        return dropAction(from: sender.draggingPasteboard, onto: item.path, connection: connection)?.operation ?? []
     }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {

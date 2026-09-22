@@ -49,6 +49,16 @@ public struct RemotePath: Hashable, Sendable, Codable {
         return RemotePath(bytes: Array(bytes[..<slash]))
     }
 
+    /// The last path component, decoded for display.
+    public var name: String { String(decoding: nameBytes, as: UTF8.self) }
+
+    /// True when this path is `ancestor` or lies under it.
+    public func isInside(_ ancestor: RemotePath) -> Bool {
+        if bytes == ancestor.bytes { return true }
+        let head = ancestor.isRoot ? ancestor.bytes : ancestor.bytes + [0x2F]
+        return bytes.count > head.count && Array(bytes[..<head.count]) == head
+    }
+
     public var nameBytes: [UInt8] {
         guard let slash = bytes.lastIndex(of: 0x2F), slash + 1 < bytes.count else {
             return bytes == [0x2F] ? [] : bytes

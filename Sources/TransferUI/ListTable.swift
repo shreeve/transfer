@@ -73,7 +73,7 @@ struct ListTable: NSViewRepresentable {
         var model: TransferModel
         weak var table: NSTableView?
         private(set) var items: [RemoteItem] = []
-        private var liveStamp: [RemotePath: String] = [:]
+        private var statusStamps: [String] = []
         private var syncing = false
         private var autosaveConnection: ConnectionID?
 
@@ -94,10 +94,11 @@ struct ListTable: NSViewRepresentable {
                 table.sortDescriptors = [descriptor]
             }
             let fresh = model.displayedItems
-            let stamps = Dictionary(uniqueKeysWithValues: model.liveFiles.map { ($0.path, model.statusText(for: $0.path)) })
-            if fresh != items || stamps != liveStamp {
+            // Status text covers Live state and active transfers, so any row can change.
+            let stamps = fresh.map { model.statusText(for: $0.path) }
+            if fresh != items || stamps != statusStamps {
                 items = fresh
-                liveStamp = stamps
+                statusStamps = stamps
                 table.reloadData()
             }
             let wanted = IndexSet(items.indices.filter { model.snapshot.selection.contains(items[$0].path) })
@@ -119,10 +120,8 @@ struct ListTable: NSViewRepresentable {
             case "name":
                 cell.imageView?.image = ItemIcon.image(for: item)
                 cell.textField?.stringValue = item.name
-                cell.textField?.textColor = .labelColor
             case "status":
                 cell.textField?.stringValue = model.statusText(for: item.path)
-                cell.textField?.textColor = .secondaryLabelColor
             case "mtime":
                 cell.textField?.stringValue = item.mtime.map(Format.date) ?? ""
             case "size":
@@ -139,6 +138,7 @@ struct ListTable: NSViewRepresentable {
             let text = NSTextField(labelWithString: "")
             text.lineBreakMode = .byTruncatingMiddle
             text.font = .systemFont(ofSize: NSFont.systemFontSize)
+            text.textColor = id.rawValue == "status" ? .secondaryLabelColor : .labelColor
             text.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(text)
             cell.textField = text
@@ -192,31 +192,26 @@ struct ListTable: NSViewRepresentable {
 
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
             guard let session = model.session, row < items.count else { return nil }
-            // One promise per row, but the payload names the whole selection so an internal
-            // drop moves every dragged item.
-            let roots = model.dragItems(including: items[row])
-            return RemoteItemPromise.providers(for: roots, session: session).first { $0.itemPath == items[row].path }
+            // One promise per row; the payload names the whole selection so an internal drop moves every item.
+            return RemoteItemPromise.provider(for: items[row], among: model.dragItems(including: items[row]), session: session)
         }
 
         func tableView(_ tableView: NSTableView, validateDrop info: any NSDraggingInfo, proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
             guard let connection = model.snapshot.connectionID else { return [] }
-            let folder: RemotePath
-            if operation == .on, row >= 0, row < items.count, items[row].kind == .directory {
-                folder = items[row].path
-            } else {
-                tableView.setDropRow(-1, dropOperation: .on)
-                folder = model.snapshot.path
-            }
-            switch dropAction(from: info.draggingPasteboard, onto: folder, connection: connection) {
-            case .uploadFiles: return .copy
-            case .moveRemote: return .move
-            case nil: return []
-            }
+            let folder = dropFolder(row: row, operation: operation)
+            if folder == model.snapshot.path { tableView.setDropRow(-1, dropOperation: .on) }
+            return dropAction(from: info.draggingPasteboard, onto: folder, connection: connection)?.operation ?? []
+        }
+
+        /// A drop on a folder row goes into that folder; anywhere else goes into the current one.
+        private func dropFolder(row: Int, operation: NSTableView.DropOperation) -> RemotePath {
+            if operation == .on, row >= 0, row < items.count, items[row].kind == .directory { return items[row].path }
+            return model.snapshot.path
         }
 
         func tableView(_ tableView: NSTableView, acceptDrop info: any NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
             guard let connection = model.snapshot.connectionID else { return false }
-            let folder = (dropOperation == .on && row >= 0 && row < items.count && items[row].kind == .directory) ? items[row].path : model.snapshot.path
+            let folder = dropFolder(row: row, operation: dropOperation)
             guard let action = dropAction(from: info.draggingPasteboard, onto: folder, connection: connection) else { return false }
             let model = model
             Task { await model.perform(action) }
@@ -246,9 +241,7 @@ struct ListTable: NSViewRepresentable {
                 add("Download Copy…") { Task { await model.downloadCopy() } }
                 add("Duplicate", enabled: item.kind == .file) { Task { await model.duplicateSelection() } }
                 add("Rename") { model.beginRename() }
-                if item.kind == .directory {
-                    add("Save Location") { Task { await model.session?.pin(item.path); await model.refresh() } }
-                }
+                add(model.isStarred(item.path) ? "Unstar" : "Star") { Task { await model.setStarred(item.path, !model.isStarred(item.path)) } }
                 add("Copy Remote URL") { model.copyRemoteURL() }
                 menu.addItem(.separator())
                 add("Delete…") { model.askToDelete() }

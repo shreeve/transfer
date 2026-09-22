@@ -21,6 +21,9 @@ struct TransferApp: App {
         }
         .defaultSize(width: 960, height: 640)
         .commands {
+            let primary = model?.primaryItem
+            let connected = model?.snapshot.connectionID != nil
+            let plainKeys = model?.plainKeysAvailable == true
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesButton(updater: delegate.updater.updater)
             }
@@ -35,26 +38,28 @@ struct TransferApp: App {
                 Divider()
                 Button("Open") { Task { await model?.openSelection() } }
                     .keyboardShortcut("o")
-                    .disabled(model?.primaryItem == nil)
+                    .disabled(primary == nil)
                 Button("Open Live") { Task { await model?.openLiveSelection() } }
                     .keyboardShortcut("o", modifiers: [.command, .option])
-                    .disabled(model?.primaryItem?.kind != .file)
+                    .disabled(primary?.kind != .file)
                 Button("Download Copy…") { Task { await model?.downloadCopy() } }
-                    .disabled(model?.selectedItems.isEmpty ?? true)
+                    .disabled(primary == nil)
                 Button("Upload…") { Task { await model?.uploadFromPanel() } }
-                    .disabled(model?.snapshot.connectionID == nil)
+                    .disabled(!connected)
                 Divider()
                 Button("New Folder") { Task { await model?.mkdir() } }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
-                    .disabled(model?.snapshot.connectionID == nil)
+                    .disabled(!connected)
                 Button("Duplicate") { Task { await model?.duplicateSelection() } }
                     .keyboardShortcut("d")
-                    .disabled(model?.primaryItem?.kind != .file)
+                    .disabled(primary?.kind != .file)
                 Button("Rename") { model?.beginRename() }
                     .keyboardShortcut(.return, modifiers: [])
-                    .disabled(model?.primaryItem == nil || model?.plainKeysAvailable != true)
+                    .disabled(primary == nil || !plainKeys)
+                Button("Forget Synced Live Files") { Task { await model?.forgetSyncedLive() } }
+                    .disabled(model?.liveFiles.contains { !$0.dirty && !$0.uploading && !$0.conflict } != true)
                 Button("Discard Live File") { Task { await model?.discardSelectedLive() } }
-                    .disabled(model.map { m in m.selectedItems.contains { m.liveFile(for: $0.path) != nil } } != true)
+                    .disabled(model.map { m in m.liveFiles.contains { m.snapshot.selection.contains($0.path) } } != true)
             }
             // The standard Cut, Copy, and Paste stay for text fields. With no text field focused the
             // standard Copy is disabled, so Command-C falls through to this item.
@@ -62,36 +67,39 @@ struct TransferApp: App {
                 Divider()
                 Button("Copy Remote URL") { model?.copyRemoteURL() }
                     .keyboardShortcut("c")
-                    .disabled(model?.snapshot.connectionID == nil || model?.plainKeysAvailable != true)
+                    .disabled(!connected || !plainKeys)
                 Button("Delete…") { model?.askToDelete() }
                     .keyboardShortcut(.delete, modifiers: .command)
                     .disabled(model?.snapshot.selection.isEmpty ?? true)
                 Divider()
                 Button("Filter") { model?.focusFilter() }
                     .keyboardShortcut("f")
-                    .disabled(model?.snapshot.connectionID == nil)
+                    .disabled(!connected)
             }
             CommandMenu("Go") {
-                Button("Back") { Task { await model?.goBack() } }
-                    .keyboardShortcut("[")
-                Button("Forward") { Task { await model?.goForward() } }
-                    .keyboardShortcut("]")
-                Button("Parent") { Task { await model?.goParent() } }
-                    .keyboardShortcut(.upArrow, modifiers: .command)
-                Button("Remote Home") { Task { await model?.goHome() } }
-                    .keyboardShortcut("h", modifiers: [.command, .shift])
-                Button("Go to Remote Folder…") { model?.sheet = .goToFolder }
-                    .keyboardShortcut("l")
-                Divider()
-                Button("Refresh") { Task { await model?.refresh() } }
-                    .keyboardShortcut("r")
-                Button("Open in Terminal") { Task { await model?.openTerminal() } }
-                    .disabled(model?.snapshot.connectionID == nil || model?.terminalAvailable != true)
+                Group {
+                    Button("Back") { Task { await model?.goBack() } }
+                        .keyboardShortcut("[")
+                    Button("Forward") { Task { await model?.goForward() } }
+                        .keyboardShortcut("]")
+                    Button("Parent") { Task { await model?.goParent() } }
+                        .keyboardShortcut(.upArrow, modifiers: .command)
+                    Button("Remote Home") { Task { await model?.goHome() } }
+                        .keyboardShortcut("h", modifiers: [.command, .shift])
+                    Button("Go to Remote Folder…") { model?.sheet = .goToFolder }
+                        .keyboardShortcut("l")
+                    Divider()
+                    Button("Refresh") { Task { await model?.refresh() } }
+                        .keyboardShortcut("r")
+                    Button("Open in Terminal") { Task { await model?.openTerminal() } }
+                        .disabled(model?.terminalAvailable != true)
+                }
+                .disabled(!connected)
             }
             CommandMenu("View") {
-                Button("as Icons") { model?.setViewMode(.icon) }.keyboardShortcut("1")
-                Button("as List") { model?.setViewMode(.list) }.keyboardShortcut("2")
-                Button("as Columns") { model?.setViewMode(.columns) }.keyboardShortcut("3")
+                ForEach(ViewMode.allCases, id: \.self) { mode in
+                    Button("as \(mode.title)") { model?.setViewMode(mode) }
+                }
                 Divider()
                 Button(model?.snapshot.showsHidden == true ? "Hide Hidden Files" : "Show Hidden Files") {
                     model?.toggleHidden()
@@ -99,21 +107,20 @@ struct TransferApp: App {
                 .keyboardShortcut(".", modifiers: [.command, .shift])
                 Button("Quick Look") { model?.togglePreview() }
                     .keyboardShortcut(.space, modifiers: [])
-                    .disabled(model?.primaryItem == nil || model?.plainKeysAvailable != true)
+                    .disabled(primary == nil || !plainKeys)
                 Divider()
-                Button("Sidebar") { model?.toggleSidebar() }
+                Button("Sidebar") { model?.sidebarCollapsed.toggle() }
                     .keyboardShortcut("s", modifiers: [.command, .option])
                 Button("Inspector") { model?.showsInspector.toggle() }
                     .keyboardShortcut("i", modifiers: [.command, .option])
                 Button("Transfers") { model?.showsShelf.toggle() }
                 Divider()
-                Button("Save This Location") { Task { await model?.pinCurrent() } }
-                    .disabled(model?.snapshot.connectionID == nil)
+                Button(model.map { $0.isStarred($0.starTarget) } == true ? "Unstar" : "Star") {
+                    Task { await model?.toggleStar() }
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .disabled(!connected)
                 Button("Clear Preview Cache") { Task { await model?.clearPreviewCache() } }
-            }
-            CommandGroup(replacing: .appTermination) {
-                Button("Quit Transfer") { NSApp.terminate(nil) }
-                    .keyboardShortcut("q")
             }
         }
         // Settings adds "Settings…" to the app menu with Command-Comma.

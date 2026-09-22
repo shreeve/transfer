@@ -21,7 +21,6 @@ public enum Preferences {
 
 public enum SidebarItem: Hashable {
     case server(ConnectionID)
-    case recent(RemotePath)
     case pin(RemotePath)
     case live(RemotePath)
     case conflict(RemotePath)
@@ -39,9 +38,11 @@ public final class TransferModel {
     public var columns: [RemotePath: [RemoteItem]] = [:]
     public var columnRoot: RemotePath?
     public var operations: [TransferOperation] = []
-    public var recents: [RemotePath] = []
     public var pins: [RemotePath] = []
-    public var liveFiles: [LiveFile] = []
+    public var liveFiles: [LiveFile] = [] {
+        didSet { liveByPath = Dictionary(liveFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first }) }
+    }
+    @ObservationIgnored private var liveByPath: [RemotePath: LiveFile] = [:]
     public var conflicts: [RemotePath] = []
     public var conflictComparable = false
     public var conflictConfirm: LiveConflictChoice?
@@ -53,10 +54,6 @@ public final class TransferModel {
     public var status = "Not connected"
     public var showsInspector = false
     public var sidebarCollapsed = false
-
-    public func toggleSidebar() {
-        sidebarCollapsed.toggle()
-    }
     public var showsShelf = false
     public var draft = SavedConnection(name: "", host: "")
     public var draftIsEdit = false
@@ -94,13 +91,7 @@ public final class TransferModel {
         let prompts = SheetPrompts()
         self.prompts = prompts
         prompts.model = self
-        if let stored = UserDefaults.standard.string(forKey: "transfer.viewMode"),
-           let mode = ViewMode(rawValue: stored) {
-            snapshot.viewMode = mode
-        }
-        snapshot.showsHidden = UserDefaults.standard.bool(forKey: "transfer.showsHidden")
-        snapshot.sort.caseInsensitive = UserDefaults.standard.bool(forKey: Preferences.caseInsensitiveSort)
-        snapshot.sort.foldersFirst = Preferences.foldersFirstValue()
+        applyPreferences()
         Task { await reloadConnections() }
         defaultsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
             Task { @MainActor in self?.applyPreferences() }
@@ -113,11 +104,11 @@ public final class TransferModel {
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
     }
 
-    /// Picks up changes made in Settings while the window is open.
+    /// Reads the global preferences at launch and whenever Settings changes them.
     private func applyPreferences() {
         let defaults = UserDefaults.standard
         var changed = false
-        let hidden = defaults.bool(forKey: "transfer.showsHidden")
+        let hidden = defaults.bool(forKey: Preferences.showsHidden)
         if hidden != snapshot.showsHidden {
             snapshot.showsHidden = hidden
             changed = true
@@ -127,14 +118,22 @@ public final class TransferModel {
         if folded != snapshot.sort.caseInsensitive || foldersFirst != snapshot.sort.foldersFirst {
             snapshot.sort.caseInsensitive = folded
             snapshot.sort.foldersFirst = foldersFirst
-            for (path, list) in columns { columns[path] = ListingSort.apply(list, sort: snapshot.sort) }
+            resortColumns()
             changed = true
         }
-        if let stored = defaults.string(forKey: "transfer.viewMode"), let mode = ViewMode(rawValue: stored), mode != snapshot.viewMode {
+        if let stored = defaults.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored), mode != snapshot.viewMode {
             snapshot.viewMode = mode
             if mode == .columns { columnRoot = snapshot.path }
         }
-        if changed { items = visible(columns[snapshot.path] ?? []) }
+        if changed { refreshItems() }
+    }
+
+    private func resortColumns() {
+        for (path, list) in columns { columns[path] = ListingSort.apply(list, sort: snapshot.sort) }
+    }
+
+    private func refreshItems() {
+        items = visible(columns[snapshot.path] ?? [])
     }
 
     // MARK: Servers
@@ -226,59 +225,61 @@ public final class TransferModel {
         let path = snapshot.path
         guard let session else { return }
         listing?.cancel()
+        // A cached listing stays on screen until the new one is complete; a fresh one streams in.
+        let flushEarly = columns[path] == nil
         let task = Task { [weak self] in
-            var page: [RemoteItem] = []
-            var lastFlush = ContinuousClock.now
-            let hadCache = self?.columns[path] != nil
-            do {
-                for try await item in session.list(path) {
-                    if Task.isCancelled { return }
-                    page.append(item)
-                    if !hadCache, lastFlush.duration(to: .now) > .milliseconds(80) {
-                        self?.publish(page, for: path)
-                        lastFlush = .now
-                    }
-                }
-                self?.publish(page, for: path)
-                await session.remember(path)
-                await self?.reloadSidebars()
-            } catch is CancellationError {
-                return
-            } catch {
-                if !page.isEmpty { self?.publish(page, for: path) }
-                self?.status = error.localizedDescription
-            }
+            guard await self?.stream(path, from: session, flushEarly: flushEarly) == true else { return }
+            await session.remember(path)
+            await self?.reloadSidebars()
         }
         listing = task
         await task.value
     }
 
+    /// Lists `path` into `columns`, publishing pages every 80 ms when asked. False when cancelled.
+    private func stream(_ path: RemotePath, from session: any RemoteSession, flushEarly: Bool) async -> Bool {
+        var page: [RemoteItem] = []
+        var lastFlush = ContinuousClock.now
+        do {
+            for try await item in session.list(path) {
+                if Task.isCancelled { return false }
+                page.append(item)
+                if flushEarly, lastFlush.duration(to: .now) > .milliseconds(80) {
+                    publish(page, for: path)
+                    lastFlush = .now
+                }
+            }
+            publish(page, for: path)
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            if !page.isEmpty { publish(page, for: path) }
+            status = error.localizedDescription
+            return false
+        }
+    }
+
     private func publish(_ page: [RemoteItem], for path: RemotePath) {
-        let sorted = ListingSort.apply(page, sort: snapshot.sort)
-        columns[path] = sorted
-        if path == snapshot.path { items = visible(sorted) }
+        columns[path] = ListingSort.apply(page, sort: snapshot.sort)
+        if path == snapshot.path { refreshItems() }
+    }
+
+    /// The column view is always in name order, like Finder's, while honoring the case and
+    /// folders-first settings. The list view's column choice applies to the other views.
+    public func columnItems(_ path: RemotePath) -> [RemoteItem]? {
+        guard let list = columns[path] else { return nil }
+        var byName = snapshot.sort
+        byName.column = "name"
+        byName.ascending = true
+        return visible(ListingSort.apply(list, sort: byName))
     }
 
     /// Lists one folder for the column view without navigating. Pages show as they arrive.
     public func loadColumn(_ path: RemotePath) {
         guard let session, columns[path] == nil else { return }
         columns[path] = []
-        Task { [weak self] in
-            var page: [RemoteItem] = []
-            var lastFlush = ContinuousClock.now
-            do {
-                for try await item in session.list(path) {
-                    page.append(item)
-                    if lastFlush.duration(to: .now) > .milliseconds(80) {
-                        self?.publish(page, for: path)
-                        lastFlush = .now
-                    }
-                }
-            } catch {
-                self?.status = error.localizedDescription
-            }
-            self?.publish(page, for: path)
-        }
+        Task { [weak self] in _ = await self?.stream(path, from: session, flushEarly: true) }
     }
 
     public func navigate(_ path: RemotePath) async {
@@ -293,7 +294,7 @@ public final class TransferModel {
         snapshot.path = path
         snapshot.selection = []
         columnRoot = path
-        items = visible(columns[path] ?? [])
+        refreshItems()
         await refresh()
     }
 
@@ -393,8 +394,8 @@ public final class TransferModel {
         if let id = snapshot.connectionID, let data = try? JSONEncoder().encode(snapshot.sort) {
             UserDefaults.standard.set(data, forKey: "transfer.sort.\(id.rawValue.uuidString)")
         }
-        for (path, list) in columns { columns[path] = ListingSort.apply(list, sort: snapshot.sort) }
-        items = visible(columns[snapshot.path] ?? [])
+        resortColumns()
+        refreshItems()
     }
 
     private func loadPreferences(for id: ConnectionID) {
@@ -413,63 +414,66 @@ public final class TransferModel {
 
     /// The Status column and inspector text for a path: Live state or an active transfer.
     public func statusText(for path: RemotePath) -> String {
-        if let live = liveFile(for: path) {
+        if let live = liveByPath[path] {
             if live.conflict { return "Conflict" }
             if live.uploading { return "Uploading" }
             if live.paused { return "Paused" }
             return live.dirty ? "Live, unsynced" : "Live"
         }
-        let name = String(decoding: path.nameBytes, as: UTF8.self)
-        if operations.contains(where: { $0.state == .active && $0.title.hasSuffix(name) }) {
+        if operations.contains(where: { $0.state == .active && $0.path == path }) {
             return "Transferring"
         }
         return ""
     }
 
+    /// The operation that moves `path`, if one is queued or running.
+    public func operation(for path: RemotePath) -> TransferOperation? {
+        operations.first { $0.path == path || $0.livePath == path }
+    }
+
     public func toggleHidden() {
         snapshot.showsHidden.toggle()
-        UserDefaults.standard.set(snapshot.showsHidden, forKey: "transfer.showsHidden")
-        items = visible(columns[snapshot.path] ?? [])
+        UserDefaults.standard.set(snapshot.showsHidden, forKey: Preferences.showsHidden)
+        refreshItems()
     }
 
     public func setViewMode(_ mode: ViewMode) {
         snapshot.viewMode = mode
-        UserDefaults.standard.set(mode.rawValue, forKey: "transfer.viewMode")
+        UserDefaults.standard.set(mode.rawValue, forKey: Preferences.viewMode)
         if mode == .columns { columnRoot = snapshot.path }
     }
 
     // MARK: Open
 
-    public func open(_ item: RemoteItem) async {
+    /// One hop through a symlink. A second hop is an error.
+    private func resolveLink(_ item: RemoteItem, session: any RemoteSession) async throws -> RemoteItem {
+        guard item.kind == .symlink else { return item }
+        let link = try await session.readlink(item.path)
+        let resolved = link.hasPrefix("/") ? RemotePath(string: link) : (item.path.parent ?? RemotePath(string: "/")).appending(name: Array(link.utf8))
+        let target = try await session.stat(resolved)
+        if target.kind == .symlink { throw TransferError.failed("\(item.name) points at another link") }
+        return target
+    }
+
+    /// Follows the double-click rule, or forces Live when asked. Folders navigate.
+    public func open(_ item: RemoteItem, forceLive: Bool = false) async {
         guard let session else { return }
-        var target = item
-        if item.kind == .symlink {
-            do {
-                let link = try await session.readlink(item.path)
-                let resolved = link.hasPrefix("/") ? RemotePath(string: link) : (item.path.parent ?? RemotePath(string: "/")).appending(name: Array(link.utf8))
-                target = try await session.stat(resolved)
-                if target.kind == .symlink {
-                    status = "\(item.name) points at another link"
-                    return
-                }
-            } catch {
-                status = error.localizedDescription
+        do {
+            let target = try await resolveLink(item, session: session)
+            if target.kind == .directory {
+                await navigate(target.path)
                 return
             }
-        }
-        if target.kind == .directory {
-            await navigate(target.path)
-            return
-        }
-        guard target.kind == .file else { return }
-        do {
+            guard target.kind == .file else { return }
+            let rule = await session.openKind(fileName: target.name)
+            let live = forceLive || rule == .live
             let url: URL
-            if await session.openKind(fileName: target.name) == .live {
+            if live {
                 url = try await session.prepareLiveFile(target.path)
             } else {
                 url = try await session.prepareViewFile(target.path)
             }
-            NSWorkspace.shared.open(url)
+            await FileOpener.open(url)
             await reloadSidebars()
         } catch TransferError.cancelled {
         } catch {
@@ -483,15 +487,8 @@ public final class TransferModel {
     }
 
     public func openLiveSelection() async {
-        guard let session, let item = primaryItem, item.kind == .file else { return }
-        do {
-            let url = try await session.prepareLiveFile(item.path)
-            NSWorkspace.shared.open(url)
-            await reloadSidebars()
-        } catch TransferError.cancelled {
-        } catch {
-            status = error.localizedDescription
-        }
+        guard let item = primaryItem, item.kind == .file else { return }
+        await open(item, forceLive: true)
     }
 
     // MARK: Preview
@@ -510,12 +507,8 @@ public final class TransferModel {
         previewTask?.cancel()
         previewTask = Task { [weak self] in
             do {
-                var path = item.path
-                if item.kind == .symlink {
-                    let link = try await session.readlink(item.path)
-                    path = link.hasPrefix("/") ? RemotePath(string: link) : (item.path.parent ?? RemotePath(string: "/")).appending(name: Array(link.utf8))
-                }
-                let url = try await session.preparePreview(path)
+                let target = try await self?.resolveLink(item, session: session) ?? item
+                let url = try await session.preparePreview(target.path)
                 if Task.isCancelled { return }
                 PreviewPanel.shared.show(url)
             } catch TransferError.cancelled {
@@ -549,7 +542,7 @@ public final class TransferModel {
         for item in selectedItems {
             let destination = directory.appendingPathComponent(item.name)
             let path = item.path
-            enqueue(title: "Download \(item.name)") { [weak self] progress in
+            enqueue(title: "Download \(item.name)", path: path) { [weak self] progress in
                 guard let session = await self?.session else { throw TransferError.notConnected }
                 try await session.download(path, to: destination, progress: progress)
             }
@@ -571,7 +564,7 @@ public final class TransferModel {
         let target = folder ?? snapshot.path
         for url in urls {
             let destination = target.appending(name: Array(url.lastPathComponent.utf8))
-            enqueue(title: "Upload \(url.lastPathComponent)") { [weak self] progress in
+            enqueue(title: "Upload \(url.lastPathComponent)", path: destination) { [weak self] progress in
                 guard let session = await self?.session else { throw TransferError.notConnected }
                 try await session.upload(url, to: destination, progress: progress)
             }
@@ -611,9 +604,9 @@ public final class TransferModel {
         await refresh()
     }
 
-    private func enqueue(title: String, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
+    private func enqueue(title: String, path: RemotePath, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
         let id = UUID().uuidString
-        operations.append(TransferOperation(id: id, title: title, state: .queued))
+        operations.append(TransferOperation(id: id, title: title, state: .queued, path: path))
         runners[id] = Runner(body: body, task: nil)
         showsShelf = true
         start(id)
@@ -625,7 +618,9 @@ public final class TransferModel {
         update(id) { $0.state = .active; $0.message = nil }
         let body = runner.body
         let prompts = prompts
-        let reporter = ProgressReporter { [weak self] progress in self?.update(id) { $0.progress = progress } }
+        let report: @Sendable (TransferProgress) -> Void = { [weak self] progress in
+            Task { @MainActor in self?.update(id) { $0.progress = progress } }
+        }
         let task = Task { [weak self] in
             var attempt = 0
             while true {
@@ -633,7 +628,7 @@ public final class TransferModel {
                     if let session = self?.session, !(await session.isConnected) {
                         _ = try await session.connect(prompts: prompts)
                     }
-                    try await body { progress in reporter.report(progress) }
+                    try await body(report)
                     self?.finish(id, state: .succeeded, message: nil)
                     return
                 } catch {
@@ -764,14 +759,45 @@ public final class TransferModel {
         await refresh()
     }
 
-    public func pinCurrent() async {
-        await session?.pin(snapshot.path)
+    public func isStarred(_ path: RemotePath) -> Bool {
+        pins.contains(path)
+    }
+
+    /// Starred entries whose kind is unknown are treated as folders; a starred file is one the
+    /// user has seen listed, so its kind is in a cached listing.
+    public func starredIsFolder(_ path: RemotePath) -> Bool {
+        guard let parent = path.parent, let item = columns[parent]?.first(where: { $0.path == path }) else { return true }
+        return item.kind == .directory
+    }
+
+    /// Starred folders sit in the sidebar for one-click return.
+    public func setStarred(_ path: RemotePath, _ starred: Bool) async {
+        if starred { await session?.pin(path) } else { await session?.unpin(path) }
         await reloadSidebars()
     }
 
-    public func unpin(_ path: RemotePath) async {
-        await session?.unpin(path)
-        await reloadSidebars()
+    /// The star target: the selected item, or the current folder with nothing selected.
+    public var starTarget: RemotePath { primaryItem?.path ?? snapshot.path }
+
+    /// Opens a starred entry: a folder is entered, a file is revealed in its folder and opened.
+    public func openStarred(_ path: RemotePath) async {
+        guard let session else { return }
+        do {
+            let item = try await session.stat(path)
+            if item.kind == .directory {
+                await navigate(path)
+            } else {
+                await reveal(path)
+                await open(item)
+            }
+        } catch {
+            status = error.localizedDescription
+        }
+    }
+
+    public func toggleStar() async {
+        let path = starTarget
+        await setStarred(path, !isStarred(path))
     }
 
     public func discardLive(_ path: RemotePath, force: Bool = false) async {
@@ -785,6 +811,16 @@ public final class TransferModel {
         } catch {
             status = error.localizedDescription
         }
+    }
+
+    /// Drops every mapping whose working copy matches the server. Nothing is lost: the remote
+    /// file is the source of truth and the next open downloads it again.
+    public func forgetSyncedLive() async {
+        guard let session else { return }
+        for live in liveFiles where !live.dirty && !live.uploading && !live.conflict {
+            try? await session.discardLiveFile(live.path, force: false)
+        }
+        await reloadSidebars()
     }
 
     public func discardSelectedLive() async {
@@ -847,8 +883,9 @@ public final class TransferModel {
         case .server(let id):
             guard let connection = connections.first(where: { $0.id == id }) else { return }
             if snapshot.connectionID != id { await connect(connection) }
-        case .recent(let path), .pin(let path):
-            await navigate(path)
+        case .pin(let path):
+            // A starred folder opens; a starred file is revealed in its folder.
+            if starredIsFolder(path) { await navigate(path) } else { await reveal(path) }
         case .live(let path):
             await reveal(path)
         case .conflict(let path):
@@ -863,15 +900,6 @@ public final class TransferModel {
         snapshot.selection = [path]
     }
 
-    public func requestQuit() async {
-        let unsynced = await provider.unsyncedLiveCount
-        if unsynced > 0 {
-            sheet = .quit(unsynced)
-        } else {
-            NSApp.terminate(nil)
-        }
-    }
-
     public func openTerminal() async {
         guard let session, let command = await session.terminalCommand(directory: snapshot.path) else { return }
         TerminalLauncher.open(command: command)
@@ -879,7 +907,6 @@ public final class TransferModel {
 
     private func reloadSidebars() async {
         guard let session else { return }
-        recents = await session.recents()
         pins = await session.pins()
         liveFiles = await session.liveFiles()
         conflicts = liveFiles.filter(\.conflict).map(\.path)
@@ -891,7 +918,7 @@ public final class TransferModel {
             for await event in session.events() {
                 guard let self else { return }
                 switch event {
-                case .notice(let text):
+                case .notice(let text), .disconnected(let text):
                     status = text
                 case .conflict(let path, let comparable):
                     conflictPath = path
@@ -904,8 +931,6 @@ public final class TransferModel {
                 case .directoryChanged(let path):
                     columns[path] = nil
                     if path == snapshot.path { await refresh() }
-                case .disconnected(let text):
-                    status = text
                 case .operation(let operation):
                     if operation.state == .succeeded {
                         operations.removeAll { $0.id == operation.id }
@@ -914,30 +939,24 @@ public final class TransferModel {
                     } else {
                         operations.append(operation)
                     }
-                    showsShelf = showsShelf || !operations.isEmpty
-                    if operations.isEmpty { showsShelf = false }
+                    showsShelf = !operations.isEmpty
                 }
             }
         }
     }
 }
 
-/// Forwards transfer progress to the main actor.
-private final class ProgressReporter: Sendable {
-    private let apply: @MainActor (TransferProgress) -> Void
-
-    init(_ apply: @escaping @MainActor (TransferProgress) -> Void) {
-        self.apply = apply
-    }
-
-    func report(_ progress: TransferProgress) {
-        Task { @MainActor in self.apply(progress) }
+public extension ViewMode {
+    var title: String {
+        switch self {
+        case .icon: "Icons"
+        case .list: "List"
+        case .columns: "Columns"
+        }
     }
 }
 
 public extension RemoteItem {
-    var sortMtime: UInt32 { mtime ?? 0 }
-    var sortSize: UInt64 { size ?? 0 }
     var kindLabel: String {
         switch kind {
         case .directory: "Folder"
@@ -947,7 +966,6 @@ public extension RemoteItem {
             UTType(filenameExtension: (name as NSString).pathExtension)?.localizedDescription ?? "Document"
         }
     }
-    var statusLabel: String { "" }
 }
 
 public enum AppSheet: Identifiable {
@@ -957,7 +975,6 @@ public enum AppSheet: Identifiable {
     case delete
     case collision(String)
     case conflict
-    case quit(Int)
     case goToFolder
     case removeServer(SavedConnection)
     case discardLive(RemotePath)
@@ -970,7 +987,6 @@ public enum AppSheet: Identifiable {
         case .delete: "delete"
         case .collision: "collision"
         case .conflict: "conflict"
-        case .quit: "quit"
         case .goToFolder: "goto"
         case .removeServer: "remove"
         case .discardLive: "discard"
@@ -978,48 +994,33 @@ public enum AppSheet: Identifiable {
     }
 }
 
-public final class SheetPrompts: PromptSink, @unchecked Sendable {
+/// Answers the session's prompts by showing sheets and parking the continuation until a button resolves it.
+@MainActor
+public final class SheetPrompts: PromptSink {
     weak var model: TransferModel?
 
     public func answer(_ request: PromptRequest) async -> PromptReply {
-        await withCheckedContinuation { continuation in
-            Task { @MainActor in
-                guard let model = self.model else {
-                    continuation.resume(returning: PromptReply(text: nil))
-                    return
-                }
-                model.pendingPrompt = continuation
-                model.sheet = .prompt(request)
-            }
+        guard let model else { return PromptReply(text: nil) }
+        return await withCheckedContinuation { continuation in
+            model.pendingPrompt = continuation
+            model.sheet = .prompt(request)
         }
     }
 
     public func resolveCollision(fileName: String) async -> NameCollisionChoice {
-        if let remembered = await MainActor.run(body: { model?.applyToAll }) {
-            return remembered
-        }
+        guard let model else { return .skip }
+        if let remembered = model.applyToAll { return remembered }
         return await withCheckedContinuation { continuation in
-            Task { @MainActor in
-                guard let model = self.model else {
-                    continuation.resume(returning: .skip)
-                    return
-                }
-                model.pendingCollision = continuation
-                model.sheet = .collision(fileName)
-            }
+            model.pendingCollision = continuation
+            model.sheet = .collision(fileName)
         }
     }
 
     public func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        await withCheckedContinuation { continuation in
-            Task { @MainActor in
-                guard let model = self.model else {
-                    continuation.resume(returning: .cancel)
-                    return
-                }
-                model.pendingHost = continuation
-                model.sheet = .hostKey(event)
-            }
+        guard let model else { return .cancel }
+        return await withCheckedContinuation { continuation in
+            model.pendingHost = continuation
+            model.sheet = .hostKey(event)
         }
     }
 }

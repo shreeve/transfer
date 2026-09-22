@@ -62,6 +62,8 @@ public struct TransferOperation: Identifiable, Hashable, Sendable {
     public var state: OperationState
     public var progress: TransferProgress
     public var message: String?
+    /// The remote item the operation moves, for rows and the inspector to match on.
+    public var path: RemotePath?
     public var livePath: RemotePath?
 
     public init(
@@ -70,6 +72,7 @@ public struct TransferOperation: Identifiable, Hashable, Sendable {
         state: OperationState,
         progress: TransferProgress = TransferProgress(completed: 0),
         message: String? = nil,
+        path: RemotePath? = nil,
         livePath: RemotePath? = nil
     ) {
         self.id = id
@@ -77,6 +80,7 @@ public struct TransferOperation: Identifiable, Hashable, Sendable {
         self.state = state
         self.progress = progress
         self.message = message
+        self.path = path
         self.livePath = livePath
     }
 }

@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import TransferCore
+import UniformTypeIdentifiers
 
 struct TransferModelKey: FocusedValueKey {
     typealias Value = TransferModel
@@ -25,5 +26,35 @@ public enum QuitGuard {
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Quit Anyway")
         return alert.runModal() == .alertSecondButtonReturn
+    }
+}
+
+/// Opens a downloaded file in its default app. When the extension has no default, asks once and
+/// records the choice with Launch Services, so Transfer and Finder both remember it.
+@MainActor
+enum FileOpener {
+    static func open(_ url: URL) async {
+        let ext = url.pathExtension
+        let type = ext.isEmpty ? nil : UTType(filenameExtension: ext)
+        if let type, NSWorkspace.shared.urlForApplication(toOpen: type) == nil {
+            guard let app = chooseApplication(for: ext) else { return }
+            // The same thing Finder's "Always Open With" does: the default for this extension.
+            try? await NSWorkspace.shared.setDefaultApplication(at: app, toOpen: type)
+            _ = try? await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    private static func chooseApplication(for ext: String) -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = "Choose an Application"
+        panel.message = "Choose the application that opens “.\(ext)” files. Transfer and Finder will remember it."
+        panel.prompt = "Choose"
+        panel.allowedContentTypes = [.application]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        return panel.runModal() == .OK ? panel.url : nil
     }
 }

@@ -19,9 +19,7 @@ public struct GeneralSettings: View {
             Section("Browsing") {
                 Toggle("Show hidden files", isOn: $showsHidden)
                 Picker("View", selection: $viewMode) {
-                    Text("Icons").tag(ViewMode.icon.rawValue)
-                    Text("List").tag(ViewMode.list.rawValue)
-                    Text("Columns").tag(ViewMode.columns.rawValue)
+                    ForEach(ViewMode.allCases, id: \.rawValue) { Text($0.title).tag($0.rawValue) }
                 }
             }
 
@@ -47,7 +45,12 @@ public struct ExtensionSettings: View {
                 TextEditor(text: $text)
                     .font(.body.monospaced())
                     .frame(minHeight: 160)
-                    .onChange(of: text) { if loaded { save() } }
+                    .task(id: text) {
+                        // Saved once typing pauses, so keystrokes never race each other to the file.
+                        guard loaded else { return }
+                        try? await Task.sleep(for: .milliseconds(400))
+                        if !Task.isCancelled { save() }
+                    }
             } header: {
                 Text("Editable extensions")
             } footer: {

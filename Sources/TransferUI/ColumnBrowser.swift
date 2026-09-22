@@ -93,16 +93,12 @@ struct ColumnBrowser: NSViewRepresentable {
         }
 
         func browser(_ browser: NSBrowser, objectValueForItem item: Any?) -> Any? {
-            if let item = item as? RemoteItem { return item.name }
-            return (item as? RemotePath)?.display ?? ""
+            (item as? RemoteItem)?.name ?? ""
         }
 
         func browser(_ browser: NSBrowser, willDisplayCell cell: Any, atRow row: Int, column: Int) {
             guard let cell = cell as? NSBrowserCell, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return }
-            let icon = ItemIcon.image(for: item).copy() as! NSImage
-            icon.size = NSSize(width: 16, height: 16)
-            cell.image = icon
-            cell.isLeaf = item.kind != .directory
+            cell.image = ItemIcon.image(for: item)
         }
 
         func browser(_ browser: NSBrowser, heightOfRow row: Int, inColumn columnIndex: Int) -> CGFloat {
@@ -118,7 +114,7 @@ struct ColumnBrowser: NSViewRepresentable {
         }
 
         private func children(_ path: RemotePath) -> [RemoteItem] {
-            if let cached = model.columns[path] { return model.visible(cached) }
+            if let cached = model.columnItems(path) { return cached }
             // Called from inside SwiftUI's update pass; the listing starts on the next turn.
             let model = model
             Task { @MainActor in model.loadColumn(path) }
@@ -153,8 +149,7 @@ struct ColumnBrowser: NSViewRepresentable {
 
         func browser(_ browser: NSBrowser, pasteboardWriterForRow row: Int, column: Int) -> (any NSPasteboardWriting)? {
             guard let session = model.session, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return nil }
-            let roots = model.dragItems(including: item)
-            return RemoteItemPromise.providers(for: roots, session: session).first { $0.itemPath == item.path }
+            return RemoteItemPromise.provider(for: item, among: model.dragItems(including: item), session: session)
         }
 
         // MARK: Drop in
@@ -166,16 +161,16 @@ struct ColumnBrowser: NSViewRepresentable {
             column: UnsafeMutablePointer<Int>,
             dropOperation: UnsafeMutablePointer<NSBrowser.DropOperation>
         ) -> NSDragOperation {
-            guard let connection = model.snapshot.connectionID, let folder = dropFolder(browser, row: row.pointee, column: column.pointee) else { return [] }
-            if let target = browser.item(atRow: row.pointee, inColumn: column.pointee) as? RemoteItem, target.kind != .directory {
+            guard let connection = model.snapshot.connectionID else { return [] }
+            // A folder row is the target only for a drop on it; between rows means the column's folder.
+            if let target = browser.item(atRow: row.pointee, inColumn: column.pointee) as? RemoteItem, target.kind == .directory {
+                dropOperation.pointee = .on
+            } else {
                 row.pointee = -1
                 dropOperation.pointee = .on
             }
-            switch dropAction(from: info.draggingPasteboard, onto: folder, connection: connection) {
-            case .uploadFiles: return .copy
-            case .moveRemote: return .move
-            case nil: return []
-            }
+            guard let folder = dropFolder(browser, row: row.pointee, column: column.pointee) else { return [] }
+            return dropAction(from: info.draggingPasteboard, onto: folder, connection: connection)?.operation ?? []
         }
 
         func browser(_ browser: NSBrowser, acceptDrop info: any NSDraggingInfo, atRow row: Int, column: Int, dropOperation: NSBrowser.DropOperation) -> Bool {
@@ -196,22 +191,46 @@ struct ColumnBrowser: NSViewRepresentable {
     }
 }
 
+/// Icons at 16 points, cached by kind and extension: every row of every view asks for one.
+@MainActor
 enum ItemIcon {
-    @MainActor
+    private static var cache: [String: NSImage] = [:]
+
     static func image(for item: RemoteItem) -> NSImage {
+        let key: String
         switch item.kind {
-        case .directory: NSWorkspace.shared.icon(for: .folder)
-        case .symlink: NSWorkspace.shared.icon(for: .symbolicLink)
-        case .other: NSWorkspace.shared.icon(for: .item)
-        case .file:
-            NSWorkspace.shared.icon(for: UTType(filenameExtension: (item.name as NSString).pathExtension) ?? .data)
+        case .directory: key = "/dir"
+        case .symlink: key = "/link"
+        case .other: key = "/other"
+        case .file: key = (item.name as NSString).pathExtension.lowercased()
         }
+        if let cached = cache[key] { return cached }
+        let type: UTType
+        switch item.kind {
+        case .directory: type = .folder
+        case .symlink: type = .symbolicLink
+        case .other: type = .item
+        case .file: type = UTType(filenameExtension: key) ?? .data
+        }
+        let icon = NSWorkspace.shared.icon(for: type)
+        icon.size = NSSize(width: 16, height: 16)
+        cache[key] = icon
+        return icon
     }
 }
 
 /// Draws the icon and title itself, centered on the row's midline. `NSBrowserCell`'s own title
 /// drawing sits low in a 22-point row. The browser still draws the highlight and the branch chevron.
 final class CenteredBrowserCell: NSBrowserCell {
+    private static let attributes = titleAttributes(color: .labelColor)
+    private static let emphasizedAttributes = titleAttributes(color: .alternateSelectedControlTextColor)
+
+    private static func titleAttributes(color: NSColor) -> [NSAttributedString.Key: Any] {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        return [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize), .foregroundColor: color, .paragraphStyle: paragraph]
+    }
+
     static let iconSize: CGFloat = 16
     static let iconInset: CGFloat = 3
     static let gap: CGFloat = 5
@@ -227,14 +246,7 @@ final class CenteredBrowserCell: NSBrowserCell {
         }
         // The browser draws the branch chevron itself; the title only needs to stop short of it.
         let right = cellFrame.maxX - (isLeaf ? Self.gap : Self.chevronInset + 12)
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineBreakMode = .byTruncatingMiddle
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
-            .foregroundColor: emphasized ? NSColor.alternateSelectedControlTextColor : NSColor.labelColor,
-            .paragraphStyle: paragraph,
-        ]
-        let title = NSAttributedString(string: stringValue, attributes: attributes)
+        let title = NSAttributedString(string: stringValue, attributes: emphasized ? Self.emphasizedAttributes : Self.attributes)
         let height = ceil(title.size().height)
         let rect = NSRect(x: x, y: cellFrame.midY - height / 2, width: max(right - x, 0), height: height)
         title.draw(with: rect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
