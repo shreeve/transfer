@@ -36,8 +36,20 @@ struct ListTable: NSViewRepresentable {
             column.width = spec.width
             column.minWidth = spec.minWidth
             column.sortDescriptorPrototype = NSSortDescriptor(key: spec.id, ascending: true)
+            if spec.id == "name" {
+                // The header's icon slot holds an up arrow; "Name" sits over the file names.
+                let cell = NameHeaderCell(textCell: spec.title)
+                column.headerCell = cell
+                context.coordinator.nameHeader = cell
+            }
             table.addTableColumn(column)
         }
+        let header = ListHeaderView()
+        header.onUp = { [weak coordinator = context.coordinator] in
+            guard let model = coordinator?.model else { return }
+            Task { await model.goParent() }
+        }
+        table.headerView = header
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
@@ -64,7 +76,6 @@ struct ListTable: NSViewRepresentable {
 
         static let columns = [
             ColumnSpec(id: "name", title: "Name", width: 280, minWidth: 120),
-            ColumnSpec(id: "status", title: "Status", width: 90, minWidth: 60),
             ColumnSpec(id: "mtime", title: "Date Modified", width: 170, minWidth: 120),
             ColumnSpec(id: "size", title: "Size", width: 80, minWidth: 60),
             ColumnSpec(id: "kind", title: "Kind", width: 120, minWidth: 80),
@@ -72,8 +83,8 @@ struct ListTable: NSViewRepresentable {
 
         var model: TransferModel
         weak var table: NSTableView?
+        weak var nameHeader: NameHeaderCell?
         private(set) var items: [RemoteItem] = []
-        private var statusStamps: [String] = []
         private var syncing = false
         private var autosaveConnection: ConnectionID?
 
@@ -88,17 +99,19 @@ struct ListTable: NSViewRepresentable {
                 autosaveConnection = model.snapshot.connectionID
                 table.autosaveName = model.snapshot.connectionID.map { "transfer.list.\($0.rawValue.uuidString)" }
             }
+            let hasParent = model.snapshot.path.parent != nil
+            if nameHeader?.showsUp != hasParent {
+                nameHeader?.showsUp = hasParent
+                table.headerView?.needsDisplay = true
+            }
             let sort = model.snapshot.sort
             let descriptor = NSSortDescriptor(key: sort.column, ascending: sort.ascending)
             if table.sortDescriptors.first?.key != descriptor.key || table.sortDescriptors.first?.ascending != descriptor.ascending {
                 table.sortDescriptors = [descriptor]
             }
             let fresh = model.displayedItems
-            // Status text covers Live state and active transfers, so any row can change.
-            let stamps = fresh.map { model.statusText(for: $0.path) }
-            if fresh != items || stamps != statusStamps {
+            if fresh != items {
                 items = fresh
-                statusStamps = stamps
                 table.reloadData()
             }
             let wanted = IndexSet(items.indices.filter { model.snapshot.selection.contains(items[$0].path) })
@@ -120,8 +133,6 @@ struct ListTable: NSViewRepresentable {
             case "name":
                 cell.imageView?.image = ItemIcon.image(for: item)
                 cell.textField?.stringValue = item.name
-            case "status":
-                cell.textField?.stringValue = model.statusText(for: item.path)
             case "mtime":
                 cell.textField?.stringValue = item.mtime.map(Format.date) ?? ""
             case "size":
@@ -138,7 +149,7 @@ struct ListTable: NSViewRepresentable {
             let text = NSTextField(labelWithString: "")
             text.lineBreakMode = .byTruncatingMiddle
             text.font = .systemFont(ofSize: NSFont.systemFontSize)
-            text.textColor = id.rawValue == "status" ? .secondaryLabelColor : .labelColor
+            text.textColor = .labelColor
             text.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(text)
             cell.textField = text
@@ -288,5 +299,64 @@ enum Format {
 
     static func date(_ mtime: UInt32) -> String {
         Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+/// The Name column's header: an up arrow in the icon slot and the title over the names, on the
+/// same offsets the rows use.
+final class NameHeaderCell: NSTableHeaderCell {
+    static let iconInset: CGFloat = 3
+    static let textInset: CGFloat = 24
+    var showsUp = false
+    /// How far the table insets row cells from the column edge; the header view measures it.
+    var rowInset: CGFloat = 0
+
+    override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
+        let cellFrame = NSRect(x: cellFrame.minX + rowInset, y: cellFrame.minY, width: cellFrame.width - rowInset, height: cellFrame.height)
+        if showsUp {
+            let rect = NSRect(x: cellFrame.minX + Self.iconInset, y: cellFrame.midY - 8, width: 16, height: 16)
+            ItemIcon.upImage.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.headerTextColor,
+        ]
+        let title = NSAttributedString(string: stringValue, attributes: attributes)
+        let size = title.size()
+        let rect = NSRect(x: cellFrame.minX + Self.textInset, y: cellFrame.midY - size.height / 2, width: max(cellFrame.width - Self.textInset - 20, 0), height: size.height)
+        title.draw(with: rect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+    }
+}
+
+/// Routes a click on the Name header's arrow to the parent folder; everything else sorts as usual.
+final class ListHeaderView: NSTableHeaderView {
+    var onUp: (() -> Void)?
+
+    private var nameCell: NameHeaderCell? {
+        tableView?.tableColumns.first?.headerCell as? NameHeaderCell
+    }
+
+    /// The inset the table applies to row cells, so the header's arrow and title sit over them.
+    private func measureRowInset() {
+        guard let table = tableView, let cell = nameCell, table.numberOfRows > 0 else { return }
+        let inset = table.frameOfCell(atColumn: 0, row: 0).minX - headerRect(ofColumn: 0).minX
+        if abs(cell.rowInset - inset) > 0.5 { cell.rowInset = max(inset, 0) }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        measureRowInset()
+        super.draw(dirtyRect)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if column(at: point) == 0, let cell = nameCell, cell.showsUp {
+            let x = point.x - headerRect(ofColumn: 0).minX - cell.rowInset
+            if x >= 0, x < NameHeaderCell.textInset {
+                onUp?()
+                return
+            }
+        }
+        super.mouseDown(with: event)
     }
 }

@@ -278,8 +278,15 @@ final class CenteredBrowserCell: NSBrowserCell {
     static let gap: CGFloat = 5
     static let chevronInset: CGFloat = 8
 
+    /// The `..` row's content draws 5 points high so its arrow and text land where list view's
+    /// header puts the same arrow and "Name": the column view's rows start 5 points lower than
+    /// the list's header does.
+    static let upRowLift: CGFloat = 5
+
     override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
         let emphasized = backgroundStyle == .emphasized
+        var cellFrame = cellFrame
+        if image === ItemIcon.upImage { cellFrame.origin.y -= Self.upRowLift }
         var x = cellFrame.minX + Self.iconInset
         if let image {
             let rect = NSRect(x: x, y: cellFrame.midY - Self.iconSize / 2, width: Self.iconSize, height: Self.iconSize)

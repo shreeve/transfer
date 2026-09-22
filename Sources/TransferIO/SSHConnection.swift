@@ -589,12 +589,21 @@ public actor SSHConnection: RemoteSession {
         if let parent = path.parent { pipe.emit(.directoryChanged(parent)) }
     }
 
+    /// A synced mapping untouched for this long is forgotten at login; the next open downloads afresh.
+    private static let liveExpiry: TimeInterval = 24 * 60 * 60
+
     private func loadLives() {
         for row in store.liveFiles(connection: connection.id) {
             let local = URL(fileURLWithPath: row.localPath)
             guard FileManager.default.fileExists(atPath: local.path) else {
                 if row.dirty { pipe.emit(.notice("The Live copy of \(row.path.display) is gone; its edits were not uploaded")) }
                 store.deleteLive(row.id)
+                continue
+            }
+            if !row.dirty, let stamp = Self.stamp(local),
+               Date().timeIntervalSince1970 - TimeInterval(stamp.mtime) > Self.liveExpiry {
+                store.deleteLive(row.id)
+                try? FileManager.default.removeItem(at: local.deletingLastPathComponent())
                 continue
             }
             var base: Fingerprint?

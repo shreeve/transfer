@@ -69,9 +69,9 @@ struct SidebarColumn: View {
                     }
                 }
             }
-            if !model.liveFiles.isEmpty {
+            if !model.activeLiveFiles.isEmpty {
                 Section("Live Files") {
-                    ForEach(model.liveFiles) { live in
+                    ForEach(model.activeLiveFiles) { live in
                         Label {
                             Text(live.path.name)
                         } icon: {

@@ -833,6 +833,12 @@ public final class TransferModel {
         }
     }
 
+    /// Live files with something happening: edited, uploading, paused, or in conflict. A synced
+    /// mapping keeps working in the background but is not worth a sidebar row.
+    public var activeLiveFiles: [LiveFile] {
+        liveFiles.filter { $0.dirty || $0.uploading || $0.paused || $0.conflict }
+    }
+
     public func liveFile(for path: RemotePath) -> LiveFile? {
         liveFiles.first { $0.path == path }
     }
