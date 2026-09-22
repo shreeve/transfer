@@ -215,8 +215,8 @@ Hidden by default. Command-Option-I toggles it. One selection shows name, icon, 
 | New Window | Command-N |
 | New Tab | Command-T |
 | Icon / List / Columns | Command-1 / 2 / 3 |
-| Sidebar | Command-Option-S |
-| Inspector | Command-Option-I |
+| Sidebar | Command-Shift-S |
+| Inspector | Command-Shift-I |
 | Hidden files | Command-Shift-Period |
 
 Download Copy, Upload, and Open in Terminal have no shortcut. There is no Command-J and no gallery shortcut.

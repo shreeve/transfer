@@ -111,9 +111,9 @@ struct TransferApp: App {
                     .disabled(primary == nil || !plainKeys)
                 Divider()
                 Button("Sidebar") { model?.sidebarCollapsed.toggle() }
-                    .keyboardShortcut("s", modifiers: [.command, .option])
+                    .keyboardShortcut("s", modifiers: [.command, .shift])
                 Button("Inspector") { model?.showsInspector.toggle() }
-                    .keyboardShortcut("i", modifiers: [.command, .option])
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
                 Button("Transfers") { model?.showsShelf.toggle() }
                 Divider()
                 Button(model.map { $0.isStarred($0.starTarget) } == true ? "Unstar" : "Star") {
