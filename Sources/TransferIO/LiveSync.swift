@@ -273,7 +273,8 @@ actor LiveSync {
         entries[id]?.looked = true
         entries[id]?.observed = stamp
         if stamp != nil { entries[id]?.missingSeen = false }
-        schedule(id, after: Self.settle)
+        // Already seen missing: a late event for the same delete must not cut the grace short.
+        schedule(id, after: stamp == nil && entry.missingSeen ? Self.missingGrace : Self.settle)
     }
 
     // MARK: The worker
@@ -380,9 +381,14 @@ actor LiveSync {
                 return report(entry, .failed, "The working copy disappeared before its edits were uploaded")
             case .forget: return drop(entry)
             case .needDigest:
-                // Unreadable bytes cannot be shown unchanged: treat them as an edit, which the
-                // upload then reports if they stay unreadable.
-                digest = Self.digest(of: entry.local) ?? "unreadable"
+                // Deleted since its stamp was read: look again, as a missing file. Bytes that are
+                // there but unreadable cannot be shown unchanged: an edit, which the upload reports.
+                guard let read = Self.digest(of: entry.local) else {
+                    if Self.stamp(entry.local) == nil { return look(id) }
+                    digest = "unreadable"
+                    continue
+                }
+                digest = read
             case .needServer:
                 if !entry.state.dirty { change(id) { $0.state.dirty = true } }
                 guard let found = await lookup(id) else { return }
@@ -616,7 +622,7 @@ actor LiveSync {
         }
         guard let resolved = entries[id] else { return }
         try? FileManager.default.removeItem(at: resolved.serverCopy)
-        report(resolved, .succeeded)
+        if resolved.shown != .succeeded { report(resolved, .succeeded) }
         emit(resolved, .liveChanged)
         if let parent = resolved.path.parent { emit(resolved, .directoryChanged(parent)) }
         if resolved.state.dirty { look(id) }
