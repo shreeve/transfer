@@ -479,6 +479,34 @@ struct LiveSyncTests {
             #expect(await h.live.unsyncedCount() == 1)
         }
     }
+
+    @Test func aWaitingRowClearsWhenTheFileNoLongerWaits() async throws {
+        try await withLive("waiting") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let states = { h.fake.events.compactMap { event -> OperationState? in
+                if case .operation(let operation) = event, operation.livePath == note { return operation.state }
+                return nil
+            } }
+            await h.live.disconnected(h.connection, server: h.fake)
+            try await edit(h, local, id, "while away")
+            #expect(await waitUntil { states().last == .queued })
+            // Edited again while still offline: the row stays, it does not flicker off and back.
+            let before = states().count
+            try await edit(h, local, id, "while away, twice")
+            #expect(await waitUntil { states().count > before })
+            #expect(!states()[before...].contains(.succeeded))
+            // Put back offline: the next pass needs no server and uploads nothing, yet the row goes.
+            try await edit(h, local, id, "first")
+            #expect(await waitUntil { states().last == .succeeded })
+            #expect(await waitUntil { await h.file()?.dirty == false })
+            // Waiting again, then login: the row goes before the upload.
+            try await edit(h, local, id, "while away again")
+            #expect(await waitUntil { states().last == .queued })
+            await h.live.connected(h.connection, server: h.fake)
+            #expect(await waitUntil { await h.fake.contents(note) == "while away again" })
+            #expect(await h.fake.saves == 1)
+        }
+    }
 }
 
 // MARK: - Fake server
