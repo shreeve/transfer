@@ -286,7 +286,7 @@ final class ChromeController: NSSplitViewController {
     /// pointer is in the toolbar. This is that line.
     private let hoverLine = NSView()
     private var hoverTracking: NSTrackingArea?
-    private var hovering = false
+    private var keyObservers: [any NSObjectProtocol] = []
     var hoverLineEnabled = true {
         didSet { refreshHoverLine(animated: false) }
     }
@@ -301,28 +301,35 @@ final class ChromeController: NSSplitViewController {
     override func viewDidLayout() {
         super.viewDidLayout()
         keepSeparatorOff()
-        let top = view.window?.contentView?.safeAreaInsets.top ?? 0
-        // The content pane spans the window under the sidebar; the line starts where it shows.
-        let content = splitViewItems[1].viewController.view
-        let x = content.convert(content.safeAreaRect, to: view).minX
-        hoverLine.frame = NSRect(x: x, y: view.bounds.height - top - 1, width: view.bounds.width - x, height: 1)
+        hideContentScrollPockets()
+        let top = placeHoverLine()
         let strip = NSRect(x: 0, y: view.bounds.height - top, width: view.bounds.width, height: top)
         if hoverTracking?.rect != strip {
             if let hoverTracking { view.removeTrackingArea(hoverTracking) }
-            // A tracking area made while the pointer is already inside never reports that entry,
-            // and without `assumeInside` it drops the exit too, leaving the line stuck on.
-            hovering = pointerInToolbar(rect: strip)
-            var options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeInKeyWindow]
-            if hovering { options.insert(.assumeInside) }
-            let area = NSTrackingArea(rect: strip, options: options, owner: self, userInfo: nil)
+            // Enter and exit only prompt a fresh look at where the pointer is; they carry no state
+            // of their own, so a dropped event (another app taking focus, a tracking area rebuilt
+            // with the pointer already inside) cannot leave the line stuck.
+            let area = NSTrackingArea(rect: strip, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil)
             view.addTrackingArea(area)
             hoverTracking = area
             refreshHoverLine(animated: false)
         }
     }
 
-    private func pointerInToolbar(rect: NSRect) -> Bool {
-        guard let window = view.window, window.isKeyWindow else { return false }
+    /// Just under the toolbar, from the content pane's visible edge to the window's right edge.
+    /// The content pane spans the window under the sidebar; the line starts where the pane shows.
+    /// Returns the toolbar's height.
+    @discardableResult private func placeHoverLine() -> CGFloat {
+        let top = view.window?.contentView?.safeAreaInsets.top ?? 0
+        let content = splitViewItems[1].viewController.view
+        let x = content.convert(content.safeAreaRect, to: view).minX
+        let frame = NSRect(x: x, y: view.bounds.height - top - 1, width: view.bounds.width - x, height: 1)
+        if hoverLine.frame != frame { hoverLine.frame = frame }
+        return top
+    }
+
+    private func pointerInToolbar() -> Bool {
+        guard let window = view.window, window.isKeyWindow, let rect = hoverTracking?.rect else { return false }
         return rect.contains(view.convert(window.mouseLocationOutsideOfEventStream, from: nil))
     }
 
@@ -331,7 +338,9 @@ final class ChromeController: NSSplitViewController {
     /// inspector as that is dismissed. List view has its own header line and shows none.
     private func refreshHoverLine(animated: Bool) {
         let inspectorOut = splitViewItems.count == 3 && !splitViewItems[2].isCollapsed
+        let hovering = pointerInToolbar()
         let target: CGFloat = hoverLineEnabled && (hovering || inspectorOut) ? 1 : 0
+        if target > 0 { placeHoverLine() }
         guard hoverLine.alphaValue != target else { return }
         hoverLine.layer?.backgroundColor = NSColor.separatorColor.cgColor
         guard animated else {
@@ -346,13 +355,11 @@ final class ChromeController: NSSplitViewController {
 
     override func mouseEntered(with event: NSEvent) {
         guard event.trackingArea === hoverTracking else { return super.mouseEntered(with: event) }
-        hovering = true
         refreshHoverLine(animated: true)
     }
 
     override func mouseExited(with event: NSEvent) {
         guard event.trackingArea === hoverTracking else { return super.mouseExited(with: event) }
-        hovering = false
         refreshHoverLine(animated: true)
     }
 
@@ -361,16 +368,57 @@ final class ChromeController: NSSplitViewController {
     /// then stays until something sets the style again, so the window is watched and every
     /// layout re-asserts none. The hover line is the only line under the toolbar.
     private var separatorObservation: NSKeyValueObservation?
+    private var separatorUpdateObserver: (any NSObjectProtocol)?
+
+
+    /// AppKit hangs a scroll pocket, the macOS 26 scroll-edge effect, under the toolbar over each
+    /// section of the window. Over the content section it draws a hard edge for the placeholder
+    /// screen and for the inspector, and keeps that edge after the inspector collapses; it has no
+    /// public switch and no public class. The hover line is the only line under the toolbar, so
+    /// every pocket right of the sidebar is hidden as soon as it appears. The sidebar keeps its
+    /// own, which fades its list under the toolbar.
+    private func hideContentScrollPockets() {
+        guard let frame = view.window?.contentView?.superview, splitViewItems.count == 3 else { return }
+        let sidebar = splitViewItems[0].viewController.view
+        let sidebarEdge = splitViewItems[0].isCollapsed ? 0 : sidebar.convert(sidebar.bounds, to: nil).maxX
+        func walk(_ v: NSView) {
+            if String(describing: type(of: v)) == "NSScrollPocket" {
+                if !v.isHidden, v.convert(v.bounds, to: nil).minX >= sidebarEdge - 1 { v.isHidden = true }
+                return
+            }
+            v.subviews.forEach(walk)
+        }
+        walk(frame)
+    }
 
     private func keepSeparatorOff() {
         guard let window = view.window, window.titlebarSeparatorStyle != .none else { return }
+        // The title bar keeps the line it drew under the automatic style until it draws again;
+        // nothing else makes it, so the whole frame is asked to.
+        defer { redraw(window.contentView?.superview) }
         window.titlebarSeparatorStyle = .none
+    }
+
+    private func redraw(_ view: NSView?) {
+        guard let view else { return }
+        view.needsDisplay = true
+        view.subviews.forEach(redraw)
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
         guard let window = view.window, !toolbarInstalled else { return }
         separatorObservation = window.observe(\.titlebarSeparatorStyle, options: [.new]) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.keepSeparatorOff() }
+        }
+        // The window posts this after every pass of event handling, so a style SwiftUI sets after
+        // the last layout of an inspector animation is still caught before the next frame draws.
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            keyObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshHoverLine(animated: true) }
+            })
+        }
+        separatorUpdateObserver = NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
         toolbarInstalled = true
@@ -441,6 +489,7 @@ final class ChromeController: NSSplitViewController {
         sidebarToggled?(splitViewItems[0].isCollapsed)
         inspectorToggled?(!splitViewItems[2].isCollapsed)
         keepSeparatorOff()
+        hideContentScrollPockets()
         refreshHoverLine(animated: true)
     }
 
