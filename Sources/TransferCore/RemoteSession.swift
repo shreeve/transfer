@@ -1,6 +1,6 @@
 import Foundation
 
-public enum TransferError: Error, Equatable, Sendable {
+public enum TransferError: Error, Equatable, Sendable, LocalizedError {
     case notConnected
     case cancelled
     case hostKeyRejected
@@ -10,6 +10,26 @@ public enum TransferError: Error, Equatable, Sendable {
     case failed(String)
     case typeMismatch(String)
     case performanceUnavailable
+    case connectionLost(String)
+    case timeout(String)
+    case liveUnsynced(Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .notConnected: "Not connected"
+        case .cancelled: "Cancelled"
+        case .hostKeyRejected: "The host key was not trusted"
+        case .authenticationFailed(let text): text.isEmpty ? "Login failed" : text
+        case .permissionDenied(let text): "Permission denied: \(text)"
+        case .noSuchFile(let text): "No such file: \(text)"
+        case .failed(let text): text
+        case .typeMismatch(let text): "A file and a folder share the name \(text)"
+        case .performanceUnavailable: "The fast copy engine is not available"
+        case .connectionLost(let text): "Connection lost: \(text)"
+        case .timeout(let text): "Timed out: \(text)"
+        case .liveUnsynced(let count): "\(count) Live file\(count == 1 ? " has" : "s have") unsynced edits"
+        }
+    }
 }
 
 public struct PromptRequest: Sendable {
@@ -42,21 +62,61 @@ public struct TransferOperation: Identifiable, Hashable, Sendable {
     public var state: OperationState
     public var progress: TransferProgress
     public var message: String?
+    public var livePath: RemotePath?
 
-    public init(id: String, title: String, state: OperationState, progress: TransferProgress = TransferProgress(completed: 0), message: String? = nil) {
+    public init(
+        id: String,
+        title: String,
+        state: OperationState,
+        progress: TransferProgress = TransferProgress(completed: 0),
+        message: String? = nil,
+        livePath: RemotePath? = nil
+    ) {
         self.id = id
         self.title = title
         self.state = state
         self.progress = progress
         self.message = message
+        self.livePath = livePath
     }
 }
 
-public protocol RemoteSession: Sendable {
+public struct LiveFile: Hashable, Sendable, Identifiable {
+    public var id: LiveFileID
+    public var path: RemotePath
+    public var dirty: Bool
+    public var paused: Bool
+    public var conflict: Bool
+    public var uploading: Bool
+
+    public init(id: LiveFileID, path: RemotePath, dirty: Bool, paused: Bool, conflict: Bool, uploading: Bool) {
+        self.id = id
+        self.path = path
+        self.dirty = dirty
+        self.paused = paused
+        self.conflict = conflict
+        self.uploading = uploading
+    }
+}
+
+/// The library: saved servers and one session per saved server.
+public protocol SessionProvider: Sendable {
     func savedConnections() async throws -> [SavedConnection]
     func save(_ connection: SavedConnection) async throws
+    /// Refuses with `TransferError.liveUnsynced` while the connection has unsynced Live bytes.
     func removeConnection(_ id: ConnectionID) async throws
-    func connect(_ connection: SavedConnection, prompts: any PromptSink) async throws -> RemotePath
+    func session(for id: ConnectionID) async throws -> any RemoteSession
+    var unsyncedLiveCount: Int { get async }
+    func unsyncedLiveCount(for id: ConnectionID) async -> Int
+    func disconnectAll() async
+}
+
+/// One saved server. Views reach the server only through this protocol.
+public protocol RemoteSession: Sendable {
+    var connection: SavedConnection { get }
+    var isConnected: Bool { get async }
+    /// Logs in, or returns the start path at once when already logged in.
+    func connect(prompts: any PromptSink) async throws -> RemotePath
     func disconnect() async
     var performanceModeEnabled: Bool { get async }
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error>
@@ -73,8 +133,10 @@ public protocol RemoteSession: Sendable {
     func prepareLiveFile(_ path: RemotePath) async throws -> URL
     func prepareViewFile(_ path: RemotePath) async throws -> URL
     func preparePreview(_ path: RemotePath) async throws -> URL
+    func clearPreviewCache() async
     func discardLiveFile(_ path: RemotePath, force: Bool) async throws
-    var livePaths: Set<RemotePath> { get async }
+    func setLivePaused(_ path: RemotePath, paused: Bool) async
+    func liveFiles() async -> [LiveFile]
     func events() -> AsyncStream<SessionEvent>
     func recents() async -> [RemotePath]
     func remember(_ path: RemotePath) async
@@ -82,14 +144,20 @@ public protocol RemoteSession: Sendable {
     func pin(_ path: RemotePath) async
     func unpin(_ path: RemotePath) async
     func duplicate(_ path: RemotePath) async throws
-    func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws -> URL?
+    /// `.compare` opens the diff tool itself and returns nil.
+    func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws
     var unsyncedLiveCount: Int { get async }
+    /// A shell command that joins the same SSH master and starts a login shell in `directory`.
+    func terminalCommand(directory: RemotePath) async -> String?
 }
 
 public enum SessionEvent: Sendable {
     case operation(TransferOperation)
     case notice(String)
-    case conflict(RemotePath)
+    case conflict(RemotePath, comparable: Bool)
+    case liveChanged
+    case directoryChanged(RemotePath)
+    case disconnected(String)
 }
 
 public extension RemoteSession {

@@ -4,6 +4,12 @@ public struct ConnectionID: Hashable, Sendable, Codable, RawRepresentable {
     public var rawValue: UUID
     public init(rawValue: UUID) { self.rawValue = rawValue }
     public init() { self.rawValue = UUID() }
+
+    /// A short stable file name for this connection's control socket. Unix socket paths are
+    /// limited to 104 bytes on macOS, and ssh appends a 17-byte suffix while it binds.
+    public var socketName: String {
+        String(rawValue.uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).lowercased()
+    }
 }
 
 public struct LiveFileID: Hashable, Sendable, Codable, RawRepresentable {

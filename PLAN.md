@@ -114,7 +114,7 @@ Listing, preview, view, and Live editing always use SFTP, even when the flag is 
 After the probe, open SFTP passengers on the master. Each is its own process:
 
 ```text
-/usr/bin/ssh -S <socket> -o Compression=no -s sftp -- <destination>
+/usr/bin/ssh -S <socket> -o Compression=no -s -- <destination> sftp
 ```
 
 At login, open browse, then interactive, then walker. Speak SFTP version 3 on stdin and stdout (length-prefixed packets). Do not parse the `sftp` command's text. If the server's version is not 3, mark that passenger down.

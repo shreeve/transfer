@@ -114,7 +114,25 @@ actor SFTPLink {
     }
 
     func rename(_ source: RemotePath, to destination: RemotePath) async throws {
-        if await extendedRename(source, to: destination) { return }
+        if await posixRename(source, to: destination) { return }
+        try await plainRename(source, to: destination)
+    }
+
+    /// `posix-rename@openssh.com` replaces the destination. False when the server lacks it.
+    func posixRename(_ source: RemotePath, to destination: RemotePath) async -> Bool {
+        var body = Data()
+        body.appendString("posix-rename@openssh.com")
+        body.appendBlob(Data(source.bytes))
+        body.appendBlob(Data(destination.bytes))
+        do {
+            _ = try await call(SFTPCode.extended, body: body)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func plainRename(_ source: RemotePath, to destination: RemotePath) async throws {
         var body = Data()
         body.appendBlob(Data(source.bytes))
         body.appendBlob(Data(destination.bytes))
@@ -142,10 +160,12 @@ actor SFTPLink {
         return String(decoding: first.filename, as: UTF8.self)
     }
 
+    /// OpenSSH's sftp-server reads SYMLINK as (target, link), the reverse of the draft. Every
+    /// version-3 server in use follows OpenSSH here.
     func symlink(target: String, link: RemotePath) async throws {
         var body = Data()
-        body.appendBlob(Data(link.bytes))
         body.appendString(target)
+        body.appendBlob(Data(link.bytes))
         _ = try await call(SFTPCode.symlink, body: body)
     }
 
@@ -181,6 +201,7 @@ actor SFTPLink {
         var received: UInt64 = 0
         var inFlight: [(offset: UInt64, task: Task<Data, Error>)] = []
         while received < limit || !inFlight.isEmpty {
+            try Task.checkCancellation()
             while inFlight.count < 32, next < limit {
                 let offset = next
                 let ask = UInt32(min(65_536, limit - next))
@@ -232,6 +253,7 @@ actor SFTPLink {
         return try reader.blob()
     }
 
+    /// Keeps 2 MB of WRITE requests in flight, 64 KB each, all writes on this channel.
     func upload(
         _ source: URL,
         to path: RemotePath,
@@ -243,17 +265,41 @@ actor SFTPLink {
         defer { try? input.close() }
         let total = (try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(UInt64.init)
         var offset: UInt64 = 0
-        while true {
-            let chunk = try input.read(upToCount: 65_536) ?? Data()
-            if chunk.isEmpty { break }
-            var body = Data()
-            body.appendBlob(handle)
-            body.appendU64(offset)
-            body.appendBlob(chunk)
-            _ = try await call(SFTPCode.write, body: body)
-            offset += UInt64(chunk.count)
-            progress(TransferProgress(completed: offset, total: total))
+        var acknowledged: UInt64 = 0
+        var inFlight: [Task<UInt64, Error>] = []
+        do {
+            while true {
+                try Task.checkCancellation()
+                let chunk = try input.read(upToCount: 65_536) ?? Data()
+                if chunk.isEmpty { break }
+                let at = offset
+                let count = UInt64(chunk.count)
+                offset += count
+                inFlight.append(Task {
+                    try await self.writeChunk(handle, offset: at, data: chunk)
+                    return count
+                })
+                if inFlight.count >= 32 {
+                    acknowledged += try await inFlight.removeFirst().value
+                    progress(TransferProgress(completed: acknowledged, total: total))
+                }
+            }
+            while !inFlight.isEmpty {
+                acknowledged += try await inFlight.removeFirst().value
+                progress(TransferProgress(completed: acknowledged, total: total))
+            }
+        } catch {
+            for task in inFlight { task.cancel() }
+            throw error
         }
+    }
+
+    private func writeChunk(_ handle: Data, offset: UInt64, data: Data) async throws {
+        var body = Data()
+        body.appendBlob(handle)
+        body.appendU64(offset)
+        body.appendBlob(data)
+        _ = try await call(SFTPCode.write, body: body)
     }
 
     func closeLink() {
@@ -267,19 +313,6 @@ actor SFTPLink {
         waiters.removeAll()
         versionWaiter?.resume(throwing: TransferError.cancelled)
         versionWaiter = nil
-    }
-
-    private func extendedRename(_ source: RemotePath, to destination: RemotePath) async -> Bool {
-        var body = Data()
-        body.appendString("posix-rename@openssh.com")
-        body.appendBlob(Data(source.bytes))
-        body.appendBlob(Data(destination.bytes))
-        do {
-            _ = try await call(SFTPCode.extended, body: body)
-            return true
-        } catch {
-            return false
-        }
     }
 
     private func openDirectory(_ path: RemotePath) async throws -> Data {
@@ -314,15 +347,27 @@ actor SFTPLink {
         _ = try await call(SFTPCode.close, body: body)
     }
 
+    private var cancelledIDs: Set<UInt32> = []
+
     private func call(_ type: UInt8, body: Data) async throws -> SFTPMessage {
+        try Task.checkCancellation()
+        guard isOpen else { throw TransferError.connectionLost("SSH channel closed") }
         let id = nextID
         nextID += 1
         var framed = Data()
         framed.appendU32(id)
         framed.append(body)
         try write(SFTPWire.packet(type: type, body: framed))
-        let message: SFTPMessage = try await withCheckedThrowingContinuation { continuation in
-            waiters[id] = continuation
+        let message: SFTPMessage = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if cancelledIDs.remove(id) != nil {
+                    continuation.resume(throwing: TransferError.cancelled)
+                } else {
+                    waiters[id] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelRequest(id) }
         }
         if message.type == SFTPCode.status {
             var reader = ByteReader(message.rest)
@@ -337,11 +382,19 @@ actor SFTPLink {
         return message
     }
 
+    private func cancelRequest(_ id: UInt32) {
+        if let waiter = waiters.removeValue(forKey: id) {
+            waiter.resume(throwing: TransferError.cancelled)
+        } else {
+            cancelledIDs.insert(id)
+        }
+    }
+
     private func write(_ packet: Data) throws {
         do {
             try input.write(contentsOf: packet)
         } catch {
-            throw TransferError.failed("Broken SSH channel")
+            throw TransferError.connectionLost("Broken SSH channel")
         }
     }
 
@@ -363,7 +416,7 @@ actor SFTPLink {
             }
         }
         isOpen = false
-        let error = TransferError.failed("SSH channel closed")
+        let error = TransferError.connectionLost("SSH channel closed")
         versionWaiter?.resume(throwing: error)
         versionWaiter = nil
         for waiter in waiters.values { waiter.resume(throwing: error) }

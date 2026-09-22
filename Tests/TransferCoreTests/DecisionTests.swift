@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 import TransferCore
 
@@ -44,4 +45,57 @@ import TransferCore
     let connection = SavedConnection(name: "Box", host: "example.com", user: "ada", port: "22")
     let url = SftpURL.string(connection: connection, path: RemotePath(string: "/work/a b.txt"))
     #expect(url == "sftp://ada@example.com:22/work/a%20b.txt")
+}
+
+@Test func retriesOnlyDroppedConnectionsAndTimeouts() {
+    #expect(RetryPolicy.isRetryable(TransferError.connectionLost("closed")))
+    #expect(RetryPolicy.isRetryable(TransferError.timeout("stat")))
+    #expect(!RetryPolicy.isRetryable(TransferError.authenticationFailed("no")))
+    #expect(!RetryPolicy.isRetryable(TransferError.permissionDenied("no")))
+    #expect(!RetryPolicy.isRetryable(TransferError.hostKeyRejected))
+    #expect(RetryPolicy.delay(afterAttempt: 0) == 1)
+    #expect(RetryPolicy.delay(afterAttempt: 2) == 4)
+    #expect(RetryPolicy.delay(afterAttempt: 3) == nil)
+}
+
+@Test func cacheEvictionDropsTheOldestFirst() {
+    let entries = [
+        CacheEntry(id: "new", size: 40, lastUsed: Date(timeIntervalSince1970: 300)),
+        CacheEntry(id: "old", size: 40, lastUsed: Date(timeIntervalSince1970: 100)),
+        CacheEntry(id: "mid", size: 40, lastUsed: Date(timeIntervalSince1970: 200)),
+    ]
+    #expect(CacheEviction.victims(entries, limit: 100) == ["old"])
+    #expect(CacheEviction.victims(entries, limit: 50) == ["old", "mid"])
+    #expect(CacheEviction.victims(entries, limit: 200).isEmpty)
+}
+
+@Test func knownHostsFilesComeFromSSHConfig() {
+    let output = """
+    user ada
+    userknownhostsfile /Users/ada/.ssh/known_hosts /Users/ada/.ssh/known_hosts2
+    globalknownhostsfile /etc/ssh/ssh_known_hosts
+    """
+    #expect(KnownHosts.files(sshConfigOutput: output) == [
+        "/Users/ada/.ssh/known_hosts", "/Users/ada/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts",
+    ])
+}
+
+@Test func hostKeySituationComparesTypeAndKey() {
+    let stored = KnownHosts.entries(keygenOutput: """
+    # Host box found: line 3
+    box ssh-ed25519 AAAAold
+    # Host box found: line 9
+    @cert-authority box ssh-rsa AAAArsa
+    """)
+    #expect(stored.count == 2)
+    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "AAAAold"), stored: stored) == .unchanged)
+    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "AAAAnew"), stored: stored) == .changed)
+    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ecdsa-sha2-nistp256", key: "AAAAec"), stored: stored) == .firstSeen)
+    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "x"), stored: []) == .firstSeen)
+}
+
+@Test func socketNameIsShortAndStable() {
+    let id = ConnectionID(rawValue: UUID(uuidString: "F10955FD-A0B1-44DA-B362-C9ED14BA0668")!)
+    #expect(id.socketName == "f10955fda0b1")
+    #expect(id.socketName.count == 12)
 }

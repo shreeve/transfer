@@ -313,3 +313,105 @@ public enum SyntaxPreview {
         )
     }
 }
+
+public enum RetryPolicy {
+    public static let delays: [Double] = [1, 2, 4]
+
+    public static func isRetryable(_ error: Error) -> Bool {
+        guard let error = error as? TransferError else { return false }
+        switch error {
+        case .connectionLost, .timeout: return true
+        default: return false
+        }
+    }
+
+    /// The delay before attempt `attempt` (zero-based), or nil when retries are exhausted.
+    public static func delay(afterAttempt attempt: Int) -> Double? {
+        attempt < delays.count ? delays[attempt] : nil
+    }
+}
+
+public struct CacheEntry: Hashable, Sendable {
+    public var id: String
+    public var size: UInt64
+    public var lastUsed: Date
+
+    public init(id: String, size: UInt64, lastUsed: Date) {
+        self.id = id
+        self.size = size
+        self.lastUsed = lastUsed
+    }
+}
+
+public enum CacheEviction {
+    public static let previewLimit: UInt64 = 1_073_741_824
+
+    /// Oldest entries first, until the rest fit under `limit`.
+    public static func victims(_ entries: [CacheEntry], limit: UInt64) -> [String] {
+        var total = entries.reduce(UInt64(0)) { $0 + $1.size }
+        guard total > limit else { return [] }
+        var removed: [String] = []
+        for entry in entries.sorted(by: { $0.lastUsed < $1.lastUsed }) {
+            guard total > limit else { break }
+            total -= entry.size
+            removed.append(entry.id)
+        }
+        return removed
+    }
+}
+
+public struct HostKeyLine: Hashable, Sendable {
+    public var host: String
+    public var keyType: String
+    public var key: String
+
+    public init(host: String, keyType: String, key: String) {
+        self.host = host
+        self.keyType = keyType
+        self.key = key
+    }
+
+    public init?(line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return nil }
+        var parts = trimmed.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        if let first = parts.first, first.hasPrefix("@") { parts.removeFirst() }
+        guard parts.count >= 3 else { return nil }
+        self.init(host: parts[0], keyType: parts[1], key: parts[2])
+    }
+
+    public var text: String { "\(host) \(keyType) \(key)" }
+}
+
+public enum KnownHosts {
+    /// The known-hosts files `ssh -G` reports, user files first.
+    public static func files(sshConfigOutput: String) -> [String] {
+        var user: [String] = []
+        var global: [String] = []
+        for line in sshConfigOutput.split(separator: "\n") {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            guard parts.count > 1 else { continue }
+            switch parts[0].lowercased() {
+            case "userknownhostsfile": user += parts.dropFirst()
+            case "globalknownhostsfile": global += parts.dropFirst()
+            default: continue
+            }
+        }
+        return user + global
+    }
+
+    /// The entries `ssh-keygen -F` printed.
+    public static func entries(keygenOutput: String) -> [HostKeyLine] {
+        keygenOutput.split(separator: "\n").compactMap { HostKeyLine(line: String($0)) }
+    }
+
+    public static func situation(offered: HostKeyLine, stored: [HostKeyLine]) -> HostKeySituation {
+        if stored.contains(where: { $0.keyType == offered.keyType && $0.key == offered.key }) {
+            return .unchanged
+        }
+        if stored.contains(where: { $0.keyType == offered.keyType }) {
+            return .changed
+        }
+        return .firstSeen
+    }
+}

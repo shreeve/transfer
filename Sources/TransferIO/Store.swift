@@ -3,17 +3,28 @@ import SQLite3
 import Security
 import TransferCore
 
+struct LiveRow: Sendable {
+    var id: LiveFileID
+    var connection: ConnectionID
+    var path: RemotePath
+    var baseSize: UInt64?
+    var baseMtime: UInt32?
+    var localPath: String
+    var dirty: Bool
+}
+
 final class Store: @unchecked Sendable {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "transfer.store")
     let root: URL
 
-    init() throws {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    /// `root` defaults to `~/Library/Application Support/Transfer`.
+    init(root customRoot: URL? = nil) throws {
+        let base = customRoot ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Transfer", isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
-        root = base
+        self.root = base
         let path = base.appendingPathComponent("transfer.sqlite").path
         if sqlite3_open(path, &db) != SQLITE_OK {
             throw TransferError.failed("Could not open the library")
@@ -36,10 +47,19 @@ final class Store: @unchecked Sendable {
         );
         CREATE TABLE IF NOT EXISTS temps (path TEXT PRIMARY KEY);
         """)
+        // Columns added after the first schema. SQLite has no ADD COLUMN IF NOT EXISTS.
+        _ = sqlite3_exec(db, "ALTER TABLE live_files ADD COLUMN dirty INTEGER DEFAULT 0", nil, nil, nil)
+        _ = sqlite3_exec(db, "ALTER TABLE temps ADD COLUMN connection_id TEXT", nil, nil, nil)
     }
+
+    // MARK: Connections
 
     func connections() -> [SavedConnection] {
         queue.sync { queryConnections() }
+    }
+
+    func connection(_ id: ConnectionID) -> SavedConnection? {
+        queue.sync { queryConnections().first { $0.id == id } }
     }
 
     func save(_ connection: SavedConnection) {
@@ -59,11 +79,16 @@ final class Store: @unchecked Sendable {
 
     func remove(_ id: ConnectionID) {
         queue.sync {
-            bind("DELETE FROM connections WHERE id = ?", id.rawValue.uuidString)
-            bind("DELETE FROM recents WHERE connection_id = ?", id.rawValue.uuidString)
-            bind("DELETE FROM pins WHERE connection_id = ?", id.rawValue.uuidString)
+            let key = id.rawValue.uuidString
+            bind("DELETE FROM connections WHERE id = ?", key)
+            bind("DELETE FROM recents WHERE connection_id = ?", key)
+            bind("DELETE FROM pins WHERE connection_id = ?", key)
+            bind("DELETE FROM live_files WHERE connection_id = ?", key)
+            bind("DELETE FROM temps WHERE connection_id = ?", key)
         }
     }
+
+    // MARK: Recents and pins
 
     func recents(connection: ConnectionID) -> [String] {
         queue.sync {
@@ -96,17 +121,91 @@ final class Store: @unchecked Sendable {
         }
     }
 
-    func rememberTemp(_ path: String) {
-        queue.sync { bind("INSERT OR REPLACE INTO temps (path) VALUES (?)", path) }
+    // MARK: Temps
+
+    /// `connection` is nil for a temp on the local disk.
+    func rememberTemp(_ path: String, connection: ConnectionID?) {
+        queue.sync {
+            bind("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", path, connection?.rawValue.uuidString ?? "")
+        }
     }
 
     func forgetTemp(_ path: String) {
         queue.sync { bind("DELETE FROM temps WHERE path = ?", path) }
     }
 
-    func temps() -> [String] {
-        queue.sync { strings("SELECT path FROM temps", nil) }
+    func localTemps() -> [String] {
+        queue.sync { strings("SELECT path FROM temps WHERE connection_id IS NULL OR connection_id = ''", nil) }
     }
+
+    func remoteTemps(connection: ConnectionID) -> [String] {
+        queue.sync { strings("SELECT path FROM temps WHERE connection_id = ?", connection.rawValue.uuidString) }
+    }
+
+    // MARK: Live files
+
+    func liveFiles(connection: ConnectionID) -> [LiveRow] {
+        queue.sync {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            let sql = "SELECT id, connection_id, path, base_size, base_mtime, local_path, dirty FROM live_files WHERE connection_id = ?"
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+            bindText(statement, 1, connection.rawValue.uuidString)
+            var rows: [LiveRow] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let id = UUID(uuidString: text(statement, 0)) else { continue }
+                let hasSize = sqlite3_column_type(statement, 3) != SQLITE_NULL
+                let hasTime = sqlite3_column_type(statement, 4) != SQLITE_NULL
+                rows.append(LiveRow(
+                    id: LiveFileID(rawValue: id),
+                    connection: connection,
+                    path: RemotePath(bytes: Array(text(statement, 2).utf8)),
+                    baseSize: hasSize ? UInt64(sqlite3_column_int64(statement, 3)) : nil,
+                    baseMtime: hasTime ? UInt32(truncatingIfNeeded: sqlite3_column_int64(statement, 4)) : nil,
+                    localPath: text(statement, 5),
+                    dirty: sqlite3_column_int(statement, 6) != 0
+                ))
+            }
+            return rows
+        }
+    }
+
+    func saveLive(_ row: LiveRow) {
+        queue.sync {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            let sql = "INSERT OR REPLACE INTO live_files (id, connection_id, path, base_size, base_mtime, local_path, dirty) VALUES (?,?,?,?,?,?,?)"
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+            bindText(statement, 1, row.id.rawValue.uuidString)
+            bindText(statement, 2, row.connection.rawValue.uuidString)
+            bindText(statement, 3, row.path.display)
+            if let size = row.baseSize { sqlite3_bind_int64(statement, 4, Int64(bitPattern: size)) } else { sqlite3_bind_null(statement, 4) }
+            if let time = row.baseMtime { sqlite3_bind_int64(statement, 5, Int64(time)) } else { sqlite3_bind_null(statement, 5) }
+            bindText(statement, 6, row.localPath)
+            sqlite3_bind_int(statement, 7, row.dirty ? 1 : 0)
+            sqlite3_step(statement)
+        }
+    }
+
+    func deleteLive(_ id: LiveFileID) {
+        queue.sync { bind("DELETE FROM live_files WHERE id = ?", id.rawValue.uuidString) }
+    }
+
+    func dirtyLiveCount(connection: ConnectionID? = nil) -> Int {
+        queue.sync {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            let sql = connection == nil
+                ? "SELECT COUNT(*) FROM live_files WHERE dirty = 1"
+                : "SELECT COUNT(*) FROM live_files WHERE dirty = 1 AND connection_id = ?"
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return 0 }
+            if let connection { bindText(statement, 1, connection.rawValue.uuidString) }
+            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+            return Int(sqlite3_column_int(statement, 0))
+        }
+    }
+
+    // MARK: Plumbing
 
     private func queryConnections() -> [SavedConnection] {
         var statement: OpaquePointer?
