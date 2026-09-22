@@ -11,6 +11,12 @@ let package = Package(
         .executable(name: "Transfer", targets: ["Transfer"])
     ],
     targets: [
-        .executableTarget(name: "Transfer")
+        .target(name: "TransferCore"),
+        .target(name: "TransferIO", dependencies: ["TransferCore"]),
+        .target(name: "TransferUI", dependencies: ["TransferCore"]),
+        .executableTarget(
+            name: "Transfer",
+            dependencies: ["TransferUI", "TransferIO"]
+        ),
     ]
 )

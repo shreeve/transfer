@@ -1,4 +1,5 @@
 import SwiftUI
+import TransferUI
 
 @main
 struct TransferApp: App {

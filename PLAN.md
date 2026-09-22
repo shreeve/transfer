@@ -1,1210 +1,391 @@
-# Transfer — Product Specification and Development Roadmap
+# Transfer — Build Specification
 
-Status: Proposed build specification  
+Status: Locked for a one-pass build  
 Target: macOS 27 and later, Apple silicon  
-Working product name: **Transfer**  
-Primary implementation language: Swift  
-UI architecture: SwiftUI-first with narrowly scoped AppKit adapters
+Bundle identifier for this pass: `com.example.Transfer`  
+Language: Swift  
+UI: SwiftUI, with AppKit only for `NSBrowser`, `NSFilePromiseProvider`, Quick Look, and `NSWorkspace`  
+Project: the existing Swift package. No Xcode project. Three libraries, one app: `TransferCore` (values), `TransferIO` (the machine), `TransferUI` (views). The `Transfer` executable only connects them.
 
-## 1. Executive summary
+This document is the specification. Where an older note disagrees with this file, this file wins.
 
-Transfer is a native macOS remote-file browser focused initially on SFTP. It is not a dual-pane Finder replacement and not a mounted remote filesystem. It gives users one clean, unmistakably Mac-native window for browsing a remote server, previewing files, opening remote files for live editing, and transferring files to or from Finder with ordinary drag and drop.
+## 1. Product
 
-The defining behavioral distinction is between **live** files and **copies**:
+Transfer is one remote browser window, not a second Finder and not a mounted disk. The user connects to an SFTP server, browses it, previews files, opens editable files so saves upload, and drags files to and from Finder.
 
-- Opening a remote file directly creates a managed **live file**. Changes saved by any Mac application are automatically and safely uploaded to the server.
-- Dragging or downloading a remote file to Finder creates an independent **local copy**. It has no continuing connection to the server.
+It should feel like a small utility Apple might have shipped next to Finder: standard controls, no custom chrome, no dual pane.
 
-The internal engineering term for a live file may be “hot,” but the user-facing term should be **Live**. The interface must always make pending uploads, conflicts, offline changes, and failures visible. The application must never silently overwrite a remotely changed file.
+### 1.1 The four actions
 
-Transfer should feel like a capability Apple might have added to Finder: restrained, current, accessible, keyboard-friendly, and based on standard macOS controls. It should not imitate Finder with hand-drawn controls. It should use current SwiftUI components wherever they are adequate and AppKit only where macOS exposes essential behavior that SwiftUI does not.
-
-## 2. Product thesis
-
-### 2.1 Problem
-
-Existing Mac file-transfer applications generally fall into one of four categories:
-
-1. Mature and reliable but visually dated dedicated clients.
-2. Dual-pane file managers that partially replace Finder and introduce their own interaction language.
-3. Cross-platform tools that do not feel native to macOS.
-4. Finder-mounted remote filesystems that inherit complex synchronization, caching, hydration, and File Provider edge cases.
-
-The immediate motivating defect is that dragging a remote file from ForkLift into Finder can yield a text link instead of the file, while an internal pane-to-pane transfer succeeds. That indicates an external drag/file-promise failure. Transfer must make external drag-out a first-class, acceptance-tested behavior.
-
-### 2.2 Opportunity
-
-Users already have Finder for local files. A remote browser does not need its own local pane. A focused application can provide:
-
-- Native remote navigation.
-- Finder-style icon, list, column, and gallery modes.
-- Reliable drag-out to Finder.
-- Drag-in upload from Finder.
-- Quick Look.
-- Live editing with automatic upload.
-- Explicit transfer state and conflict safety.
-- Existing OpenSSH configuration compatibility.
-
-### 2.3 Product statement
-
-> Transfer is a native macOS remote-file browser that makes SFTP files feel natural: open to edit live, or drag out to make a copy.
-
-### 2.4 Core interaction rule
-
-> **Open means Live. Drag out means Copy.**
-
-This rule must remain consistent across double-click, keyboard commands, context menus, drag and drop, and accessibility actions.
-
-## 3. Goals and non-goals
-
-### 3.1 Goals
-
-- Feel unmistakably native on macOS 27.
-- Browse SFTP servers with Finder-familiar navigation and view modes.
-- Support remote-to-Finder drag as a real file, never a link or text clipping.
-- Support Finder-to-remote drag as an upload.
-- Open remote files in their normal applications as managed live files.
-- Automatically upload completed saves, including atomic/safe-save replacements.
-- Preserve data during disconnections, application termination, and crashes.
-- Detect remote changes before upload and prevent silent data loss.
-- Respect existing SSH identities, agents, host keys, configuration, and jump hosts wherever practical.
-- Provide excellent keyboard navigation, accessibility, Voice Control, and standard Mac menus.
-- Keep the remote-provider layer independent enough to add WebDAV, S3, or other backends later.
-
-### 3.2 Non-goals for version 1
-
-- Replacing Finder for local files.
-- A permanent dual-pane interface.
-- Mounting an SFTP server into Finder.
-- Implementing a File Provider extension.
-- Implementing a Finder Sync extension.
-- Cross-platform support.
-- iPhone or iPad support.
-- A built-in code editor.
-- A built-in terminal emulator.
-- Real-time multi-user collaborative editing.
-- Perfect mirroring of every Unix filesystem feature.
-- A Rust or GPUI user interface.
-- Supporting every remote protocol in the initial release.
-
-### 3.3 Deferred possibilities
-
-- Optional File Provider integration using the same backend.
-- S3, WebDAV, Backblaze B2, Azure, and cloud-drive providers.
-- Remote-to-remote transfers.
-- Directory synchronization.
-- Server bookmarks synchronized through iCloud.
-- CLI companion.
-- Rust transfer core shared by a CLI or non-Apple client.
-- Remote search and indexing.
-- Git-aware decorations.
-
-## 4. Naming
-
-The working name is **Transfer**. It is direct, understandable, and fits the restrained product concept, but it is generic and may be difficult to trademark, search for, or distinguish in the App Store.
-
-Before public release, conduct naming and trademark research. Candidate names should feel like native Mac utilities, be easy to say, and avoid cute network metaphors. Until a final name is chosen:
-
-- Use `Transfer` in documentation and UI.
-- Use a reversible internal bundle namespace such as `com.example.Transfer` during prototyping.
-- Do not bake the product name into database schemas or protocol identifiers.
-
-## 5. User model: remote, live, cached, and copied
-
-### 5.1 Remote item
-
-A remote item exists only on the server and is represented by provider metadata. It may have cached metadata or preview data locally, but it is not a local user document.
-
-### 5.2 Live file
-
-A live file is a remote item opened through Transfer and backed by a managed local working copy. Transfer retains a durable mapping between the remote identity and local working URL. Saves to the local working copy are monitored and uploaded.
-
-A live file remains live across:
-
-- Safe-save file replacement.
-- Temporary network loss.
-- Closing the editor.
-- Closing Transfer’s main window.
-- Relaunching Transfer.
-- Restarting the Mac, if pending work exists and background continuation is enabled.
-
-### 5.3 Cached file
-
-A cached file contains local bytes for previewing, Quick Look, or performance but is not necessarily live. Cache status and live status are orthogonal:
-
-- A preview cache is not live.
-- A live file is managed even when currently synchronized.
-- “Keep Downloaded” retains bytes for offline availability but does not change remote identity.
-
-### 5.4 Local copy
-
-A local copy is exported to a user-selected Finder destination. It is detached from Transfer. Changes are not uploaded automatically.
-
-The application should not add proprietary sidecars or extended attributes merely to simulate continued linkage after export. A future explicit “Link as Live File” command may opt a local file into management, but version 1 should avoid ambiguous implicit relationships.
-
-### 5.5 Truth rule
-
-Live status is determined by Transfer’s durable identity mapping, not by filename, bytes, or a decorative badge. The mapping includes:
-
-- Connection/domain identifier.
-- Remote stable identifier where available.
-- Canonical remote path.
-- Local working URL.
-- Base remote version.
-- Last uploaded version.
-- Local content version.
-- Current synchronization state.
-
-## 6. Primary user workflows
-
-### 6.1 Connect to a server
-
-1. User chooses File > New Connection or clicks Add Server.
-2. User selects or enters an SSH host.
-3. Transfer resolves relevant OpenSSH configuration.
-4. Transfer verifies the host key using familiar, explicit language.
-5. Authentication uses agent, key, security key, certificate, password, or keyboard-interactive flow as supported.
-6. Successful connections appear under Servers in the sidebar.
-7. The starting directory is the configured path, otherwise the user’s remote home.
-
-### 6.2 Browse
-
-- Single-click selects.
-- Double-clicking a directory navigates into it.
-- Right arrow enters a selected directory; left arrow moves to the parent where appropriate.
-- Back and Forward navigate location history.
-- Command-Up moves to the parent.
-- Command-L focuses a location field or opens “Go to Remote Folder.”
-- Command-F searches or filters according to the active search mode.
-- Space opens Quick Look.
-- Command-I toggles the inspector.
-- Command-J opens view options if implemented.
-
-### 6.3 Open a remote file live
-
-1. User double-clicks a remote file, presses Command-Down, presses Return according to configured behavior, or chooses Open Live.
-2. Transfer downloads the current remote content into its managed Live workspace.
-3. Transfer records a base version before opening the file.
-4. Transfer opens the local working copy with `NSWorkspace` and the default application, or with a chosen application.
-5. Transfer observes the containing directory for modifications and safe-save replacements.
-6. After a completed save and a short stabilization debounce, Transfer compares the current server version with the base version.
-7. If unchanged, Transfer uploads to a temporary remote name and atomically renames it into place where the server supports it.
-8. Transfer updates the base version and marks the item Up to Date.
-9. If the server version changed, Transfer creates a conflict and never silently overwrites either version.
-
-### 6.4 Drag a remote file to Finder
-
-1. User begins dragging one or more remote items.
-2. Transfer initiates a native AppKit dragging session containing `NSFilePromiseProvider` instances.
-3. Finder chooses the destination.
-4. Transfer downloads each promised file directly to an appropriately staged destination.
-5. Progress appears in Transfer and, where supported, in Finder.
-6. Successful completion produces normal local files or folders.
-7. The exported items are cold local copies.
-
-Acceptance requirement: the result must never be `.textClipping`, `.webloc`, a URL string, a remote path string, or a zero-byte placeholder.
-
-### 6.5 Drag local files into Transfer
-
-1. User drags files or folders from Finder into the current remote directory or onto a remote folder.
-2. The drop target highlights using standard macOS behavior.
-3. Transfer creates an upload operation for each item.
-4. Uploads use temporary remote names when feasible and rename atomically on success.
-5. Conflicts invoke the standard conflict sheet with Replace, Keep Both, Skip, and Apply to All.
-
-### 6.6 Download explicitly
-
-Context menu and File menu provide **Download Copy…**. This uses a standard destination picker and produces a cold copy. It is equivalent in semantics to dragging into Finder.
-
-### 6.7 Preview
-
-- Space invokes Quick Look.
-- Quick Look follows selection when the user navigates with arrow keys.
-- Preview bytes are temporary cache entries, not live files.
-- Large files should not be fully downloaded when a provider or file format permits a bounded preview, but ordinary SFTP may require complete download.
-- An optional inspector can show preview and metadata without making preview a permanent third pane.
-
-### 6.8 Rename, move, duplicate, and delete
-
-- Return begins inline rename where standard for the active view.
-- Remote rename should be atomic when supported.
-- Moving within the same server should use remote rename rather than download/upload.
-- Duplicate creates another remote item.
-- Delete should use server-side trash only when a well-defined trash capability exists; otherwise show an explicit permanent-delete confirmation.
-- Undo is offered only for operations Transfer can actually reverse. Never present false undo affordances.
-
-## 7. Synchronization state model
-
-### 7.1 User-visible states
-
-Use restrained standard symbols and labels:
-
-| State | Meaning |
+| Action | Result |
 | --- | --- |
-| Remote | Metadata only; not live |
-| Preparing | Downloading/opening the live working copy |
-| Up to Date | Live local and remote versions match |
-| Modified | A stable local change has been detected |
-| Uploading | Upload in progress |
-| Waiting | Queued behind another operation |
-| Offline | Network unavailable; local changes preserved |
-| Conflict | Remote changed since the local base version |
-| Error | Operation failed and requires attention |
-| Paused | Automatic synchronization paused by user |
+| Double-click, Command-O, or Command-Down on an editable file | Live. The file opens in its normal editor. Completed saves upload. |
+| Double-click, Command-O, or Command-Down on anything else | View. The file opens from the preview cache. Saves are not uploaded. |
+| Space | Preview in Quick Look. Not Live. |
+| Drag to Finder, or Download Copy | A detached local copy. |
 
-Do not display the word `HOT` in the production interface. “Live” and “Up to Date” are clearer.
+Open Live (Option-Command-O) forces a Live file even when double-click would only view. Return renames. Drag never deletes the remote file.
 
-### 7.2 Suggested state transitions
+An editable file is one whose filename UTI conforms to `public.plain-text` or `public.source-code`, or whose extension is exactly one of: `rip`, `txt`, `json`, `ts`, `rs`, `c`, `md`, `swift`, `py`, `js`, `jsx`, `tsx`, `html`, `css`, `yaml`, `yml`, `toml`, `sh`. Do not sniff contents. PDF, images, and every other type view.
+
+### 1.2 What this pass builds
+
+- Connect, host-key prompt, and password or keyboard-interactive prompt.
+- Sidebar, toolbar, icon view, list view, column view, inspector, transfer shelf.
+- Native tabs and extra windows that share one login per saved server.
+- Quick Look, including a syntax-colored text preview when the system preview would be generic.
+- Drag in, drag out, Download Copy, Upload, duplicate, rename, new folder, permanent delete.
+- Directory copy on the SFTP channels.
+- Live open, view open, conflicts, and Open in Terminal.
+- A performance-mode probe and a `DirectoryCopyEngine` seam. The fast engine is a stub.
+
+### 1.3 What this pass does not build
+
+Do not add disabled controls for these. They are absent.
+
+Gallery, a permissions editor, trash, a background helper or login item, File Provider, any protocol other than SFTP, remote-to-remote copy, sync roots, iCloud, a CLI, remote search, git decorations, an editor, an embedded terminal, a diff viewer, spring-loaded folders, block checksums, byte-range resume, Keep Downloaded, AppleDouble or resource forks, onboarding, a help book, telemetry, and an updater.
+
+`rsync` is not called. The fast directory copy is the later program that replaces `Tools/performance-version`. This pass only reserves that slot.
+
+## 2. Connection
+
+### 2.1 The sheet
+
+File > New Connection, or Add Server in the sidebar, opens one sheet:
+
+| Field | Required | When blank |
+| --- | --- | --- |
+| Name | no | Use the Host text |
+| Host | yes | — |
+| User | no | Let `~/.ssh/config` decide |
+| Port | no | Let `~/.ssh/config` decide |
+| Identity file | no | Let `~/.ssh/config` and the agent decide |
+| Remote path | no | Start at the remote home (`realpath(".")`) |
+
+There is no password field, proxy field, compression field, or protocol picker. The same sheet edits a saved connection. Edits apply on the next connect. Remove deletes the saved connection after confirmation, never remote files, and refuses while that connection has unsynced Live bytes.
+
+### 2.2 Login
+
+Each saved connection has its own SSH master. Two saved connections never share a socket, even on the same host.
+
+The socket directory is `~/Library/Application Support/Transfer/ssh`, mode `0700`. The socket path includes the connection's stable id.
+
+Login runs `/usr/bin/ssh` and no other SSH binary. These options override user config: `ControlMaster=yes`, `Compression=no`, `ControlPath` set to that socket. The master uses `-N` and does not speak SFTP. Every later `ssh` for this connection, including passengers, the probe, and Open in Terminal, also passes `Compression=no`.
+
+The agent holds keys. The app never reads private-key bytes, never puts secrets in argv or the environment, and never logs passwords, passphrases, or prompt replies.
+
+Password and keyboard-interactive prompts are sheets, driven by an askpass helper with `SSH_ASKPASS_REQUIRE=force`. Each sheet shows ssh's prompt text, a secure field, Cancel, and Continue. The first prompt of a connection may offer "Save in Keychain", off by default. A saved secret is replayed only as the first prompt of a later login. Secrets are not stored in SQLite.
+
+On disconnect or quit, the app runs `ssh -S <socket> -O exit` and does not leave a master behind. A stale socket whose process is dead is removed before the next login.
+
+### 2.3 Host keys
+
+`StrictHostKeyChecking` is never `no`.
+
+| Situation | Sheet | Default button |
+| --- | --- | --- |
+| Key already stored and unchanged | no sheet | connect |
+| First-seen key | Cancel, Trust Once, Always Trust | Cancel |
+| Changed key | Cancel, Replace Trusted Key | Cancel |
+
+Show the key type and SHA256 fingerprint. Always Trust and Replace Trusted Key write only the known-hosts file that `ssh -G` reports. Trust Once uses a temporary known-hosts file for that master and discards it on disconnect. A rejected or changed key does not open channels. Acceptance starts a new login.
+
+### 2.4 Performance probe
+
+Immediately after the master is up, probe once. Do not probe again until the next login.
+
+The probe runs:
 
 ```text
-Remote
-  -> Preparing
-  -> Up to Date
-  -> Modified
-  -> Uploading
-  -> Up to Date
-
-Modified
-  -> Offline
-  -> Waiting
-  -> Conflict
-  -> Error
-
-Offline
-  -> Waiting when connectivity returns
-  -> Uploading
-
-Conflict
-  -> Up to Date after explicit resolution
+/usr/bin/ssh -S <socket> -o Compression=no -- performance-version --probe
 ```
 
-State transitions must be serialized per live file. Multiple rapid saves may coalesce, but the latest stable local revision must never be lost.
+The connection stores one boolean, `performanceModeEnabled`, in memory only:
 
-### 7.3 Save detection
+- `true` only when the exit code is 0 and stdout is one non-empty version line.
+- `false` on any other result, including command-not-found, timeout at 10 seconds, or an SFTP-only server that refuses the command.
 
-Editors commonly perform safe save:
+v1 servers do not have this program, so the flag is false and every copy uses SFTP. The repository still contains `Tools/performance-version`, which prints `performance-version 0` and exits 2, so the contract has a home. The app does not install it on the server.
 
-1. Write a temporary sibling file.
-2. Flush and close it.
-3. Rename or replace the original.
+Listing, preview, view, and Live editing always use SFTP, even when the flag is true.
 
-Therefore, do not watch only the original inode. Observe the containing directory, re-resolve the working URL after filesystem events, and debounce until size and modification metadata stabilize. Use Foundation file coordination where it provides value, but test against real applications rather than assuming uniform behavior.
+## 3. Channels
 
-Initial debounce target: 300–500 ms after the last relevant filesystem event. Large or actively growing files may require adaptive stabilization.
+After the probe, open SFTP passengers on the master. Each is its own process:
 
-### 7.4 Version fingerprint
+```text
+/usr/bin/ssh -S <socket> -o Compression=no -s sftp -- <destination>
+```
 
-The provider should expose a version abstraction. For SFTP, use the strongest affordable combination available:
+Open them in this order: browse, interactive, walker, data 1, data 2, data 3, data 4. Speak SFTP version 3 on stdin and stdout (length-prefixed packets). Do not parse the `sftp` command's text. If the server's version is not 3, mark that passenger down.
 
-- File type.
-- Size.
-- Modification time with maximum available precision.
-- Remote file identifier/inode if exposed and meaningful.
-- Optional content hash for ambiguous or high-risk cases.
+Stop at the first refusal. Do not retry that refusal during this login. A passenger that dies later gets one reopen. A second death marks it down until the next login.
 
-Do not hash every large remote file by default. Hash when metadata is insufficient, a conflict is suspected, or the user requests verification.
+| Role | Count | Work |
+| --- | --- | --- |
+| Browse | 1 | Browser listings and metadata. At most one request in flight. |
+| Interactive | 1 | The one file the user is waiting on: Quick Look, view, Live open, or Live save. |
+| Walker | 1 | Names, mkdir, readlink, and delete for a tree copy. No file bodies. |
+| Data | 4 | File bodies for drag, download, upload, duplicate, and directory copy. |
 
-### 7.5 Conflict behavior
+A new preview, open, or save cancels whatever the interactive channel is doing, deletes that temp, and starts the new request. A displaced preview or view is dropped. A displaced Live save stays pending and is next on that channel.
 
-Before upload, compare the server’s current fingerprint to the live file’s base fingerprint.
+File bodies never use the browse channel. If browse failed to open, listings use interactive between its jobs. If interactive failed, preview and Live borrow one data channel and follow the same preempt rule. If the walker failed, the name walk uses browse when it is idle. If no data channel opened, transfers fail and browsing still works.
 
-If they differ:
+Concurrent files use the four data channels. A fifth file waits. A file of 2 MB or larger occupies its channel alone. Smaller files may share a channel while its window has room. Do not open a channel per file.
 
-- Preserve the local working copy.
-- Preserve or fetch the current remote copy.
-- Mark the file Conflict.
-- Never overwrite automatically.
-- Offer Compare, Keep Local, Keep Remote, and Keep Both.
-- Require explicit confirmation for destructive resolution.
-- For text files, “Compare” should open the user’s configured comparison tool or a standard diff integration rather than building an editor in version 1.
+Each data channel keeps 2 MB (2,097,152 bytes of payload, not packet overhead) of READ or WRITE in flight, in 64 KB chunks, the last chunk shorter. Outstanding requests on one channel are all reads or all writes.
 
-## 8. Interface specification
+Metadata operations use `LSTAT` and `READDIR` and do not follow links. `READLINK` reads a link target.
 
-### 8.1 Design principles
+## 4. Directory copy
 
-- Use standard system components before custom components.
-- Avoid custom chrome, browser-like tabs, thick activity bars, oversized lock icons, hand-drawn folders, and decorative rounded rectangles.
-- Let macOS provide typography, spacing, materials, hover behavior, selection, focus rings, and reduced-motion behavior.
-- Prefer semantic hierarchy over persistent labels and visual ornament.
-- The application should remain visually quiet when no transfer needs attention.
-- Remote files should look like files, not database records.
-- Connection security should be visible but not dominate the content.
+`DirectoryCopyEngine` has two implementations.
 
-### 8.2 Window structure
+- `SftpDirectoryCopy` is the v1 engine. The walker emits each directory page as it arrives. Directories are created as their names arrive. File bodies are assigned to data channels immediately. The copy does not wait for the whole tree to be listed.
+- `PerformanceDirectoryCopy` is the later engine. v1's probe is false, so it is not selected. If a future probe is true and that engine then fails to start, that copy uses `SftpDirectoryCopy` and the flag is cleared for the rest of the connection.
 
-The standard window contains:
+Upload walks the local disk and does not use the walker for that walk. Download walks on the walker.
 
-1. Native unified toolbar/title area.
-2. Optional collapsible server sidebar.
-3. One browser content area.
-4. Optional trailing inspector.
-5. A transfer/status shelf that appears only when useful.
+### 4.1 One file
 
-There is no permanent local pane.
+1. Stat the destination without following links.
+2. If it is a regular file with the same size and the same whole-second mtime, skip it. Live saves do not use this skip.
+3. If it exists and differs, show the collision sheet (§7). If a file name is occupied by a directory, or the reverse, fail that item and continue.
+4. Otherwise write `.<basename>.transfer-<uuid>` in the same parent directory. Record that temp in SQLite before the first byte.
+5. On success, set the temp's mode and mtime from the source, then rename it onto the final name. Prefer `posix-rename@openssh.com` when the server advertises it. Otherwise delete the destination only after the temp is complete, then rename.
+6. If the rename fails, leave the temp, mark the item failed, and do not report success.
+7. Cancel or failure before rename deletes the temp. Finished files and directories already created stay.
 
-### 8.3 Toolbar
+A later launch deletes only temps still recorded in SQLite. There is no byte-range resume.
 
-Use native `ToolbarItem` controls for:
+Symlinks are copied as symlinks, using the exact `READLINK` target, and are never followed. Anything that is not a file, directory, or symlink is skipped.
 
-- Back and Forward.
-- Current server/location title.
-- View-mode picker.
-- Sort/group menu where relevant.
-- Share or copy URL if useful.
-- Transfer activity.
-- Inspector toggle.
-- Search.
+## 5. Browsing
 
-Avoid showing every possible action. Secondary operations belong in menus and context menus.
+### 5.1 Window
 
-### 8.4 Sidebar
+A `NavigationSplitView`: sidebar, browser, optional inspector. The transfer shelf is a bottom bar, not a second pane. The toolbar uses the standard unified style and contains back, forward, path, view mode (Icon, List, Columns), and a transfers button that shows the active count and toggles the shelf.
 
-Use `NavigationSplitView` and `.listStyle(.sidebar)`. Suggested sections:
+Icon is a SwiftUI grid. List is a SwiftUI table. Columns are `NSBrowser`. All three read the same `BrowserModel`. The AppKit view does not own that model.
 
-- Recents: recently visited remote locations and recently opened live files.
-- Servers: configured connections such as `pop`, `live`, and `medlabs`.
-- Saved Locations: pinned remote paths.
-- Smart Groups: Live Files, Pending Uploads, Conflicts.
+List columns default to Name, Status, Date Modified, Size, and Kind. Status is blank unless the row is Live or transferring. Directory and symlink sizes are blank. The default sort is name ascending, raw bytes, case-sensitive, directories not pinned. Column layout and sort persist per connection. The view mode persists globally. Names that start with `.` are hidden. The choice is global, off by default, toggled by View > Show Hidden Files (Command-Shift-Period). `.` and `..` are never shown.
 
-The sidebar is collapsible. A user with only one server should be able to hide it and work in a clean single browser.
+### 5.2 Identity and listing
 
-### 8.5 View modes
+A row's identity is the connection id plus the raw path bytes. Do not Unicode-normalize, case-fold, or use a server inode. Invalid UTF-8 is displayed with replacement characters and the original bytes are what every operation uses.
 
-Support familiar Finder-style modes:
+`list` is an `AsyncThrowingStream` of `READDIR` pages. The browser appends rows as pages arrive and does not publish one main-actor update per name. On revisit, show the cached page immediately, then refresh in place matched by raw path. A failed refresh keeps the rows and shows the error.
 
-1. **Icon view** — visual browsing using SwiftUI lazy grids or an AppKit collection view if later required for fidelity/performance.
-2. **List view** — sortable metadata columns using SwiftUI `Table` initially.
-3. **Column view** — true hierarchical navigation implemented with AppKit `NSBrowser` wrapped in `NSViewRepresentable`.
-4. **Gallery view** — large preview with a horizontal or vertical item strip, deferred until after core modes if schedule requires.
+There is no polling. Reload a directory when it is entered, on Command-R, and after Transfer itself changes that directory.
 
-View switching must preserve path and selection wherever possible.
+Command-F filters the names already listed. It does not touch the network.
 
-### 8.6 Column view
+### 5.3 Sidebar
 
-Column view is a primary mode, not an optional experiment. It represents one browser path, not multiple independent panes.
+Sections, top to bottom: Servers, Recents, Saved Locations, Live Files, Conflicts. Empty sections other than Servers are hidden.
 
-Required behaviors:
+Recents are the last 10 remote directories. Saved Locations are directories pinned from the context menu. Selecting a server connects and opens its start path. Selecting a location navigates. Selecting a Live file or a conflict reveals and selects it and does not open it.
 
-- One successive column per selected hierarchy level.
-- Automatic horizontal scrolling to reveal the newest column.
-- User-resizable columns.
-- Persisted column widths.
-- Native row selection and keyboard navigation.
-- Multiple selection in the final column.
-- Right arrow enters a folder; left arrow returns focus to its parent.
-- Async loading indicator in a newly opened column.
-- Directory listing cache for fast backward traversal.
-- Drag source and drop destination support.
+### 5.4 Inspector
 
-`NSBrowser` is the preferred initial implementation. If visual testing shows that its current appearance materially diverges from macOS 27 Finder, retain the same public adapter and replace its internals with a custom AppKit/SwiftUI column implementation. Do not begin by recreating it.
+Hidden by default. Command-Option-I toggles it. One selection shows name, icon, remote path, kind, size, modified time, read-only permissions, owner, group, Live state, and progress or error. Actions are Open, Open Live, Download Copy, and Copy Remote URL. Copy Remote URL writes one `sftp://` URL per item, with no password. Multiple selection shows a count. Empty selection shows the current folder. There is no preview inside the inspector. Permissions cannot be edited.
 
-### 8.7 List view columns
-
-Default columns:
-
-- Name.
-- Status.
-- Date Modified.
-- Size.
-- Kind.
-
-Optional columns:
-
-- Permissions.
-- Owner.
-- Group.
-- Remote path.
-
-Column visibility, order, widths, sort direction, and per-connection defaults should persist.
-
-### 8.8 Inspector
-
-Use SwiftUI `inspector` where possible. Show:
-
-- Name and icon/thumbnail.
-- Remote location.
-- Kind, size, modification time.
-- Permissions, owner, group when available.
-- Live state and last synchronization.
-- Transfer progress or error.
-- Actions such as Open Live, Download Copy, Copy Remote URL, and Resolve Conflict.
-
-### 8.9 Quick Look
-
-Quick Look should behave like Finder:
-
-- Space toggles it.
-- It follows current selection.
-- Escape closes it.
-- Arrow-key selection continues to work.
-- Preview caching is bounded and evictable.
-
-Use Quick Look APIs through the smallest necessary AppKit bridge.
-
-### 8.10 Native window tabs and multiple windows
-
-Use macOS native window tabbing rather than custom in-content tabs. Users may open separate servers or locations in:
-
-- Another native tab.
-- Another window.
-
-Command-T creates a new tab. Standard Window menu behavior should work.
-
-### 8.11 Menus and keyboard commands
-
-Provide standard macOS menus with appropriate enablement:
-
-- File: New Connection, New Window, New Tab, Open Live, Download Copy, Upload, Close.
-- Edit: Cut/Copy/Paste only where semantics are honest, Rename, Select All.
-- View: view modes, sort/group, sidebar, inspector, Quick Look, hidden files, refresh.
-- Go: Back, Forward, Parent, Home, Go to Remote Folder, recent locations.
-- Transfer: pause/resume/cancel, retry failed, show activity.
-- Window and Help: standard behaviors.
-
-Suggested shortcuts:
+### 5.5 Menus and keys
 
 | Command | Shortcut |
 | --- | --- |
-| Open Live | Command-Down or Command-O |
+| Follow double-click (Live or View) | Command-O, Command-Down |
+| Open Live | Option-Command-O |
 | Quick Look | Space |
 | Rename | Return |
 | Parent | Command-Up |
-| Back/Forward | Command-[ / Command-] |
+| Back / Forward | Command-[ / Command-] |
+| Remote Home | Command-Shift-H |
+| Go to Remote Folder | Command-L or Command-Shift-G |
+| Filter listed names | Command-F |
 | Refresh | Command-R |
-| Download Copy | Command-Shift-D |
 | New Folder | Command-Shift-N |
-| Toggle sidebar | Command-Control-S |
-| Toggle inspector | Command-Control-I |
+| Duplicate | Command-D |
+| Delete | Command-Delete |
+| New Connection | Command-K |
+| New Window | Command-N |
+| New Tab | Command-T |
+| Icon / List / Columns | Command-1 / 2 / 3 |
+| Sidebar | Command-Option-S |
+| Inspector | Command-Option-I |
+| Hidden files | Command-Shift-Period |
 
-Validate shortcuts against current macOS conventions before release.
+Download Copy, Upload, and Open in Terminal have no shortcut. There is no Command-J and no gallery shortcut.
 
-## 9. Technical architecture
+Open, Open Live, and Quick Look use the primary selection. Transfers use the whole selection. Command-Z works only in text fields.
 
-### 9.1 High-level components
+Go > Open in Terminal is disabled when disconnected or when none of Terminal, iTerm2, and Ghostty is installed. It opens the current remote directory, not the selection, in a running Terminal, iTerm2, or Ghostty if one is running, otherwise the first of those three that is installed. That app runs `/usr/bin/ssh` as another client of the same master, `cd`s to the remote path (POSIX single quotes), and starts the remote login shell. It does not take an SFTP channel. There is no terminal view inside Transfer.
 
-```text
-TransferApp (SwiftUI lifecycle)
-├── Window/UI layer
-│   ├── SwiftUI toolbar/sidebar/list/icon/gallery/inspector
-│   ├── NSBrowser adapter for column view
-│   ├── AppKit file-promise drag adapter
-│   └── Quick Look adapter
-├── Browser domain
-│   ├── BrowserModel
-│   ├── NavigationHistory
-│   ├── SelectionModel
-│   └── DirectoryCache
-├── Provider layer
-│   ├── RemoteProvider protocol
-│   └── SFTPProvider
-├── Transfer engine
-│   ├── Scheduler
-│   ├── Progress
-│   ├── Retry/cancellation
-│   └── Atomic staging
-├── Live-file subsystem
-│   ├── LiveFileManager
-│   ├── ChangeObserver
-│   ├── ConflictDetector
-│   └── WorkspaceManager
-├── Persistence
-│   ├── SQLite database
-│   ├── Keychain
-│   └── Preferences
-└── Background continuation
-    └── Login item/helper or agent, added only when required
-```
+## 6. Preview, view, and Live
 
-### 9.2 SwiftUI/AppKit boundary
+### 6.1 Preview
 
-The application is SwiftUI-first. AppKit is used deliberately for capabilities without an adequate SwiftUI equivalent:
+Space toggles `QLPreviewPanel`. Escape closes it. Changing the selection aborts the previous preview download on the interactive channel.
 
-- `NSBrowser` for authentic hierarchical column view.
-- `NSFilePromiseProvider` and native dragging sessions for remote-to-Finder export.
-- Quick Look panel integration where necessary.
-- `NSWorkspace` for opening live files and application selection.
+PDF, images, and other non-text files are downloaded whole into the preview cache and handed to Quick Look. For text and source, if the system preview would be generic, read at most the first 512 KB, write a temporary HTML file in the system monospace font with simple syntax coloring, and preview that HTML. Do not add a Quick Look extension. Invalid UTF-8 uses the generic system preview. Preview files are never Live and are never uploaded.
 
-Keep each AppKit integration behind a small SwiftUI adapter and protocol. AppKit views must not own business state; they bind to shared models.
+The preview cache is `~/Library/Caches/Transfer/Preview/`, names hashed from the raw path, LRU-capped at 1 GB, and is not backed up. View > Clear Preview Cache does not touch Live files.
 
-### 9.3 Shared browser model
+### 6.2 View
 
-All view modes consume the same logical state:
+A non-editable double-click downloads the whole file into the preview cache and opens it with `NSWorkspace`. Transfer does not watch it and does not upload it.
 
-```swift
-@Observable
-@MainActor
-final class BrowserModel {
-    var connectionID: ConnectionID
-    var path: RemotePath
-    var selection: Set<RemoteItemID>
-    var viewMode: ViewMode
-    var sort: SortConfiguration
-    var history: NavigationHistory
-    var loadingState: LoadingState
-}
-```
+### 6.3 Live
 
-Business operations run outside the main actor. Only presentation state is main-actor isolated.
-
-### 9.4 Remote provider protocol
-
-Define provider-neutral operations early:
-
-```swift
-protocol RemoteProvider: Sendable {
-    func connect() async throws
-    func disconnect() async
-    func list(_ path: RemotePath) async throws -> [RemoteItem]
-    func stat(_ path: RemotePath) async throws -> RemoteItem
-    func download(
-        _ path: RemotePath,
-        to destination: URL,
-        progress: @Sendable (TransferProgress) -> Void
-    ) async throws
-    func upload(
-        _ source: URL,
-        to destination: RemotePath,
-        progress: @Sendable (TransferProgress) -> Void
-    ) async throws
-    func createDirectory(_ path: RemotePath) async throws
-    func move(_ source: RemotePath, to destination: RemotePath) async throws
-    func remove(_ paths: [RemotePath]) async throws
-    func setAttributes(_ attributes: RemoteAttributes, at path: RemotePath) async throws
-}
-```
-
-Add capability reporting rather than assuming every backend supports every operation:
-
-- Atomic rename.
-- Resume.
-- Symlinks.
-- Permissions.
-- Owner/group.
-- Server-side copy.
-- Trash.
-- Checksums.
-- Precise timestamps.
-
-### 9.5 SFTP implementation decision
-
-Do not implement SSH or SFTP from scratch.
-
-Requirements include:
-
-- `~/.ssh/config` compatibility.
-- SSH agent support.
-- Keychain/passphrase handling.
-- Ed25519 and hardware/security keys where possible.
-- Host-key verification and known-host persistence.
-- `ProxyJump` and preferably `ProxyCommand`.
-- Keyboard-interactive authentication.
-- Connection reuse and keepalive.
-
-Conduct a short implementation spike comparing:
-
-1. A direct library implementation.
-2. A controlled OpenSSH subprocess/helper architecture.
-3. A Rust SFTP engine exposed through a narrow C/Swift interface.
-
-Choose based on actual compatibility tests, not theoretical purity. Apple’s SwiftNIO SSH is a building block, not a complete production SFTP client; using it implies substantial protocol work.
-
-Preferred v1 direction: reuse system/OpenSSH behavior when it materially improves compatibility with existing configuration. Isolate process control and parsing behind `SFTPTransport` so it can be replaced.
-
-### 9.6 Transfer scheduler
-
-The scheduler must support:
-
-- Queued, active, paused, completed, failed, and canceled operations.
-- Per-host and global concurrency limits.
-- Progress by bytes and items.
-- Cancellation.
-- Retry with bounded exponential backoff for transient failures.
-- Resume when supported and safe.
-- Persistence of incomplete operations.
-- Atomic temporary names for uploads.
-- Cleanup of abandoned temporary files.
-- Priority for interactive operations such as Open Live and Quick Look.
-
-Never block UI interaction on network I/O.
-
-### 9.7 Live workspace
-
-Use an application-managed directory, for example:
+A Live open downloads into:
 
 ```text
-~/Library/Application Support/Transfer/Live/<connection-id>/<stable-item-id>/filename
+~/Library/Application Support/Transfer/Live/<connection-uuid>/<live-uuid>/<basename>
 ```
 
-Do not expose opaque IDs in the user-visible filename. Store mappings in SQLite rather than deriving remote identity solely from the path.
+Mode `0700` for the directory and `0600` for the file. The mapping is a UUID stored in SQLite. The remote identity remains the raw path. A rename updates the path and the basename and keeps the UUID.
 
-The workspace manager must:
+Before opening, record the base fingerprint: type, size, and whole-second mtime. No hash and no inode. Open with `NSWorkspace`.
 
-- Use safe file permissions.
-- Prevent different remote items from colliding.
-- Preserve unsynchronized changes indefinitely unless the user explicitly discards them.
-- Reconcile orphaned database records and files.
-- Apply storage quotas only to disposable preview/cache data, never pending live edits.
-- Support “Reveal Local Working Copy” for diagnostics.
+Watch the workspace directory. A safe-save that replaces the file is the same Live file. Upload 400 ms after size and mtime stop changing, reading through `NSFileCoordinator`, on the interactive channel, using the temp-and-rename rule in §4.1. The pre-check is the base fingerprint, not the size-and-mtime skip. If the remote fingerprint changed, or the remote file is gone, the state becomes Conflict and nothing is uploaded.
 
-### 9.8 Persistence
+The mapping remains after the editor closes, the window closes, quit, and reboot. Uploads run only while Transfer is open. On launch, resume Live uploads. Do not resume drags or directory copies. Quit with unsynced or active Live work asks Cancel (default) or Quit Anyway.
 
-Use SQLite with migrations. Suggested entities:
+Save As outside the workspace is a detached file. If a clean working file disappears, drop the mapping. If a dirty one disappears, mark it failed and do not upload. File > Discard Live File removes a clean mapping immediately and asks before discarding unsynced bytes. It is disabled while an upload of that file is in flight.
 
-- `connections`
-- `saved_locations`
-- `directory_cache`
-- `live_files`
-- `remote_versions`
-- `transfers`
-- `conflicts`
-- `recent_locations`
-- `preferences_by_connection`
+A symlink is listed as itself. Double-click, Open, and Quick Look follow one hop. A directory hop is navigated. A file hop is viewed or opened Live at the resolved path, so a save writes the file that was read. A loop or a second hop is an error. The inspector fetches the target when that row is selected.
 
-Secrets do not belong in SQLite. Store passwords and private secret material in Keychain. Prefer existing keys and agents instead of copying private keys.
+## 7. Collisions, conflicts, and delete
 
-### 9.9 Background behavior
+Two different sheets.
 
-The first prototype may require the main application to remain running for live synchronization. Before claiming durable Live behavior, add a lightweight background component using current Apple-supported service/login-item mechanisms.
+**Name collision** (upload, download, or directory copy onto an existing item that is not an exact size-and-mtime match): Skip (default), Keep Both, Replace, and Apply to All for that operation only. Keep Both inserts ` 2`, ` 3`, before the extension. The sheet blocks that operation. Other operations continue.
 
-Responsibilities:
+**Live conflict:** Compare, Keep Local, Keep Remote, Keep Both. No Apply to All and no destructive default. Compare writes the remote bytes beside the working copy as `<basename> (server)` and opens `/usr/bin/opendiff` when both sides are valid UTF-8 and `opendiff` exists. Otherwise Compare is disabled. Keep Local and Keep Remote each require a second confirmation. Keep Both uploads the local bytes as `<basename> (from this Mac)`, leaves the original remote file, and rebases the working copy on the remote bytes. That sibling is not Live.
 
-- Continue pending uploads after the last main window closes.
-- Monitor live working directories.
-- Restore queued work after relaunch or reboot.
-- Surface notifications for conflicts and failures.
+Delete is permanent. There is no trash. Command-Delete asks once for the selection, names the count, says the delete is permanent, and says when unsynced Live bytes will be discarded. Cancel is the default. The button says Delete. A directory is walked depth-first. Symlink nodes are removed and not followed. Files already removed are not rolled back. On success, delete the matching Live workspace folders.
 
-Avoid always-on background activity when there are no live or pending files. Provide a clear preference and status indicator.
+## 8. Drag and the shelf
 
-## 10. File promise and drag specification
+Drag to Finder uses `NSFilePromiseProvider`, one promise per dragged root. A directory promise is fulfilled by §4. Option and Command do not change the drag and never remove the remote item. The result is a real file or folder, never a clipping, a URL, or a zero-byte placeholder.
 
-### 10.1 Why AppKit is required
+Drag from Finder uploads. The local original stays. A drop on the background uses the current directory. A drop on a folder row uses that folder. There is no spring-loading.
 
-A remote file does not have a local URL at drag start. Finder needs a promise that declares the eventual filename and type and supplies the bytes after Finder selects a destination. SwiftUI’s normal `Transferable` flow may stage temporary files and does not expose all required promised-file control.
+A drag inside the browser, to another folder on the same server, is one SFTP rename. If rename fails, show the error. Do not copy-then-delete.
 
-Use `NSFilePromiseProvider` through a dedicated adapter.
+Duplicate (Command-D) creates `name copy`, then `name copy 2`, through §4.1.
 
-### 10.2 Drag source requirements
+With a selection and no text field focused, Command-C copies the `sftp://` URLs. Command-V does not upload. Cut is disabled outside text fields.
 
-- Drag starts from file icon/row, never accidentally from selectable filename text.
-- Multiple selected items create multiple promises.
-- Directories are supported after individual-file behavior is reliable.
-- Drag image uses native file icons and multi-item badges.
-- Copy cursor appears for remote-to-local drag.
-- Option and Command modifiers follow truthful semantics.
-- Canceling the drag does not download.
-- Download starts only after promise fulfillment.
-- Partial destination files are not exposed as completed files.
+The shelf is one row per top-level operation. A directory copy is one row, with byte and item progress. It is hidden when nothing is active, paused, failed, or in conflict. Successful rows disappear when they finish. Failed rows stay and offer Retry and Remove. Remove does not delete finished files. Pause applies to that one operation, including one Live upload. There is no global pause.
 
-### 10.3 Drag destination requirements
+Retry a dropped connection or a timeout three times, at 1 s, 2 s, and 4 s, then show the error. Do not auto-retry an authentication failure, a permission denial, a host-key failure, or a conflict. The user presses Retry to log in again.
 
-- Accept file URLs, promised files, and standard Finder drags.
-- Resolve whether the target is the current directory or a hovered subfolder.
-- Spring-loaded folder navigation may be deferred, but target highlighting must be native.
-- Never move/delete the local source unless the user explicitly invokes a move operation and the system semantics guarantee it.
+## 9. Storage
 
-## 11. SFTP and filesystem semantics
+SQLite in Application Support holds connections (no secrets), recents, saved locations, Live mappings, the operation queue, and temp-file records. Preferences hold the view mode, hidden-files flag, and window state. The Keychain holds only the secrets the user chose to save.
 
-### 11.1 Paths and encoding
+## 10. Errors
 
-- Treat remote paths as byte-sensitive where the transport allows it.
-- Do not assume Unicode normalization matches APFS.
-- Display invalid byte sequences safely and preserve round-trip identity.
-- Never construct shell commands through unsafe interpolation.
-- Canonicalize navigation without resolving away meaningful symlinks unexpectedly.
+Every failed operation names the file and the reason in the shelf and, for a connection failure, in the window. A partial `READDIR` keeps the names already shown. The app never reports success for a file whose rename did not finish.
 
-### 11.2 Case sensitivity
+## 11. Code layout
 
-Remote Linux directories may contain `README` and `readme`. Local managed storage and UI identifiers must not collapse these items. Use stable IDs and per-item storage directories rather than bare remote filenames.
-
-### 11.3 Symlinks
-
-- Distinguish symlink metadata from target metadata.
-- Show a standard alias/symlink visual treatment.
-- Avoid recursive loops during folder operations.
-- Confirm whether download copies the link or dereferenced contents; default should match familiar SFTP-client behavior and be documented.
-
-### 11.4 Permissions and resource forks
-
-- Preserve Unix executable and permission bits when feasible.
-- Do not promise full macOS metadata preservation over SFTP.
-- Handle AppleDouble/resource-fork behavior deliberately for Mac-to-Mac transfers.
-- Make metadata preservation rules visible in documentation and tests.
-
-### 11.5 Large files and folders
-
-- Stream transfers with bounded memory.
-- Display determinate progress when total size is known.
-- Enumerate folders incrementally.
-- Allow cancellation between items and during file streams.
-- Use bounded concurrency to avoid overwhelming servers.
-
-## 12. Security and privacy
-
-### 12.1 Authentication
-
-- Prefer SSH agent and configured identities.
-- Store passwords/passphrases only in Keychain when the user elects to save them.
-- Support keyboard-interactive challenges without logging responses.
-- Redact secrets from diagnostics.
-
-### 12.2 Host verification
-
-- Never silently accept a new or changed host key.
-- Present algorithm and fingerprint in a clear native sheet.
-- Distinguish first connection from changed-key danger.
-- Integrate with known hosts where architecture permits.
-
-### 12.3 Local data
-
-- Live-file contents may be sensitive, including medical documents.
-- Use restrictive permissions for live and preview workspaces.
-- Exclude disposable caches from backup where appropriate.
-- Do not exclude unsynchronized live edits from backup without a documented recovery strategy.
-- Provide Clear Preview Cache separately from destructive live-file cleanup.
-- Avoid telemetry containing paths, filenames, server names, document content, or patient information.
-
-### 12.4 Sandboxing and distribution
-
-Prototype outside App Store constraints if necessary to validate SSH configuration, agents, helpers, and file promises. Before choosing App Store distribution, evaluate whether sandbox restrictions compromise core compatibility. Notarized direct distribution may be the correct product choice.
-
-## 13. Accessibility and native behavior
-
-- Full VoiceOver labels for rows, columns, status, progress, and toolbar controls.
-- Voice Control-accessible names.
-- Complete keyboard operation without a mouse.
-- Respect system text size, contrast, reduce transparency, and reduce motion.
-- Use system accent color and selection colors.
-- Expose transfer and synchronization state semantically, not only through color.
-- Maintain predictable focus when changing view modes or loading directories.
-- Support standard Services and Open With behavior where feasible.
-
-## 14. Error handling
-
-Errors must be actionable and associated with the affected item or connection.
-
-Examples:
-
-- Connection lost: retain queue and offer Retry.
-- Authentication failed: identify authentication stage without exposing secrets.
-- Permission denied: identify operation and path.
-- Disk full: preserve remote state and pending local work.
-- Host key changed: block connection and explain risk.
-- Upload conflict: preserve both versions and enter Conflict state.
-- Partial folder download: list completed and failed items.
-- App crash during upload: reconcile temporary remote file on restart.
-
-Use transient banners for recoverable informational events, sheets for decisions, and a durable activity/error view for operations requiring later attention.
-
-## 15. Performance expectations
-
-Initial targets for a normal broadband/LAN connection:
-
-- Window usable within 500 ms excluding connection establishment.
-- Cached directory revisit appears within 100 ms.
-- Visible response to folder selection within one frame, even if content then loads.
-- Directory UI remains responsive with 100,000 items through incremental loading/virtualization.
-- File transfers stream with bounded memory independent of file size.
-- Preview/live interactive downloads receive priority over background batch transfers.
-- Main-thread stalls longer than 50 ms should be treated as defects during ordinary browsing.
-
-Measure before optimizing. Include signposts for directory load, time-to-first-row, transfer setup, hashing, live-save detection, and upload completion.
-
-## 16. Observability and diagnostics
-
-Provide opt-in diagnostics suitable for support:
-
-- Application and OS version.
-- Provider/transport version.
-- Connection phase and non-secret capability information.
-- Transfer state transitions and error codes.
-- Timing and retry information.
-- Live-file state machine transitions.
-
-Never log:
-
-- Passwords or interactive responses.
-- Private key material.
-- File contents.
-- Medical or other sensitive document names by default.
-- Full remote paths unless the user explicitly includes them in an exported diagnostic package.
-
-## 17. Proposed repository layout
+Three libraries and one executable. Dependencies point one way: UI and IO may use Core. Core uses neither. UI does not use IO. The executable is the only place that may import both UI and IO.
 
 ```text
-Transfer/
-├── Transfer.xcodeproj
-├── App/
-│   ├── TransferApp.swift
-│   ├── AppCommands.swift
-│   └── AppState.swift
-├── Features/
-│   ├── Browser/
-│   │   ├── BrowserModel.swift
-│   │   ├── BrowserView.swift
-│   │   ├── IconBrowserView.swift
-│   │   ├── ListBrowserView.swift
-│   │   ├── ColumnBrowserView.swift
-│   │   └── GalleryBrowserView.swift
-│   ├── Connections/
-│   ├── Transfers/
-│   ├── LiveFiles/
-│   ├── Inspector/
-│   └── Settings/
-├── Core/
-│   ├── Providers/
-│   │   ├── RemoteProvider.swift
-│   │   └── SFTPProvider.swift
-│   ├── Transport/
-│   ├── TransferEngine/
-│   ├── LiveFiles/
-│   ├── Persistence/
-│   └── Security/
-├── Platform/
-│   ├── ColumnBrowser/
-│   ├── FilePromises/
-│   ├── QuickLook/
-│   ├── Workspace/
-│   └── Keychain/
-├── Resources/
-└── Tests/
-    ├── Unit/
-    ├── Integration/
-    ├── UI/
-    └── Fixtures/
+Sources/TransferCore/     values and decisions
+Sources/TransferIO/       ssh, SFTP, files, SQLite, Keychain
+Sources/TransferUI/       SwiftUI and the four AppKit adapters
+Sources/Transfer/         @main, wiring only
+Tests/TransferCoreTests/  no network, no window
+Tools/performance-version/
 ```
 
-Keep platform adapters small and test business logic independently of UI frameworks.
-
-## 18. Development roadmap
-
-### Phase 0 — Decision spikes
-
-Purpose: retire the highest-risk unknowns before building the product shell.
-
-Deliverables:
-
-1. **Finder file-promise spike**
-   - Hard-code one remote file or generated stream.
-   - Drag it from a minimal Mac window to Desktop.
-   - Confirm Finder creates the actual file.
-   - Test cancellation, name collisions, multiple files, and a large file.
-
-2. **Column-view spike**
-   - Wrap `NSBrowser` in SwiftUI.
-   - Load an asynchronous mock hierarchy.
-   - Validate appearance on macOS 27, keyboard behavior, selection, resizing, and drag initiation.
-
-3. **SFTP transport spike**
-   - Test SSH config, agent, hardware key if available, keyboard-interactive authentication, ProxyJump, host-key handling, listing, upload, download, cancellation, and connection reuse.
-   - Compare implementation options and record the decision.
-
-4. **Live-save spike**
-   - Open a managed test file in TextEdit, BBEdit/VS Code if available, Preview for supported editable formats, and an Office application if available.
-   - Confirm detection of in-place writes and safe-save replacements.
-
-Exit criteria:
-
-- External drag produces actual files reliably.
-- Column view looks acceptably native.
-- A transport strategy is selected with documented limitations.
-- Safe-save monitoring works for representative editors.
-
-Estimated effort: 1–2 weeks.
-
-### Phase 1 — Browsing MVP
-
-Deliverables:
-
-- SwiftUI app/window lifecycle.
-- Connection model and one SFTP connection.
-- Host-key verification.
-- Sidebar with saved server.
-- List view with Name, Modified, Size, Kind.
-- Back, Forward, Parent, Home, Refresh.
-- Column view using the proven adapter.
-- Directory cache and asynchronous loading.
-- Basic native toolbar and menus.
-- Space/Quick Look for a selected file.
-
-Exit criteria:
-
-- User can connect and navigate a real server for an hour without UI corruption or leaked connections.
-- Backward column navigation is effectively instant from cache.
-- Network delay never freezes the UI.
-
-Estimated effort: 2–3 weeks after Phase 0.
-
-### Phase 2 — Transfers and Finder interoperability
-
-Deliverables:
-
-- Transfer scheduler and activity view.
-- Drag remote files to Finder using file promises.
-- Drag Finder files into remote folders.
-- Download Copy and Upload commands.
-- Progress, cancellation, retry, name conflicts.
-- Temporary upload names and atomic rename.
-- Folder transfers.
-- Persistent incomplete-transfer records.
-
-Exit criteria:
-
-- Drag-out acceptance matrix passes for Desktop and Finder folders.
-- No operation creates a link or text clipping.
-- Canceling leaves neither false completed local files nor silent remote corruption.
-- Large transfers use bounded memory.
-
-Estimated effort: 2–4 weeks.
-
-### Phase 3 — Live editing
-
-Deliverables:
-
-- Managed Live workspace.
-- Persistent live-file mappings.
-- Open Live/Open With.
-- Directory-based save observer.
-- Debounced upload.
-- Base-version checking.
-- Atomic remote replacement.
-- Live status badges and activity.
-- Offline queue.
-- Conflict preservation and resolution.
-
-Exit criteria:
-
-- Edits from representative Mac applications upload automatically.
-- Multiple rapid saves converge to the latest complete version.
-- Remote concurrent modification never causes silent overwrite.
-- Network loss does not lose local changes.
-- Relaunch restores pending state.
-
-Estimated effort: 3–5 weeks.
-
-### Phase 4 — Native polish
-
-Deliverables:
-
-- Icon and gallery views.
-- View-mode persistence.
-- Inspector.
-- Native window tabs and multi-window state.
-- Inline rename.
-- Permissions editing where supported.
-- Saved remote locations and Recents.
-- Refined menus and shortcuts.
-- Accessibility and Voice Control pass.
-- Reduced-motion/contrast testing.
-- App icon, onboarding, help, and diagnostics.
-
-Exit criteria:
-
-- The app visually and behaviorally belongs beside Finder on macOS 27.
-- Complete keyboard-only workflow passes.
-- VoiceOver can connect, navigate, transfer, open live, and resolve an error.
-
-Estimated effort: 3–5 weeks.
-
-### Phase 5 — Background reliability and release
-
-Deliverables:
-
-- Background continuation for pending live changes.
-- Crash/reboot recovery.
-- Automatic cleanup and reconciliation.
-- Signing, notarization, update mechanism, and distribution decision.
-- Performance profiling and stress testing.
-- Security review and privacy documentation.
-- Migration/versioning strategy.
-- Beta feedback and compatibility fixes.
-
-Exit criteria:
-
-- No known path to loss of a saved local live edit.
-- Pending work survives forced termination and restart.
-- Host-key and credential behavior passes security review.
-- Release build is signed, notarized, and updateable.
-
-Estimated effort: 3–6 weeks.
-
-### Overall estimate
-
-- Convincing prototype: 2–4 weeks.
-- Strong personal daily-use application: approximately 8–12 weeks.
-- Polished public release: approximately 4–6 months depending on transport complexity, background requirements, and beta findings.
-
-These estimates assume one experienced developer/AI-assisted development stream and should be revised after Phase 0.
-
-## 19. Testing strategy
-
-### 19.1 Unit tests
-
-- Remote path parsing and normalization.
-- Filename encoding and normalization.
-- Version comparison.
-- Live-file state transitions.
-- Conflict decisions.
-- Retry classification.
-- Transfer scheduling and cancellation.
-- Cache eviction excluding unsynchronized work.
-- Database migrations.
-
-### 19.2 Integration test server
-
-Maintain a disposable SFTP test environment with fixtures for:
-
-- Password, key, agent, and keyboard-interactive authentication.
-- Proxy/jump host.
-- Permission-denied directories.
-- Symlinks and symlink loops.
-- Case-distinct filenames.
-- Unicode normalization differences.
-- Invalid filename bytes if supported.
-- Huge sparse files.
-- Many small files.
-- Slow and interrupted connections.
-- Remote concurrent modifications.
-- Full disk/quota errors.
-
-### 19.3 UI tests
-
-- Connection and host verification.
-- Navigation in every view mode.
-- Switching views while preserving path/selection.
-- Keyboard-only navigation.
-- Sidebar show/hide.
-- Quick Look behavior.
-- Inline rename.
-- Transfer conflict sheets.
-- Live-state indicators.
-- Error recovery.
-
-### 19.4 Drag acceptance matrix
-
-Test remote drag-out to:
-
-- Desktop.
-- Finder window in list, icon, and column view.
-- Finder sidebar folder if supported.
-- Mail compose window.
-- Messages compose window.
-- An application accepting file URLs.
-- Trash only if semantics are explicitly supported.
-
-For each target test:
-
-- One file.
-- Multiple files.
-- Folder.
-- Empty file.
-- Large file.
-- Unicode filename.
-- Existing-name conflict.
-- Canceled drag or canceled transfer.
-
-### 19.5 Live-edit application matrix
-
-Test at minimum:
-
-- TextEdit.
-- Preview where editable content applies.
-- Xcode.
-- Visual Studio Code or another common editor.
-- BBEdit if available.
-- Microsoft Word/Excel if available.
-- An application known to save atomically by replacement.
-
-Verify open, save, repeated save, Save As, app crash, file rename, local deletion, remote concurrent change, and offline save.
-
-## 20. Acceptance criteria for version 1
-
-Version 1 is acceptable when all of the following are true:
-
-1. The app runs only on supported Apple-silicon macOS 27 systems and looks native without custom imitation chrome.
-2. Users can configure and connect to representative SFTP servers securely.
-3. List and column navigation are complete and keyboard accessible.
-4. Icon mode is available or explicitly deferred with no misleading control.
-5. Space provides useful Quick Look behavior.
-6. Dragging a remote file to Desktop or Finder always creates the actual file.
-7. Dragging a local file into the browser uploads it to the intended directory.
-8. Double-click/Open Live creates a managed working copy and opens the default app.
-9. Completed saves upload automatically.
-10. Safe-save replacement is detected.
-11. Offline saves remain pending without loss.
-12. Concurrent remote changes produce a conflict rather than silent overwrite.
-13. Transfer progress, cancellation, retry, and failure are visible.
-14. No secret or sensitive filename/content is included in default diagnostics or telemetry.
-15. Pending live work survives relaunch, and release readiness requires survival across forced termination/reboot.
-16. Core workflows work with keyboard, VoiceOver, and Voice Control.
-
-## 21. Product decisions already made
-
-The following decisions should be treated as settled unless implementation evidence forces reconsideration:
-
-- macOS 27+, Apple silicon only.
-- Native Swift application.
-- SwiftUI-first UI.
-- Selective AppKit adapters are preferred over forcing pure SwiftUI.
-- Single remote browser window, not permanent dual panes.
-- Finder remains the local-file manager.
-- No File Provider/Finder mount in version 1.
-- Finder-style view switching is important.
-- Column view is required and should begin with `NSBrowser`.
-- Remote-to-Finder drag must use native file promises.
-- Open means Live; drag/download means detached Copy.
-- User-facing term is Live, not Hot.
-- Conflicts must never silently overwrite remote or local work.
-- Visual design uses standard Apple components with minimal overrides.
-- AppKit does not imply an old appearance; custom styling should be the exception.
-- GPUI is not the right UI foundation for this Mac-only product.
-- Rust may be considered later for a shared transfer core, not as an initial requirement.
-
-## 22. Open decisions requiring spikes or product choice
-
-1. Final product name and bundle identity.
-2. Direct notarized distribution versus Mac App Store.
-3. Exact SFTP transport/library architecture.
-4. Whether a background helper ships in the first public version or the main app remains running while Live files exist.
-5. Whether Return renames or opens; default should follow current Finder behavior.
-6. Exact delete/trash semantics for generic SFTP servers.
-7. Whether Gallery view is version 1 or a subsequent release.
-8. Whether hidden files are off by default and how the toggle persists.
-9. How much OpenSSH configuration can be honored under the selected distribution/security model.
-10. Whether remote directory polling is automatic, manual, or adaptive while Live files are open.
-11. Default live-file retention policy after editors close.
-12. Licensing and pricing if released publicly.
-
-## 23. Guidance for the implementing AI
-
-1. Begin with Phase 0 spikes. Do not build an elaborate UI before proving file promises, column view, SFTP compatibility, and save monitoring.
-2. Prefer first-party Apple APIs and current platform conventions.
-3. Do not recreate a standard control for styling reasons.
-4. Keep all network and filesystem work off the main actor.
-5. Make cancellation and failure explicit in every asynchronous operation.
-6. Treat remote data and unsynchronized live edits as irreplaceable.
-7. Write tests for state machines before connecting them to UI.
-8. Never shell-interpolate remote paths, filenames, usernames, or credentials.
-9. Preserve existing user SSH configuration when safely possible.
-10. Add signposts and structured errors early.
-11. Test with actual Finder and actual editing applications; mocks are insufficient for drag and safe-save correctness.
-12. Keep AppKit adapters narrow and driven by shared domain state.
-13. If a design choice starts making the application look like a custom cross-platform file manager, return to the standard macOS component.
-14. Do not add dual-pane behavior unless future user evidence demonstrates a need.
-15. Update this specification whenever an open decision is resolved or an implementation constraint changes product behavior.
-
-## 24. First concrete implementation task
-
-Create a minimal signed macOS 27 Swift project named Transfer containing:
-
-- A SwiftUI window with a native toolbar.
-- A mock remote hierarchy.
-- A view-mode control for List and Columns.
-- A SwiftUI `Table` list presentation.
-- An `NSBrowser` column presentation through `NSViewRepresentable`.
-- Shared path and selection state.
-- A draggable mock remote file exported through `NSFilePromiseProvider`.
-- Automated tests for view-state preservation.
-- A manual acceptance script confirming that dragging the mock item to Desktop creates a real file with expected bytes.
-
-Do not add real SFTP until that shell proves the native browsing and external-drag architecture.
-
+| Target | Holds | Must not import |
+| --- | --- | --- |
+| `TransferCore` | The types in §11.1 and the `RemoteSession` methods in §11.2 | SwiftUI, AppKit, `Process`, `FileManager`, Network, SQLite, Keychain |
+| `TransferIO` | `SSHConnection` and everything that touches a process, a socket, a file, SQLite, or the Keychain | SwiftUI, AppKit |
+| `TransferUI` | Windows, lists, columns, sheets, `NSBrowser`, file promises, Quick Look | `TransferIO`, `Process` |
+| `Transfer` | Creates `SSHConnection`, passes it to the window as a `RemoteSession` | — |
+
+A Core function returns a decision, such as "this file is editable" or "skip this copy", and does not open a socket or a file. A view holds those values and calls `RemoteSession`. It does not know the bytes came from `/usr/bin/ssh`. Tests for Core run with no network and no window.
+
+### 11.1 Where each type lives
+
+**TransferCore**
+
+- `RemotePath`: the raw path bytes. No normalization, no case folding.
+- `ConnectionID`, `LiveFileID`: stable UUIDs.
+- `RemoteItem`: path, name bytes, kind (file, directory, symlink, other), size, whole-second mtime, mode, owner, group, and the symlink target when already known.
+- `Fingerprint`: type, size, whole-second mtime.
+- `OpenKind`: the decision `live` or `view`, from the rule in §1.1. `func openKind(name:extension:uti:) -> OpenKind`.
+- `ChannelRole`: browse, interactive, walker, and the four data roles. This type already exists.
+- `NameCollisionChoice`: skip, keep both, replace. `KeepBothName` produces `name 2`, `name 3`.
+- `LiveConflictChoice`: compare, keep local, keep remote, keep both.
+- `CopyDisposition`: skip, fail, or write `.<basename>.transfer-<uuid>`. Pure comparison of two `RemoteItem`s. No I/O.
+- `TransferProgress`, `OperationState`: queued, active, paused, succeeded, failed, canceled.
+- `HostKeyEvent`: unchanged, first seen, changed, plus the key type and SHA256 fingerprint. The sheet is not in Core.
+- `ProbeResult`: the boolean and the version line. Parsing stdout is pure. Running the process is not.
+- `SftpURL`: one password-free `sftp://` string for a path.
+- `BrowserSnapshot`: connection, path, selection (raw paths), view mode, sort, hidden-files flag. A value, not an `@Observable` object.
+
+**TransferIO**
+
+- `SSHConnection`: the master, the probe, the passengers, and the `RemoteSession` implementation.
+- `SFTPChannel`, the version-3 packet codec, and the scheduler that fills the data channels.
+- `SftpDirectoryCopy`, `PerformanceDirectoryCopy`, and `DirectoryCopyEngine`.
+- SQLite, the Keychain, the preview-cache files, the Live workspace files, and the directory watcher.
+- The askpass helper that feeds prompt replies back to `ssh`. It does not draw the sheet.
+
+**TransferUI**
+
+- `@Observable` window state that holds a `BrowserSnapshot` and a `RemoteSession`.
+- Sidebar, toolbar, icon grid, table, `NSBrowser` adapter, inspector, shelf, menus.
+- Sheets for the connection, host key, password, name collision, Live conflict, delete, and quit. Each sheet returns a Core choice. It does not apply the choice itself.
+- File-promise and drop adapters. They call `RemoteSession`.
+- Quick Look. The HTML for a syntax preview is produced from bytes the session already returned.
+
+### 11.2 The seam
+
+`RemoteSession` is a protocol in `TransferCore`. `SSHConnection` is the only implementation, and it stays in `TransferIO`. Views depend on the protocol.
+
+The protocol covers connect, disconnect, list, stat, readlink, download, upload, mkdir, rename, remove, symlink, the one probe result, and directory copy. Listing returns an asynchronous stream of `RemoteItem`. Progress is a stream of `TransferProgress`. Methods return Core values and Core errors. They do not return file descriptors, process objects, or SwiftUI types.
+
+The app target constructs `SSHConnection`, erases it to `RemoteSession`, and hands that to the window. A preview, a test, or a later performance engine can supply another implementation without changing a view.
+
+## 12. Build order
+
+Build on the existing package, in this order. Each step compiles and is worth a commit. New code goes into the target named in §11.
+
+1. The `TransferCore` types in §11.1, including `RemoteSession` and `openKind`, with tests and no network.
+2. `SSHConnection` in `TransferIO`, as the `RemoteSession` implementation: master, askpass replies, the one probe, and the seven passengers. The sheets that collect those replies stay in `TransferUI`.
+3. SFTP version-3 session in `TransferIO`: list, stat, readlink, mkdir, rename, remove.
+4. The browser in `TransferUI`: sidebar, icon, list, columns, hidden files, and cached reload.
+5. `SftpDirectoryCopy` in `TransferIO`; the shelf and drag adapters in `TransferUI`. Download Copy and delete.
+6. View, Live, the conflict sheets, and quit-with-unsynced-work.
+7. Quick Look, the inspector, and Open in Terminal.
+8. `Tools/performance-version` and `PerformanceDirectoryCopy`, present and unused.
+
+`Tools/performance-version` prints `performance-version 0` and exits 2. `PerformanceDirectoryCopy` is not selected while the probe is false. Replacing that tool later must not require a change to the browser.
+
+## 13. Acceptance
+
+This pass is done when all of the following are true.
+
+1. The app runs on Apple-silicon macOS 27, from the Swift package, and uses standard controls.
+2. A new connection honors `~/.ssh/config`, the agent, `ProxyJump`, and keyboard-interactive prompts, with compression forced off.
+3. A first-seen host key and a changed host key use the sheets in §2.3.
+4. The probe runs once after login. A missing `performance-version` leaves the connection on SFTP.
+5. Listing a large directory shows the first page before the listing finishes, and a download does not block that listing.
+6. Icon, list, and column view share one selection and one path. There is no gallery control.
+7. Space previews PDF and images, and previews text and source with syntax coloring. Preview does not upload.
+8. Dragging a remote file to the Desktop creates the real file. Dragging a local file in uploads it.
+9. Double-clicking `.json`, `.rs`, `.c`, `.ts`, `.txt`, or `.rip` opens a Live file and a completed save uploads. Double-clicking `.pdf`, `.jpg`, or `.png` views it and does not upload.
+10. A remote change during a Live edit becomes a conflict and does not overwrite either side.
+11. A directory copy starts before the walk finishes, uses at most four data channels, skips matching size and mtime, copies symlinks as links, and deletes only its own temp on cancel.
+12. Delete is permanent, confirmed, and has no trash.
+13. Open in Terminal opens the current directory in Terminal, iTerm2, or Ghostty and does not add a pane to the window.
+14. No secret is written to the log or to SQLite.
+15. `TransferUI` does not import `TransferIO`. `TransferCore` does not import `TransferUI` or `TransferIO`. A view reaches the server only through `RemoteSession`.
