@@ -29,21 +29,26 @@ eval "$(Scripts/local-sshd.sh)" && swift test; kill $TRANSFER_TEST_SSHD
 
 The script starts an unprivileged `sshd` on 127.0.0.1:2222 with its own keys and never touches the system's Remote Login. The tests use Trust Once, so the user's `known_hosts` is never written. Their library roots live under `~/Library/Caches/TransferTests` and are removed afterwards.
 
+## Window chrome
+
+The window is an AppKit frame with SwiftUI columns, in `Sources/TransferUI/WindowChrome.swift`. `ChromeController` is an `NSSplitViewController` with sidebar, content, and inspector items and it installs the `NSToolbar`: the system sidebar toggle, the navigational back/forward group, the view-switcher group, Transfers, and an `NSSearchToolbarItem`. The columns are `SidebarColumn`, `DetailColumn`, and `InspectorColumn` in `ContentView.swift`, each hosted once and observing the model on its own. `ChromeContainer` gives the split view explicit size constraints because SwiftUI's host view does not run the constraint engine for a representable's subtree. The content and inspector columns start below the toolbar; the sidebar runs full height. The title bar is transparent and every separator style is `.none`; the faint line Finder shows on toolbar hover is the system's own scroll pocket, so the content views hide their scroll-edge effect and nothing draws a line by hand.
+
+The list view is `ListTable.swift`, an `NSTableView` with 22-point rows, header sorting, per-connection column autosave, drag out, drop onto folders, and the row context menu. The column view is `NSBrowser`; `CenteredBrowserCell` draws the icon and title itself so they sit on the row's midline. Both views are 22 points a row, matching Finder's column view.
+
 ## Working
 
 - Login, askpass sheets, Keychain opt-in, one probe, browse, interactive, walker, and up to seven data channels. A reserved passenger that dies is reopened once. The master's death emits `.disconnected`.
 - Host keys: the offered key is learned with a no-auth `ssh` run into a temporary known-hosts file, which honors `~/.ssh/config`, aliases, and `ProxyJump`. It is compared against the files `ssh -G` reports with `ssh-keygen -F`. Always Trust and Replace write only the first user file `ssh -G` names. Trust Once keeps the temporary file for that master and deletes it on disconnect.
-- Listing streams pages; the model publishes at most every 80 ms and shows a cached listing first on revisit. Icon, list, and column views share one path and selection. Column view is `NSBrowser` with real selection, double-click, drag out, and drop.
-- Sort and column layout persist per connection in preferences. View mode and hidden files persist globally. The window frame autosaves.
-- Downloads and uploads keep 2 MB in flight per channel. Directory copy walks on the walker and assigns file bodies to the data pool as names arrive. Both directions use temp-and-rename, size-and-mtime skip, symlinks as links, and record temps in SQLite. A later launch deletes local temps; the next login deletes that server's remote temps.
-- Drag to Finder writes real files through `NSFilePromiseProvider`. Drop on the background uploads into the current folder; drop on a folder row, in any view, uploads into that folder. A drag between folders on the same server is one SFTP rename per item.
-- Live files persist in `live_files` with a dirty flag and resume on the next login. The workspace folder and the file itself are both watched, so safe-saves and in-place writes are seen. Uploads read through `NSFileCoordinator`, run on the interactive lane, and go 400 ms after size and mtime settle. Remote changes become conflicts with a `(server)` copy beside the working file; Compare opens `opendiff` from IO. Keep Local and Keep Remote need a second press.
-- Shelf rows offer Pause, Resume, Retry, and Remove. Dropped connections and timeouts retry at 1 s, 2 s, and 4 s. A paused or retried operation re-runs its body; finished files are skipped by size and mtime. Live uploads can be paused too.
-- Command-F focuses the filter. Space toggles Quick Look, and a new selection replaces the preview and cancels the download in flight. Space and Return leave text fields alone.
-- Preview cache names are SHA256 of the raw path, capped at 1 GB by last use, excluded from backup. View files keep their extension so `NSWorkspace` picks the right app.
+- Listing keeps four `READDIR` requests in flight and streams pages; the model publishes at most every 80 ms in every view and shows a cached listing first on revisit. Icon, list, and column views share one path and selection. Selecting a folder in column view makes it the current location and keeps it selected.
+- Sorting: directories first and case-insensitive names are global switches in Settings > General; column and direction persist per connection. View mode and hidden files persist globally.
+- Downloads and uploads keep 2 MB in flight per channel. Directory copy walks on the walker and assigns file bodies to the data pool as names arrive. Both directions use temp-and-rename, size-and-mtime skip, symlinks as links, and record temps in SQLite.
+- Drag to Finder writes real files through `NSFilePromiseProvider`; a multi-item drag moves every item on an internal drop. Drop on the background uploads into the current folder; drop on a folder row, in any view, uploads into that folder. A drag between folders on the same server is one SFTP rename per item.
+- Live files persist in `live_files` with a dirty flag and resume on the next login. The workspace folder and the file itself are both watched. Uploads read through `NSFileCoordinator` on the interactive lane 400 ms after size and mtime settle. Remote changes become conflicts with a `(server)` copy; Compare opens `opendiff` from IO. Keep Local and Keep Remote need a second press.
+- Shelf rows offer Pause, Resume, Retry, and Remove. Dropped connections and timeouts retry at 1 s, 2 s, and 4 s. Live uploads can be paused too.
+- Command-F expands the toolbar search. The search item shows the full field when the toolbar has room and a magnifier when it does not, as Finder's does. Space and Return leave text fields alone.
+- Settings (Command-Comma) has General, Extensions, and Updates tabs. Extensions edits `config.json` through the provider; open sessions pick the list up at once.
+- Preview cache names are SHA256 of the raw path, capped at 1 GB by last use, excluded from backup.
 - Sidebar: Servers, Recents, Saved Locations, Live Files, Conflicts. Server rows offer Connect, Edit, and Remove. Remove refuses while that server has unsynced Live bytes.
-- Delete names the count, says it is permanent, and mentions unsynced Live bytes only when the selection has them. Deleting a Live file also removes its workspace.
-- Open in Terminal joins the same master with `-S` and is disabled without a connection or a terminal app.
 - Quit asks Cancel or Quit Anyway through the app delegate whenever any server has unsynced Live work, and disconnects every master on the way out.
 
 ## Updates
@@ -56,8 +61,7 @@ To turn updates on: run `.build/artifacts/sparkle/Sparkle/bin/generate_keys` onc
 
 - Small files do not share a data channel; every file takes a channel from the pool of seven.
 - Command-Down is not bound as a second shortcut for Open.
-- New Tab sends `newWindowForTab:`; the tab bar itself was not exercised.
-- The list view's name cell is an AppKit view so it can start a promise drag; clicks on it select the row but shift-click ranges only work in the other columns.
+- Only one live window can own the frame autosave name; a second window or tab does not persist its frame.
 - The fast directory engine stays unwired. `PerformanceDirectoryCopy.available()` returns false.
 
 ## Traps
@@ -66,8 +70,9 @@ To turn updates on: run `.build/artifacts/sparkle/Sparkle/bin/generate_keys` onc
 - OpenSSH's sftp-server reads `SSH_FXP_SYMLINK` as target then link, the reverse of the draft. The draft order creates a stray link in the server user's home directory.
 - Unix socket paths are capped at 104 bytes and ssh appends 17 bytes while binding. The socket name is `ConnectionID.socketName`, twelve hex characters, not the full UUID.
 - ssh splits a bare `-o Name=value` on spaces, and the library lives under `Application Support`. Paths go through `-S`, `-i`, or a double-quoted `-o` value. A bare value silently wrote a known-hosts file at `~/Library/Application`.
-- `URL.resourceValues` caches per URL instance. Size and mtime for a file that changes underneath are read with `FileManager.attributesOfItem`.
 - A directory watch does not see in-place writes to a file. Live files watch the file descriptor as well, re-armed after every event because safe-saves replace the inode.
+- Re-hosting a SwiftUI column (assigning `rootView` on every update) resets its safe-area and scroll-edge state and keeps the toolbar's edge line drawn. Host each column once and let it observe the model.
+- `URL.resourceValues` caches per URL instance. Size and mtime for a file that changes underneath are read with `FileManager.attributesOfItem`.
 - On this SDK `NSFilePromiseProvider` is an `NSPasteboardWriting` object, not an `NSItemProvider`. `RemoteItemPromise` also writes `com.example.transfer.remote-items` so a drop inside Transfer knows the remote paths.
 - Do not add libssh, a tunnel, HTTP/3, or compression. The transport is `/usr/bin/ssh`.
 - Do not embed rsync. A later fast copy replaces `Tools/performance-version` and must not change the browser.
