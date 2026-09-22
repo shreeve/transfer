@@ -156,3 +156,55 @@ import TransferCore
     #expect(Units.scale(.infinity, unit: "B") == "??? B")
     #expect(Units.scale(1e16, unit: "B") == "??? B")
 }
+
+@Test func clipTextNamesASingleItem() {
+    var tally = ClipTally()
+    tally.add(root: .file(size: 2100))
+    tally.complete = true
+    #expect(ClipText.summary(tally, name: "notes.txt") == "“notes.txt” (2.1kB)")
+}
+
+@Test func clipTextCountsFilesInsideFolders() {
+    var tally = ClipTally()
+    for _ in 0..<3 { tally.add(root: .file(size: 1000)) }
+    tally.add(root: .directory)
+    #expect(ClipText.summary(tally, name: nil) == "3 files and 1 folder (counting… 3 files so far)")
+    for _ in 0..<28 { tally.add(inside: .file(size: 1000)) }
+    tally.add(inside: .directory)
+    tally.complete = true
+    #expect(ClipText.summary(tally, name: nil) == "3 files and 1 folder (31 files in all, 31kB)")
+}
+
+@Test func clipTextForFoldersAlone() {
+    var tally = ClipTally()
+    tally.add(root: .directory)
+    tally.add(root: .directory)
+    tally.complete = true
+    #expect(ClipText.summary(tally, name: nil) == "2 folders (no files)")
+    tally.add(inside: .link)
+    #expect(ClipText.summary(tally, name: nil) == "2 folders (1 file, 0 B)")
+}
+
+@Test func pasteRefusesAFolderIntoItself() {
+    let site = RemotePath(string: "/srv/site")
+    #expect(PasteRules.refusal(sources: [site], into: site) != nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/site/assets")) != nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/site2")) == nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv")) == nil)
+}
+
+@Test func pasteIntoTheSameFolderMakesACopy() {
+    let file = RemotePath(string: "/srv/notes.txt")
+    #expect(PasteRules.destinationName(for: file, into: RemotePath(string: "/srv"), existing: ["notes.txt"]) == "notes copy.txt")
+    #expect(PasteRules.destinationName(for: file, into: RemotePath(string: "/tmp"), existing: ["notes.txt"]) == "notes.txt")
+}
+
+@Test func treeCheckFindsWhatAMoveWouldLose() {
+    let source: [String: TreeEntry] = ["": .directory, "a.txt": .file(size: 4), "sub": .directory, "sub/b": .link]
+    #expect(TreeCheck.missing(source: source, destination: source).isEmpty)
+    var partial = source
+    partial["a.txt"] = .file(size: 3)
+    partial["sub/b"] = nil
+    partial["extra"] = .file(size: 1)
+    #expect(TreeCheck.missing(source: source, destination: partial) == ["a.txt", "sub/b"])
+}

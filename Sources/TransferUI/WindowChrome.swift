@@ -51,6 +51,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
     }
 
     private func apply(to controller: ChromeController, context: Context) {
+        controller.model = model
         controller.setTitle(title, subtitle: subtitle)
         controller.setSidebarCollapsed(sidebarCollapsed)
         controller.setInspectorShown(inspectorShown)
@@ -408,6 +409,7 @@ final class ChromeController: NSSplitViewController {
     override func viewDidAppear() {
         super.viewDidAppear()
         guard let window = view.window, !toolbarInstalled else { return }
+        Self.live.add(self)
         separatorObservation = window.observe(\.titlebarSeparatorStyle, options: [.new]) { [weak self] _, _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
@@ -478,6 +480,39 @@ final class ChromeController: NSSplitViewController {
         }
     }
 
+    // MARK: Edit menu
+
+    /// Edit > Copy and Paste reach the window here through the responder chain whenever no text
+    /// field has focus; a focused field answers them first and keeps its own text editing. When
+    /// nothing in the content holds the focus (a folder just opened in icon view, or a toolbar
+    /// button has it), the chain skips this controller, and the app delegate, last in the chain,
+    /// forwards them here through `KeyWindowEdit`.
+    weak var model: TransferModel?
+
+    private static let live = NSHashTable<ChromeController>.weakObjects()
+
+    static var keyWindowController: ChromeController? {
+        guard let key = NSApp.keyWindow else { return nil }
+        return live.allObjects.first { $0.view.window === key }
+    }
+
+    @objc func copy(_ sender: Any?) {
+        model?.copySelection()
+    }
+
+    @objc func paste(_ sender: Any?) {
+        guard let model else { return }
+        Task { await model.paste(moving: false) }
+    }
+
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        switch item.action {
+        case #selector(copy(_:)): model?.canCopy == true
+        case #selector(paste(_:)): model?.canPaste == true
+        default: super.validateUserInterfaceItem(item)
+        }
+    }
+
     /// Set by the coordinator so the model follows the toolbar's sidebar toggle and divider drags.
     var sidebarToggled: ((Bool) -> Void)?
     var inspectorToggled: ((Bool) -> Void)?
@@ -501,6 +536,17 @@ final class ChromeController: NSSplitViewController {
         sidebarToggled?(splitViewItems[0].isCollapsed)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.toggling = false }
     }
+}
+
+/// Copy and Paste for the key window when its content holds no focus. The app delegate, last in
+/// the responder chain, sends them here.
+@MainActor
+public enum KeyWindowEdit {
+    public static func copy() { ChromeController.keyWindowController?.copy(nil) }
+    public static func paste() { ChromeController.keyWindowController?.paste(nil) }
+
+    public static func canCopy() -> Bool { ChromeController.keyWindowController?.model?.canCopy == true }
+    public static func canPaste() -> Bool { ChromeController.keyWindowController?.model?.canPaste == true }
 }
 
 /// Anchors the AppKit split view to the size SwiftUI assigns. SwiftUI's host view is not part

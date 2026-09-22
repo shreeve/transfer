@@ -24,6 +24,8 @@ actor SFTPLink {
     private var nextID: UInt32 = 1
     private var waiters: [UInt32: CheckedContinuation<SFTPMessage, Error>] = [:]
     private var versionWaiter: CheckedContinuation<UInt32, Error>?
+    /// The extensions the server named in its VERSION reply, such as `copy-data`.
+    private(set) var extensions: Set<String> = []
     private var reader: Task<Void, Never>?
     private(set) var isOpen = true
 
@@ -149,6 +151,22 @@ actor SFTPLink {
         }
     }
 
+    /// Puts `temp` in place of `placed`. With `posix-rename@openssh.com` the swap is atomic and a
+    /// failure leaves `placed` untouched. Without it, SFTP v3 rename will not replace a file, so
+    /// `placed` is removed first.
+    func replace(_ temp: RemotePath, onto placed: RemotePath) async throws {
+        if extensions.contains("posix-rename@openssh.com") {
+            var body = Data()
+            body.appendString("posix-rename@openssh.com")
+            body.appendBlob(Data(temp.bytes))
+            body.appendBlob(Data(placed.bytes))
+            _ = try await call(SFTPCode.extended, body: body)
+            return
+        }
+        try? await removeFile(placed)
+        try await plainRename(temp, to: placed)
+    }
+
     func plainRename(_ source: RemotePath, to destination: RemotePath) async throws {
         var body = Data()
         body.appendBlob(Data(source.bytes))
@@ -184,6 +202,34 @@ actor SFTPLink {
         body.appendString(target)
         body.appendBlob(Data(link.bytes))
         _ = try await call(SFTPCode.symlink, body: body)
+    }
+
+    /// Copies a file on the server with OpenSSH's `copy-data` extension; no bytes cross the
+    /// network. The reply comes when the whole file is written. Callers check `extensions` first.
+    func copyData(_ source: RemotePath, to destination: RemotePath) async throws {
+        let from = try await openFile(source, flags: SFTPCode.fxRead)
+        do {
+            let to = try await openFile(destination, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
+            do {
+                var body = Data()
+                body.appendString("copy-data")
+                body.appendBlob(from)
+                body.appendU64(0)
+                // A length of zero copies to the end of the file.
+                body.appendU64(0)
+                body.appendBlob(to)
+                body.appendU64(0)
+                _ = try await call(SFTPCode.extended, body: body)
+            } catch {
+                try? await close(to)
+                throw error
+            }
+            try await close(to)
+        } catch {
+            try? await close(from)
+            throw error
+        }
+        try? await close(from)
     }
 
     func setstat(_ path: RemotePath, mode: UInt32?, mtime: UInt32?) async throws {
@@ -421,6 +467,10 @@ actor SFTPLink {
             while let packet = SFTPWire.popPacket(from: &buffer) {
                 if packet.type == SFTPCode.version {
                     let version = packet.rest.prefix(4).loadU32()
+                    var reader = ByteReader(Data(packet.rest.dropFirst(4)))
+                    while let name = try? reader.utf8(), (try? reader.blob()) != nil {
+                        extensions.insert(name)
+                    }
                     versionWaiter?.resume(returning: version)
                     versionWaiter = nil
                     continue

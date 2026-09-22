@@ -36,6 +36,7 @@ An editable file is one whose filename UTI conforms to `public.plain-text` or `p
 - Quick Look, including a syntax-colored text preview when the system preview would be generic.
 - Drag in, drag out, Download Copy, Upload, duplicate, rename, new folder, permanent delete.
 - Directory copy on the SFTP channels.
+- Copy and Paste of files and folders: inside a server, between servers, windows, and tabs, and with Finder in both directions.
 - Live open, view open, conflicts, and Open in Terminal.
 - A performance-mode probe and a `DirectoryCopyEngine` seam. The fast engine is a stub.
 - Updates through Sparkle: `Check for Updates…` in the app menu, an appcast on GitHub Releases, EdDSA-signed archives.
@@ -44,7 +45,7 @@ An editable file is one whose filename UTI conforms to `public.plain-text` or `p
 
 Do not add disabled controls for these. They are absent.
 
-Gallery, a permissions editor, trash, a background helper or login item, File Provider, any protocol other than SFTP, remote-to-remote copy, sync roots, iCloud, a CLI, remote search, git decorations, an editor, an embedded terminal, a diff viewer, spring-loaded folders, block checksums, byte-range resume, Keep Downloaded, AppleDouble or resource forks, onboarding, a help book, and telemetry.
+Gallery, a permissions editor, trash, a background helper or login item, File Provider, any protocol other than SFTP, sync roots, iCloud, a CLI, remote search, git decorations, an editor, an embedded terminal, a diff viewer, spring-loaded folders, block checksums, byte-range resume, Keep Downloaded, AppleDouble or resource forks, onboarding, a help book, and telemetry.
 
 `rsync` is not called. The fast directory copy is the later program that replaces `Tools/performance-version`. This pass only reserves that slot.
 
@@ -210,6 +211,10 @@ Hidden by default. Command-Option-I toggles it. One selection shows name, icon, 
 | Refresh | Command-R |
 | New Folder | Command-Shift-N |
 | Duplicate | Command-D |
+| Copy / Paste items | Command-C / Command-V |
+| Move Item Here | Option-Command-V |
+| Clear the clipboard | Escape |
+| Copy Remote URL | Option-Command-C |
 | Delete | Command-Delete |
 | New Connection | Command-K |
 | New Window | Command-N |
@@ -249,13 +254,13 @@ A Live open downloads into:
 
 Mode `0700` for the directory and `0600` for the file. The mapping is a UUID stored in SQLite. The remote identity remains the raw path. A rename updates the path and the basename and keeps the UUID.
 
-Before opening, record the base fingerprint: type, size, and whole-second mtime. No hash and no inode. Open with `NSWorkspace`.
+Before opening, record the base fingerprint: type, size, and whole-second mtime. No hash of the server file and no inode. Also record the working copy's exact size and mtime and a SHA-256 of its bytes: the local clock tells two same-size saves in one second apart, and the digest tells a touch from an edit, so a touched file is not uploaded. Open with `NSWorkspace`.
 
-Watch the workspace directory. A safe-save that replaces the file is the same Live file. Upload 400 ms after size and mtime stop changing, reading through `NSFileCoordinator`, on the interactive channel, using the temp-and-rename rule in §4.1. The pre-check is the base fingerprint, not the size-and-mtime skip. If the remote fingerprint changed, or the remote file is gone, the state becomes Conflict and nothing is uploaded.
+Watch the Live folder with one FSEvents stream. A safe-save that replaces the file is the same Live file. Upload once size and exact mtime have held still for 350 ms, reading through `NSFileCoordinator`, on the interactive channel, using the temp-and-rename rule in §4.1. The pre-check is the base fingerprint, not the size-and-mtime skip, and it is made again just before the rename. If the remote fingerprint changed, or the remote file is gone or is no longer a file, the state becomes Conflict and nothing is uploaded. A server that cannot be reached is not a conflict: the upload waits and retries. An untouched working copy is refreshed from the server only when it is opened again, never while an editor may hold it.
 
 The mapping remains after the editor closes, the window closes, quit, and reboot. Uploads run only while Transfer is open. On launch, resume Live uploads. Do not resume drags or directory copies. Quit with unsynced or active Live work asks Cancel (default) or Quit Anyway.
 
-Save As outside the workspace is a detached file. If a clean working file disappears, drop the mapping. If a dirty one disappears, mark it failed and do not upload. File > Discard Live File removes a clean mapping immediately and asks before discarding unsynced bytes. It is disabled while an upload of that file is in flight.
+Save As outside the workspace is a detached file. A working file that disappears gets a second look a second later, as an editor may be between delete and write. If a clean one is still gone, drop the mapping. If a dirty one is, mark it failed and do not upload. File > Discard Live File removes a clean mapping immediately and asks before discarding unsynced bytes. It is disabled while an upload of that file is in flight.
 
 A symlink is listed as itself. Double-click, Open, and Quick Look follow one hop. A directory hop is navigated. A file hop is viewed or opened Live at the resolved path, so a save writes the file that was read. A loop or a second hop is an error. The inspector fetches the target when that row is selected.
 
@@ -279,7 +284,14 @@ A drag inside the browser, to another folder on the same server, is one SFTP ren
 
 Duplicate (Command-D) creates `name copy`, then `name copy 2`, through §4.1.
 
-With a selection and no text field focused, Command-C copies the `sftp://` URLs. Command-V does not upload. Cut is disabled outside text fields.
+With a selection and no text field focused, Command-C copies the items. Command-V pastes them into the current folder; Option-Command-V moves them there. Text fields keep their own Copy and Paste. Cut is disabled outside text fields. Copy Remote URL is Option-Command-C.
+
+- Within one server, Paste copies on the server with the `copy-data` extension when the server offers it, and through the Mac otherwise. Pasting into the folder the items came from makes `name copy` beside each one. A folder cannot be pasted into itself. Move is one SFTP rename per item, as a drag is.
+- Between servers, Paste downloads into a scratch folder and uploads from it. Move removes each original only after its copy holds every file the original did, by name and size.
+- Files copied in Finder upload on Paste. Move sends each original to the Trash once the server holds all of it.
+- Items copied in Transfer paste in Finder as real files. Finder reads only file URLs from the clipboard, so Transfer downloads the items to a staging folder right after the copy and adds their URLs when they are complete. Copies over 1 GB are not staged.
+- A bar at the bottom of every window names what the clipboard holds, where it came from, and whether Finder can paste it yet, such as "Copied 3 files and 1 folder (31 files in all, 12 MB)". Escape clears the clipboard. Files copied in Finder show there too.
+- Collisions follow §4.1: matching size and time skip, others ask.
 
 The shelf is one row per top-level operation. A directory copy is one row, with byte and item progress. It is hidden when nothing is active, paused, failed, or in conflict. Successful rows disappear when they finish. Failed rows stay and offer Retry and Remove. Remove does not delete finished files. Pause applies to that one operation, including one Live upload. There is no global pause.
 
@@ -333,13 +345,16 @@ A Core function returns a decision, such as "this file is editable" or "skip thi
 - `ProbeResult`: the boolean and the version line. Parsing stdout is pure. Running the process is not.
 - `SftpURL`: one password-free `sftp://` string for a path.
 - `BrowserSnapshot`: connection, path, selection (raw paths), view mode, sort, hidden-files flag. A value, not an `@Observable` object.
+- `LiveDecision` with `LiveState`, `LiveStamp`, `LiveLocal`, `LiveServerFact`, and `LiveAction`: the Live sync rules as one pure function.
+- `TreeEntry`, `ClipTally`, `ClipText`, `PasteRules`, `TreeCheck`: what a copied tree holds, the clipboard bar's words, where a paste lands, and whether a copy is complete before a move removes its source.
 
 **TransferIO**
 
 - `SSHConnection`: the master, the probe, the passengers, and the `RemoteSession` implementation.
 - `SFTPChannel`, the version-3 packet codec, and the scheduler that fills the data channels.
 - `SftpDirectoryCopy`, `PerformanceDirectoryCopy`, and `DirectoryCopyEngine`.
-- SQLite, the Keychain, the preview-cache files, the Live workspace files, and the directory watcher.
+- SQLite, the Keychain, and the preview-cache files.
+- `LiveSync`: the Live workspace files, their records, one FSEvents watcher, and one worker per server. `SSHConnection` serves it through the `LiveServer` protocol.
 - The askpass helper that feeds prompt replies back to `ssh`. It does not draw the sheet.
 
 **TransferUI**
@@ -348,13 +363,14 @@ A Core function returns a decision, such as "this file is editable" or "skip thi
 - Sidebar, toolbar, icon grid, table, `NSBrowser` adapter, inspector, shelf, menus.
 - Sheets for the connection, host key, password, name collision, Live conflict, delete, and quit. Each sheet returns a Core choice. It does not apply the choice itself.
 - File-promise and drop adapters. They call `RemoteSession`.
+- `Clipboard`: the app's one clipboard, mirrored from the general pasteboard, with the Finder staging folder. Paste actions call `RemoteSession`.
 - Quick Look. The HTML for a syntax preview is produced from bytes the session already returned.
 
 ### 11.2 The seam
 
 `RemoteSession` is a protocol in `TransferCore`. `SSHConnection` is the only implementation, and it stays in `TransferIO`. Views depend on the protocol.
 
-The protocol covers connect, disconnect, list, stat, readlink, download, upload, mkdir, rename, remove, symlink, the one probe result, and directory copy. Listing returns an asynchronous stream of `RemoteItem`. Progress is a stream of `TransferProgress`. Methods return Core values and Core errors. They do not return file descriptors, process objects, or SwiftUI types.
+The protocol covers connect, disconnect, list, stat, readlink, download, upload, mkdir, rename, remove, symlink, the one probe result, directory copy, copy within the server, and a tree walk. Listing returns an asynchronous stream of `RemoteItem`. Progress is a stream of `TransferProgress`. Methods return Core values and Core errors. They do not return file descriptors, process objects, or SwiftUI types.
 
 The app target constructs `SSHConnection`, erases it to `RemoteSession`, and hands that to the window. A preview, a test, or a later performance engine can supply another implementation without changing a view.
 
@@ -391,4 +407,5 @@ This pass is done when all of the following are true.
 12. Delete is permanent, confirmed, and has no trash.
 13. Open in Terminal opens the current directory in Terminal, iTerm2, or Ghostty and does not add a pane to the window.
 14. No secret is written to the log or to SQLite.
-15. `TransferUI` does not import `TransferIO`. `TransferCore` does not import `TransferUI` or `TransferIO`. A view reaches the server only through `RemoteSession`.
+15. Copy and Paste work inside a server, between servers, and with Finder in both directions, and a move never removes a source whose copy is incomplete.
+16. `TransferUI` does not import `TransferIO`. `TransferCore` does not import `TransferUI` or `TransferIO`. A view reaches the server only through `RemoteSession`.

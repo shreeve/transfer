@@ -63,19 +63,26 @@ struct ColumnBrowser: NSViewRepresentable {
                 browser.loadColumnZero()
                 return
             }
-            for column in 0...max(browser.lastColumn, 0) {
+            // Reloading a column can drop the columns after it, so the last column is read again on
+            // every pass. Asking the browser about a column it no longer has throws an Objective-C
+            // exception inside SwiftUI's update; AppKit catches it, but the unwinding leaves the
+            // main thread's observation tracking dangling, and the next observable read crashes.
+            var column = 0
+            while column <= max(browser.lastColumn, 0) {
                 let path = self.path(forColumn: column) ?? newRoot
                 let current = children(path)
                 if shown[path] != current {
                     shown[path] = current
                     browser.reloadColumn(column)
                 }
+                column += 1
             }
         }
 
         private func path(forColumn column: Int) -> RemotePath? {
             guard let browser else { return nil }
             if column == 0 { return root }
+            guard column <= browser.lastColumn else { return nil }
             guard let parent = browser.parentForItems(inColumn: column) as? RemoteItem else { return nil }
             return parent.path
         }

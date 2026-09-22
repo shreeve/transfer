@@ -152,6 +152,13 @@ public protocol RemoteSession: Sendable {
     func pin(_ path: RemotePath) async
     func unpin(_ path: RemotePath) async
     func duplicate(_ path: RemotePath) async throws
+    /// Copies a file, link, or folder tree to `destination` on this same server. Files are copied
+    /// on the server when it offers `copy-data`, else through the Mac. Folders merge into an
+    /// existing folder and file collisions are settled as uploads settle them.
+    func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
+    /// Walks `root` on the walker channel and reports every entry, the root first under the
+    /// empty key, the rest by their path relative to it.
+    func walkTree(_ root: RemotePath, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws
     /// `.compare` opens the diff tool itself and returns nil.
     func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws
     var unsyncedLiveCount: Int { get async }

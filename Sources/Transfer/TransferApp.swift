@@ -61,12 +61,15 @@ struct TransferApp: App {
                 Button("Discard Live File") { Task { await model?.discardSelectedLive() } }
                     .disabled(model.map { m in m.liveFiles.contains { m.snapshot.selection.contains($0.path) } } != true)
             }
-            // The standard Cut, Copy, and Paste stay for text fields. With no text field focused the
-            // standard Copy is disabled, so Command-C falls through to this item.
+            // The standard Copy and Paste serve text fields, and with no text field focused they
+            // reach the window's ChromeController, which copies and pastes files.
             CommandGroup(after: .pasteboard) {
                 Divider()
+                Button(model?.moveTitle ?? "Move Item Here") { Task { await model?.paste(moving: true) } }
+                    .keyboardShortcut("v", modifiers: [.command, .option])
+                    .disabled(model?.canPaste != true || !plainKeys)
                 Button("Copy Remote URL") { model?.copyRemoteURL() }
-                    .keyboardShortcut("c")
+                    .keyboardShortcut("c", modifiers: [.command, .option])
                     .disabled(!connected || !plainKeys)
                 Button("Delete…") { model?.askToDelete() }
                     .keyboardShortcut(.delete, modifiers: .command)
@@ -234,6 +237,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         _ = semaphore.wait(timeout: .now() + 3)
         return QuitGuard.mayQuit(unsynced: box.value) ? .terminateNow : .terminateCancel
+    }
+
+    // Last in the responder chain: Copy and Paste for a window whose content holds no focus.
+    @objc func copy(_ sender: Any?) { KeyWindowEdit.copy() }
+    @objc func paste(_ sender: Any?) { KeyWindowEdit.paste() }
+
+    @objc func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(copy(_:)): KeyWindowEdit.canCopy()
+        case #selector(paste(_:)): KeyWindowEdit.canPaste()
+        default: true
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

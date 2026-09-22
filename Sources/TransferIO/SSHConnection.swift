@@ -25,15 +25,18 @@ public actor SSHConnection: RemoteSession {
     private var prompted = false
     private let pipe = EventPipe()
     private let lane = InteractiveLane()
-    private var lives: [LiveFileID: LiveRecord] = [:]
-    private var watchers: [LiveFileID: DispatchSourceFileSystemObject] = [:]
-    private var fileWatchers: [LiveFileID: DispatchSourceFileSystemObject] = [:]
-    private var settling: [LiveFileID: Task<Void, Never>] = [:]
+    /// Live files are `LiveSync`'s; this connection is its `LiveServer` and forwards the Live API.
+    private let live: LiveSync
+    private let ownsLive: Bool
 
-    init(connection: SavedConnection, store: Store, editableExtensions: Set<String>) {
+    /// The hub passes its one `LiveSync`. Without one, as in tests, the connection makes its own
+    /// and closes it on disconnect.
+    init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync? = nil) {
         self.connection = connection
         self.store = store
         self.editableExtensions = editableExtensions
+        self.live = live ?? LiveSync(store: store)
+        ownsLive = live == nil
     }
 
     public nonisolated func events() -> AsyncStream<SessionEvent> { pipe.stream() }
@@ -44,7 +47,7 @@ public actor SSHConnection: RemoteSession {
 
     public var performanceModeEnabled: Bool { performance }
     public var isConnected: Bool { startPath != nil && master?.isRunning == true }
-    public var unsyncedLiveCount: Int { lives.values.filter(\.dirty).count }
+    public var unsyncedLiveCount: Int { get async { await live.unsyncedCount(on: connection.id) } }
 
     // MARK: Login
 
@@ -108,18 +111,12 @@ public actor SSHConnection: RemoteSession {
         }
         startPath = resolved
         await removeRecordedRemoteTemps()
-        loadLives()
+        await live.connected(connection.id, server: self)
         return resolved
     }
 
     public func disconnect() async {
-        for task in settling.values { task.cancel() }
-        settling.removeAll()
-        for watcher in watchers.values { watcher.cancel() }
-        watchers.removeAll()
-        for watcher in fileWatchers.values { watcher.cancel() }
-        fileWatchers.removeAll()
-        lives.removeAll()
+        if ownsLive { await live.closeAll() } else { await live.disconnected(connection.id, server: self) }
         for link in [browse, interactive, walker].compactMap({ $0 }) + pool {
             await link.closeLink()
         }
@@ -190,32 +187,19 @@ public actor SSHConnection: RemoteSession {
     }
 
     public func rename(_ source: RemotePath, to destination: RemotePath) async throws {
-        try await metadataLink().rename(source, to: destination)
-        for (id, var record) in lives {
-            guard let moved = record.path.replacing(prefix: source, with: destination) else { continue }
-            record.path = moved
-            let newLocal = record.local.deletingLastPathComponent().appendingPathComponent(String(decoding: moved.nameBytes, as: UTF8.self))
-            if newLocal != record.local, (try? FileManager.default.moveItem(at: record.local, to: newLocal)) != nil {
-                record.local = newLocal
-            }
-            lives[id] = record
-            persist(record)
-            rearmFileWatch(record)
+        try await live.rename(source, to: destination, on: connection.id) {
+            try await self.metadataLink().rename(source, to: destination)
         }
-        pipe.emit(.liveChanged)
         if let parent = source.parent { pipe.emit(.directoryChanged(parent)) }
         if let parent = destination.parent, parent != source.parent { pipe.emit(.directoryChanged(parent)) }
     }
 
     public func remove(_ path: RemotePath) async throws {
-        let link: SFTPLink
-        if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
-        try await removeTree(path, link: link)
-        for (id, record) in lives where record.path.replacing(prefix: path, with: path) != nil {
-            forget(id)
-            try? FileManager.default.removeItem(at: record.local.deletingLastPathComponent())
+        try await live.remove(path, on: connection.id) {
+            let link: SFTPLink
+            if let walker = await self.liveLink(.walker) { link = walker } else { link = try await self.metadataLink() }
+            try await self.removeTree(path, link: link)
         }
-        pipe.emit(.liveChanged)
         if let parent = path.parent { pipe.emit(.directoryChanged(parent)) }
     }
 
@@ -265,10 +249,10 @@ public actor SSHConnection: RemoteSession {
             if let mode = info.mode { attributes[.posixPermissions] = Int(mode & 0o7777) }
             if let mtime = info.mtime { attributes[.modificationDate] = Date(timeIntervalSince1970: TimeInterval(mtime)) }
             if !attributes.isEmpty { try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path) }
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
+            // One rename replaces the destination, so a watched Live copy is never briefly missing.
+            guard Darwin.rename(temp.path, destination.path) == 0 else {
+                throw TransferError.failed("Could not place \(destination.lastPathComponent): \(String(cString: strerror(errno)))")
             }
-            try FileManager.default.moveItem(at: temp, to: destination)
             store.forgetTemp(temp.path)
         } catch {
             try? FileManager.default.removeItem(at: temp)
@@ -280,8 +264,11 @@ public actor SSHConnection: RemoteSession {
     public func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         if values.isSymbolicLink == true {
-            let target = try FileManager.default.destinationOfSymbolicLink(atPath: source.path)
-            try await metadataLink().symlink(target: target, link: destination)
+            // A link already at the destination is left alone, as a copy on the server does.
+            if (try? await stat(destination)) == nil {
+                let target = try FileManager.default.destinationOfSymbolicLink(atPath: source.path)
+                try await metadataLink().symlink(target: target, link: destination)
+            }
             if let parent = destination.parent { pipe.emit(.directoryChanged(parent)) }
             return
         }
@@ -294,8 +281,20 @@ public actor SSHConnection: RemoteSession {
         if let parent = placed.parent { pipe.emit(.directoryChanged(parent)) }
     }
 
-    /// Temp-and-rename onto the server. No collision check.
-    private func uploadBytes(_ source: URL, to placed: RemotePath, interactive: Bool, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    /// Temp-and-rename onto the server. No collision check. A Live save passes `expecting`, what
+    /// the destination must still be just before the rename; anything else throws
+    /// `LiveRemoteChanged` and the temp is removed, so another person's edit is never overwritten.
+    /// With `measure`, returns the temp's fingerprint, which the rename carries onto the
+    /// destination: read from our own temp, it cannot pick up someone else's later edit.
+    @discardableResult
+    private func uploadBytes(
+        _ source: URL,
+        to placed: RemotePath,
+        interactive: Bool,
+        expecting: ServerExpectation? = nil,
+        measure: Bool = false,
+        progress: @escaping @Sendable (TransferProgress) -> Void
+    ) async throws -> Fingerprint? {
         let base = String(decoding: placed.nameBytes, as: UTF8.self)
         let parent = placed.parent ?? RemotePath(string: "/")
         let temp = parent.appending(name: Array(CopyRules.tempName(for: base, transferID: UUID().uuidString).utf8))
@@ -311,15 +310,37 @@ public actor SSHConnection: RemoteSession {
             let mtime = (attributes?[.modificationDate] as? Date).map { UInt32($0.timeIntervalSince1970) }
             let link = try await metadataLink()
             try? await link.setstat(temp, mode: mode, mtime: mtime)
-            if !(await link.posixRename(temp, to: placed)) {
-                try? await link.removeFile(placed)
-                try await link.plainRename(temp, to: placed)
+            var written: Fingerprint?
+            if measure || expecting != nil { written = Fingerprint(item: try await link.lstat(temp)) }
+            if let expecting {
+                let found = try await existing(placed, on: link)
+                let now = found.flatMap(Fingerprint.init(item:))
+                // "Absent" means nothing at all there: a folder or a link is not absent.
+                let matches = switch expecting {
+                case .file(let print): now == print
+                case .absent: found == nil
+                }
+                // A save that runs again after it already landed finds its own bytes there.
+                if !matches, now == nil || now != written { throw LiveRemoteChanged() }
             }
+            try await link.replace(temp, onto: placed)
             store.forgetTemp(temp.display)
+            return written
         } catch {
             try? await metadataLink().removeFile(temp)
             store.forgetTemp(temp.display)
             throw error
+        }
+    }
+
+    /// The item at `path`, or nil when there is none. Any other failure, such as a dropped
+    /// connection, is thrown: it is not evidence that the file was removed.
+    private func existing(_ path: RemotePath, on link: SFTPLink? = nil) async throws -> RemoteItem? {
+        do {
+            if let link { return try await link.lstat(path) }
+            return try await stat(path)
+        } catch TransferError.noSuchFile {
+            return nil
         }
     }
 
@@ -397,8 +418,10 @@ public actor SSHConnection: RemoteSession {
             let values = try child.resourceValues(forKeys: keys)
             let destination = remote.appending(name: Array(child.lastPathComponent.utf8))
             if values.isSymbolicLink == true {
-                let target = try FileManager.default.destinationOfSymbolicLink(atPath: child.path)
-                try await metadataLink().symlink(target: target, link: destination)
+                if (try? await stat(destination)) == nil {
+                    let target = try FileManager.default.destinationOfSymbolicLink(atPath: child.path)
+                    try await metadataLink().symlink(target: target, link: destination)
+                }
                 tally.finished(bytes: 0)
             } else if values.isDirectory == true {
                 try await walkUpload(child, to: destination, group: &group, tally: tally)
@@ -416,6 +439,126 @@ public actor SSHConnection: RemoteSession {
         }
     }
 
+    // MARK: Copy on the server
+
+    public func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+        if let refusal = PasteRules.refusal(sources: [source], into: destination) { throw TransferError.failed(refusal) }
+        let item = try await stat(source)
+        let tally = ProgressTally(progress)
+        switch item.kind {
+        case .directory:
+            let link: SFTPLink
+            if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                try await walkCopy(source, to: destination, link: link, group: &group, tally: tally)
+                try await group.waitForAll()
+            }
+        case .symlink:
+            try await copyLink(source, to: destination, link: try await metadataLink())
+            tally.finished(bytes: 0)
+        case .file:
+            try await copyFile(item, to: destination)
+            tally.finished(bytes: item.size ?? 0)
+        case .other:
+            return
+        }
+        if let parent = destination.parent { pipe.emit(.directoryChanged(parent)) }
+    }
+
+    private func walkCopy(
+        _ source: RemotePath,
+        to destination: RemotePath,
+        link: SFTPLink,
+        group: inout ThrowingTaskGroup<Void, Error>,
+        tally: ProgressTally
+    ) async throws {
+        do {
+            try await metadataLink().mkdir(destination)
+        } catch {
+            let existing = try? await stat(destination)
+            if existing?.kind != .directory {
+                if existing != nil { throw TransferError.typeMismatch(destination.display) }
+                throw error
+            }
+        }
+        for try await child in await link.list(source) {
+            try Task.checkCancellation()
+            let target = destination.appending(name: child.path.nameBytes)
+            switch child.kind {
+            case .directory:
+                try await walkCopy(child.path, to: target, link: link, group: &group, tally: tally)
+            case .symlink:
+                try await copyLink(child.path, to: target, link: link)
+                tally.finished(bytes: 0)
+            case .file:
+                group.addTask {
+                    try await self.copyFile(child, to: target)
+                    tally.finished(bytes: child.size ?? 0)
+                }
+            case .other:
+                continue
+            }
+        }
+    }
+
+    /// A link is copied as a link. One already at the destination is left alone.
+    private func copyLink(_ source: RemotePath, to destination: RemotePath, link: SFTPLink) async throws {
+        if (try? await stat(destination)) != nil { return }
+        let target = try await link.readlink(source)
+        try await metadataLink().symlink(target: target, link: destination)
+    }
+
+    /// Temp-and-rename on the server, keeping the source's mode and time so a later copy of the
+    /// same file is skipped. `copy-data` when the server has it; else down to the Mac and back.
+    private func copyFile(_ item: RemoteItem, to proposed: RemotePath) async throws {
+        guard let placed = try await resolvedDestination(size: item.size ?? 0, mtime: item.mtime ?? 0, proposed: proposed) else { return }
+        let parent = placed.parent ?? RemotePath(string: "/")
+        let temp = parent.appending(name: Array(CopyRules.tempName(for: placed.name, transferID: UUID().uuidString).utf8))
+        store.rememberTemp(temp.display, connection: connection.id)
+        do {
+            let onServer = try await withData { link in
+                guard await link.extensions.contains("copy-data") else { return false }
+                try await link.copyData(item.path, to: temp)
+                return true
+            }
+            if !onServer {
+                let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: scratch) }
+                try await fetch(item.path, info: item, to: scratch) { _ in }
+                try await withData { link in try await link.upload(scratch, to: temp) { _ in } }
+            }
+            let link = try await metadataLink()
+            try? await link.setstat(temp, mode: item.mode.map { $0 & 0o7777 }, mtime: item.mtime)
+            try await link.replace(temp, onto: placed)
+            store.forgetTemp(temp.display)
+        } catch {
+            try? await metadataLink().removeFile(temp)
+            store.forgetTemp(temp.display)
+            throw error
+        }
+    }
+
+    public func walkTree(_ root: RemotePath, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {
+        let link: SFTPLink
+        if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
+        let item = try await link.lstat(root)
+        visit("", TreeEntry(item))
+        guard item.kind == .directory else { return }
+        try await walk(root, prefix: "", link: link, visit: visit)
+    }
+
+    private func walk(_ folder: RemotePath, prefix: String, link: SFTPLink, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {
+        for try await child in await link.list(folder) {
+            try Task.checkCancellation()
+            guard child.kind != .other else { continue }
+            let key = prefix + child.name
+            visit(key, TreeEntry(child))
+            if child.kind == .directory {
+                try await walk(child.path, prefix: key + "/", link: link, visit: visit)
+            }
+        }
+    }
+
     // MARK: Open, view, preview
 
     public func openKind(fileName: String) async -> OpenKind {
@@ -423,33 +566,7 @@ public actor SSHConnection: RemoteSession {
     }
 
     public func prepareLiveFile(_ path: RemotePath) async throws -> URL {
-        let item = try await stat(path)
-        guard item.kind == .file else { throw TransferError.typeMismatch(path.display) }
-        if let existing = lives.values.first(where: { $0.path == path }) {
-            if FileManager.default.fileExists(atPath: existing.local.path) {
-                if !existing.dirty, let base = existing.base, Fingerprint(item: item) != base {
-                    try await refreshLive(existing.id, from: item)
-                }
-                return existing.local
-            }
-            lives[existing.id] = nil
-            store.deleteLive(existing.id)
-        }
-        let id = LiveFileID()
-        let folder = store.root.appendingPathComponent("Live/\(connection.id.rawValue.uuidString)/\(id.rawValue.uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
-        let file = folder.appendingPathComponent(item.name)
-        try await lane.submit(.preview) {
-            try await self.fetch(path, info: item, to: file) { _ in }
-        }
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-        let record = LiveRecord(id: id, path: path, local: file, base: Fingerprint(item: item))
-        lives[id] = record
-        persist(record)
-        watch(record)
-        pipe.emit(.liveChanged)
-        return file
+        try await live.open(path, on: connection.id)
     }
 
     public func prepareViewFile(_ path: RemotePath) async throws -> URL {
@@ -529,297 +646,19 @@ public actor SSHConnection: RemoteSession {
     // MARK: Live
 
     public func liveFiles() async -> [LiveFile] {
-        lives.values.map {
-            LiveFile(id: $0.id, path: $0.path, dirty: $0.dirty, paused: $0.paused, conflict: $0.conflict, uploading: $0.uploading)
-        }
-        .sorted { $0.path.display < $1.path.display }
+        await live.files(on: connection.id)
     }
 
     public func discardLiveFile(_ path: RemotePath, force: Bool) async throws {
-        guard let record = lives.values.first(where: { $0.path == path }) else { return }
-        if record.uploading { throw TransferError.failed("An upload of \(record.name) is in flight") }
-        if !force, record.dirty { throw TransferError.liveUnsynced(1) }
-        forget(record.id)
-        try? FileManager.default.removeItem(at: record.local.deletingLastPathComponent())
-        pipe.emit(.liveChanged)
+        try await live.discard(path, on: connection.id, force: force)
     }
 
     public func setLivePaused(_ path: RemotePath, paused: Bool) async {
-        guard var record = lives.values.first(where: { $0.path == path }) else { return }
-        record.paused = paused
-        lives[record.id] = record
-        if paused {
-            settling[record.id]?.cancel()
-            settling[record.id] = nil
-            emitLive(record, state: .paused)
-        } else if record.dirty {
-            await syncLive(record.id)
-        }
-        pipe.emit(.liveChanged)
+        await live.setPaused(path, on: connection.id, paused: paused)
     }
 
     public func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws {
-        guard var record = lives.values.first(where: { $0.path == path }) else { throw TransferError.noSuchFile(path.display) }
-        let server = record.local.deletingLastPathComponent().appendingPathComponent("\(record.name) (server)")
-        switch choice {
-        case .compare:
-            if !FileManager.default.fileExists(atPath: server.path) {
-                let item = try await stat(path)
-                try await fetch(path, info: item, to: server) { _ in }
-            }
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/opendiff")
-            process.arguments = [record.local.path, server.path]
-            try process.run()
-            return
-        case .keepLocal:
-            let snapshot = try coordinatedSnapshot(of: record.local)
-            defer { try? FileManager.default.removeItem(at: snapshot) }
-            try await uploadBytes(snapshot, to: path, interactive: true) { _ in }
-        case .keepRemote:
-            let item = try await stat(path)
-            try await fetch(path, info: item, to: record.local) { _ in }
-        case .keepBoth:
-            let sibling = (path.parent ?? RemotePath(string: "/")).appending(name: Array("\(record.name) (from this Mac)".utf8))
-            let snapshot = try coordinatedSnapshot(of: record.local)
-            defer { try? FileManager.default.removeItem(at: snapshot) }
-            try await uploadBytes(snapshot, to: sibling, interactive: true) { _ in }
-            let item = try await stat(path)
-            try await fetch(path, info: item, to: record.local) { _ in }
-        }
-        try? FileManager.default.removeItem(at: server)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: record.local.path)
-        record.base = Fingerprint(item: try await stat(path))
-        record.dirty = false
-        record.conflict = false
-        lives[record.id] = record
-        persist(record)
-        emitLive(record, state: .succeeded)
-        pipe.emit(.liveChanged)
-        if let parent = path.parent { pipe.emit(.directoryChanged(parent)) }
-    }
-
-    /// A synced mapping untouched for this long is forgotten at login; the next open downloads afresh.
-    private static let liveExpiry: TimeInterval = 24 * 60 * 60
-
-    private func loadLives() {
-        for row in store.liveFiles(connection: connection.id) {
-            let local = URL(fileURLWithPath: row.localPath)
-            guard FileManager.default.fileExists(atPath: local.path) else {
-                if row.dirty { pipe.emit(.notice("The Live copy of \(row.path.display) is gone; its edits were not uploaded")) }
-                store.deleteLive(row.id)
-                continue
-            }
-            if !row.dirty, let stamp = Self.stamp(local),
-               Date().timeIntervalSince1970 - TimeInterval(stamp.mtime) > Self.liveExpiry {
-                store.deleteLive(row.id)
-                try? FileManager.default.removeItem(at: local.deletingLastPathComponent())
-                continue
-            }
-            var base: Fingerprint?
-            if let size = row.baseSize, let mtime = row.baseMtime { base = Fingerprint(kind: .file, size: size, mtime: mtime) }
-            var record = LiveRecord(id: row.id, path: row.path, local: local, base: base)
-            record.dirty = row.dirty || !Self.localMatchesBase(local, base: base)
-            lives[row.id] = record
-            watch(record)
-            if record.dirty {
-                persist(record)
-                let id = row.id
-                Task { await self.syncLive(id) }
-            }
-        }
-        pipe.emit(.liveChanged)
-    }
-
-    private func refreshLive(_ id: LiveFileID, from item: RemoteItem) async throws {
-        guard var record = lives[id] else { return }
-        try await fetch(record.path, info: item, to: record.local) { _ in }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: record.local.path)
-        record.base = Fingerprint(item: item)
-        lives[id] = record
-        persist(record)
-    }
-
-    /// Watches the workspace folder, which sees safe-saves, and the file itself, which sees writes in place.
-    private func watch(_ record: LiveRecord) {
-        if let source = Self.watchSource(record.local.deletingLastPathComponent(), id: record.id, owner: self) {
-            watchers[record.id] = source
-        }
-        rearmFileWatch(record)
-    }
-
-    private func rearmFileWatch(_ record: LiveRecord) {
-        fileWatchers[record.id]?.cancel()
-        fileWatchers[record.id] = Self.watchSource(record.local, id: record.id, owner: self)
-    }
-
-    private static func watchSource(_ url: URL, id: LiveFileID, owner: SSHConnection) -> DispatchSourceFileSystemObject? {
-        let descriptor = open(url.path, O_EVTONLY)
-        guard descriptor >= 0 else { return nil }
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: descriptor,
-            eventMask: [.write, .extend, .rename, .delete, .attrib],
-            queue: .global()
-        )
-        source.setEventHandler { [weak owner] in
-            Task { await owner?.liveChanged(id) }
-        }
-        source.setCancelHandler { close(descriptor) }
-        source.resume()
-        return source
-    }
-
-    /// Waits until size and mtime have stopped changing for 400 ms, then syncs.
-    private func liveChanged(_ id: LiveFileID) {
-        guard let record = lives[id], !record.uploading else { return }
-        rearmFileWatch(record)
-        settling[id]?.cancel()
-        settling[id] = Task { [weak self] in
-            var last = Self.stamp(record.local)
-            while true {
-                try? await Task.sleep(nanoseconds: 400_000_000)
-                if Task.isCancelled { return }
-                let now = Self.stamp(record.local)
-                if now == last { break }
-                last = now
-            }
-            await self?.syncLive(id)
-        }
-    }
-
-    private func syncLive(_ id: LiveFileID) async {
-        guard var record = lives[id], !record.uploading else { return }
-        guard FileManager.default.fileExists(atPath: record.local.path) else {
-            if record.dirty {
-                emitLive(record, state: .failed, message: "The working copy disappeared before its edits were uploaded")
-            } else {
-                forget(id)
-                pipe.emit(.liveChanged)
-            }
-            return
-        }
-        if Self.localMatchesBase(record.local, base: record.base) {
-            if record.dirty {
-                record.dirty = false
-                lives[id] = record
-                persist(record)
-                pipe.emit(.liveChanged)
-            }
-            return
-        }
-        record.dirty = true
-        lives[id] = record
-        persist(record)
-        pipe.emit(.liveChanged)
-        guard !record.paused, !record.conflict else { return }
-        let remote = try? await stat(record.path)
-        if remote == nil || Fingerprint(item: remote!) != record.base {
-            record.conflict = true
-            lives[id] = record
-            let server = record.local.deletingLastPathComponent().appendingPathComponent("\(record.name) (server)")
-            var comparable = false
-            if let remote {
-                try? await fetch(record.path, info: remote, to: server) { _ in }
-                comparable = FileManager.default.isExecutableFile(atPath: "/usr/bin/opendiff")
-                    && Self.isUTF8(record.local) && Self.isUTF8(server)
-            }
-            emitLive(record, state: .failed, message: "Changed on the server")
-            pipe.emit(.conflict(record.path, comparable: comparable))
-            pipe.emit(.liveChanged)
-            return
-        }
-        record.uploading = true
-        lives[id] = record
-        var attempt = 0
-        while true {
-            do {
-                let snapshot = try coordinatedSnapshot(of: record.local)
-                defer { try? FileManager.default.removeItem(at: snapshot) }
-                let operation = record
-                let events = pipe
-                try await lane.submit(.save) {
-                    try await self.uploadBytes(snapshot, to: operation.path, interactive: true) { progress in
-                        events.emit(.operation(TransferOperation(id: operation.id.rawValue.uuidString, title: operation.name, state: .active, progress: progress, livePath: operation.path)))
-                    }
-                }
-                break
-            } catch {
-                if RetryPolicy.isRetryable(error), let delay = RetryPolicy.delay(afterAttempt: attempt) {
-                    attempt += 1
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    continue
-                }
-                record.uploading = false
-                lives[id] = record
-                emitLive(record, state: .failed, message: error.localizedDescription)
-                return
-            }
-        }
-        guard var finished = lives[id] else { return }
-        finished.uploading = false
-        if let updated = try? await stat(finished.path) {
-            finished.base = Fingerprint(item: updated)
-        }
-        finished.dirty = !Self.localMatchesBase(finished.local, base: finished.base)
-        lives[id] = finished
-        persist(finished)
-        emitLive(finished, state: .succeeded)
-        pipe.emit(.liveChanged)
-        if let parent = finished.path.parent { pipe.emit(.directoryChanged(parent)) }
-        if finished.dirty { await syncLive(id) }
-    }
-
-    private func emitLive(_ record: LiveRecord, state: OperationState, message: String? = nil) {
-        pipe.emit(.operation(TransferOperation(
-            id: record.id.rawValue.uuidString,
-            title: record.name,
-            state: state,
-            message: message,
-            livePath: record.path
-        )))
-    }
-
-    private func forget(_ id: LiveFileID) {
-        watchers[id]?.cancel()
-        watchers[id] = nil
-        fileWatchers[id]?.cancel()
-        fileWatchers[id] = nil
-        settling[id]?.cancel()
-        settling[id] = nil
-        lives[id] = nil
-        store.deleteLive(id)
-    }
-
-    private func persist(_ record: LiveRecord) {
-        store.saveLive(LiveRow(
-            id: record.id,
-            connection: connection.id,
-            path: record.path,
-            baseSize: record.base?.size,
-            baseMtime: record.base?.mtime,
-            localPath: record.local.path,
-            dirty: record.dirty
-        ))
-    }
-
-    /// A copy of the working file taken under an `NSFileCoordinator` read, with the same mtime.
-    private func coordinatedSnapshot(of file: URL) throws -> URL {
-        let snapshot = FileManager.default.temporaryDirectory.appendingPathComponent("live-\(UUID().uuidString)")
-        var coordinatorError: NSError?
-        var copyError: Error?
-        NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: file, options: [], error: &coordinatorError) { url in
-            do {
-                try FileManager.default.copyItem(at: url, to: snapshot)
-                if let date = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date {
-                    try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: snapshot.path)
-                }
-            } catch {
-                copyError = error
-            }
-        }
-        if let coordinatorError { throw TransferError.failed(coordinatorError.localizedDescription) }
-        if let copyError { throw TransferError.failed(copyError.localizedDescription) }
-        return snapshot
+        try await live.resolve(path, on: connection.id, choice: choice)
     }
 
     private struct LocalStamp: Equatable {
@@ -833,16 +672,6 @@ public actor SSHConnection: RemoteSession {
               let size = (attributes[.size] as? NSNumber)?.uint64Value,
               let date = attributes[.modificationDate] as? Date else { return nil }
         return LocalStamp(size: size, mtime: UInt32(date.timeIntervalSince1970))
-    }
-
-    private static func localMatchesBase(_ url: URL, base: Fingerprint?) -> Bool {
-        guard let base, let local = stamp(url) else { return false }
-        return local.size == base.size && local.mtime == base.mtime
-    }
-
-    private static func isUTF8(_ url: URL) -> Bool {
-        guard let data = try? Data(contentsOf: url) else { return false }
-        return String(data: data, encoding: .utf8) != nil
     }
 
     // MARK: Sidebar data
@@ -896,7 +725,13 @@ public actor SSHConnection: RemoteSession {
 
     private func resolvedUploadDestination(_ source: URL, proposed: RemotePath) async throws -> RemotePath? {
         let local = Self.stamp(source)
-        let sourceItem = RemoteItem(path: proposed, kind: .file, size: local?.size ?? 0, mtime: local?.mtime ?? 0)
+        return try await resolvedDestination(size: local?.size ?? 0, mtime: local?.mtime ?? 0, proposed: proposed)
+    }
+
+    /// Where a file of this size and time lands at `proposed`: nil to skip it, else the path to
+    /// write, after asking the user when a different file already has the name.
+    private func resolvedDestination(size: UInt64, mtime: UInt32, proposed: RemotePath) async throws -> RemotePath? {
+        let sourceItem = RemoteItem(path: proposed, kind: .file, size: size, mtime: mtime)
         let existing = try? await stat(proposed)
         switch CopyRules.fileDisposition(source: sourceItem, destination: existing, transferID: "place", liveSave: false) {
         case .skip:
@@ -1099,6 +934,9 @@ public actor SSHConnection: RemoteSession {
             "-N",
             "-o", "ControlMaster=yes",
             "-o", "Compression=no",
+            // A dead network is noticed in about 45 s instead of hanging every request on it.
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
             "-S", socketPath,
             "-o", "StrictHostKeyChecking=yes",
         ]
@@ -1309,17 +1147,45 @@ private final class TimeoutFlag: @unchecked Sendable {
     var fired = false
 }
 
-private struct LiveRecord {
-    var id: LiveFileID
-    var path: RemotePath
-    var local: URL
-    var base: Fingerprint?
-    var dirty = false
-    var paused = false
-    var conflict = false
-    var uploading = false
+extension SSHConnection: LiveServer {
+    func liveLookup(_ path: RemotePath) async throws -> RemoteItem? {
+        try await existing(path)
+    }
 
-    var name: String { String(decoding: path.nameBytes, as: UTF8.self) }
+    func liveFetch(_ item: RemoteItem, to local: URL, interactive: Bool) async throws {
+        if interactive {
+            try await lane.submit(.preview) { try await self.fetch(item.path, info: item, to: local) { _ in } }
+        } else {
+            try await fetch(item.path, info: item, to: local) { _ in }
+        }
+    }
+
+    func liveSave(_ snapshot: URL, to path: RemotePath, expecting: ServerExpectation, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> Fingerprint {
+        let written = WrittenBox()
+        try await lane.submit(.save) {
+            written.value = try await self.uploadBytes(snapshot, to: path, interactive: true, expecting: expecting, measure: true, progress: progress)
+        }
+        guard let print = written.value else { throw TransferError.failed("The server did not report the saved file") }
+        return print
+    }
+
+    func liveNames(in folder: RemotePath) async throws -> Set<String> {
+        try await listedNames(folder)
+    }
+
+    nonisolated func liveEmit(_ event: SessionEvent) {
+        pipe.emit(event)
+    }
+}
+
+/// Carries a save's fingerprint out of the interactive lane's closure.
+private final class WrittenBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Fingerprint?
+    var value: Fingerprint? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
 }
 
 /// Byte and item counts for one directory copy, safe to bump from any task.

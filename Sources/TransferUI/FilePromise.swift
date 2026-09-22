@@ -191,9 +191,15 @@ final class IconItemView: NSView, NSDraggingSource {
         }
     }
 
+    /// A clicked cell holds the focus, as a table row does, so the Edit menu reaches the window
+    /// through the responder chain; nothing else in the grid would take it.
+    override var acceptsFirstResponder: Bool { true }
+
     override func mouseDown(with event: NSEvent) {
         down = event.locationInWindow
         guard let model else { return }
+        model.itemClickTime = event.timestamp
+        window?.makeFirstResponder(self)
         if event.modifierFlags.contains(.command) {
             if model.snapshot.selection.contains(item.path) {
                 model.snapshot.selection.remove(item.path)
@@ -207,6 +213,15 @@ final class IconItemView: NSView, NSDraggingSource {
             let item = item
             Task { await model.open(item) }
         }
+    }
+
+    /// Space opens Quick Look, as the grid itself does.
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
+            model?.togglePreview()
+            return
+        }
+        super.keyDown(with: event)
     }
 
     override func mouseDragged(with event: NSEvent) {

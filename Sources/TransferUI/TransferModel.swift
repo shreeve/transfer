@@ -52,6 +52,10 @@ public final class TransferModel {
     public var conflictConfirm: LiveConflictChoice?
     public var filter = ""
     public var filterFocusTick = 0
+    /// When an icon cell last took a mouse down, in system uptime, so the grid's background tap
+    /// that follows the same click does not clear the selection the cell just made. A time rather
+    /// than a flag: a click that becomes a drag is never followed by a tap.
+    @ObservationIgnored public var itemClickTime: TimeInterval = 0
     /// True while a text field in the window has focus, so Space and Return stay with the field.
     public var textEditing = false
     public var folderText = ""
@@ -736,7 +740,7 @@ public final class TransferModel {
         await refresh()
     }
 
-    private func enqueue(title: String, path: RemotePath, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
+    func enqueue(title: String, path: RemotePath, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
         let id = UUID().uuidString
         operations.append(TransferOperation(id: id, title: title, state: .queued, path: path))
         runners[id] = Runner(body: body, task: nil)
@@ -951,6 +955,10 @@ public final class TransferModel {
         } catch {
             status = error.localizedDescription
         }
+    }
+
+    public func resumeLive(_ path: RemotePath) async {
+        await session?.setLivePaused(path, paused: false)
     }
 
     /// Drops every mapping whose working copy matches the server. Nothing is lost: the remote
