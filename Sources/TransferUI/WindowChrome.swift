@@ -38,13 +38,11 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         return container
     }
 
+    /// The hosted columns observe the model on their own, so they are never re-hosted here;
+    /// only the chrome's own state is applied.
     func updateNSView(_ container: ChromeContainer, context: Context) {
-        let controller = container.controller
         context.coordinator.model = model
-        controller.sidebarHost?.rootView = AnyView(sidebar)
-        controller.detailHost?.rootView = AnyView(detail)
-        controller.inspectorHost?.rootView = AnyView(inspector)
-        apply(to: controller, context: context)
+        apply(to: container.controller, context: context)
     }
 
     /// The chrome fills whatever the window offers.

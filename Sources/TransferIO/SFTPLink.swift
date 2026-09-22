@@ -75,24 +75,32 @@ actor SFTPLink {
         return try item(path: path, message: message)
     }
 
+    /// Keeps several READDIR requests in flight. OpenSSH answers each with about a hundred names,
+    /// so a large folder no longer pays one round trip per page.
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     let handle = try await openDirectory(path)
                     do {
-                    while true {
-                        do {
-                            let page = try await readDirectory(handle, parent: path)
-                            if page.isEmpty { break }
+                        var inFlight: [Task<[RemoteItem]?, Error>] = []
+                        var finished = false
+                        while !finished || !inFlight.isEmpty {
+                            while !finished, inFlight.count < 4 {
+                                inFlight.append(Task { try await self.readDirectoryPage(handle, parent: path) })
+                            }
+                            let next = inFlight.removeFirst()
+                            guard let page = try await next.value else {
+                                finished = true
+                                continue
+                            }
+                            if page.isEmpty { finished = true }
                             for item in page where !item.isDotEntry {
                                 continuation.yield(item)
                             }
-                        } catch TransferError.failed(let text) where text == "EOF" {
-                            break
+                            try Task.checkCancellation()
                         }
-                    }
-                    try? await self.close(handle)
+                        try? await self.close(handle)
                     } catch {
                         try? await self.close(handle)
                         throw error
@@ -103,6 +111,15 @@ actor SFTPLink {
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// One page, or nil at the end of the directory.
+    private func readDirectoryPage(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem]? {
+        do {
+            return try await readDirectory(handle, parent: parent)
+        } catch TransferError.failed(let text) where text == "EOF" {
+            return nil
         }
     }
 

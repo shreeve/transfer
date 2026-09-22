@@ -259,14 +259,21 @@ public final class TransferModel {
         if path == snapshot.path { items = visible(sorted) }
     }
 
-    /// Lists one folder for the column view without navigating.
+    /// Lists one folder for the column view without navigating. Pages show as they arrive.
     public func loadColumn(_ path: RemotePath) {
         guard let session, columns[path] == nil else { return }
         columns[path] = []
         Task { [weak self] in
             var page: [RemoteItem] = []
+            var lastFlush = ContinuousClock.now
             do {
-                for try await item in session.list(path) { page.append(item) }
+                for try await item in session.list(path) {
+                    page.append(item)
+                    if lastFlush.duration(to: .now) > .milliseconds(80) {
+                        self?.publish(page, for: path)
+                        lastFlush = .now
+                    }
+                }
             } catch {
                 self?.status = error.localizedDescription
             }

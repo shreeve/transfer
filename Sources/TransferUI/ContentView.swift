@@ -19,9 +19,9 @@ public struct ContentView: View {
             sidebarCollapsed: model.sidebarCollapsed,
             inspectorShown: model.showsInspector,
             searchTick: model.filterFocusTick,
-            sidebar: sidebar,
-            detail: detail,
-            inspector: inspector
+            sidebar: SidebarColumn(model: model),
+            detail: DetailColumn(model: model),
+            inspector: InspectorColumn(model: model)
         )
         .ignoresSafeArea()
         .focusedSceneValue(\.transferModel, model)
@@ -29,20 +29,15 @@ public struct ContentView: View {
         .onChange(of: model.sidebarSelection) { _, item in Task { await model.sidebarSelected(item) } }
         .frame(minWidth: 640, idealWidth: 960, minHeight: 400, idealHeight: 640)
     }
+}
 
-    private var detail: some View {
-        VStack(spacing: 0) {
-            if model.renaming { renameBar }
-            browser
-            if model.showsShelf { shelf }
-        }
-        .sheet(item: $model.sheet) { sheet in sheetView(sheet) }
-        .scrollEdgeEffectHidden(true, for: .top)
-    }
+/// The sidebar column. It observes the model itself, so the chrome never re-hosts it.
+struct SidebarColumn: View {
+    @Bindable var model: TransferModel
 
     // MARK: Sidebar
 
-    private var sidebar: some View {
+    var body: some View {
         List(selection: $model.sidebarSelection) {
             Section("Servers") {
                 ForEach(model.connections) { connection in
@@ -119,6 +114,21 @@ public struct ContentView: View {
         if live.uploading { return "arrow.up.circle" }
         if live.paused { return "pause.circle" }
         return live.dirty ? "circle.fill" : "circle"
+    }
+}
+
+/// The content column: browser, rename bar, shelf, and every sheet.
+struct DetailColumn: View {
+    @Bindable var model: TransferModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if model.renaming { renameBar }
+            browser
+            if model.showsShelf { shelf }
+        }
+        .sheet(item: $model.sheet) { sheet in sheetView(sheet) }
+        .scrollEdgeEffectHidden(true, for: .top)
     }
 
     // MARK: Browser
@@ -276,56 +286,9 @@ public struct ContentView: View {
 
     private func progressText(_ progress: TransferProgress) -> String {
         var parts: [String] = []
-        if progress.completed > 0 { parts.append(byteCount(progress.completed)) }
+        if progress.completed > 0 { parts.append(Format.bytes(progress.completed)) }
         if progress.itemsCompleted > 0 { parts.append("\(progress.itemsCompleted) items") }
         return parts.joined(separator: ", ")
-    }
-
-    // MARK: Inspector
-
-    private var inspector: some View {
-        let selected = model.selectedItems
-        return Form {
-            if selected.count > 1 {
-                Text("\(selected.count) items selected").foregroundStyle(.secondary)
-            } else if let item = selected.first {
-                HStack {
-                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 32, height: 32)
-                    Text(item.name).font(.headline)
-                }
-                LabeledContent("Path", value: item.path.display)
-                LabeledContent("Kind", value: item.kindLabel)
-                if item.kind == .file { LabeledContent("Size", value: byteCount(item.size)) }
-                LabeledContent("Modified", value: item.mtime.map { date($0) } ?? "")
-                if let mode = item.mode { LabeledContent("Permissions", value: permissions(mode)) }
-                if let owner = item.owner { LabeledContent("Owner", value: owner) }
-                if let group = item.group { LabeledContent("Group", value: group) }
-                if item.kind == .symlink { LabeledContent("Target", value: model.inspectorLinkTarget ?? "…") }
-                if model.liveFile(for: item.path) != nil { LabeledContent("Live", value: status(item)) }
-                if let operation = model.operations.first(where: { $0.livePath == item.path || $0.title.hasSuffix(item.name) }) {
-                    LabeledContent("Transfer", value: operation.message ?? operation.state.rawValue.capitalized)
-                }
-                Section {
-                    Button("Open") { Task { await model.open(item) } }
-                    Button("Open Live") { Task { await model.openLiveSelection() } }
-                        .disabled(item.kind != .file)
-                    Button("Download Copy…") { Task { await model.downloadCopy() } }
-                    Button("Copy Remote URL") { model.copyRemoteURL() }
-                }
-            } else {
-                LabeledContent("Folder", value: model.snapshot.path.display)
-                LabeledContent("Items", value: "\(model.items.count)")
-                Button("Copy Remote URL") { model.copyRemoteURL() }
-            }
-        }
-        .formStyle(.grouped)
-        .scrollEdgeEffectHidden(true, for: .top)
-    }
-
-    private func permissions(_ mode: UInt32) -> String {
-        let bits = mode & 0o777
-        let letters = ["---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"]
-        return letters[Int(bits >> 6 & 7)] + letters[Int(bits >> 3 & 7)] + letters[Int(bits & 7)]
     }
 
     // MARK: Sheets
@@ -518,15 +481,65 @@ public struct ContentView: View {
         Task { await model.goToFolder(text) }
     }
 
-    private func byteCount(_ size: UInt64?) -> String {
-        guard let size else { return "" }
-        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-    }
 
     private func date(_ mtime: UInt32) -> String {
         Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .abbreviated, time: .shortened)
     }
 }
+
+/// The inspector column.
+struct InspectorColumn: View {
+    @Bindable var model: TransferModel
+
+    // MARK: Inspector
+
+    var body: some View {
+        let selected = model.selectedItems
+        return Form {
+            if selected.count > 1 {
+                Text("\(selected.count) items selected").foregroundStyle(.secondary)
+            } else if let item = selected.first {
+                HStack {
+                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 32, height: 32)
+                    Text(item.name).font(.headline)
+                }
+                LabeledContent("Path", value: item.path.display)
+                LabeledContent("Kind", value: item.kindLabel)
+                if item.kind == .file { LabeledContent("Size", value: Format.bytes(item.size)) }
+                LabeledContent("Modified", value: item.mtime.map { Format.date($0) } ?? "")
+                if let mode = item.mode { LabeledContent("Permissions", value: permissions(mode)) }
+                if let owner = item.owner { LabeledContent("Owner", value: owner) }
+                if let group = item.group { LabeledContent("Group", value: group) }
+                if item.kind == .symlink { LabeledContent("Target", value: model.inspectorLinkTarget ?? "…") }
+                if model.liveFile(for: item.path) != nil { LabeledContent("Live", value: model.statusText(for: item.path)) }
+                if let operation = model.operations.first(where: { $0.livePath == item.path || $0.title.hasSuffix(item.name) }) {
+                    LabeledContent("Transfer", value: operation.message ?? operation.state.rawValue.capitalized)
+                }
+                Section {
+                    Button("Open") { Task { await model.open(item) } }
+                    Button("Open Live") { Task { await model.openLiveSelection() } }
+                        .disabled(item.kind != .file)
+                    Button("Download Copy…") { Task { await model.downloadCopy() } }
+                    Button("Copy Remote URL") { model.copyRemoteURL() }
+                }
+            } else {
+                LabeledContent("Folder", value: model.snapshot.path.display)
+                LabeledContent("Items", value: "\(model.items.count)")
+                Button("Copy Remote URL") { model.copyRemoteURL() }
+            }
+        }
+        .formStyle(.grouped)
+        .scrollEdgeEffectHidden(true, for: .top)
+    }
+
+    private func permissions(_ mode: UInt32) -> String {
+        let bits = mode & 0o777
+        let letters = ["---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"]
+        return letters[Int(bits >> 6 & 7)] + letters[Int(bits >> 3 & 7)] + letters[Int(bits & 7)]
+    }
+}
+
+
 
 /// Gathers the URLs of one drop before starting uploads, so one operation row appears per file in order.
 private final class URLCollector: @unchecked Sendable {
