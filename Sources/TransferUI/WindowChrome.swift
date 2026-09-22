@@ -222,7 +222,7 @@ enum ChromeItem {
     static let search = NSToolbarItem.Identifier("transfer.search")
 }
 
-/// The split view controller. It also owns the window's toolbar, title, and frame autosave,
+/// The split view controller. It also owns the window's toolbar, title, and frame placement,
 /// which it applies when it lands in a window.
 @MainActor
 final class ChromeController: NSSplitViewController {
@@ -423,8 +423,14 @@ final class ChromeController: NSSplitViewController {
         separatorUpdateObserver = NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didBecomeMainNotification] {
+            keyObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak window] _ in
+                MainActor.assumeIsolated { if let window { WindowFrames.remember(window) } }
+            })
+        }
         toolbarInstalled = true
-        window.setFrameAutosaveName("Transfer.Browser")
+        WindowFrames.place(window, among: Self.live.allObjects.compactMap { $0 === self ? nil : $0.view.window })
+        OpenShortcut.install()
         window.tabbingMode = .preferred
         window.titlebarSeparatorStyle = .none
         // The opaque title bar over the content column draws its own bottom edge regardless of
@@ -535,6 +541,67 @@ final class ChromeController: NSSplitViewController {
         super.toggleSidebar(sender)
         sidebarToggled?(splitViewItems[0].isCollapsed)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.toggling = false }
+    }
+}
+
+/// Window frames as Finder keeps them. A new window opens at the size of the window used last,
+/// cascaded from the front window, or where that window was when no other is open. A window that
+/// state restoration brings back keeps its own frame, and a tab takes its window's.
+///
+/// One frame autosave name cannot serve this: only one open window may hold a name, and a second
+/// window that asks for it is refused and left with none. SwiftUI's own names count windows
+/// (`browser-AppWindow-1`, `-2`, …) and open a new window at the scene's default size. So every
+/// browser window drops its autosave name, and the frame of the window used last is kept here
+/// under one key.
+@MainActor
+public enum WindowFrames {
+    private static let key = "transfer.windowFrame"
+    /// AppKit restores windows between will- and did-finish-launching, so a window that lands
+    /// before the app has finished launching is one that restoration placed.
+    private static var launched = false
+
+    /// Called from `applicationDidFinishLaunching`.
+    public static func launchFinished() { launched = true }
+
+    static func place(_ window: NSWindow, among others: [NSWindow]) {
+        window.setFrameAutosaveName("")
+        guard launched, (window.tabbedWindows?.count ?? 1) <= 1,
+              let saved = UserDefaults.standard.string(forKey: key) else { return }
+        window.setFrame(from: saved)
+        let open = others.filter { $0.isVisible && !$0.isMiniaturized && !$0.styleMask.contains(.fullScreen) }
+        guard let front = open.first(where: \.isMainWindow) ?? NSApp.orderedWindows.first(where: open.contains) else { return }
+        // Placed at the front window's corner, then one cascade step down and to the right.
+        let next = window.cascadeTopLeft(from: NSPoint(x: front.frame.minX, y: front.frame.maxY))
+        window.cascadeTopLeft(from: next)
+    }
+
+    static func remember(_ window: NSWindow) {
+        guard window.isVisible, !window.isMiniaturized, !window.styleMask.contains(.fullScreen) else { return }
+        UserDefaults.standard.set(window.frameDescriptor, forKey: key)
+    }
+}
+
+/// Command-Down opens the selection, as in Finder: a second shortcut for File > Open, with no menu
+/// item of its own. `NSBrowser`'s columns take Command-Down as a plain Down arrow before the
+/// browser sees the key, so it is watched here, as Escape is in `Clipboard`, and left alone for
+/// text fields, sheets, and any window that is not a browser.
+@MainActor
+enum OpenShortcut {
+    private static var monitor: Any?
+
+    static func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            MainActor.assumeIsolated { takes(event) } ? nil : event
+        }
+    }
+
+    private static func takes(_ event: NSEvent) -> Bool {
+        guard event.keyCode == 125, event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
+              let window = event.window, window.isKeyWindow, window.attachedSheet == nil, !(window.firstResponder is NSText),
+              let model = ChromeController.keyWindowController?.model, model.plainKeysAvailable else { return false }
+        Task { await model.openSelection() }
+        return true
     }
 }
 
