@@ -51,7 +51,7 @@ struct ColumnBrowser: NSViewRepresentable {
 
         init(model: TransferModel) { self.model = model }
 
-        /// Reloads only the columns whose listing changed.
+        /// Reloads only the columns whose listing changed, then puts back what the reload dropped.
         func sync(_ browser: NSBrowser) {
             let newRoot = model.columnRoot ?? model.snapshot.path
             syncing = true
@@ -63,10 +63,17 @@ struct ColumnBrowser: NSViewRepresentable {
                 browser.loadColumnZero()
                 return
             }
-            // Reloading a column can drop the columns after it, so the last column is read again on
-            // every pass. Asking the browser about a column it no longer has throws an Objective-C
-            // exception inside SwiftUI's update; AppKit catches it, but the unwinding leaves the
-            // main thread's observation tracking dangling, and the next observable read crashes.
+            // Reloading a column makes it the last one and drops its selection, so a change to any
+            // column but the last (a move out of the parent folder, say) left the location's column
+            // gone and nothing selected while the model still stood in it. From the first reloaded
+            // column on, each column takes its selection back from the model's trail, which brings
+            // back the column after it.
+            //
+            // The last column is read again on every pass. Asking the browser about a column it no
+            // longer has throws an Objective-C exception inside SwiftUI's update; AppKit catches it,
+            // but the unwinding leaves the main thread's observation tracking dangling, and the next
+            // observable read crashes.
+            var trail: [ColumnTrail.Column]?
             var column = 0
             while column <= max(browser.lastColumn, 0) {
                 let path = self.path(forColumn: column) ?? newRoot
@@ -74,8 +81,34 @@ struct ColumnBrowser: NSViewRepresentable {
                 if shown[path] != current {
                     shown[path] = current
                     browser.reloadColumn(column)
+                    // Every later column is then rebuilt below from listings read in this pass,
+                    // so the rows selected in it are rows it has.
+                    if browser.lastColumn > column { browser.lastColumn = column }
+                    if trail == nil {
+                        trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
+                    }
                 }
+                if let trail { restoreSelection(browser, column: column, folder: path, items: current, trail: trail) }
                 column += 1
+            }
+        }
+
+        /// Selects in `column` what the trail selects there, when the column still shows the
+        /// trail's folder. A single folder selected gets its column after this one.
+        private func restoreSelection(_ browser: NSBrowser, column: Int, folder: RemotePath, items: [RemoteItem], trail: [ColumnTrail.Column]) {
+            guard column <= browser.lastColumn, column < trail.count, trail[column].folder == folder else { return }
+            let wanted = trail[column].selected
+            let offset = hasUpEntry(folder) ? 1 : 0
+            let indexes = items.indices.filter { wanted.contains(items[$0].path) }
+            let rows = IndexSet(indexes.map { $0 + offset })
+            if browser.selectedRowIndexes(inColumn: column) != rows {
+                browser.selectRowIndexes(rows, inColumn: column)
+            }
+            let opens = indexes.count == 1 && items[indexes[0]].kind == .directory
+            if opens {
+                if browser.lastColumn == column { browser.addColumn() }
+            } else if browser.lastColumn > column {
+                browser.lastColumn = column
             }
         }
 
