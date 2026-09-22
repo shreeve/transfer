@@ -101,7 +101,7 @@ struct TransferApp: App {
                     .keyboardShortcut(.space, modifiers: [])
                     .disabled(model?.primaryItem == nil || model?.plainKeysAvailable != true)
                 Divider()
-                Button("Sidebar") { NSApp.sendAction(#selector(NSSplitViewController.toggleSidebar(_:)), to: nil, from: nil) }
+                Button("Sidebar") { model?.toggleSidebar() }
                     .keyboardShortcut("s", modifiers: [.command, .option])
                 Button("Inspector") { model?.showsInspector.toggle() }
                     .keyboardShortcut("i", modifiers: [.command, .option])
@@ -116,6 +116,42 @@ struct TransferApp: App {
                     .keyboardShortcut("q")
             }
         }
+        // Settings adds "Settings…" to the app menu with Command-Comma.
+        Settings {
+            TabView {
+                GeneralSettings()
+                    .tabItem { Label("General", systemImage: "gearshape") }
+                if let provider = delegate.provider {
+                    ExtensionSettings(provider: provider)
+                        .tabItem { Label("Extensions", systemImage: "doc.text") }
+                }
+                UpdateSettings(updater: delegate.updater.updater)
+                    .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
+            }
+            .frame(width: 480, height: 320)
+        }
+    }
+}
+
+/// The Updates tab: Sparkle's own schedule switch.
+struct UpdateSettings: View {
+    let updater: SPUUpdater
+    @State private var automatic: Bool
+
+    init(updater: SPUUpdater) {
+        self.updater = updater
+        _automatic = State(initialValue: updater.automaticallyChecksForUpdates)
+    }
+
+    var body: some View {
+        Form {
+            Toggle("Check for updates automatically", isOn: $automatic)
+                .onChange(of: automatic) { updater.automaticallyChecksForUpdates = automatic }
+            LabeledContent("Last checked", value: updater.lastUpdateCheckDate?.formatted(date: .abbreviated, time: .shortened) ?? "Never")
+            Button("Check Now") { updater.checkForUpdates() }
+                .disabled(!updater.canCheckForUpdates)
+        }
+        .formStyle(.grouped)
     }
 }
 

@@ -99,3 +99,32 @@ import TransferCore
     #expect(id.socketName == "f10955fda0b1")
     #expect(id.socketName.count == 12)
 }
+
+@Test func directoriesAlwaysSortAboveFiles() {
+    let items = [
+        RemoteItem(path: RemotePath(string: "/b.txt"), kind: .file, size: 5, mtime: 9),
+        RemoteItem(path: RemotePath(string: "/zeta"), kind: .directory, mtime: 1),
+        RemoteItem(path: RemotePath(string: "/a.txt"), kind: .file, size: 1, mtime: 2),
+        RemoteItem(path: RemotePath(string: "/alpha"), kind: .directory, mtime: 8),
+    ]
+    let byName = ListingSort.apply(items, sort: SortConfiguration(column: "name", ascending: true)).map(\.name)
+    #expect(byName == ["alpha", "zeta", "a.txt", "b.txt"])
+    let byNameDescending = ListingSort.apply(items, sort: SortConfiguration(column: "name", ascending: false)).map(\.name)
+    #expect(byNameDescending == ["zeta", "alpha", "b.txt", "a.txt"])
+    let byTime = ListingSort.apply(items, sort: SortConfiguration(column: "mtime", ascending: true)).map(\.name)
+    #expect(byTime == ["zeta", "alpha", "a.txt", "b.txt"])
+    let mixed = ListingSort.apply(items, sort: SortConfiguration(foldersFirst: false)).map(\.name)
+    #expect(mixed == ["a.txt", "alpha", "b.txt", "zeta"])
+    let old = try? JSONDecoder().decode(SortConfiguration.self, from: Data(#"{"column":"name","ascending":true}"#.utf8))
+    #expect(old?.foldersFirst == true)
+}
+
+@Test func caseInsensitiveSortFoldsNamesAndKeepsRawOrderForTies() {
+    let items = ["b.txt", "A.txt", "a.txt", "B.txt"].map { RemoteItem(path: RemotePath(string: "/" + $0), kind: .file) }
+    let raw = ListingSort.apply(items, sort: SortConfiguration()).map(\.name)
+    #expect(raw == ["A.txt", "B.txt", "a.txt", "b.txt"])
+    let folded = ListingSort.apply(items, sort: SortConfiguration(caseInsensitive: true)).map(\.name)
+    #expect(folded == ["A.txt", "a.txt", "B.txt", "b.txt"])
+    let decoded = try? JSONDecoder().decode(SortConfiguration.self, from: Data(#"{"column":"size","ascending":false}"#.utf8))
+    #expect(decoded == SortConfiguration(column: "size", ascending: false, caseInsensitive: false))
+}

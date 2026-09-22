@@ -121,15 +121,17 @@ extension RemotePath {
 struct FilePromiseLabel: NSViewRepresentable {
     var item: RemoteItem
     var model: TransferModel
+    /// Centered under an icon; leading in a table row.
+    var centered = false
 
     func makeNSView(context: Context) -> PromiseText {
         let view = PromiseText()
-        view.apply(item: item, model: model)
+        view.apply(item: item, model: model, centered: centered)
         return view
     }
 
     func updateNSView(_ view: PromiseText, context: Context) {
-        view.apply(item: item, model: model)
+        view.apply(item: item, model: model, centered: centered)
     }
 }
 
@@ -140,10 +142,26 @@ final class PromiseText: NSTextField, NSDraggingSource {
 
     override var acceptsFirstResponder: Bool { false }
 
-    func apply(item: RemoteItem, model: TransferModel) {
+    /// The list table keeps AppKit's default 2-point row spacing, which SwiftUI does not expose.
+    /// Zeroing it brings the row pitch to 22, matching the column view.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard alignment != .center else { return }
+        var view: NSView? = superview
+        while let current = view, !(current is NSTableView) { view = current.superview }
+        if let table = view as? NSTableView {
+            if table.intercellSpacing.height != 0 {
+                table.intercellSpacing = NSSize(width: table.intercellSpacing.width, height: 0)
+            }
+            if table.rowHeight != 22 { table.rowHeight = 22 }
+        }
+    }
+
+    func apply(item: RemoteItem, model: TransferModel, centered: Bool) {
         stringValue = item.name
         self.item = item
         self.model = model
+        alignment = centered ? .center : .natural
         isBordered = false
         isEditable = false
         isSelectable = false

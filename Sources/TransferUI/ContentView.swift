@@ -5,7 +5,6 @@ import UniformTypeIdentifiers
 
 public struct ContentView: View {
     @Bindable var model: TransferModel
-    @FocusState private var filterFocused: Bool
     @FocusState private var renameFocused: Bool
 
     public init(model: TransferModel) {
@@ -13,31 +12,36 @@ public struct ContentView: View {
     }
 
     public var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            VStack(spacing: 0) {
-                if model.renaming { renameBar }
-                browser
-                if model.showsShelf { shelf }
-            }
-            .background(WindowFrameSaver(name: "Transfer.Browser"))
-        }
-        .navigationTitle(model.status)
-        .navigationSubtitle(model.snapshot.connectionID == nil ? "" : model.snapshot.path.display)
-        .toolbar { toolbar }
-        .inspector(isPresented: $model.showsInspector) { inspector }
-        .sheet(item: $model.sheet) { sheet in sheetView(sheet) }
+        WindowChrome(
+            model: model,
+            title: model.status,
+            subtitle: model.snapshot.connectionID == nil ? "" : model.snapshot.path.display,
+            viewMode: model.snapshot.viewMode,
+            sidebarCollapsed: model.sidebarCollapsed,
+            inspectorShown: model.showsInspector,
+            searchTick: model.filterFocusTick,
+            showsAppIcon: model.showsAppIcon,
+            sidebar: sidebar,
+            detail: detail,
+            inspector: inspector
+        )
+        .ignoresSafeArea()
         .focusedSceneValue(\.transferModel, model)
-        .onChange(of: model.sortOrder) { model.applySort() }
-        .onChange(of: model.columnCustomization) { model.saveColumns() }
         .onChange(of: model.snapshot.selection) { model.selectionChanged() }
-        .onChange(of: model.filterFocusTick) { filterFocused = true }
-        .onChange(of: filterFocused) { model.textEditing = filterFocused || renameFocused }
-        .onChange(of: renameFocused) { model.textEditing = filterFocused || renameFocused }
+        .onChange(of: renameFocused) { model.textEditing = renameFocused }
         .onChange(of: model.renaming) { if model.renaming { renameFocused = true } }
         .onChange(of: model.sidebarSelection) { _, item in Task { await model.sidebarSelected(item) } }
-        .frame(minWidth: 760, minHeight: 480)
+        .frame(minWidth: 880, idealWidth: 960, minHeight: 480, idealHeight: 640)
+    }
+
+    private var detail: some View {
+        VStack(spacing: 0) {
+            if model.renaming { renameBar }
+            browser
+            if model.showsShelf { shelf }
+        }
+        .sheet(item: $model.sheet) { sheet in sheetView(sheet) }
+        .scrollEdgeEffectHidden(true, for: .top)
     }
 
     // MARK: Sidebar
@@ -106,7 +110,8 @@ public struct ContentView: View {
                 }
             }
         }
-        .navigationSplitViewColumnWidth(min: 180, ideal: 220)
+        .listStyle(.sidebar)
+        .modifier(SidebarExp())
     }
 
     private func folderName(_ path: RemotePath) -> String {
@@ -162,7 +167,7 @@ public struct ContentView: View {
                         Image(nsImage: ItemIcon.image(for: item))
                             .resizable()
                             .frame(width: 48, height: 48)
-                        FilePromiseLabel(item: item, model: model)
+                        FilePromiseLabel(item: item, model: model, centered: true)
                             .frame(height: 18)
                     }
                     .frame(width: 96)
@@ -184,52 +189,7 @@ public struct ContentView: View {
     }
 
     private var listView: some View {
-        Table(
-            model.displayedItems,
-            selection: $model.snapshot.selection,
-            sortOrder: $model.sortOrder,
-            columnCustomization: $model.columnCustomization
-        ) {
-            TableColumn("Name", value: \RemoteItem.name) { item in
-                HStack(spacing: 6) {
-                    Image(nsImage: ItemIcon.image(for: item))
-                        .resizable()
-                        .frame(width: 16, height: 16)
-                    FilePromiseLabel(item: item, model: model)
-                        .frame(height: 18)
-                }
-            }
-            .customizationID("name")
-            .disabledCustomizationBehavior(.visibility)
-            TableColumn("Status", value: \RemoteItem.statusLabel) { item in
-                Text(status(item)).foregroundStyle(.secondary)
-            }
-            .width(min: 60, ideal: 90)
-            .customizationID("status")
-            TableColumn("Date Modified", value: \RemoteItem.sortMtime) { item in
-                Text(item.mtime.map { date($0) } ?? "")
-            }
-            .width(min: 120, ideal: 160)
-            .customizationID("modified")
-            TableColumn("Size", value: \RemoteItem.sortSize) { item in
-                Text(item.kind == .file ? byteCount(item.size) : "")
-            }
-            .width(min: 60, ideal: 80)
-            .customizationID("size")
-            TableColumn("Kind", value: \RemoteItem.kindLabel) { item in
-                Text(item.kindLabel)
-            }
-            .width(min: 80, ideal: 120)
-            .customizationID("kind")
-        }
-        .contextMenu(forSelectionType: RemotePath.self) { paths in
-            if let item = model.items.first(where: { paths.contains($0.path) }) { rowMenu(item) }
-        } primaryAction: { paths in
-            if let item = model.items.first(where: { paths.contains($0.path) }) {
-                Task { await model.open(item) }
-            }
-        }
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in dropFiles(providers) }
+        ListTable(model: model)
     }
 
     private func dropFiles(_ providers: [NSItemProvider]) -> Bool {
@@ -284,16 +244,7 @@ public struct ContentView: View {
     }
 
     private func status(_ item: RemoteItem) -> String {
-        if let live = model.liveFile(for: item.path) {
-            if live.conflict { return "Conflict" }
-            if live.uploading { return "Uploading" }
-            if live.paused { return "Paused" }
-            return live.dirty ? "Live, unsynced" : "Live"
-        }
-        if model.operations.contains(where: { $0.state == .active && $0.title.hasSuffix(item.name) }) {
-            return "Transferring"
-        }
-        return ""
+        model.statusText(for: item.path)
     }
 
     // MARK: Shelf
@@ -382,47 +333,13 @@ public struct ContentView: View {
             }
         }
         .formStyle(.grouped)
-        .inspectorColumnWidth(min: 240, ideal: 280)
+        .scrollEdgeEffectHidden(true, for: .top)
     }
 
     private func permissions(_ mode: UInt32) -> String {
         let bits = mode & 0o777
         let letters = ["---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"]
         return letters[Int(bits >> 6 & 7)] + letters[Int(bits >> 3 & 7)] + letters[Int(bits & 7)]
-    }
-
-    // MARK: Toolbar
-
-    @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .navigation) {
-            Button { Task { await model.goBack() } } label: { Image(systemName: "chevron.backward") }
-                .help("Back")
-            Button { Task { await model.goForward() } } label: { Image(systemName: "chevron.forward") }
-                .help("Forward")
-        }
-        ToolbarItemGroup {
-            Picker("View", selection: Binding(get: { model.snapshot.viewMode }, set: { model.setViewMode($0) })) {
-                Image(systemName: "square.grid.2x2").tag(ViewMode.icon).help("Icon")
-                Image(systemName: "list.bullet").tag(ViewMode.list).help("List")
-                Image(systemName: "rectangle.split.3x1").tag(ViewMode.columns).help("Columns")
-            }
-            .pickerStyle(.segmented)
-            TextField("Filter", text: $model.filter)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 160)
-                .focused($filterFocused)
-            Button {
-                model.showsShelf.toggle()
-            } label: {
-                let active = model.operations.filter { $0.state == .active }.count
-                if active > 0 {
-                    Label("\(active)", systemImage: "arrow.up.arrow.down.circle").labelStyle(.titleAndIcon)
-                } else {
-                    Label("Transfers", systemImage: "arrow.up.arrow.down.circle").labelStyle(.iconOnly)
-                }
-            }
-            .help("Transfers")
-        }
     }
 
     // MARK: Sheets
@@ -670,6 +587,21 @@ struct ConnectionForm: View {
                 Button(model.draftIsEdit ? "Save" : "Connect") { Task { await model.saveDraft() } }
                     .disabled(model.draft.host.trimmingCharacters(in: .whitespaces).isEmpty)
             }
+        }
+    }
+}
+
+
+// EXPERIMENT
+struct SidebarExp: ViewModifier {
+    func body(content: Content) -> some View {
+        switch ProcessInfo.processInfo.environment["TRANSFER_EXP_SIDEBAR"] ?? "hidden" {
+        case "soft": content.scrollEdgeEffectStyle(.soft, for: .top)
+        case "hard": content.scrollEdgeEffectStyle(.hard, for: .top)
+        case "none": content
+        case "hiddenall": content.scrollEdgeEffectHidden(true, for: .all)
+        case "ignoresafe": content.scrollEdgeEffectHidden(true, for: .top).ignoresSafeArea(edges: .top)
+        default: content.scrollEdgeEffectHidden(true, for: .top)
         }
     }
 }

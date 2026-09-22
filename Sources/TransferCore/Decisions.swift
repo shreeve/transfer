@@ -211,10 +211,26 @@ public enum ViewMode: String, Hashable, Sendable, Codable, CaseIterable {
 public struct SortConfiguration: Hashable, Sendable, Codable {
     public var column: String
     public var ascending: Bool
+    /// Fold case when comparing names. Off means raw bytes.
+    public var caseInsensitive: Bool
+    /// Keep directories above files whatever the column or direction.
+    public var foldersFirst: Bool
 
-    public init(column: String = "name", ascending: Bool = true) {
+    public init(column: String = "name", ascending: Bool = true, caseInsensitive: Bool = false, foldersFirst: Bool = true) {
         self.column = column
         self.ascending = ascending
+        self.caseInsensitive = caseInsensitive
+        self.foldersFirst = foldersFirst
+    }
+
+    private enum CodingKeys: String, CodingKey { case column, ascending, caseInsensitive, foldersFirst }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        column = try container.decodeIfPresent(String.self, forKey: .column) ?? "name"
+        ascending = try container.decodeIfPresent(Bool.self, forKey: .ascending) ?? true
+        caseInsensitive = try container.decodeIfPresent(Bool.self, forKey: .caseInsensitive) ?? false
+        foldersFirst = try container.decodeIfPresent(Bool.self, forKey: .foldersFirst) ?? true
     }
 }
 
@@ -244,8 +260,13 @@ public struct BrowserSnapshot: Hashable, Sendable {
 }
 
 public enum ListingSort {
+    /// With `foldersFirst`, directories come first in every column and direction. Within each
+    /// group the chosen column applies, with raw-byte name order breaking ties.
     public static func apply(_ items: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
         items.sorted { lhs, rhs in
+            if sort.foldersFirst, (lhs.kind == .directory) != (rhs.kind == .directory) {
+                return lhs.kind == .directory
+            }
             let order: ComparisonResult
             switch sort.column {
             case "size":
@@ -255,13 +276,21 @@ public enum ListingSort {
             case "kind":
                 order = lhs.kind.rawValue.compare(rhs.kind.rawValue, options: .literal)
             default:
-                order = compareBytes(lhs.path.nameBytes, rhs.path.nameBytes)
+                order = compareNames(lhs, rhs, caseInsensitive: sort.caseInsensitive)
             }
             if order == .orderedSame {
-                return compareBytes(lhs.path.nameBytes, rhs.path.nameBytes) == .orderedAscending
+                return compareNames(lhs, rhs, caseInsensitive: sort.caseInsensitive) == .orderedAscending
             }
             return sort.ascending ? order == .orderedAscending : order == .orderedDescending
         }
+    }
+
+    private static func compareNames(_ lhs: RemoteItem, _ rhs: RemoteItem, caseInsensitive: Bool) -> ComparisonResult {
+        if caseInsensitive {
+            let folded = lhs.name.lowercased().compare(rhs.name.lowercased(), options: .literal)
+            if folded != .orderedSame { return folded }
+        }
+        return compareBytes(lhs.path.nameBytes, rhs.path.nameBytes)
     }
 
     private static func compareBytes(_ left: [UInt8], _ right: [UInt8]) -> ComparisonResult {

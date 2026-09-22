@@ -6,7 +6,7 @@ public actor SSHConnection: RemoteSession {
     public nonisolated let connection: SavedConnection
 
     private let store: Store
-    private let editableExtensions: Set<String>
+    private var editableExtensions: Set<String>
     private var promptSink: (any PromptSink)?
     private var master: Process?
     private var socketPath = ""
@@ -37,6 +37,10 @@ public actor SSHConnection: RemoteSession {
     }
 
     public nonisolated func events() -> AsyncStream<SessionEvent> { pipe.stream() }
+
+    func setEditableExtensions(_ extensions: Set<String>) {
+        editableExtensions = extensions
+    }
 
     public var performanceModeEnabled: Bool { performance }
     public var isConnected: Bool { startPath != nil && master?.isRunning == true }

@@ -13,6 +13,12 @@ enum ConfigLoader {
         return .builtIn
     }
 
+    static func save(_ config: TransferConfig, root: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(config).write(to: root.appendingPathComponent("config.json"), options: .atomic)
+    }
+
     private static func read(_ url: URL) -> TransferConfig? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(TransferConfig.self, from: data)

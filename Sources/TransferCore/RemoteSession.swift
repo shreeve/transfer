@@ -109,6 +109,10 @@ public protocol SessionProvider: Sendable {
     var unsyncedLiveCount: Int { get async }
     func unsyncedLiveCount(for id: ConnectionID) async -> Int
     func disconnectAll() async
+    /// The extensions that open Live, from the user's config file.
+    func editableExtensions() async -> [String]
+    /// Rewrites the config file. Open sessions pick the list up at once.
+    func setEditableExtensions(_ extensions: [String]) async throws
 }
 
 /// One saved server. Views reach the server only through this protocol.

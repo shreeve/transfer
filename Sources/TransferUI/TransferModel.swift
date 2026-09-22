@@ -6,6 +6,25 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
+/// Keys for the global preferences that Settings and the menus share.
+public enum Preferences {
+    public static let caseInsensitiveSort = "transfer.sortCaseInsensitive"
+    public static let foldersFirst = "transfer.foldersFirst"
+    public static let showsAppIcon = "transfer.showsAppIcon"
+
+    /// On unless the user turned it off.
+    public static func showsAppIconValue(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: showsAppIcon) == nil ? true : defaults.bool(forKey: showsAppIcon)
+    }
+
+    /// On unless the user turned it off; a missing default reads as true.
+    public static func foldersFirstValue(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: foldersFirst) == nil ? true : defaults.bool(forKey: foldersFirst)
+    }
+    public static let showsHidden = "transfer.showsHidden"
+    public static let viewMode = "transfer.viewMode"
+}
+
 public enum SidebarItem: Hashable {
     case server(ConnectionID)
     case recent(RemotePath)
@@ -39,6 +58,12 @@ public final class TransferModel {
     public var folderText = ""
     public var status = "Not connected"
     public var showsInspector = false
+    public var sidebarCollapsed = false
+    public var showsAppIcon = Preferences.showsAppIconValue()
+
+    public func toggleSidebar() {
+        sidebarCollapsed.toggle()
+    }
     public var showsShelf = false
     public var draft = SavedConnection(name: "", host: "")
     public var draftIsEdit = false
@@ -50,8 +75,6 @@ public final class TransferModel {
     public var conflictPath: RemotePath?
     public var applyCollisionToAll = false
     public var sidebarSelection: SidebarItem?
-    public var sortOrder: [KeyPathComparator<RemoteItem>] = [KeyPathComparator(\.name)]
-    public var columnCustomization = TableColumnCustomization<RemoteItem>()
     public var inspectorLinkTarget: String?
     public var terminalAvailable = TerminalLauncher.anyInstalled()
 
@@ -83,7 +106,38 @@ public final class TransferModel {
             snapshot.viewMode = mode
         }
         snapshot.showsHidden = UserDefaults.standard.bool(forKey: "transfer.showsHidden")
+        snapshot.sort.caseInsensitive = UserDefaults.standard.bool(forKey: Preferences.caseInsensitiveSort)
+        snapshot.sort.foldersFirst = Preferences.foldersFirstValue()
         Task { await reloadConnections() }
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
+            Task { @MainActor in self?.applyPreferences() }
+        }
+    }
+
+    /// Picks up changes made in Settings while the window is open.
+    private func applyPreferences() {
+        let defaults = UserDefaults.standard
+        var changed = false
+        let hidden = defaults.bool(forKey: "transfer.showsHidden")
+        if hidden != snapshot.showsHidden {
+            snapshot.showsHidden = hidden
+            changed = true
+        }
+        let folded = defaults.bool(forKey: Preferences.caseInsensitiveSort)
+        let foldersFirst = Preferences.foldersFirstValue(defaults)
+        if folded != snapshot.sort.caseInsensitive || foldersFirst != snapshot.sort.foldersFirst {
+            snapshot.sort.caseInsensitive = folded
+            snapshot.sort.foldersFirst = foldersFirst
+            for (path, list) in columns { columns[path] = ListingSort.apply(list, sort: snapshot.sort) }
+            changed = true
+        }
+        let icon = Preferences.showsAppIconValue(defaults)
+        if icon != showsAppIcon { showsAppIcon = icon }
+        if let stored = defaults.string(forKey: "transfer.viewMode"), let mode = ViewMode(rawValue: stored), mode != snapshot.viewMode {
+            snapshot.viewMode = mode
+            if mode == .columns { columnRoot = snapshot.path }
+        }
+        if changed { items = visible(columns[snapshot.path] ?? []) }
     }
 
     // MARK: Servers
@@ -283,23 +337,41 @@ public final class TransferModel {
         items.filter { snapshot.showsHidden || !$0.isHidden }
     }
 
+    /// Selected items may live in another column's listing when a folder is selected in column
+    /// view, so the lookup falls back to every cached listing.
     public var primaryItem: RemoteItem? {
-        displayedItems.first { snapshot.selection.contains($0.path) }
+        if let item = displayedItems.first(where: { snapshot.selection.contains($0.path) }) { return item }
+        for list in columns.values {
+            if let item = list.first(where: { snapshot.selection.contains($0.path) }) { return item }
+        }
+        return nil
     }
 
     /// Menu items whose shortcut is a plain key stay out of the way of text entry.
     public var plainKeysAvailable: Bool { !textEditing && sheet == nil }
 
     public var selectedItems: [RemoteItem] {
-        displayedItems.filter { snapshot.selection.contains($0.path) }
+        let shown = displayedItems.filter { snapshot.selection.contains($0.path) }
+        if shown.count == snapshot.selection.count { return shown }
+        var found: [RemotePath: RemoteItem] = [:]
+        for list in columns.values {
+            for item in list where snapshot.selection.contains(item.path) { found[item.path] = item }
+        }
+        return found.values.sorted { $0.path.display < $1.path.display }
     }
 
+    /// A single selected folder becomes the current location, as in Finder, and stays selected.
+    /// Files and multiple selections leave the location at their parent.
     public func selectInColumns(_ selected: [RemoteItem], parent: RemotePath) {
-        snapshot.path = parent
-        items = visible(columns[parent] ?? [])
         snapshot.selection = Set(selected.map(\.path))
         if let folder = selected.first, selected.count == 1, folder.kind == .directory {
             loadColumn(folder.path)
+            snapshot.path = folder.path
+            items = visible(columns[folder.path] ?? [])
+            Task { await session?.remember(folder.path) }
+        } else {
+            snapshot.path = parent
+            items = visible(columns[parent] ?? [])
         }
     }
 
@@ -309,63 +381,45 @@ public final class TransferModel {
         return selected.contains(where: { $0.path == item.path }) ? selected : [item]
     }
 
-    // MARK: Sort and columns
+    // MARK: Sort
 
-    public func applySort() {
-        var sort = SortConfiguration()
-        if let first = sortOrder.first {
-            sort.column = Self.columnName(for: first.keyPath)
-            sort.ascending = first.order == .forward
-        }
-        snapshot.sort = sort
-        if let id = snapshot.connectionID, let data = try? JSONEncoder().encode(sort) {
+    public func setSort(column: String, ascending: Bool) {
+        snapshot.sort.column = column
+        snapshot.sort.ascending = ascending
+        if let id = snapshot.connectionID, let data = try? JSONEncoder().encode(snapshot.sort) {
             UserDefaults.standard.set(data, forKey: "transfer.sort.\(id.rawValue.uuidString)")
         }
-        for (path, list) in columns { columns[path] = ListingSort.apply(list, sort: sort) }
+        for (path, list) in columns { columns[path] = ListingSort.apply(list, sort: snapshot.sort) }
         items = visible(columns[snapshot.path] ?? [])
-    }
-
-    public func saveColumns() {
-        guard let id = snapshot.connectionID, let data = try? JSONEncoder().encode(columnCustomization) else { return }
-        UserDefaults.standard.set(data, forKey: "transfer.columns.\(id.rawValue.uuidString)")
     }
 
     private func loadPreferences(for id: ConnectionID) {
         let key = id.rawValue.uuidString
+        let folded = UserDefaults.standard.bool(forKey: Preferences.caseInsensitiveSort)
+        let foldersFirst = Preferences.foldersFirstValue()
         if let data = UserDefaults.standard.data(forKey: "transfer.sort.\(key)"),
-           let sort = try? JSONDecoder().decode(SortConfiguration.self, from: data) {
+           var sort = try? JSONDecoder().decode(SortConfiguration.self, from: data) {
+            sort.caseInsensitive = folded
+            sort.foldersFirst = foldersFirst
             snapshot.sort = sort
-            sortOrder = [Self.comparator(for: sort)]
         } else {
-            snapshot.sort = SortConfiguration()
-            sortOrder = [KeyPathComparator(\.name)]
-        }
-        if let data = UserDefaults.standard.data(forKey: "transfer.columns.\(key)"),
-           let custom = try? JSONDecoder().decode(TableColumnCustomization<RemoteItem>.self, from: data) {
-            columnCustomization = custom
-        } else {
-            columnCustomization = TableColumnCustomization<RemoteItem>()
+            snapshot.sort = SortConfiguration(caseInsensitive: folded, foldersFirst: foldersFirst)
         }
     }
 
-    private static func columnName(for keyPath: PartialKeyPath<RemoteItem>) -> String {
-        switch keyPath {
-        case \RemoteItem.sortMtime: "mtime"
-        case \RemoteItem.sortSize: "size"
-        case \RemoteItem.kindLabel: "kind"
-        case \RemoteItem.statusLabel: "status"
-        default: "name"
+    /// The Status column and inspector text for a path: Live state or an active transfer.
+    public func statusText(for path: RemotePath) -> String {
+        if let live = liveFile(for: path) {
+            if live.conflict { return "Conflict" }
+            if live.uploading { return "Uploading" }
+            if live.paused { return "Paused" }
+            return live.dirty ? "Live, unsynced" : "Live"
         }
-    }
-
-    private static func comparator(for sort: SortConfiguration) -> KeyPathComparator<RemoteItem> {
-        let order: SortOrder = sort.ascending ? .forward : .reverse
-        switch sort.column {
-        case "mtime": return KeyPathComparator(\.sortMtime, order: order)
-        case "size": return KeyPathComparator(\.sortSize, order: order)
-        case "kind": return KeyPathComparator(\.kindLabel, order: order)
-        default: return KeyPathComparator(\.name, order: order)
+        let name = String(decoding: path.nameBytes, as: UTF8.self)
+        if operations.contains(where: { $0.state == .active && $0.title.hasSuffix(name) }) {
+            return "Transferring"
         }
+        return ""
     }
 
     public func toggleHidden() {

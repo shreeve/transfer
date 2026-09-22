@@ -172,7 +172,7 @@ A `NavigationSplitView`: sidebar, browser, optional inspector. The transfer shel
 
 Icon is a SwiftUI grid. List is a SwiftUI table. Columns are `NSBrowser`. All three read the same `BrowserModel`. The AppKit view does not own that model.
 
-List columns default to Name, Status, Date Modified, Size, and Kind. Status is blank unless the row is Live or transferring. Directory and symlink sizes are blank. The default sort is name ascending, raw bytes, case-sensitive, directories not pinned. Column layout and sort persist per connection. The view mode persists globally. Names that start with `.` are hidden. The choice is global, off by default, toggled by View > Show Hidden Files (Command-Shift-Period). `.` and `..` are never shown.
+List columns default to Name, Status, Date Modified, Size, and Kind. Status is blank unless the row is Live or transferring. Directory and symlink sizes are blank. The default sort is name ascending, raw bytes, case-sensitive, directories above files whatever the column or direction. Settings > General can fold case and can let directories intermix with files; both are global. Column layout and sort persist per connection. The view mode persists globally. Names that start with `.` are hidden. The choice is global, off by default, toggled by View > Show Hidden Files (Command-Shift-Period). `.` and `..` are never shown.
 
 ### 5.2 Identity and listing
 

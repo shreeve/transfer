@@ -11,6 +11,7 @@ struct ColumnBrowser: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSBrowser {
         let browser = NSBrowser()
+        browser.setCellClass(CenteredBrowserCell.self)
         browser.delegate = context.coordinator
         browser.target = context.coordinator
         browser.action = #selector(Coordinator.selectionChanged(_:))
@@ -20,6 +21,7 @@ struct ColumnBrowser: NSViewRepresentable {
         browser.hasHorizontalScroller = true
         browser.autohidesScroller = true
         browser.minColumnWidth = 180
+        browser.isTitled = false
         browser.registerForDraggedTypes([.fileURL, remoteDragType])
         browser.setDraggingSourceOperationMask(.copy, forLocal: false)
         browser.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
@@ -97,8 +99,14 @@ struct ColumnBrowser: NSViewRepresentable {
 
         func browser(_ browser: NSBrowser, willDisplayCell cell: Any, atRow row: Int, column: Int) {
             guard let cell = cell as? NSBrowserCell, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return }
-            cell.image = ItemIcon.image(for: item)
+            let icon = ItemIcon.image(for: item).copy() as! NSImage
+            icon.size = NSSize(width: 16, height: 16)
+            cell.image = icon
             cell.isLeaf = item.kind != .directory
+        }
+
+        func browser(_ browser: NSBrowser, heightOfRow row: Int, inColumn columnIndex: Int) -> CGFloat {
+            22
         }
 
         func browser(_ browser: NSBrowser, shouldEditItem item: Any?) -> Bool { false }
@@ -195,5 +203,37 @@ enum ItemIcon {
         case .file:
             NSWorkspace.shared.icon(for: UTType(filenameExtension: (item.name as NSString).pathExtension) ?? .data)
         }
+    }
+}
+
+/// Draws the icon and title itself, centered on the row's midline. `NSBrowserCell`'s own title
+/// drawing sits low in a 22-point row. The browser still draws the highlight and the branch chevron.
+final class CenteredBrowserCell: NSBrowserCell {
+    static let iconSize: CGFloat = 16
+    static let iconInset: CGFloat = 3
+    static let gap: CGFloat = 5
+    static let chevronInset: CGFloat = 8
+
+    override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
+        let emphasized = backgroundStyle == .emphasized
+        var x = cellFrame.minX + Self.iconInset
+        if let image {
+            let rect = NSRect(x: x, y: cellFrame.midY - Self.iconSize / 2, width: Self.iconSize, height: Self.iconSize)
+            image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            x += Self.iconSize + Self.gap
+        }
+        // The browser draws the branch chevron itself; the title only needs to stop short of it.
+        let right = cellFrame.maxX - (isLeaf ? Self.gap : Self.chevronInset + 12)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize),
+            .foregroundColor: emphasized ? NSColor.alternateSelectedControlTextColor : NSColor.labelColor,
+            .paragraphStyle: paragraph,
+        ]
+        let title = NSAttributedString(string: stringValue, attributes: attributes)
+        let height = ceil(title.size().height)
+        let rect = NSRect(x: x, y: cellFrame.midY - height / 2, width: max(right - x, 0), height: height)
+        title.draw(with: rect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 }

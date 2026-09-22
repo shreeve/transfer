@@ -4,13 +4,13 @@ import TransferCore
 /// The library and one `SSHConnection` per saved server, shared by every window and tab.
 public actor TransferHub: SessionProvider {
     private let store: Store
-    private let editableExtensions: Set<String>
+    private var config: TransferConfig
     private var sessions: [ConnectionID: SSHConnection] = [:]
 
     /// `root` defaults to `~/Library/Application Support/Transfer`.
     public init(root: URL? = nil) throws {
         store = try Store(root: root)
-        editableExtensions = ConfigLoader.load(root: store.root).extensionSet
+        config = ConfigLoader.load(root: store.root)
         for path in store.localTemps() {
             if FileManager.default.fileExists(atPath: path) {
                 try? FileManager.default.removeItem(atPath: path)
@@ -46,7 +46,7 @@ public actor TransferHub: SessionProvider {
         if let existing = sessions[id] {
             if await existing.isConnected || existing.connection == saved { return existing }
         }
-        let session = SSHConnection(connection: saved, store: store, editableExtensions: editableExtensions)
+        let session = SSHConnection(connection: saved, store: store, editableExtensions: config.extensionSet)
         sessions[id] = session
         return session
     }
@@ -59,5 +59,19 @@ public actor TransferHub: SessionProvider {
 
     public func disconnectAll() async {
         for session in sessions.values { await session.disconnect() }
+    }
+
+    public func editableExtensions() async -> [String] {
+        config.editableExtensions
+    }
+
+    public func setEditableExtensions(_ extensions: [String]) async throws {
+        let cleaned = extensions
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
+            .filter { !$0.isEmpty }
+        var seen: Set<String> = []
+        config = TransferConfig(editableExtensions: cleaned.filter { seen.insert($0).inserted })
+        try ConfigLoader.save(config, root: store.root)
+        for session in sessions.values { await session.setEditableExtensions(config.extensionSet) }
     }
 }
