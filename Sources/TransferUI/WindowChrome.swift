@@ -244,6 +244,10 @@ final class ChromeController: NSSplitViewController {
         // The sidebar holds its width while the inspector animates; only the content pane gives up
         // space. Without this the split view shrinks both siblings and the sidebar appears to move.
         sidebarItem.holdingPriority = NSLayoutConstraint.Priority(260)
+        // Collapse and reveal by constraint animation alone. With the other behaviors a reveal
+        // grows the content pane's frame past the window, so the pane's safe area holds still and
+        // snaps to its final size on the last frame; with constraints it moves on every frame.
+        sidebarItem.collapseBehavior = .useConstraints
         // Finder draws no line under the title bar over the sidebar, and over the content only
         // on hover, which the hover line handles. The built-in separators stay off.
         sidebarItem.titlebarSeparatorStyle = .none
@@ -258,6 +262,10 @@ final class ChromeController: NSSplitViewController {
         detailItem.titlebarSeparatorStyle = .none
         // Lowest priority, so the content pane is the one that resizes for the inspector.
         detailItem.holdingPriority = NSLayoutConstraint.Priority(250)
+        // The sidebar and inspector float over the content pane, which spans the whole window; the
+        // regions they cover arrive as the pane's safe-area insets, animated with them. Icon and
+        // list views stay inside the safe area. The column view lets its stack run under the sidebar.
+        detailItem.automaticallyAdjustsSafeAreaInsets = true
         let inspectorItem = NSSplitViewItem(inspectorWithViewController: BelowToolbarController(hosting: inspector))
         inspectorItem.minimumThickness = 240
         inspectorItem.maximumThickness = 320
@@ -265,9 +273,9 @@ final class ChromeController: NSSplitViewController {
         inspectorItem.isCollapsed = true
         inspectorItem.titlebarSeparatorStyle = .none
         inspectorItem.holdingPriority = NSLayoutConstraint.Priority(260)
-        // The content pane alone yields the space; the sidebar's higher priority and the content
-        // pane's low minimum keep the sidebar fixed.
-        inspectorItem.collapseBehavior = .preferResizingSiblingsWithFixedSplitView
+        // Same as the sidebar: only the constraint animation keeps the content pane's safe area
+        // moving in step with the inspector's edge while it opens.
+        inspectorItem.collapseBehavior = .useConstraints
         addSplitViewItem(sidebarItem)
         addSplitViewItem(detailItem)
         addSplitViewItem(inspectorItem)
@@ -292,13 +300,9 @@ final class ChromeController: NSSplitViewController {
     override func viewDidLayout() {
         super.viewDidLayout()
         let top = view.window?.contentView?.safeAreaInsets.top ?? 0
-        // The toolbar arrives after the columns' first layout, and a collapsed column keeps its
-        // width when it opens, so each column checks the safe area again here.
-        for item in splitViewItems where item.viewController.view is BelowToolbarView {
-            item.viewController.view.needsLayout = true
-        }
+        // The content pane spans the window under the sidebar; the line starts where it shows.
         let content = splitViewItems[1].viewController.view
-        let x = content.convert(content.bounds, to: view).minX
+        let x = content.convert(content.safeAreaRect, to: view).minX
         hoverLine.frame = NSRect(x: x, y: view.bounds.height - top - 1, width: view.bounds.width - x, height: 1)
         let strip = NSRect(x: 0, y: view.bounds.height - top, width: view.bounds.width, height: top)
         if hoverTracking?.rect != strip {
@@ -379,12 +383,24 @@ final class ChromeController: NSSplitViewController {
     func setSidebarCollapsed(_ collapsed: Bool) {
         guard !toggling else { return }
         let item = splitViewItems[0]
-        if item.isCollapsed != collapsed { item.animator().isCollapsed = collapsed }
+        if item.isCollapsed != collapsed { animateCollapse { item.animator().isCollapsed = collapsed } }
     }
 
     func setInspectorShown(_ shown: Bool) {
         let item = splitViewItems[2]
-        if item.isCollapsed == shown { item.animator().isCollapsed = !shown }
+        if item.isCollapsed == shown { animateCollapse { item.animator().isCollapsed = !shown } }
+    }
+
+    /// `TRANSFER_ANIMATION_SCALE=8` in the environment stretches the sidebar and inspector
+    /// animations for watching them; unset, AppKit's own timing applies.
+    private static let animationScale = Double(ProcessInfo.processInfo.environment["TRANSFER_ANIMATION_SCALE"] ?? "") ?? 1
+
+    private func animateCollapse(_ body: @escaping () -> Void) {
+        guard Self.animationScale != 1 else { return body() }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.25 * Self.animationScale
+            body()
+        }
     }
 
     /// Set by the coordinator so the model follows the toolbar's sidebar toggle and divider drags.
@@ -481,24 +497,21 @@ final class BelowToolbarView: NSView {
     init(hosted: NSView) {
         self.hosted = hosted
         super.init(frame: .zero)
-        hosted.translatesAutoresizingMaskIntoConstraints = true
-        hosted.autoresizingMask = [.width, .height]
+        hosted.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hosted)
+        // The safe area is what no toolbar, sidebar, or inspector covers. Constraints to its guide
+        // follow it frame by frame through those animations; a frame set in layout() would not,
+        // because AppKit gives a view no callback when only its safe-area insets change.
+        let guide = safeAreaLayoutGuide
+        NSLayoutConstraint.activate([
+            hosted.leadingAnchor.constraint(equalTo: guide.leadingAnchor),
+            hosted.trailingAnchor.constraint(equalTo: guide.trailingAnchor),
+            hosted.topAnchor.constraint(equalTo: guide.topAnchor),
+            hosted.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    override func layout() {
-        super.layout()
-        let inset = window?.contentView?.safeAreaInsets.top ?? 0
-        let frame = NSRect(x: 0, y: 0, width: bounds.width, height: max(bounds.height - inset, 0))
-        if hosted.frame != frame { hosted.frame = frame }
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        needsLayout = true
-    }
 }
 
 /// The search control: a magnifier that becomes a fixed-width field on demand.

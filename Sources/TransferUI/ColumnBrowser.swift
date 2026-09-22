@@ -9,7 +9,7 @@ struct ColumnBrowser: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
 
-    func makeNSView(context: Context) -> NSBrowser {
+    func makeNSView(context: Context) -> ColumnStack {
         let browser = TiledBrowser()
         browser.model = model
         browser.setCellClass(CenteredBrowserCell.self)
@@ -26,21 +26,25 @@ struct ColumnBrowser: NSViewRepresentable {
         browser.registerForDraggedTypes([.fileURL, remoteDragType])
         browser.setDraggingSourceOperationMask(.copy, forLocal: false)
         browser.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
-        browser.hasHorizontalScroller = true
-        browser.autohidesScroller = true
+        // The stack keeps the browser at least as wide as its columns, so it never scrolls sideways.
+        browser.hasHorizontalScroller = false
+        let stack = ColumnStack(browser: browser)
         context.coordinator.browser = browser
-        return browser
+        context.coordinator.stack = stack
+        return stack
     }
 
-    func updateNSView(_ browser: NSBrowser, context: Context) {
+    func updateNSView(_ stack: ColumnStack, context: Context) {
         context.coordinator.model = model
-        context.coordinator.sync(browser)
+        context.coordinator.sync(stack.browser)
+        stack.needsLayout = true
     }
 
     @MainActor
     final class Coordinator: NSObject, NSBrowserDelegate {
         var model: TransferModel
         weak var browser: NSBrowser?
+        weak var stack: ColumnStack?
         private var root: RemotePath?
         private var shown: [RemotePath: [RemoteItem]] = [:]
         private var syncing = false
@@ -150,6 +154,15 @@ struct ColumnBrowser: NSViewRepresentable {
             return []
         }
 
+        /// A column added, removed, or resized changes the stack's width; the stack re-places it.
+        func browser(_ browser: NSBrowser, didChangeLastColumn oldLastColumn: Int, toColumn column: Int) {
+            stack?.needsLayout = true
+        }
+
+        func browserColumnConfigurationDidChange(_ notification: Notification) {
+            stack?.needsLayout = true
+        }
+
         // MARK: Selection
 
         @objc func selectionChanged(_ sender: Any?) {
@@ -232,12 +245,71 @@ struct ColumnBrowser: NSViewRepresentable {
 /// The `..` row's item in the column view.
 final class UpEntry: NSObject {}
 
+/// Places the browser so its right edge sits on this view's right edge and its width is never
+/// less than its columns, so the browser itself never scrolls sideways. When the columns are wider
+/// than this view, the stack begins left of it, under the floating sidebar, which the split view
+/// draws on top. This view's bounds are the visible region, the content pane's safe area, so each
+/// frame of the inspector or sidebar animation arrives as a new width and the whole stack moves
+/// as one piece: still while the columns fit, then abutting the inspector once they do not.
+final class ColumnStack: NSView {
+    let browser: TiledBrowser
+    private var lastWidth: CGFloat = 0
+    private var lastColumns: CGFloat = 0
+
+    init(browser: TiledBrowser) {
+        self.browser = browser
+        super.init(frame: .zero)
+        clipsToBounds = false
+        browser.translatesAutoresizingMaskIntoConstraints = true
+        browser.autoresizingMask = []
+        addSubview(browser)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// The width of every loaded column, measured from the browser's own tiling so a column the
+    /// user has resized counts at its real width. A column the browser has not tiled yet counts
+    /// at the default width, and `measured` is false so the caller asks again after tiling.
+    private var columnsWidth: (width: CGFloat, measured: Bool) {
+        let last = browser.lastColumn
+        guard last >= 0 else { return (0, true) }
+        let end = browser.frame(ofColumn: last)
+        guard end.width > 0 else { return (CGFloat(last + 1) * TiledBrowser.columnWidth, false) }
+        return (end.maxX - browser.frame(ofColumn: 0).minX, true)
+    }
+
+    override func layout() {
+        super.layout()
+        let visible = bounds.width
+        let (columns, measured) = columnsWidth
+        if !measured { DispatchQueue.main.async { [weak self] in self?.needsLayout = true } }
+        let width = max(columns, visible)
+        let target = NSRect(x: visible - width, y: 0, width: width, height: bounds.height)
+        // A column that appears or resizes while the pane is at rest slides the stack, as Finder
+        // does. While the pane itself is animating, each frame is placed directly and the split
+        // view's timing rules.
+        let slide = visible == lastWidth && columns != lastColumns && lastColumns > 0 && window != nil
+        lastWidth = visible
+        lastColumns = columns
+        if browser.frame != target {
+            if slide {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.2
+                    browser.animator().frame = target
+                }
+            } else {
+                browser.frame = target
+            }
+        }
+        if browser.firstVisibleColumn > 0 { browser.scrollColumnToVisible(0) }
+    }
+}
+
 /// The column browser: fixed-width columns. Space opens Quick Look, as in Finder.
 final class TiledBrowser: NSBrowser {
-    /// Columns keep this width and never reflow. When the inspector opens, the pane narrows from
-    /// the right and the columns hold still and clip, so the whole set slides left as one piece
-    /// and slides back on exit, the way Finder's columns do. Re-tiling to fit made every column
-    /// visibly resize during the toggle, which read as an overlay rather than a slide.
+    /// Columns start at this width and never reflow to fit the pane. `ColumnStack` moves the whole
+    /// set instead. Re-tiling to fit made every column visibly resize during the inspector toggle,
+    /// which read as an overlay rather than a slide.
     static let columnWidth: CGFloat = 260
     weak var model: TransferModel?
 
