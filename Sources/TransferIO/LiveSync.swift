@@ -43,7 +43,7 @@ actor LiveSync {
         let id: LiveFileID
         let connection: ConnectionID
         var path: RemotePath
-        var local: URL
+        let local: URL
         var state: LiveState
         var conflict: LiveConflictKind?
         var uploading = false
@@ -58,7 +58,8 @@ actor LiveSync {
 
         var name: String { path.name }
         var folder: URL { local.deletingLastPathComponent() }
-        var serverCopy: URL { folder.appendingPathComponent("\(name) (server)") }
+        /// Named after the working copy, which keeps its name when the remote file is renamed.
+        var serverCopy: URL { folder.appendingPathComponent("\(local.lastPathComponent) (server)") }
     }
 
     private struct Command {
@@ -88,6 +89,8 @@ actor LiveSync {
     private var ready: Set<ConnectionID> = []
     private var workers: [ConnectionID: Worker] = [:]
     private var notices: [ConnectionID: [String]] = [:]
+    /// Live opens queued or running on a worker, whose records do not exist yet.
+    private var opening: [UUID: (connection: ConnectionID, path: RemotePath)] = [:]
     private var watcher: LiveWatcher?
     private var watching: Task<Void, Never>?
 
@@ -194,7 +197,10 @@ actor LiveSync {
 
     /// The working copy for `path`: downloaded, or refreshed if the server moved on and it is untouched.
     func open(_ path: RemotePath, on connection: ConnectionID) async throws -> URL {
-        try await perform(on: connection) { try await self.openNow(path, on: connection) }
+        let token = UUID()
+        opening[token] = (connection, path)
+        defer { opening[token] = nil }
+        return try await perform(on: connection) { try await self.openNow(path, on: connection) }
     }
 
     func setPaused(_ path: RemotePath, on connection: ConnectionID, paused: Bool) {
@@ -226,10 +232,13 @@ actor LiveSync {
         try await barrier(under: path, on: connection, remove) { await self.removed(path, on: connection) }
     }
 
-    /// Runs `body` at once, or, when Live files lie under `path`, between their passes and then
-    /// `after`, so no save of theirs lands on the old path.
+    /// Runs `body` at once, or, when Live files lie under `path` or are being opened there, between
+    /// their passes and then `after`, so no save of theirs lands on the old path. An open still
+    /// queued or downloading has no record yet; waiting for it lets `after` see the record it makes.
     private func barrier(under path: RemotePath, on connection: ConnectionID, _ body: @escaping @Sendable () async throws -> Void, then after: @escaping @Sendable () async -> Void) async throws {
-        guard entries.values.contains(where: { $0.connection == connection && $0.path.isInside(path) }) else { return try await body() }
+        let live = entries.values.contains { $0.connection == connection && $0.path.isInside(path) }
+            || opening.values.contains { $0.connection == connection && $0.path.isInside(path) }
+        guard live else { return try await body() }
         try await perform(on: connection) {
             try await body()
             await after()
@@ -652,15 +661,12 @@ actor LiveSync {
         drop(entry)
     }
 
+    /// Only the remote path follows a rename. The working copy keeps its name and place: an editor
+    /// that has it open goes on saving there, and the watcher knows the copy only by that name.
     private func moved(_ source: RemotePath, to destination: RemotePath, on connection: ConnectionID) {
         for entry in entries.values where entry.connection == connection {
             guard let path = entry.path.replacing(prefix: source, with: destination) else { continue }
-            let local = entry.folder.appendingPathComponent(path.name)
-            let renamed = local == entry.local || (try? FileManager.default.moveItem(at: entry.local, to: local)) != nil
-            update(entry.id) {
-                $0.path = path
-                if renamed { $0.local = local }
-            }
+            update(entry.id) { $0.path = path }
             emit(entry, .liveChanged)
         }
     }

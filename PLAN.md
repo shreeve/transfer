@@ -252,7 +252,7 @@ A Live open downloads into:
 ~/Library/Application Support/Transfer/Live/<connection-uuid>/<live-uuid>/<basename>
 ```
 
-Mode `0700` for the directory and `0600` for the file. The mapping is a UUID stored in SQLite. The remote identity remains the raw path. A rename updates the path and the basename and keeps the UUID.
+Mode `0700` for the directory and `0600` for the file. The mapping is a UUID stored in SQLite. The remote identity remains the raw path. A rename updates the path and keeps the UUID. The working copy keeps its local name, since an editor may hold it open and go on saving there.
 
 Before opening, record the base fingerprint: type, size, and whole-second mtime. No hash of the server file and no inode. Also record the working copy's exact size and mtime and a SHA-256 of its bytes: the local clock tells two same-size saves in one second apart, and the digest tells a touch from an edit, so a touched file is not uploaded. Open with `NSWorkspace`.
 

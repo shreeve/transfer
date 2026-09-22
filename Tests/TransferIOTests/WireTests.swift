@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import TransferCore
 @testable import TransferIO
 
 @Test func initPacketIsVersionThree() {
@@ -38,6 +39,35 @@ import Testing
     try await lane.submit(.preview) {}
     try await save.value
     #expect(runs.value == 1)
+}
+
+/// A Live open displaced by a preview (the user clicks another file while it downloads) is not
+/// dropped: it runs again after the preview and completes.
+@Test func openDisplacedByAPreviewStillCompletes() async throws {
+    let lane = InteractiveLane()
+    let runs = RunCount()
+    let open = Task {
+        try await lane.submit(.open) {
+            runs.bump()
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+    }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    try await lane.submit(.preview) {}
+    try await open.value
+    #expect(runs.value == 2)
+}
+
+/// Previews still displace each other: a queued preview is dropped by a newer one.
+@Test func aNewerPreviewDropsAQueuedOne() async throws {
+    let lane = InteractiveLane()
+    let blocker = Task { try await lane.submit(.save) { usleep(200_000) } }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let older = Task { try await lane.submit(.preview) {} }
+    try await Task.sleep(nanoseconds: 20_000_000)
+    try await lane.submit(.preview) {}
+    await #expect(throws: TransferError.cancelled) { try await older.value }
+    try await blocker.value
 }
 
 private final class RunCount: @unchecked Sendable {

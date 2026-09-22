@@ -1192,7 +1192,7 @@ extension SSHConnection: LiveServer {
 
     func liveFetch(_ item: RemoteItem, to local: URL, interactive: Bool) async throws {
         if interactive {
-            try await lane.submit(.preview) { try await self.fetch(item.path, info: item, to: local) { _ in } }
+            try await lane.submit(.open) { try await self.fetch(item.path, info: item, to: local) { _ in } }
         } else {
             try await fetch(item.path, info: item, to: local) { _ in }
         }
