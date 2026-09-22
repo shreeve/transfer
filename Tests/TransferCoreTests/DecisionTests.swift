@@ -128,3 +128,31 @@ import TransferCore
     let decoded = try? JSONDecoder().decode(SortConfiguration.self, from: Data(#"{"column":"size","ascending":false}"#.utf8))
     #expect(decoded == SortConfiguration(column: "size", ascending: false, caseInsensitive: false))
 }
+
+@Test func syntaxPreviewKeepsItsOwnMarkupOutOfStrings() {
+    let html = SyntaxPreview.html(text: "const a = 'x' // note\nlet b = \"k\"", fileName: "a.js")
+    #expect(html.contains("<span class=\"k\">const</span> a = <span class=\"s\">'x'</span> <span class=\"c\">// note</span>"))
+    #expect(html.contains("<span class=\"k\">let</span> b = <span class=\"s\">\"k\"</span>"))
+    #expect(html.components(separatedBy: "<span").count == 6)
+}
+
+@Test func syntaxPreviewEscapesAndLeavesStringsWhole() {
+    let html = SyntaxPreview.html(text: "if (a < b) { return \"// not a comment\" }", fileName: "a.js")
+    #expect(html.contains("(a &lt; b)"))
+    #expect(html.contains("<span class=\"s\">\"// not a comment\"</span>"))
+    #expect(!html.contains("class=\"c\""))
+}
+
+@Test func unitsScaleToThreeCharacters() {
+    #expect(Units.bytes(0) == "  0 B")
+    #expect(Units.bytes(959) == "959 B")
+    #expect(Units.bytes(1000) == "1.0kB")
+    #expect(Units.bytes(14336) == " 14kB")
+    #expect(Units.bytes(999_499) == "999kB")
+    #expect(Units.bytes(999_500) == "1.0MB")
+    #expect(Units.bytes(1_500_000_000) == "1.5GB")
+    #expect(Units.scale(0.0025, unit: "s") == "2.5ms")
+    #expect(Units.scale(0.000_000_4, unit: "s") == "400ns")
+    #expect(Units.scale(.infinity, unit: "B") == "??? B")
+    #expect(Units.scale(1e16, unit: "B") == "??? B")
+}

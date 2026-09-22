@@ -20,7 +20,11 @@ struct ColumnBrowser: NSViewRepresentable {
         browser.allowsMultipleSelection = true
         browser.hasHorizontalScroller = true
         browser.autohidesScroller = true
+        // Finder's columns keep their width when the window or inspector resizes; only the number
+        // in view changes. Widths that track the browser truncate every name during an animation.
+        browser.columnResizingType = .userColumnResizing
         browser.minColumnWidth = 180
+        browser.setDefaultColumnWidth(260)
         browser.isTitled = false
         browser.registerForDraggedTypes([.fileURL, remoteDragType])
         browser.setDraggingSourceOperationMask(.copy, forLocal: false)

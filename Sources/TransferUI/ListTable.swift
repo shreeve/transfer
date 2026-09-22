@@ -24,7 +24,7 @@ struct ListTable: NSViewRepresentable {
         table.allowsColumnReordering = true
         table.allowsColumnResizing = true
         table.autosaveTableColumns = true
-        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         table.target = context.coordinator
         table.doubleAction = #selector(Coordinator.doubleClicked(_:))
         table.registerForDraggedTypes([.fileURL, remoteDragType])
@@ -42,6 +42,7 @@ struct ListTable: NSViewRepresentable {
                 column.headerCell = cell
                 context.coordinator.nameHeader = cell
             }
+            if spec.id == "size" { column.headerCell.alignment = .right }
             table.addTableColumn(column)
         }
         let header = ListHeaderView()
@@ -136,7 +137,7 @@ struct ListTable: NSViewRepresentable {
             case "mtime":
                 cell.textField?.stringValue = item.mtime.map(Format.date) ?? ""
             case "size":
-                cell.textField?.stringValue = item.kind == .file ? Format.bytes(item.size) : ""
+                cell.textField?.stringValue = item.kind == .file ? Format.si(item.size) : ""
             default:
                 cell.textField?.stringValue = item.kindLabel
             }
@@ -150,6 +151,11 @@ struct ListTable: NSViewRepresentable {
             text.lineBreakMode = .byTruncatingMiddle
             text.font = .systemFont(ofSize: NSFont.systemFontSize)
             text.textColor = .labelColor
+            if id.rawValue == "size" {
+                // Three digits, a prefix, and the unit line up down the column.
+                text.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+                text.alignment = .right
+            }
             text.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(text)
             cell.textField = text
@@ -292,13 +298,32 @@ final class ClosureMenuItem: NSMenuItem {
 }
 
 enum Format {
-    static func bytes(_ size: UInt64?) -> String {
-        guard let size else { return "" }
-        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+    /// `959 B`, `1.2kB`, ` 14kB`: see `Units`.
+    static func si(_ size: UInt64?) -> String {
+        size.map(Units.bytes) ?? ""
     }
 
     static func date(_ mtime: UInt32) -> String {
         Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .abbreviated, time: .shortened)
+    }
+
+    /// The inspector's date, `2026-08-31`, and its time, `2:44:07 PM`.
+    static func day(_ mtime: UInt32) -> String {
+        dayFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(mtime)))
+    }
+
+    static func clock(_ mtime: UInt32) -> String {
+        clockFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(mtime)))
+    }
+
+    private static let dayFormatter = fixed("yyyy-MM-dd")
+    private static let clockFormatter = fixed("h:mm:ss a")
+
+    private static func fixed(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = format
+        return formatter
     }
 }
 

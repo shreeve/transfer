@@ -1,4 +1,6 @@
 import AppKit
+import QuickLookUI
+import WebKit
 import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
@@ -280,7 +282,7 @@ struct DetailColumn: View {
 
     private func progressText(_ progress: TransferProgress) -> String {
         var parts: [String] = []
-        if progress.completed > 0 { parts.append(Format.bytes(progress.completed)) }
+        if progress.completed > 0 { parts.append(Format.si(progress.completed)) }
         if progress.itemsCompleted > 0 { parts.append("\(progress.itemsCompleted) items") }
         return parts.joined(separator: ", ")
     }
@@ -477,46 +479,134 @@ struct DetailColumn: View {
 /// The inspector column.
 struct InspectorColumn: View {
     let model: TransferModel
+    @AppStorage(Preferences.wrapsPreview) private var wrapsPreview = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The view's copy of the model's phase, so each change can pick its own animation.
+    @State private var shown = PreviewPhase()
+    @State private var previewID = 0
 
     // MARK: Inspector
 
     var body: some View {
         let selected = model.selectedItems
-        return Form {
+        // A plain stack, not a scroll view: hosted scroll views reach up under the toolbar.
+        return VStack(alignment: .leading, spacing: 12) {
             if selected.count > 1 {
                 Text("\(selected.count) items selected").foregroundStyle(.secondary)
             } else if let item = selected.first {
-                HStack {
-                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 32, height: 32)
-                    Text(item.name).font(.headline)
-                }
-                LabeledContent("Path", value: item.path.display)
-                LabeledContent("Kind", value: item.kindLabel)
-                if item.kind == .file { LabeledContent("Size", value: Format.bytes(item.size)) }
-                LabeledContent("Modified", value: item.mtime.map { Format.date($0) } ?? "")
-                if let mode = item.mode { LabeledContent("Permissions", value: permissions(mode)) }
-                if let owner = item.owner { LabeledContent("Owner", value: owner) }
-                if let group = item.group { LabeledContent("Group", value: group) }
-                if item.kind == .symlink { LabeledContent("Target", value: model.inspectorLinkTarget ?? "…") }
-                if model.liveFile(for: item.path) != nil { LabeledContent("Live", value: model.statusText(for: item.path)) }
-                if let operation = model.operation(for: item.path) {
-                    LabeledContent("Transfer", value: operation.message ?? operation.state.rawValue.capitalized)
-                }
-                Section {
-                    Button("Open") { Task { await model.open(item) } }
-                    Button("Open Live") { Task { await model.openLiveSelection() } }
-                        .disabled(item.kind != .file)
-                    Button("Download Copy…") { Task { await model.downloadCopy() } }
-                    Button("Copy Remote URL") { model.copyRemoteURL() }
-                }
+                facts(item)
+                preview(item)
             } else {
-                LabeledContent("Folder", value: model.snapshot.path.display)
-                LabeledContent("Items", value: "\(model.items.count)")
-                Button("Copy Remote URL") { model.copyRemoteURL() }
+                Text(model.snapshot.path.name.isEmpty ? "/" : model.snapshot.path.name).font(.headline)
+                Text("\(model.items.count) items").font(.subheadline).foregroundStyle(.secondary)
+                line(model.snapshot.path.display).font(.subheadline).foregroundStyle(.secondary)
             }
         }
-        .formStyle(.grouped)
-        .scrollEdgeEffectHidden(true, for: .top)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 16)
+    }
+
+    /// The file itself when a copy has arrived, else its icon, directly under the facts. Only
+    /// source gets a frame, as in Finder; pictures and icons stand on their own.
+    private func preview(_ item: RemoteItem) -> some View {
+        let phase = PreviewPhase(preview: model.inspectorPreview, wait: model.inspectorWait)
+        return ZStack(alignment: .top) {
+            if let preview = shown.preview {
+                content(preview, item).id(previewID).transition(.opacity)
+            } else if shown.wait != .nothing {
+                VStack(spacing: 12) {
+                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 96, height: 96)
+                    if shown.wait == .spinner { ProgressView().controlSize(.small).transition(.opacity) }
+                }
+                .padding(.top, 24)
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onChange(of: phase, initial: true) { old, new in
+            if new.preview != old.preview { previewID &+= 1 }
+            withAnimation(animation(from: old, to: new)) { shown = new }
+        }
+    }
+
+    /// A swap inside the hold reads as instant, so it gets no animation, and so does content
+    /// landing in an empty pane. Old content fades out, the icon and spinner fade in, and a
+    /// picture arriving over the icon crossfades. Web and Quick Look views draw late, so a fade
+    /// on them would only show an empty box.
+    private func animation(from old: PreviewPhase, to new: PreviewPhase) -> Animation? {
+        guard !reduceMotion else { return nil }
+        if let preview = new.preview {
+            guard old.preview == nil, old.wait != .nothing, case .picture = preview else { return nil }
+            return .easeOut(duration: PreviewTiming.reveal)
+        }
+        if old.preview != nil { return .easeOut(duration: PreviewTiming.swap) }
+        if new.wait != old.wait { return .easeIn(duration: PreviewTiming.reveal) }
+        return nil
+    }
+
+    @ViewBuilder private func content(_ preview: InspectorPreview, _ item: RemoteItem) -> some View {
+        switch preview {
+        case .picture(let picture):
+            Image(decorative: picture, scale: 1).resizable().scaledToFit()
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .frame(maxWidth: .infinity, alignment: .top)
+        case .file(let url):
+            QuickLookPreview(url: url)
+        case .text(let text):
+            VStack(alignment: .trailing, spacing: 4) {
+                SourcePreview(html: SyntaxPreview.html(text: text, fileName: item.name, compact: true, wraps: wrapsPreview))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+                Toggle("Wrap lines", isOn: $wrapsPreview)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+
+    /// Name, then kind against size, then the `ls -l` facts; the folder is already in the title
+    /// bar. Actions live in the context menu and on double-click, as in the browser.
+    private func facts(_ item: RemoteItem) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(item.name).font(.headline).foregroundStyle(.primary).lineLimit(2)
+            HStack {
+                Text(item.kindLabel)
+                Spacer()
+                if item.kind == .file { Text(Format.si(item.size)).monospacedDigit() }
+            }
+            Divider().padding(.vertical, 4)
+            if let mtime = item.mtime {
+                HStack {
+                    Text(Format.day(mtime))
+                    Spacer()
+                    Text(Format.clock(mtime)).monospacedDigit()
+                }
+            }
+            HStack {
+                if let mode = item.mode { Text(permissions(mode)).monospaced() }
+                Spacer()
+                if let owner = item.owner { Text(item.group.map { "\(owner):\($0)" } ?? owner) }
+            }
+            if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
+            if model.liveFile(for: item.path) != nil { line(model.statusText(for: item.path)) }
+            if let operation = model.operation(for: item.path) {
+                line(operation.message ?? operation.state.rawValue.capitalized)
+            }
+        }
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
+    }
+
+    private func line(_ text: String) -> some View {
+        Text(text)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .textSelection(.enabled)
+            .help(text)
     }
 
     private func permissions(_ mode: UInt32) -> String {
@@ -598,4 +688,52 @@ private struct RenameBar: View {
         .onChange(of: focused) { model.textEditing = focused }
         .onDisappear { model.textEditing = false }
     }
+}
+
+/// Quick Look's preview of a local file, inline.
+struct QuickLookPreview: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> QLPreviewView {
+        let view = QLPreviewView(frame: .zero, style: .compact) ?? QLPreviewView()
+        view.autostarts = true
+        view.shouldCloseWithWindow = false
+        view.previewItem = url as NSURL
+        return view
+    }
+
+    func updateNSView(_ view: QLPreviewView, context: Context) {
+        if (view.previewItem as? NSURL) as URL? != url { view.previewItem = url as NSURL }
+    }
+}
+
+/// Highlighted source in a web view, scrollable, with the pane's own background.
+struct SourcePreview: NSViewRepresentable {
+    let html: String
+
+    func makeNSView(context: Context) -> WKWebView {
+        let view = WKWebView()
+        view.setValue(false, forKey: "drawsBackground")
+        view.loadHTMLString(html, baseURL: nil)
+        context.coordinator.html = html
+        return view
+    }
+
+    func updateNSView(_ view: WKWebView, context: Context) {
+        guard context.coordinator.html != html else { return }
+        context.coordinator.html = html
+        view.loadHTMLString(html, baseURL: nil)
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var html = ""
+    }
+}
+
+/// What the inspector's preview area shows: content, or a wait state while none is up.
+struct PreviewPhase: Equatable {
+    var preview: InspectorPreview?
+    var wait: InspectorWait = .nothing
 }

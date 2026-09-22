@@ -47,8 +47,9 @@ The list view is `ListTable.swift`, an `NSTableView` with 22-point rows, header 
 - Shelf rows offer Pause, Resume, Retry, and Remove. Dropped connections and timeouts retry at 1 s, 2 s, and 4 s. Live uploads can be paused too.
 - Command-F expands the toolbar search. The search item shows the full field when the toolbar has room and a magnifier when it does not, as Finder's does. Space and Return leave text fields alone.
 - Settings (Command-Comma) has General, Extensions, and Updates tabs. Extensions edits `config.json` through the provider; open sessions pick the list up at once.
-- Preview cache names are SHA256 of the raw path, capped at 1 GB by last use, excluded from backup.
-- Sidebar: Servers, Recents, Saved Locations, Live Files, Conflicts. Server rows offer Connect, Edit, and Remove. Remove refuses while that server has unsynced Live bytes.
+- Preview cache names are SHA256 of the raw path, capped at 1 GB by last use, excluded from backup. `prepareViewFile` returns the cached copy without a download when its size and mtime match the remote file.
+- The inspector (Command-Shift-I) is a split column: bold name, kind against size, a divider, date against time, permissions against `owner:group`, then the preview. Text files render as highlighted, wrapped-or-not source in a `WKWebView` (the `Wrap lines` checkbox is a preference); pictures are decoded off the main thread; everything else goes through `QLPreviewView`. `PreviewTiming` in `TransferModel.swift` is the choreography: the fetch starts on the selection change, the old preview holds 100 ms so a fast fetch swaps with no animation, then the pane clears, the file icon fades in at 500 ms, a spinner joins it at 1 s. After each preview the files on either side are prefetched one at a time. Sizes everywhere use `Units.scale`, three characters plus an SI prefix.
+- Sidebar: Servers, Starred, Live Files (only while active), Conflicts. Starred holds files and folders; a star's kind is learned from the server once so a starred file is revealed, never listed. Server rows offer Connect, Edit, and Remove. Remove refuses while that server has unsynced Live bytes.
 - Quit asks Cancel or Quit Anyway through the app delegate whenever any server has unsynced Live work, and disconnects every master on the way out.
 
 ## Updates

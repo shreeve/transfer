@@ -456,11 +456,21 @@ public actor SSHConnection: RemoteSession {
         let item = try await stat(path)
         let ext = (item.name as NSString).pathExtension
         let file = try previewURL(path, ext: ext.isEmpty ? "bin" : ext)
+        // The copy carries the remote size and mtime; the same pair means the same bytes.
+        if Self.cachedCopyMatches(file, item) { return file }
         try await lane.submit(.preview) {
             try await self.fetch(path, info: item, to: file) { _ in }
         }
         trimPreviewCache()
         return file
+    }
+
+    private static func cachedCopyMatches(_ file: URL, _ item: RemoteItem) -> Bool {
+        guard let mtime = item.mtime, let size = item.size,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let localSize = attributes[.size] as? UInt64,
+              let localDate = attributes[.modificationDate] as? Date else { return false }
+        return localSize == size && UInt32(localDate.timeIntervalSince1970) == mtime
     }
 
     public func preparePreview(_ path: RemotePath) async throws -> URL {

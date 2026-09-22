@@ -132,6 +132,30 @@ struct ServerTests {
         #expect(await h.session.isConnected == false)
     }
 
+    @Test func viewFileReusesTheCachedCopyUntilTheRemoteChanges() async throws {
+        guard let h = try harness("vc") else { return }
+        _ = try await h.session.connect(prompts: h.prompts)
+        let local = h.remote.appendingPathComponent("note.txt")
+        try Data("first".utf8).write(to: local)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: local.path)
+        let remote = h.remotePath.appending(name: Array("note.txt".utf8))
+
+        let first = try await h.session.prepareViewFile(remote)
+        #expect(try String(contentsOf: first, encoding: .utf8) == "first")
+        let identity = try first.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
+
+        let again = try await h.session.prepareViewFile(remote)
+        let sameIdentity = try again.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
+        #expect(identity?.isEqual(sameIdentity) == true, "an unchanged file is not downloaded twice")
+
+        // Same size, later mtime: a real change that the cache must not hide.
+        try Data("later".utf8).write(to: local)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_060)], ofItemAtPath: local.path)
+        let changed = try await h.session.prepareViewFile(remote)
+        #expect(try String(contentsOf: changed, encoding: .utf8) == "later")
+        await h.cleanUp()
+    }
+
     @Test func directoryCopyRoundTripsWithSymlinks() async throws {
         guard let h = try harness("tree") else { return }
         defer { Task { await h.cleanUp() } }

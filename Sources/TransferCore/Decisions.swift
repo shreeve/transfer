@@ -306,40 +306,77 @@ public enum ListingSort {
 }
 
 public enum SyntaxPreview {
-    public static func html(text: String, fileName: String) -> String {
+    /// A page for Quick Look, or when `compact`, a small unwrapped listing that follows the
+    /// system appearance for the inspector pane.
+    public static func html(text: String, fileName: String, compact: Bool = false, wraps: Bool = false) -> String {
         let escaped = text
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
         let colored = color(escaped)
         let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
+        let body = compact
+            ? "body{margin:6px 8px;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:\(wraps ? "pre-wrap" : "pre");overflow-wrap:anywhere;color:#1d1d1f;background:transparent;-webkit-user-select:text}"
+                + "@media(prefers-color-scheme:dark){body{color:#e5e5e7}.k{color:#6cb3ff}.s{color:#7ed49a}.c{color:#98989d}}"
+            : "body{margin:24px;font:13px ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#1d1d1f;background:#fff}"
         return """
         <!doctype html><html><head><meta charset="utf-8"><title>\(ext)</title>
         <style>
-        body{margin:24px;font:13px ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#1d1d1f;background:#fff}
+        \(body)
         .k{color:#0b4f9c;font-weight:600}.s{color:#0b6b3a}.c{color:#6e6e73}
         </style>
         </head><body>\(colored)</body></html>
         """
     }
 
+    /// One pass over the text: a comment, a string, or a keyword, whichever starts first, so a
+    /// later rule never re-matches the markup an earlier one inserted.
     private static func color(_ text: String) -> String {
-        let keywords = "func|let|var|class|struct|enum|import|return|if|else|for|while|fn|pub|def|const|public|private"
-        var colored = text.replacingOccurrences(
-            of: "\\b(\(keywords))\\b",
-            with: "<span class=\"k\">$1</span>",
-            options: .regularExpression
-        )
-        colored = colored.replacingOccurrences(
-            of: "(&quot;.*?&quot;|\".*?\")",
-            with: "<span class=\"s\">$1</span>",
-            options: .regularExpression
-        )
-        return colored.replacingOccurrences(
-            of: "(//[^<\\n]*)",
-            with: "<span class=\"c\">$1</span>",
-            options: .regularExpression
-        )
+        let keywords = "func|let|var|class|struct|enum|import|export|return|if|else|for|while|fn|pub|def|const|public|private|async|await"
+        let pattern = #"(//[^\n]*|(?m:^[ \t]*#[^\n]*))|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`)|\b("# + keywords + #")\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let source = text as NSString
+        var out = ""
+        var cursor = 0
+        for match in regex.matches(in: text, range: NSRange(location: 0, length: source.length)) {
+            out += source.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+            let token = source.substring(with: match.range)
+            let cls = match.range(at: 1).location != NSNotFound ? "c" : match.range(at: 2).location != NSNotFound ? "s" : "k"
+            out += "<span class=\"\(cls)\">\(token)</span>"
+            cursor = match.range.location + match.range.length
+        }
+        out += source.substring(from: cursor)
+        return out
+    }
+}
+
+/// Values with units in three characters and an SI prefix: `959 B`, `1.2kB`, ` 14kB`, `2.5ms`.
+/// Sizes, rates, and times read the same way everywhere.
+public enum Units {
+    public static func scale(_ value: Double, unit: String) -> String {
+        if value > 0, value.isFinite {
+            let span = ["T", "G", "M", "k", " ", "m", "µ", "n", "p"]
+            var value = value
+            var slot = 4
+            while value < 0.995, slot < 8 {
+                value *= 1000
+                slot += 1
+            }
+            while value >= 999.5, slot > 0 {
+                value /= 1000
+                slot -= 1
+            }
+            if value < 999.5 {
+                let tenth = (value * 10).rounded() / 10
+                let digits = tenth >= 10 ? String(Int(value.rounded())) : String(format: "%.1f", tenth)
+                return String(repeating: " ", count: max(0, 3 - digits.count)) + digits + span[slot] + unit
+            }
+        }
+        return value == 0 ? "  0 \(unit)" : "??? \(unit)"
+    }
+
+    public static func bytes(_ size: UInt64) -> String {
+        scale(Double(size), unit: "B")
     }
 }
 

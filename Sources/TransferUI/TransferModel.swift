@@ -17,6 +17,8 @@ public enum Preferences {
     }
     public static let showsHidden = "transfer.showsHidden"
     public static let viewMode = "transfer.viewMode"
+    /// Off unless turned on: the inspector's source preview wraps long lines.
+    public static let wrapsPreview = "transfer.wrapsPreview"
 }
 
 public enum SidebarItem: Hashable {
@@ -39,6 +41,8 @@ public final class TransferModel {
     public var columnRoot: RemotePath?
     public var operations: [TransferOperation] = []
     public var pins: [RemotePath] = []
+    /// Whether each starred path is a folder, from the server, so a starred file is never listed.
+    @ObservationIgnored private var pinIsFolder: [RemotePath: Bool] = [:]
     public var liveFiles: [LiveFile] = [] {
         didSet { liveByPath = Dictionary(liveFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first }) }
     }
@@ -52,7 +56,20 @@ public final class TransferModel {
     public var textEditing = false
     public var folderText = ""
     public var status = "Not connected"
-    public var showsInspector = false
+    public var showsInspector = false {
+        didSet { if showsInspector != oldValue { refreshInspectorPreview() } }
+    }
+    /// The primary file for the inspector's preview, when it is small enough: its first lines
+    /// when it is text, a decoded picture, else a local copy for Quick Look. Stays on the
+    /// previous file for a moment after the selection moves, so a fast fetch swaps with no gap.
+    public var inspectorPreview: InspectorPreview?
+    /// What the pane shows while no preview is up: nothing, the file's icon, or the icon with a
+    /// spinner once the wait has grown long.
+    public var inspectorWait: InspectorWait = .nothing
+    @ObservationIgnored private var inspectorTasks: [Task<Void, Never>] = []
+    @ObservationIgnored private var inspectorGeneration = 0
+    @ObservationIgnored private var lastSelectionChange = ContinuousClock.now - .seconds(10)
+    private static let inspectorPreviewLimit = 8 << 20
     public var sidebarCollapsed = false
     public var showsShelf = false
     public var draft = SavedConnection(name: "", host: "")
@@ -158,6 +175,7 @@ public final class TransferModel {
             backStack.removeAll()
             forwardStack.removeAll()
             columns.removeAll()
+            pinIsFolder.removeAll()
             loadPreferences(for: connection.id)
             status = connection.displayName
             snapshot.path = path
@@ -174,6 +192,7 @@ public final class TransferModel {
         snapshot.connectionID = nil
         items = []
         columns.removeAll()
+        pinIsFolder.removeAll()
         liveFiles = []
         status = "Not connected"
     }
@@ -250,6 +269,8 @@ public final class TransferModel {
                 }
             }
             publish(page, for: path)
+            // A listing that worked ends any earlier error in the title.
+            if let name = currentConnection?.displayName { status = name }
             return true
         } catch is CancellationError {
             return false
@@ -450,7 +471,7 @@ public final class TransferModel {
     // MARK: Open
 
     /// One hop through a symlink. A second hop is an error.
-    private func resolveLink(_ item: RemoteItem, session: any RemoteSession) async throws -> RemoteItem {
+    private static func resolveLink(_ item: RemoteItem, session: any RemoteSession) async throws -> RemoteItem {
         guard item.kind == .symlink else { return item }
         let link = try await session.readlink(item.path)
         let resolved = link.hasPrefix("/") ? RemotePath(string: link) : (item.path.parent ?? RemotePath(string: "/")).appending(name: Array(link.utf8))
@@ -463,7 +484,7 @@ public final class TransferModel {
     public func open(_ item: RemoteItem, forceLive: Bool = false) async {
         guard let session else { return }
         do {
-            let target = try await resolveLink(item, session: session)
+            let target = try await Self.resolveLink(item, session: session)
             if target.kind == .directory {
                 await navigate(target.path)
                 return
@@ -511,7 +532,7 @@ public final class TransferModel {
         previewTask?.cancel()
         previewTask = Task { [weak self] in
             do {
-                let target = try await self?.resolveLink(item, session: session) ?? item
+                let target = try await Self.resolveLink(item, session: session)
                 let url = try await session.preparePreview(target.path)
                 if Task.isCancelled { return }
                 PreviewPanel.shared.show(url)
@@ -527,6 +548,7 @@ public final class TransferModel {
         if PreviewPanel.shared.isVisible {
             if primaryItem != nil { showPreview() } else { PreviewPanel.shared.close() }
         }
+        refreshInspectorPreview()
         inspectorLinkTarget = nil
         if let item = primaryItem, item.kind == .symlink, let session {
             Task { [weak self] in
@@ -534,6 +556,112 @@ public final class TransferModel {
                 self?.inspectorLinkTarget = target
             }
         }
+    }
+
+    /// Starts fetching the primary file the instant the selection moves; nothing waits on an
+    /// animation. The old preview stays up for `hold` so a quick fetch swaps with no gap, then
+    /// the pane clears, the icon arrives once the wait is plainly long, and a spinner joins it
+    /// later still. A held arrow key coalesces: only a change that follows another within
+    /// `coalesce` waits.
+    private func refreshInspectorPreview() {
+        for task in inspectorTasks { task.cancel() }
+        inspectorTasks.removeAll()
+        inspectorGeneration &+= 1
+        let generation = inspectorGeneration
+        let now = ContinuousClock.now
+        let rapid = lastSelectionChange.duration(to: now) < PreviewTiming.coalesce
+        lastSelectionChange = now
+        inspectorWait = .nothing
+        guard showsInspector, let session, let item = primaryItem else {
+            inspectorPreview = nil
+            return
+        }
+        guard item.kind != .directory else {
+            inspectorPreview = nil
+            inspectorWait = .icon
+            return
+        }
+        inspectorTasks = [
+            Task { [weak self] in
+                try? await Task.sleep(for: PreviewTiming.hold)
+                guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
+                inspectorPreview = nil
+            },
+            Task { [weak self] in
+                try? await Task.sleep(for: PreviewTiming.icon)
+                guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
+                inspectorWait = .icon
+            },
+            Task { [weak self] in
+                try? await Task.sleep(for: PreviewTiming.spinner)
+                guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
+                inspectorWait = .spinner
+            },
+            Task { [weak self] in
+                if rapid { try? await Task.sleep(for: PreviewTiming.coalesce) }
+                guard !Task.isCancelled else { return }
+                let preview = await Self.fetchPreview(item, session: session)
+                guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
+                for task in inspectorTasks { task.cancel() }
+                inspectorPreview = preview
+                inspectorWait = preview == nil ? .icon : .nothing
+                if preview != nil { prefetchNeighbors(of: item, session: session, generation: generation) }
+            },
+        ]
+    }
+
+    /// The preview for one file, ready to draw: text, a decoded picture, or a local copy for
+    /// Quick Look. Nil when it is not a small file after all.
+    private static func fetchPreview(_ item: RemoteItem, session: any RemoteSession) async -> InspectorPreview? {
+        do {
+            let target = try await Self.resolveLink(item, session: session)
+            guard target.kind == .file, (target.size ?? 0) <= inspectorPreviewLimit else { return nil }
+            let url = try await session.prepareViewFile(target.path)
+            if await session.openKind(fileName: target.name) == .live, let text = previewText(url) {
+                return .text(text)
+            }
+            if let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .image),
+               let picture = await Task.detached(priority: .userInitiated, operation: { decodePicture(url) }).value {
+                return .picture(picture)
+            }
+            return .file(try await session.preparePreview(target.path))
+        } catch {
+            return nil
+        }
+    }
+
+    /// Warms the cache for the files on either side of `item`, one at a time, so an arrow key
+    /// lands on a copy that is already here. A newer selection cancels this like everything else.
+    private func prefetchNeighbors(of item: RemoteItem, session: any RemoteSession, generation: Int) {
+        let list = items
+        guard let index = list.firstIndex(of: item) else { return }
+        let neighbors = [index + 1, index - 1].filter(list.indices.contains).map { list[$0] }
+            .filter { $0.kind == .file && ($0.size ?? 0) <= Self.inspectorPreviewLimit }
+        guard !neighbors.isEmpty else { return }
+        inspectorTasks.append(Task { [weak self] in
+            for neighbor in neighbors {
+                guard !Task.isCancelled, self?.inspectorGeneration == generation else { return }
+                _ = try? await session.prepareViewFile(neighbor.path)
+            }
+        })
+    }
+
+    /// A picture decoded at a size the pane can use, so showing it never stalls the main thread.
+    nonisolated private static func decodePicture(_ url: URL) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 1200,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+
+    /// The first lines of a text file; nil when the bytes are not text after all.
+    private static func previewText(_ url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url), let data = try? handle.read(upToCount: 64 << 10) else { return nil }
+        if data.prefix(8 << 10).contains(0) { return nil }
+        return String(decoding: data, as: UTF8.self)
     }
 
     public func focusFilter() {
@@ -770,13 +898,21 @@ public final class TransferModel {
     /// Starred entries whose kind is unknown are treated as folders; a starred file is one the
     /// user has seen listed, so its kind is in a cached listing.
     public func starredIsFolder(_ path: RemotePath) -> Bool {
+        if let known = pinIsFolder[path] { return known }
         guard let parent = path.parent, let item = columns[parent]?.first(where: { $0.path == path }) else { return true }
         return item.kind == .directory
     }
 
+    /// Asks the server about `path` once, following a link, and remembers the answer.
+    private func learnStarred(_ path: RemotePath, session: any RemoteSession) async {
+        guard pinIsFolder[path] == nil else { return }
+        guard let item = try? await session.stat(path), let target = try? await Self.resolveLink(item, session: session) else { return }
+        pinIsFolder[path] = target.kind == .directory
+    }
+
     /// Starred folders sit in the sidebar for one-click return.
     public func setStarred(_ path: RemotePath, _ starred: Bool) async {
-        if starred { await session?.pin(path) } else { await session?.unpin(path) }
+        if starred { await session?.pin(path) } else { await session?.unpin(path); pinIsFolder[path] = nil }
         await reloadSidebars()
     }
 
@@ -895,6 +1031,7 @@ public final class TransferModel {
             if snapshot.connectionID != id { await connect(connection) }
         case .pin(let path):
             // A starred folder opens; a starred file is revealed in its folder.
+            if let session { await learnStarred(path, session: session) }
             if starredIsFolder(path) { await navigate(path) } else { await reveal(path) }
         case .live(let path):
             await reveal(path)
@@ -917,7 +1054,10 @@ public final class TransferModel {
 
     private func reloadSidebars() async {
         guard let session else { return }
-        pins = await session.pins()
+        let starred = await session.pins()
+        // Learn each star's kind before publishing, so the sidebar draws the right icon at once.
+        for path in starred { await learnStarred(path, session: session) }
+        pins = starred
         liveFiles = await session.liveFiles()
         conflicts = liveFiles.filter(\.conflict).map(\.path)
     }
@@ -1140,4 +1280,40 @@ final class PreviewPanel: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDele
     func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
         false
     }
+}
+
+public enum InspectorPreview: Equatable {
+    case file(URL)
+    case text(String)
+    case picture(CGImage)
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        switch (lhs, rhs) {
+        case (.file(let a), .file(let b)): a == b
+        case (.text(let a), .text(let b)): a == b
+        case (.picture(let a), .picture(let b)): a === b
+        default: false
+        }
+    }
+}
+
+public enum InspectorWait: Equatable {
+    case nothing, icon, spinner
+}
+
+/// The inspector's choreography. The fetch always starts at once; these only shape what shows
+/// while it runs. Under 100 ms reads as instant, so a swap inside `hold` needs no animation.
+/// Finder's own pane goes blank rather than showing an icon, then adds a spinner near half a
+/// second; an icon that lands and is replaced within a few frames is a flicker, so it waits.
+public enum PreviewTiming {
+    /// How long the previous preview stays up while the next one is on its way.
+    public static let hold: Duration = .milliseconds(100)
+    /// Selection changes closer together than this are a held key; only then does the fetch wait.
+    public static let coalesce: Duration = .milliseconds(120)
+    /// When the file's icon fills the empty pane, and when it gains a spinner.
+    public static let icon: Duration = .milliseconds(500)
+    public static let spinner: Duration = .seconds(1)
+    /// The old preview leaving, and the icon or a picture arriving over what was there.
+    public static let swap: TimeInterval = 0.12
+    public static let reveal: TimeInterval = 0.2
 }

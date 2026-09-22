@@ -236,7 +236,8 @@ final class ChromeController: NSSplitViewController {
             host.sizingOptions = []
         }
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
-        sidebarItem.minimumThickness = 200
+        // Finder's sidebar narrows to about this before a further drag snaps it closed.
+        sidebarItem.minimumThickness = 150
         sidebarItem.maximumThickness = 320
         sidebarItem.canCollapse = true
         sidebarItem.allowsFullHeightLayout = true
@@ -280,6 +281,11 @@ final class ChromeController: NSSplitViewController {
     override func viewDidLayout() {
         super.viewDidLayout()
         let top = view.window?.contentView?.safeAreaInsets.top ?? 0
+        // The toolbar arrives after the columns' first layout, and a collapsed column keeps its
+        // width when it opens, so each column checks the safe area again here.
+        for item in splitViewItems where item.viewController.view is BelowToolbarView {
+            item.viewController.view.needsLayout = true
+        }
         let content = splitViewItems[1].viewController.view
         let x = content.convert(content.bounds, to: view).minX
         hoverLine.frame = NSRect(x: x, y: view.bounds.height - top - 1, width: view.bounds.width - x, height: 1)
