@@ -140,6 +140,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 view.button.action = #selector(expandSearch(_:))
                 view.onCollapse = { [weak self] in self?.model.textEditing = false }
                 item.view = view
+                view.item = item
                 item.label = "Search"
                 item.visibilityPriority = .high
                 searchView = view
@@ -493,6 +494,9 @@ final class SearchToolbarView: NSView {
     let button = NSButton()
     let field = NSSearchField()
     var onCollapse: (() -> Void)?
+    /// The toolbar measures a view item once, when the view is attached. After a state change the
+    /// view is attached again so the toolbar re-reads the new range and lays out for it.
+    weak var item: NSToolbarItem?
     private(set) var isExpanded = false
     private var minWidth: NSLayoutConstraint!
     private var maxWidth: NSLayoutConstraint!
@@ -534,12 +538,10 @@ final class SearchToolbarView: NSView {
         isExpanded = true
         button.isHidden = true
         field.isHidden = false
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
-            maxWidth.animator().constant = Self.expandedWidth
-            preferredWidth.animator().constant = Self.expandedWidth
-            minWidth.animator().constant = Self.expandedMinWidth
-        }
+        minWidth.constant = Self.expandedMinWidth
+        preferredWidth.constant = Self.expandedWidth
+        maxWidth.constant = Self.expandedWidth
+        remeasure()
         if focus { window?.makeFirstResponder(field) }
     }
 
@@ -550,18 +552,20 @@ final class SearchToolbarView: NSView {
         if window?.firstResponder === field.currentEditor() || window?.firstResponder === field {
             window?.makeFirstResponder(nil)
         }
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.15
-            minWidth.animator().constant = Self.collapsedWidth
-            preferredWidth.animator().constant = Self.collapsedWidth
-            maxWidth.animator().constant = Self.collapsedWidth
-        }, completionHandler: { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, !self.isExpanded else { return }
-                self.field.isHidden = true
-                self.button.isHidden = false
-            }
-        })
+        field.isHidden = true
+        button.isHidden = false
+        minWidth.constant = Self.collapsedWidth
+        preferredWidth.constant = Self.collapsedWidth
+        maxWidth.constant = Self.collapsedWidth
+        remeasure()
         onCollapse?()
+    }
+
+    private func remeasure() {
+        guard let item else { return }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            item.view = self
+        }
     }
 }
