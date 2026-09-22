@@ -259,6 +259,41 @@ public struct BrowserSnapshot: Hashable, Sendable {
     }
 }
 
+/// What the column view shows for a location: one column per folder from the root down to the
+/// location, each with its selection. Every column above the location selects the next folder on
+/// the way down; the location's own column selects the items of `selection` it holds. A selected
+/// folder that is itself the location is therefore selected in its parent's column, and its own
+/// column shows with nothing selected, as it does after a click.
+public enum ColumnTrail {
+    public struct Column: Hashable, Sendable {
+        public var folder: RemotePath
+        public var selected: Set<RemotePath>
+
+        public init(folder: RemotePath, selected: Set<RemotePath>) {
+            self.folder = folder
+            self.selected = selected
+        }
+    }
+
+    public static func columns(root: RemotePath, path: RemotePath, selection: Set<RemotePath>) -> [Column] {
+        var folders = [path]
+        if path.isInside(root) {
+            while let last = folders.last, last != root, let parent = last.parent { folders.append(parent) }
+            folders.reverse()
+        } else {
+            folders = [root]
+        }
+        var columns: [Column] = []
+        for (index, folder) in folders.enumerated() {
+            let selected: Set<RemotePath> = index + 1 < folders.count
+                ? [folders[index + 1]]
+                : selection.filter { $0.parent == folder }
+            columns.append(Column(folder: folder, selected: selected))
+        }
+        return columns
+    }
+}
+
 public enum ListingSort {
     /// With `foldersFirst`, directories come first in every column and direction. Within each
     /// group the chosen column applies, with raw-byte name order breaking ties.

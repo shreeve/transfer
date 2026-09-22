@@ -2,6 +2,43 @@ import Foundation
 import Testing
 import TransferCore
 
+@Test func columnTrailSelectsTheWayDownToASelectedFolder() {
+    let root = RemotePath(string: "/home/u")
+    let folder = RemotePath(string: "/home/u/work/movedir")
+    let trail = ColumnTrail.columns(root: root, path: folder, selection: [folder])
+    #expect(trail == [
+        ColumnTrail.Column(folder: root, selected: [RemotePath(string: "/home/u/work")]),
+        ColumnTrail.Column(folder: RemotePath(string: "/home/u/work"), selected: [folder]),
+        ColumnTrail.Column(folder: folder, selected: []),
+    ])
+}
+
+@Test func columnTrailSelectsFilesInTheLocationsColumn() {
+    let root = RemotePath(string: "/")
+    let folder = RemotePath(string: "/srv")
+    let files: Set<RemotePath> = [RemotePath(string: "/srv/a.txt"), RemotePath(string: "/srv/b.txt")]
+    let trail = ColumnTrail.columns(root: root, path: folder, selection: files)
+    #expect(trail == [
+        ColumnTrail.Column(folder: root, selected: [folder]),
+        ColumnTrail.Column(folder: folder, selected: files),
+    ])
+}
+
+@Test func columnTrailAtTheRootIgnoresSelectionElsewhere() {
+    let root = RemotePath(string: "/home/u")
+    let stray = RemotePath(string: "/tmp/x")
+    let file = RemotePath(string: "/home/u/notes.txt")
+    #expect(ColumnTrail.columns(root: root, path: root, selection: [file, stray, root]) == [
+        ColumnTrail.Column(folder: root, selected: [file]),
+    ])
+}
+
+@Test func columnTrailOutsideTheRootShowsOnlyTheRoot() {
+    let root = RemotePath(string: "/home/u")
+    let trail = ColumnTrail.columns(root: root, path: RemotePath(string: "/home/other"), selection: [RemotePath(string: "/home/other/x")])
+    #expect(trail == [ColumnTrail.Column(folder: root, selected: [])])
+}
+
 @Test func editableExtensionsOpenLive() {
     for name in ["notes.txt", "app.swift", "main.rs", "page.tsx", "config.json", "clip.rip"] {
         #expect(EditableFile.openKind(fileName: name) == .live)
