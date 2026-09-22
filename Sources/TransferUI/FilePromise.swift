@@ -128,42 +128,62 @@ struct FilePromiseLabel: NSViewRepresentable {
     var item: RemoteItem
     var model: TransferModel
 
-    func makeNSView(context: Context) -> PromiseText {
-        let view = PromiseText()
+    func makeNSView(context: Context) -> IconItemView {
+        let view = IconItemView()
         view.apply(item: item, model: model)
         return view
     }
 
-    func updateNSView(_ view: PromiseText, context: Context) {
+    func updateNSView(_ view: IconItemView, context: Context) {
         view.apply(item: item, model: model)
     }
 }
 
-final class PromiseText: NSTextField, NSDraggingSource {
+/// A whole icon-grid cell: the glyph and the name, both a drag source, so a drag can start
+/// anywhere on the cell as in Finder. Selection, open, and drop onto folders live here too.
+final class IconItemView: NSView, NSDraggingSource {
     private var item = RemoteItem(path: RemotePath(string: "/"), kind: .other)
     private weak var model: TransferModel?
     private var down: NSPoint = .zero
+    private let icon = NSImageView()
+    private let label = NSTextField(labelWithString: "")
 
-    override var acceptsFirstResponder: Bool { false }
-
-    init() {
-        super.init(frame: .zero)
-        alignment = .center
-        isBordered = false
-        isEditable = false
-        isSelectable = false
-        drawsBackground = false
-        lineBreakMode = .byTruncatingMiddle
-        font = .systemFont(ofSize: NSFont.systemFontSize)
-        textColor = .labelColor
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        label.alignment = .center
+        // Finder wraps a long name to two lines, then truncates the middle so the extension stays.
+        label.maximumNumberOfLines = 2
+        label.lineBreakMode = .byTruncatingMiddle
+        label.cell?.wraps = true
+        label.cell?.isScrollable = false
+        label.cell?.truncatesLastVisibleLine = true
+        label.preferredMaxLayoutWidth = 96
+        label.font = .systemFont(ofSize: NSFont.systemFontSize)
+        label.textColor = .labelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(icon)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            icon.topAnchor.constraint(equalTo: topAnchor),
+            icon.centerXAnchor.constraint(equalTo: centerXAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 48),
+            icon.heightAnchor.constraint(equalToConstant: 48),
+            label.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 4),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor),
+            label.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor),
+        ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     func apply(item: RemoteItem, model: TransferModel) {
-        stringValue = item.name
         self.item = item
         self.model = model
+        icon.image = ItemIcon.image(for: item)
+        label.stringValue = item.name
         if item.kind == .directory {
             registerForDraggedTypes([.fileURL, remoteDragType])
         } else {
@@ -194,11 +214,11 @@ final class PromiseText: NSTextField, NSDraggingSource {
         guard moved > 4, let model, let session = model.session else { return }
         let roots = model.dragItems(including: item)
         let providers = RemoteItemPromise.providers(for: roots, session: session)
-        let dragging = providers.enumerated().map { index, provider in
-            let draggingItem = NSDraggingItem(pasteboardWriter: provider)
-            let frame = index == 0 ? bounds : NSRect(x: bounds.minX, y: bounds.minY - CGFloat(index) * 4, width: bounds.width, height: bounds.height)
-            draggingItem.setDraggingFrame(frame, contents: index == 0 ? stringValue : nil)
-            return draggingItem
+        let dragging = providers.enumerated().map { index, provider -> NSDraggingItem in
+            let dragItem = NSDraggingItem(pasteboardWriter: provider)
+            let frame = index == 0 ? icon.frame : NSRect(x: icon.frame.minX, y: icon.frame.minY - CGFloat(index) * 4, width: icon.frame.width, height: icon.frame.height)
+            dragItem.setDraggingFrame(frame, contents: index == 0 ? ItemIcon.image(for: item) : nil)
+            return dragItem
         }
         beginDraggingSession(with: dragging, event: event, source: self)
     }

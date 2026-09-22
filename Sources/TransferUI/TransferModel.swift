@@ -1277,8 +1277,24 @@ final class PreviewPanel: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDele
         return (url ?? URL(fileURLWithPath: "/")) as NSURL
     }
 
+    /// Space and Escape put the panel away; the arrow keys go to the browser behind it, so the
+    /// selection moves and the panel follows, as Finder's does.
     func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
-        false
+        guard event.type == .keyDown else { return false }
+        switch event.keyCode {
+        case 49, 53:
+            MainActor.assumeIsolated { close() }
+            return true
+        case 123, 124, 125, 126:
+            // The panel calls this on the main thread; NSEvent just is not marked Sendable.
+            nonisolated(unsafe) let forwarded = event!
+            MainActor.assumeIsolated {
+                if let responder = NSApp.mainWindow?.firstResponder as? NSView { responder.keyDown(with: forwarded) }
+            }
+            return true
+        default:
+            return false
+        }
     }
 }
 

@@ -54,6 +54,8 @@ struct ListTable: NSViewRepresentable {
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
+        // Narrower than its columns, the table scrolls sideways as Finder's does, never clips.
+        scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
         context.coordinator.table = table
@@ -275,10 +277,35 @@ struct ListTable: NSViewRepresentable {
 /// Serves the coordinator's context menu for the row under the mouse.
 final class RowMenuTableView: NSTableView {
     weak var coordinator: ListTable.Coordinator?
+    private var fittedWidth: CGFloat = 0
+
+    /// The Name column takes whatever width the others leave, down to its minimum, so the table
+    /// reflows with the window and the inspector. Autoresizing alone only tracks changes, and
+    /// misses a restored column set that is already wider than the view.
+    override func layout() {
+        super.layout()
+        guard let clip = enclosingScrollView?.contentView, let name = tableColumns.first else { return }
+        let available = clip.bounds.width
+        guard available > 0, abs(available - fittedWidth) > 0.5 else { return }
+        fittedWidth = available
+        let others = tableColumns.dropFirst().filter { !$0.isHidden }.reduce(0) { $0 + $1.width }
+        let spacing = intercellSpacing.width * CGFloat(tableColumns.count)
+        let width = max(name.minWidth, available - others - spacing)
+        if abs(name.width - width) > 0.5 { name.width = width }
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
         return coordinator?.menu(forRow: row(at: point))
+    }
+
+    /// Space opens Quick Look, as in Finder; the table would otherwise swallow it.
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
+            coordinator?.model.togglePreview()
+            return
+        }
+        super.keyDown(with: event)
     }
 }
 

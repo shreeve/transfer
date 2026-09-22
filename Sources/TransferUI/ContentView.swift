@@ -162,23 +162,17 @@ struct DetailColumn: View {
 
     private var iconView: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96))], spacing: 16) {
+            // Fixed-width columns packed from the left, not stretched to fill: as the inspector
+            // narrows the pane, items hold their positions and only the column count steps, so the
+            // grid never shimmies. Finder's icon view reflows the same way.
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 108, maximum: 108), spacing: 16)], alignment: .leading, spacing: 16) {
                 ForEach(model.displayedItems) { item in
-                    VStack(spacing: 4) {
-                        Image(nsImage: ItemIcon.image(for: item))
-                            .resizable()
-                            .frame(width: 48, height: 48)
-                        FilePromiseLabel(item: item, model: model)
-                            .frame(height: 18)
-                    }
-                    .frame(width: 96)
-                    .padding(6)
-                    .background(model.snapshot.selection.contains(item.path) ? Color.accentColor.opacity(0.2) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { Task { await model.open(item) } }
-                    .onTapGesture { model.snapshot.selection = [item.path] }
-                    .contextMenu { rowMenu(item) }
+                    FilePromiseLabel(item: item, model: model)
+                        .frame(width: 96, height: 88)
+                        .padding(6)
+                        .background(model.snapshot.selection.contains(item.path) ? Color.accentColor.opacity(0.2) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .contextMenu { rowMenu(item) }
                 }
             }
             .padding()
@@ -187,6 +181,12 @@ struct DetailColumn: View {
         .contentShape(Rectangle())
         .onTapGesture { model.snapshot.selection = [] }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in dropFiles(providers) }
+        .focusable()
+        .focusEffectDisabled()
+        .onKeyPress(.space) {
+            model.togglePreview()
+            return .handled
+        }
     }
 
     private func dropFiles(_ providers: [NSItemProvider]) -> Bool {

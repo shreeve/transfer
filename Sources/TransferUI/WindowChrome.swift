@@ -241,6 +241,9 @@ final class ChromeController: NSSplitViewController {
         sidebarItem.maximumThickness = 320
         sidebarItem.canCollapse = true
         sidebarItem.allowsFullHeightLayout = true
+        // The sidebar holds its width while the inspector animates; only the content pane gives up
+        // space. Without this the split view shrinks both siblings and the sidebar appears to move.
+        sidebarItem.holdingPriority = NSLayoutConstraint.Priority(260)
         // Finder draws no line under the title bar over the sidebar, and over the content only
         // on hover, which the hover line handles. The built-in separators stay off.
         sidebarItem.titlebarSeparatorStyle = .none
@@ -249,14 +252,22 @@ final class ChromeController: NSSplitViewController {
         detail.safeAreaRegions = []
         inspector.safeAreaRegions = []
         let detailItem = NSSplitViewItem(viewController: BelowToolbarController(hosting: detail))
-        detailItem.minimumThickness = 420
+        // Low enough that the content pane can absorb the whole inspector without the split view
+        // ever pushing into the sidebar; one column stays visible at the minimum.
+        detailItem.minimumThickness = 260
         detailItem.titlebarSeparatorStyle = .none
+        // Lowest priority, so the content pane is the one that resizes for the inspector.
+        detailItem.holdingPriority = NSLayoutConstraint.Priority(250)
         let inspectorItem = NSSplitViewItem(inspectorWithViewController: BelowToolbarController(hosting: inspector))
         inspectorItem.minimumThickness = 240
         inspectorItem.maximumThickness = 320
         inspectorItem.canCollapse = true
         inspectorItem.isCollapsed = true
         inspectorItem.titlebarSeparatorStyle = .none
+        inspectorItem.holdingPriority = NSLayoutConstraint.Priority(260)
+        // The content pane alone yields the space; the sidebar's higher priority and the content
+        // pane's low minimum keep the sidebar fixed.
+        inspectorItem.collapseBehavior = .preferResizingSiblingsWithFixedSplitView
         addSplitViewItem(sidebarItem)
         addSplitViewItem(detailItem)
         addSplitViewItem(inspectorItem)

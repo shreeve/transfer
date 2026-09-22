@@ -10,7 +10,8 @@ struct ColumnBrowser: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
 
     func makeNSView(context: Context) -> NSBrowser {
-        let browser = NSBrowser()
+        let browser = TiledBrowser()
+        browser.model = model
         browser.setCellClass(CenteredBrowserCell.self)
         browser.delegate = context.coordinator
         browser.target = context.coordinator
@@ -18,17 +19,15 @@ struct ColumnBrowser: NSViewRepresentable {
         browser.doubleAction = #selector(Coordinator.doubleClicked(_:))
         browser.sendsActionOnArrowKeys = true
         browser.allowsMultipleSelection = true
-        browser.hasHorizontalScroller = true
-        browser.autohidesScroller = true
-        // Finder's columns keep their width when the window or inspector resizes; only the number
-        // in view changes. Widths that track the browser truncate every name during an animation.
         browser.columnResizingType = .userColumnResizing
         browser.minColumnWidth = 180
-        browser.setDefaultColumnWidth(260)
+        browser.setDefaultColumnWidth(TiledBrowser.columnWidth)
         browser.isTitled = false
         browser.registerForDraggedTypes([.fileURL, remoteDragType])
         browser.setDraggingSourceOperationMask(.copy, forLocal: false)
         browser.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
+        browser.hasHorizontalScroller = true
+        browser.autohidesScroller = true
         context.coordinator.browser = browser
         return browser
     }
@@ -179,7 +178,7 @@ struct ColumnBrowser: NSViewRepresentable {
         // MARK: Drag out
 
         func browser(_ browser: NSBrowser, canDragRowsWith rowIndexes: IndexSet, inColumn column: Int, with event: NSEvent) -> Bool {
-            model.session != nil
+            return model.session != nil
         }
 
         func browser(_ browser: NSBrowser, pasteboardWriterForRow row: Int, column: Int) -> (any NSPasteboardWriting)? {
@@ -196,6 +195,10 @@ struct ColumnBrowser: NSViewRepresentable {
             column: UnsafeMutablePointer<Int>,
             dropOperation: UnsafeMutablePointer<NSBrowser.DropOperation>
         ) -> NSDragOperation {
+            // The browser's own empty area, outside every column, is no target for its own drag:
+            // answering it with an operation makes NSBrowser cancel a drag that crosses it on the
+            // way out to Finder. Files arriving from elsewhere still drop there, into this folder.
+            if column.pointee < 0, RemoteDragPayload.read(from: info.draggingPasteboard) != nil { return [] }
             guard let connection = model.snapshot.connectionID else { return [] }
             // A folder row is the target only for a drop on it; between rows means the column's folder.
             if let target = browser.item(atRow: row.pointee, inColumn: column.pointee) as? RemoteItem, target.kind == .directory {
@@ -228,6 +231,25 @@ struct ColumnBrowser: NSViewRepresentable {
 
 /// The `..` row's item in the column view.
 final class UpEntry: NSObject {}
+
+/// The column browser: fixed-width columns. Space opens Quick Look, as in Finder.
+final class TiledBrowser: NSBrowser {
+    /// Columns keep this width and never reflow. When the inspector opens, the pane narrows from
+    /// the right and the columns hold still and clip, so the whole set slides left as one piece
+    /// and slides back on exit, the way Finder's columns do. Re-tiling to fit made every column
+    /// visibly resize during the toggle, which read as an overlay rather than a slide.
+    static let columnWidth: CGFloat = 260
+    weak var model: TransferModel?
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
+            model?.togglePreview()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
 
 /// Icons at 16 points, cached by kind and extension: every row of every view asks for one.
 @MainActor
