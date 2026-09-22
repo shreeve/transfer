@@ -1,0 +1,22 @@
+{
+  "editableExtensions": [
+    "rip",
+    "txt",
+    "json",
+    "ts",
+    "rs",
+    "c",
+    "md",
+    "swift",
+    "py",
+    "js",
+    "jsx",
+    "tsx",
+    "html",
+    "css",
+    "yaml",
+    "yml",
+    "toml",
+    "sh"
+  ]
+}

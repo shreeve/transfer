@@ -12,11 +12,17 @@ let package = Package(
     ],
     targets: [
         .target(name: "TransferCore"),
-        .target(name: "TransferIO", dependencies: ["TransferCore"]),
+        .target(
+            name: "TransferIO",
+            dependencies: ["TransferCore"],
+            linkerSettings: [.linkedLibrary("sqlite3")]
+        ),
         .target(name: "TransferUI", dependencies: ["TransferCore"]),
         .executableTarget(
             name: "Transfer",
             dependencies: ["TransferUI", "TransferIO"]
         ),
+        .testTarget(name: "TransferCoreTests", dependencies: ["TransferCore"]),
+        .testTarget(name: "TransferIOTests", dependencies: ["TransferIO"]),
     ]
 )

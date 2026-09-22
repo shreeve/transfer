@@ -26,7 +26,7 @@ It should feel like a small utility Apple might have shipped next to Finder: sta
 
 Open Live (Option-Command-O) forces a Live file even when double-click would only view. Return renames. Drag never deletes the remote file.
 
-An editable file is one whose filename UTI conforms to `public.plain-text` or `public.source-code`, or whose extension is exactly one of: `rip`, `txt`, `json`, `ts`, `rs`, `c`, `md`, `swift`, `py`, `js`, `jsx`, `tsx`, `html`, `css`, `yaml`, `yml`, `toml`, `sh`. Do not sniff contents. PDF, images, and every other type view.
+An editable file is one whose filename UTI conforms to `public.plain-text` or `public.source-code`, or whose extension is listed in `editableExtensions` in `Support/config.json`. That file is JSON, which Foundation decodes with no extra library. On first launch Transfer copies it to `~/Library/Application Support/Transfer/config.json`, and that copy is the one later edits use. If the file is missing or unreadable, the built-in list in `TransferConfig.builtIn` is the fallback. Do not sniff contents. PDF, images, and every other type view.
 
 ### 1.2 What this pass builds
 

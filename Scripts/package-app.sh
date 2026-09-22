@@ -13,6 +13,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin_dir/Transfer" "$app/Contents/MacOS/Transfer"
 cp "$root/Support/Info.plist" "$app/Contents/Info.plist"
 cp "$root/Support/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+cp "$root/Support/config.json" "$app/Contents/Resources/config.json"
 
 codesign --force --sign - "$app"
 echo "$app"
