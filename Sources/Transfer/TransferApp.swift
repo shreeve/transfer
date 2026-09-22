@@ -96,10 +96,11 @@ struct TransferApp: App {
                 }
                 .disabled(!connected)
             }
-            CommandMenu("View") {
-                ForEach(ViewMode.allCases, id: \.self) { mode in
-                    Button("as \(mode.title)") { model?.setViewMode(mode) }
-                }
+            // Replaces SwiftUI's own View menu rather than sitting beside it.
+            CommandGroup(replacing: .toolbar) {
+                Button("as Icons") { model?.setViewMode(.icon) }.keyboardShortcut("1")
+                Button("as List") { model?.setViewMode(.list) }.keyboardShortcut("2")
+                Button("as Columns") { model?.setViewMode(.columns) }.keyboardShortcut("3")
                 Divider()
                 Button(model?.snapshot.showsHidden == true ? "Hide Hidden Files" : "Show Hidden Files") {
                     model?.toggleHidden()

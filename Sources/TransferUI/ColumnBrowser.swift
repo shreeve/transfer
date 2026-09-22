@@ -51,6 +51,7 @@ struct ColumnBrowser: NSViewRepresentable {
             defer { syncing = false }
             if root != newRoot {
                 root = newRoot
+                showsUpEntry = newRoot.parent != nil
                 shown.removeAll()
                 browser.loadColumnZero()
                 return
@@ -78,31 +79,56 @@ struct ColumnBrowser: NSViewRepresentable {
             root ?? model.snapshot.path
         }
 
+        /// The `..` row at the top of the first column, shown whenever the folder has a parent.
+        /// `showsUpEntry` is a plain flag set during sync: AppKit asks for row heights inside its
+        /// layout pass, and touching observable model state there is not safe.
+        private let upEntry = UpEntry()
+        private var showsUpEntry = false
+
+        private func hasUpEntry(_ path: RemotePath) -> Bool {
+            showsUpEntry && path == root
+        }
+
         func browser(_ browser: NSBrowser, numberOfChildrenOfItem item: Any?) -> Int {
-            children(path(of: item)).count
+            let path = path(of: item)
+            return children(path).count + (hasUpEntry(path) ? 1 : 0)
         }
 
         func browser(_ browser: NSBrowser, child index: Int, ofItem item: Any?) -> Any {
-            let list = children(path(of: item))
+            let path = path(of: item)
+            var index = index
+            if hasUpEntry(path) {
+                if index == 0 { return upEntry }
+                index -= 1
+            }
+            let list = children(path)
             return index < list.count ? list[index] : RemoteItem(path: RemotePath(string: "/"), kind: .other)
         }
 
         func browser(_ browser: NSBrowser, isLeafItem item: Any?) -> Bool {
-            guard let item = item as? RemoteItem else { return false }
+            guard let item = item as? RemoteItem else { return true }
             return item.kind != .directory
         }
 
         func browser(_ browser: NSBrowser, objectValueForItem item: Any?) -> Any? {
-            (item as? RemoteItem)?.name ?? ""
+            if item is UpEntry { return ".." }
+            return (item as? RemoteItem)?.name ?? ""
         }
 
         func browser(_ browser: NSBrowser, willDisplayCell cell: Any, atRow row: Int, column: Int) {
-            guard let cell = cell as? NSBrowserCell, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return }
+            guard let cell = cell as? NSBrowserCell else { return }
+            if browser.item(atRow: row, inColumn: column) is UpEntry {
+                cell.image = ItemIcon.upImage
+                return
+            }
+            guard let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return }
             cell.image = ItemIcon.image(for: item)
         }
 
+        /// The `..` row is as tall as the list view's column header, so the rows beneath it sit
+        /// on the same lines as in list view and switching views does not shift them.
         func browser(_ browser: NSBrowser, heightOfRow row: Int, inColumn columnIndex: Int) -> CGFloat {
-            22
+            row == 0 && columnIndex == 0 && showsUpEntry ? 28 : 22
         }
 
         func browser(_ browser: NSBrowser, shouldEditItem item: Any?) -> Bool { false }
@@ -128,6 +154,11 @@ struct ColumnBrowser: NSViewRepresentable {
             let column = browser.selectedColumn
             guard column >= 0 else { return }
             let selected = browser.selectedRowIndexes(inColumn: column) ?? IndexSet()
+            if selected.contains(where: { browser.item(atRow: $0, inColumn: column) is UpEntry }) {
+                let model = model
+                Task { await model.goParent() }
+                return
+            }
             let items = selected.compactMap { browser.item(atRow: $0, inColumn: column) as? RemoteItem }
             let parent = path(forColumn: column) ?? model.snapshot.path
             model.selectInColumns(items, parent: parent)
@@ -191,10 +222,21 @@ struct ColumnBrowser: NSViewRepresentable {
     }
 }
 
+/// The `..` row's item in the column view.
+final class UpEntry: NSObject {}
+
 /// Icons at 16 points, cached by kind and extension: every row of every view asks for one.
 @MainActor
 enum ItemIcon {
     private static var cache: [String: NSImage] = [:]
+
+    /// The folder icon with an up arrow is not a system image; the arrow alone reads clearly.
+    static let upImage: NSImage = {
+        let image = NSImage(systemSymbolName: "arrow.up.circle", accessibilityDescription: "Parent folder")?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular)) ?? NSImage()
+        image.size = NSSize(width: 16, height: 16)
+        return image
+    }()
 
     static func image(for item: RemoteItem) -> NSImage {
         let key: String

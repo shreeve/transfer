@@ -149,11 +149,11 @@ struct ListTable: NSViewRepresentable {
                 cell.addSubview(image)
                 cell.imageView = image
                 NSLayoutConstraint.activate([
-                    image.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                    image.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 3),
                     image.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
                     image.widthAnchor.constraint(equalToConstant: 16),
                     image.heightAnchor.constraint(equalToConstant: 16),
-                    text.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 6),
+                    text.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 5),
                 ])
             } else {
                 text.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2).isActive = true
