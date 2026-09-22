@@ -253,6 +253,10 @@ public final class TransferModel {
             return true
         } catch is CancellationError {
             return false
+        } catch TransferError.noSuchFile {
+            // The server's text is just "No such file"; name the folder instead.
+            status = "No such folder: \(path.display)"
+            return false
         } catch {
             if !page.isEmpty { publish(page, for: path) }
             status = error.localizedDescription

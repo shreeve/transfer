@@ -70,7 +70,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         weak var controller: ChromeController?
         var searchTick = 0
         private var viewGroup: NSToolbarItemGroup?
-        private var searchItem: NSSearchToolbarItem?
+        private var searchView: SearchToolbarView?
 
         init(model: TransferModel) { self.model = model }
 
@@ -99,6 +99,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 )
                 group.isNavigational = true
                 group.controlRepresentation = .expanded
+                group.visibilityPriority = .high
                 group.label = "Back/Forward"
                 return group
             case ChromeItem.viewMode:
@@ -111,6 +112,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                     action: #selector(changeViewMode(_:))
                 )
                 group.controlRepresentation = .expanded
+                group.visibilityPriority = .high
                 group.label = "View"
                 group.selectedIndex = index(of: model.snapshot.viewMode)
                 viewGroup = group
@@ -119,20 +121,28 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 let item = NSToolbarItem(itemIdentifier: identifier)
                 item.image = symbol("arrow.up.arrow.down.circle")
                 item.label = "Transfers"
+                item.visibilityPriority = .high
                 item.toolTip = "Show or hide transfers"
                 item.isBordered = true
                 item.target = self
                 item.action = #selector(toggleShelf(_:))
                 return item
             case ChromeItem.search:
-                let item = NSSearchToolbarItem(itemIdentifier: identifier)
+                // Two fixed sizes, magnifier or field, changed only by the user. The system search
+                // item resizes itself whenever the toolbar's free space changes and shoves the
+                // other items in and out of the overflow menu as it does.
+                let item = NSToolbarItem(itemIdentifier: identifier)
+                let view = SearchToolbarView()
+                view.field.placeholderString = "Search"
+                view.field.delegate = self
+                view.field.sendsSearchStringImmediately = true
+                view.button.target = self
+                view.button.action = #selector(expandSearch(_:))
+                view.onCollapse = { [weak self] in self?.model.textEditing = false }
+                item.view = view
                 item.label = "Search"
-                item.preferredWidthForSearchField = 150
-                item.resignsFirstResponderWithCancel = true
-                item.searchField.placeholderString = "Search"
-                item.searchField.delegate = self
-                item.searchField.sendsSearchStringImmediately = true
-                searchItem = item
+                item.visibilityPriority = .high
+                searchView = view
                 return item
             default:
                 return nil
@@ -153,7 +163,11 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         }
 
         func beginSearch() {
-            searchItem?.beginSearchInteraction()
+            searchView?.expand(focus: true)
+        }
+
+        @objc private func expandSearch(_ sender: Any?) {
+            searchView?.expand(focus: true)
         }
 
         @objc private func navigate(_ sender: NSToolbarItemGroup) {
@@ -175,13 +189,11 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             model.filter = field.stringValue
         }
 
-        /// One Escape clears the text and collapses the field, rather than the item's two-step.
+        /// One Escape clears the text and collapses the field.
         func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
             guard selector == #selector(NSResponder.cancelOperation(_:)) else { return false }
             model.filter = ""
-            searchItem?.searchField.stringValue = ""
-            searchItem?.endSearchInteraction()
-            control.window?.makeFirstResponder(nil)
+            searchView?.collapse()
             return true
         }
 
@@ -190,9 +202,14 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         func searchFieldDidEndSearching(_ sender: NSSearchField) {
             model.textEditing = false
             model.filter = ""
+            searchView?.collapse()
         }
 
-        func controlTextDidEndEditing(_ notification: Notification) { model.textEditing = false }
+        func controlTextDidEndEditing(_ notification: Notification) {
+            model.textEditing = false
+            // An empty field that loses focus folds back to the magnifier.
+            if model.filter.isEmpty { searchView?.collapse() }
+        }
     }
 }
 
@@ -463,5 +480,88 @@ final class BelowToolbarView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         needsLayout = true
+    }
+}
+
+/// The search control: a magnifier that becomes a fixed-width field on demand.
+final class SearchToolbarView: NSView {
+    static let collapsedWidth: CGFloat = 32
+    /// Expanded, the toolbar may give the field anything in this range; it prefers the top.
+    static let expandedMinWidth: CGFloat = 90
+    static let expandedWidth: CGFloat = 160
+
+    let button = NSButton()
+    let field = NSSearchField()
+    var onCollapse: (() -> Void)?
+    private(set) var isExpanded = false
+    private var minWidth: NSLayoutConstraint!
+    private var maxWidth: NSLayoutConstraint!
+    private var preferredWidth: NSLayoutConstraint!
+
+    init() {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        minWidth = widthAnchor.constraint(greaterThanOrEqualToConstant: Self.collapsedWidth)
+        maxWidth = widthAnchor.constraint(lessThanOrEqualToConstant: Self.collapsedWidth)
+        preferredWidth = widthAnchor.constraint(equalToConstant: Self.collapsedWidth)
+        preferredWidth.priority = .defaultLow
+        button.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Search")
+        button.bezelStyle = .toolbar
+        button.isBordered = true
+        button.toolTip = "Search the listed names"
+        button.setAccessibilityLabel("Search")
+        field.controlSize = .regular
+        for subview in [button, field] {
+            subview.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(subview)
+            NSLayoutConstraint.activate([
+                subview.leadingAnchor.constraint(equalTo: leadingAnchor),
+                subview.trailingAnchor.constraint(equalTo: trailingAnchor),
+                subview.centerYAnchor.constraint(equalTo: centerYAnchor),
+            ])
+        }
+        NSLayoutConstraint.activate([minWidth, maxWidth, preferredWidth, heightAnchor.constraint(equalToConstant: 28)])
+        field.isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func expand(focus: Bool) {
+        guard !isExpanded else {
+            if focus { window?.makeFirstResponder(field) }
+            return
+        }
+        isExpanded = true
+        button.isHidden = true
+        field.isHidden = false
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            maxWidth.animator().constant = Self.expandedWidth
+            preferredWidth.animator().constant = Self.expandedWidth
+            minWidth.animator().constant = Self.expandedMinWidth
+        }
+        if focus { window?.makeFirstResponder(field) }
+    }
+
+    func collapse() {
+        guard isExpanded else { return }
+        isExpanded = false
+        field.stringValue = ""
+        if window?.firstResponder === field.currentEditor() || window?.firstResponder === field {
+            window?.makeFirstResponder(nil)
+        }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.15
+            minWidth.animator().constant = Self.collapsedWidth
+            preferredWidth.animator().constant = Self.collapsedWidth
+            maxWidth.animator().constant = Self.collapsedWidth
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, !self.isExpanded else { return }
+                self.field.isHidden = true
+                self.button.isHidden = false
+            }
+        })
+        onCollapse?()
     }
 }
