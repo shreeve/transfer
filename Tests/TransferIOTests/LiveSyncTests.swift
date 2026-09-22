@@ -377,7 +377,7 @@ struct LiveSyncTests {
         }
     }
 
-    @Test func renameMovesTheRecordAndTheWorkingCopy() async throws {
+    @Test func renameMovesTheRecordAndKeepsTheWorkingCopy() async throws {
         try await withLive("rename") { h in
             let path = RemotePath(string: "/srv/dir/note.txt")
             let (local, id) = try await openLive(h, path, "first")
@@ -390,18 +390,55 @@ struct LiveSyncTests {
             let renamed = RemotePath(string: "/srv/moved/other.txt")
             try await h.live.rename(inside, to: renamed, on: h.connection) { await h.fake.move(inside, to: renamed) }
             #expect(await h.file()?.path == renamed)
-            let newLocal = local.deletingLastPathComponent().appendingPathComponent("other.txt")
-            #expect(FileManager.default.fileExists(atPath: newLocal.path))
-            #expect(!FileManager.default.fileExists(atPath: local.path))
+            // The editor still holds the working copy under its old name, so it stays there.
+            #expect(FileManager.default.fileExists(atPath: local.path))
+            #expect(!FileManager.default.fileExists(atPath: local.deletingLastPathComponent().appendingPathComponent("other.txt").path))
 
-            // Edits follow the new name.
-            try await edit(h, newLocal, id, "after rename")
+            // The editor's next save, to the name it opened, goes to the new remote path.
+            try await edit(h, local, id, "after rename")
             #expect(await waitUntil { await h.fake.contents(renamed) == "after rename" })
+            #expect(await h.fake.contents(path) == nil)
+            #expect(await h.fake.contents(inside) == nil)
 
             let ran = Flag()
             try await h.live.rename(RemotePath(string: "/srv/elsewhere"), to: RemotePath(string: "/srv/else2"), on: h.connection) { ran.set() }
             #expect(ran.value)
             #expect(await h.file()?.path == renamed)
+        }
+    }
+
+    /// A rename that arrives while a Live open of a file under it is still downloading waits for
+    /// that open, so the record follows the rename instead of keeping the old path.
+    @Test func renameWaitsForAnOpenInFlight() async throws {
+        try await withLive("rename-open") { h in
+            let path = RemotePath(string: "/srv/dir/note.txt")
+            await h.fake.put(path, "first", mtime: Self.serverNow)
+            await h.fake.holdFetches()
+            let opening = Task { try await h.live.open(path, on: h.connection) }
+            #expect(await waitUntil { await h.fake.heldFetches == 1 })
+
+            let folder = RemotePath(string: "/srv/dir")
+            let moved = RemotePath(string: "/srv/moved")
+            let ran = Flag()
+            let renaming = Task {
+                try await h.live.rename(folder, to: moved, on: h.connection) {
+                    ran.set()
+                    await h.fake.move(folder, to: moved)
+                }
+            }
+            await pause(150)
+            #expect(!ran.value)
+            await h.fake.releaseFetches()
+            let local = try await opening.value
+            try await renaming.value
+            #expect(ran.value)
+
+            let inside = RemotePath(string: "/srv/moved/note.txt")
+            let file = try #require(await h.file())
+            #expect(file.path == inside)
+            try await edit(h, local, file.id, "after rename")
+            #expect(await waitUntil { await h.fake.contents(inside) == "after rename" })
+            #expect(await h.fake.contents(path) == nil)
         }
     }
 
@@ -522,6 +559,8 @@ actor FakeServer: LiveServer {
     private(set) var saves = 0
     private(set) var lookups = 0
     private var failing = false
+    private var holding = false
+    private var held: [CheckedContinuation<Void, Never>] = []
     private let log = FakeEventLog()
 
     // Knobs
@@ -539,6 +578,17 @@ actor FakeServer: LiveServer {
     func delete(_ path: RemotePath) { files[path] = nil }
 
     func setFailing(_ failing: Bool) { self.failing = failing }
+
+    /// Fetches read the server's bytes, then wait for `releaseFetches` before writing them.
+    func holdFetches() { holding = true }
+
+    var heldFetches: Int { held.count }
+
+    func releaseFetches() {
+        holding = false
+        for fetch in held { fetch.resume() }
+        held.removeAll()
+    }
 
     func contents(_ path: RemotePath) -> String? {
         files[path].map { String(decoding: $0.data, as: UTF8.self) }
@@ -572,6 +622,7 @@ actor FakeServer: LiveServer {
     func liveFetch(_ item: RemoteItem, to local: URL, interactive: Bool) async throws {
         if failing { throw TransferError.connectionLost("fake server unreachable") }
         guard let file = files[item.path] else { throw TransferError.noSuchFile(item.path.display) }
+        if holding { await withCheckedContinuation { held.append($0) } }
         let temp = local.deletingLastPathComponent().appendingPathComponent(".fetch-\(UUID().uuidString)")
         try file.data.write(to: temp)
         let mtime = TimeInterval(item.mtime ?? file.mtime)

@@ -310,12 +310,21 @@ struct ServerTests {
             #expect(await h.session.liveFiles().first?.conflict == false)
             #expect(await h.session.liveFiles().first?.dirty == false)
 
-            // Rename keeps the mapping and moves the working copy's name.
+            // Rename keeps the mapping and the working copy's name, which an editor may hold open;
+            // its next save goes to the new remote name.
             let renamed = h.remotePath.appending(name: Array("renamed.txt".utf8))
             try await h.session.rename(path, to: renamed)
             let live = await h.session.liveFiles().first
             #expect(live?.path == renamed)
-            #expect(FileManager.default.fileExists(atPath: local.deletingLastPathComponent().appendingPathComponent("renamed.txt").path))
+            #expect(FileManager.default.fileExists(atPath: local.path))
+            #expect(!FileManager.default.fileExists(atPath: local.deletingLastPathComponent().appendingPathComponent("renamed.txt").path))
+            try Data("fourth".utf8).write(to: local)
+            let renamedFile = h.remote.appendingPathComponent("renamed.txt")
+            let followed = await waitUntil { (try? Data(contentsOf: renamedFile)) == Data("fourth".utf8) }
+            #expect(followed)
+            #expect(!FileManager.default.fileExists(atPath: remoteFile.path))
+            let settled = await waitUntil { await h.session.liveFiles().first?.dirty == false }
+            #expect(settled)
 
             try await h.session.discardLiveFile(renamed, force: false)
             #expect(await h.session.liveFiles().isEmpty)
