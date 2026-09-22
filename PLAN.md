@@ -117,22 +117,24 @@ After the probe, open SFTP passengers on the master. Each is its own process:
 /usr/bin/ssh -S <socket> -o Compression=no -s sftp -- <destination>
 ```
 
-Open them in this order: browse, interactive, walker, data 1, data 2, data 3, data 4. Speak SFTP version 3 on stdin and stdout (length-prefixed packets). Do not parse the `sftp` command's text. If the server's version is not 3, mark that passenger down.
+At login, open browse, then interactive, then walker. Speak SFTP version 3 on stdin and stdout (length-prefixed packets). Do not parse the `sftp` command's text. If the server's version is not 3, mark that passenger down.
 
-Stop at the first refusal. Do not retry that refusal during this login. A passenger that dies later gets one reopen. A second death marks it down until the next login.
+A data channel is the same role opened again, not a different kind of channel. Open one when a transfer needs it and every data channel already up is busy. Open at most 7. Three reserved channels plus 7 data channels is 10, the usual server limit. If the server refuses another, stop growing the pool and queue the file. A data channel, once up, stays up for the rest of the connection.
+
+A passenger that dies later gets one reopen. A second death marks it down until the next login. Losing a data channel does not close browse.
 
 | Role | Count | Work |
 | --- | --- | --- |
 | Browse | 1 | Browser listings and metadata. At most one request in flight. |
 | Interactive | 1 | The one file the user is waiting on: Quick Look, view, Live open, or Live save. |
 | Walker | 1 | Names, mkdir, readlink, and delete for a tree copy. No file bodies. |
-| Data | 4 | File bodies for drag, download, upload, duplicate, and directory copy. |
+| Data | 0 to 7 | File bodies for drag, download, upload, duplicate, and directory copy. |
 
 A new preview, open, or save cancels whatever the interactive channel is doing, deletes that temp, and starts the new request. A displaced preview or view is dropped. A displaced Live save stays pending and is next on that channel.
 
 File bodies never use the browse channel. If browse failed to open, listings use interactive between its jobs. If interactive failed, preview and Live borrow one data channel and follow the same preempt rule. If the walker failed, the name walk uses browse when it is idle. If no data channel opened, transfers fail and browsing still works.
 
-Concurrent files use the four data channels. A fifth file waits. A file of 2 MB or larger occupies its channel alone. Smaller files may share a channel while its window has room. Do not open a channel per file.
+Concurrent files share the data pool. A file of 2 MB or larger occupies its channel alone. Smaller files may share a channel while its window has room. When every open data channel is busy and fewer than 7 are up, open one more. Otherwise the file waits. Do not open a channel per file, and do not open an eighth.
 
 Each data channel keeps 2 MB (2,097,152 bytes of payload, not packet overhead) of READ or WRITE in flight, in 64 KB chunks, the last chunk shorter. Outstanding requests on one channel are all reads or all writes.
 
@@ -321,7 +323,7 @@ A Core function returns a decision, such as "this file is editable" or "skip thi
 - `RemoteItem`: path, name bytes, kind (file, directory, symlink, other), size, whole-second mtime, mode, owner, group, and the symlink target when already known.
 - `Fingerprint`: type, size, whole-second mtime.
 - `OpenKind`: the decision `live` or `view`, from the rule in §1.1. `func openKind(name:extension:uti:) -> OpenKind`.
-- `ChannelRole`: browse, interactive, walker, and the four data roles. This type already exists.
+- `ChannelRole`: browse, interactive, walker, and data. Data is one role. The connection holds zero to seven channels of that role.
 - `NameCollisionChoice`: skip, keep both, replace. `KeepBothName` produces `name 2`, `name 3`.
 - `LiveConflictChoice`: compare, keep local, keep remote, keep both.
 - `CopyDisposition`: skip, fail, or write `.<basename>.transfer-<uuid>`. Pure comparison of two `RemoteItem`s. No I/O.
@@ -360,7 +362,7 @@ The app target constructs `SSHConnection`, erases it to `RemoteSession`, and han
 Build on the existing package, in this order. Each step compiles and is worth a commit. New code goes into the target named in §11.
 
 1. The `TransferCore` types in §11.1, including `RemoteSession` and `openKind`, with tests and no network.
-2. `SSHConnection` in `TransferIO`, as the `RemoteSession` implementation: master, askpass replies, the one probe, and the seven passengers. The sheets that collect those replies stay in `TransferUI`.
+2. `SSHConnection` in `TransferIO`, as the `RemoteSession` implementation: master, askpass replies, the one probe, and the browse, interactive, and walker passengers. Data passengers open later, up to 7. The sheets that collect those replies stay in `TransferUI`.
 3. SFTP version-3 session in `TransferIO`: list, stat, readlink, mkdir, rename, remove.
 4. The browser in `TransferUI`: sidebar, icon, list, columns, hidden files, and cached reload.
 5. `SftpDirectoryCopy` in `TransferIO`; the shelf and drag adapters in `TransferUI`. Download Copy and delete.
@@ -384,7 +386,7 @@ This pass is done when all of the following are true.
 8. Dragging a remote file to the Desktop creates the real file. Dragging a local file in uploads it.
 9. Double-clicking `.json`, `.rs`, `.c`, `.ts`, `.txt`, or `.rip` opens a Live file and a completed save uploads. Double-clicking `.pdf`, `.jpg`, or `.png` views it and does not upload.
 10. A remote change during a Live edit becomes a conflict and does not overwrite either side.
-11. A directory copy starts before the walk finishes, uses at most four data channels, skips matching size and mtime, copies symlinks as links, and deletes only its own temp on cancel.
+11. A directory copy starts before the walk finishes, uses at most seven data channels, skips matching size and mtime, copies symlinks as links, and deletes only its own temp on cancel.
 12. Delete is permanent, confirmed, and has no trash.
 13. Open in Terminal opens the current directory in Terminal, iTerm2, or Ghostty and does not add a pane to the window.
 14. No secret is written to the log or to SQLite.
