@@ -4,8 +4,10 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-swift build
-bin_dir="$(swift build --show-bin-path)"
+# CONFIG=release for a release build; the default is a debug build for local work.
+config="${CONFIG:-debug}"
+swift build -c "$config"
+bin_dir="$(swift build -c "$config" --show-bin-path)"
 app="$root/.build/Transfer.app"
 
 rm -rf "$app"
@@ -21,10 +23,12 @@ sparkle="$(find "$root/.build/artifacts" -type d -name Sparkle.framework -path '
 cp -R "$sparkle" "$app/Contents/Frameworks/Sparkle.framework"
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$app/Contents/MacOS/Transfer"
 
-# Ad-hoc signing for local builds. A release needs Developer ID on every step, inner components
-# first: SIGN="Developer ID Application: …" Scripts/package-app.sh
-# The hardened runtime is only for real identities: with ad-hoc signatures its library validation
-# refuses the framework because neither side has a team.
+# Ad-hoc signing, releases included, as DuckTable ships: the installer fetches with curl, which
+# sets no quarantine, so Gatekeeper never judges the bundle, and Sparkle accepts an update whose
+# code signature is valid and whose EdDSA signature matches. SIGN="Developer ID Application: …"
+# signs with a real identity instead, inner components first. The hardened runtime is only for
+# real identities: with ad-hoc signatures its library validation refuses the framework because
+# neither side has a team.
 sign="${SIGN:--}"
 runtime=""
 if [ "$sign" != "-" ]; then runtime="--options=runtime"; fi
@@ -36,4 +40,9 @@ resign "$framework/Versions/B/Autoupdate"
 resign "$framework/Versions/B/Updater.app"
 resign "$framework"
 resign "$app"
+# macOS files permissions under the signing identifier, so every build signs as the bundle id.
+codesign --verify --deep --strict "$app"
+identifier=$( (codesign -dv "$app" 2>&1 || true) | sed -n 's/^Identifier=//p')
+expected=$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")
+[ "$identifier" = "$expected" ] || { echo "error: signed as '$identifier', not $expected" >&2; exit 1; }
 echo "$app"

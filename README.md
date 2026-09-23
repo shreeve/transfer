@@ -4,6 +4,16 @@ Transfer is a native Mac app for browsing an SFTP server. Open an editable file 
 
 It targets macOS 27 on Apple silicon. The bundle id is `com.github.shreeve.transfer`.
 
+## Install
+
+One command installs or updates the newest release into `/Applications`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash
+```
+
+The app is ad-hoc signed, with no Developer ID; `curl` sets no quarantine, so it opens on first launch. A copy downloaded in a browser needs System Settings → Privacy & Security → Open Anyway once. Uninstall with `… | bash -s -- --uninstall`; your servers and settings stay.
+
 ## Build and run
 
 The Xcode 27 toolchain has to be selected (`xcode-select` pointing at Xcode.app). There is no Xcode project.
@@ -30,7 +40,14 @@ Which files open for editing is `editableExtensions` in `Support/config.json`. T
 
 ## Updates
 
-`Check for Updates…` is in the app menu and stays quiet until `SUPublicEDKey` in `Support/Info.plist` is set. Shipping an update needs a Developer ID signature: `SIGN="Developer ID Application: …" Scripts/package-app.sh`.
+Installed copies update themselves through `Check for Updates…` in the app menu (Sparkle). To ship a version, from a clean, pushed `main`:
+
+```bash
+Scripts/release.sh 0.2.0 --dry-run
+Scripts/release.sh 0.2.0
+```
+
+The dry run builds everything under `.build/release-0.2.0` and publishes nothing; the real run also commits the version, tags `v0.2.0`, and publishes the GitHub release.
 
 ## For people changing it
 
