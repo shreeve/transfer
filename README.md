@@ -4,15 +4,59 @@ Transfer is a native Mac app for browsing an SFTP server. Open an editable file 
 
 It targets macOS 27 on Apple silicon. The bundle id is `com.github.shreeve.transfer`.
 
+## Requirements
+
+A Mac with Apple silicon running macOS 27 or later.
+
 ## Install
 
-One command installs or updates the newest release into `/Applications`:
+Paste this into Terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash
 ```
 
-The app is ad-hoc signed, with no Developer ID; `curl` sets no quarantine, so it opens on first launch. A copy downloaded in a browser needs System Settings → Privacy & Security → Open Anyway once. Uninstall with `… | bash -s -- --uninstall`; your servers and settings stay.
+It downloads the newest release from GitHub, checks the app's signature, and puts `Transfer.app` in `/Applications` (or `~/Applications` if `/Applications` is not writable). Then open it from Launchpad, Spotlight, or with `open -a Transfer`.
+
+To install somewhere else, name the folder:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | TRANSFER_DEST=~/Apps bash
+```
+
+Transfer is not signed with an Apple Developer ID. Installed with the command above it opens normally, because files fetched by `curl` are not marked as downloaded from the internet. If you instead download `Transfer.zip` from the [releases page](https://github.com/shreeve/transfer/releases) in a browser, macOS will say it cannot verify the app. Either open System Settings → Privacy & Security and click **Open Anyway** once, or clear the mark in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Transfer.app
+```
+
+## Update
+
+Transfer updates itself. Choose **Transfer → Check for Updates…** at any time; a new version downloads, installs, and relaunches when you click **Install Update**. Settings → Updates turns automatic checks on or off and shows when it last checked.
+
+Running the install command again also updates to the newest release, replacing the app in place.
+
+## Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash -s -- --uninstall
+```
+
+This removes only the app. Your saved servers, Live files, and settings stay, so a later install picks up where you left off.
+
+## Where your data lives
+
+| What | Where |
+| --- | --- |
+| Saved servers, recents, stars, Live file records | `~/Library/Application Support/Transfer/transfer.sqlite` |
+| Working copies of Live files | `~/Library/Application Support/Transfer/Live/` |
+| Editable file extensions | `~/Library/Application Support/Transfer/config.json` (Settings → Extensions) |
+| Passwords you chose to save | Keychain, service "Transfer" |
+| Preview cache | `~/Library/Caches/Transfer/` |
+| Copy and paste staging | `~/Library/Caches/com.github.shreeve.transfer/` |
+| Preferences | `defaults read com.github.shreeve.transfer` |
+
+To remove everything after uninstalling, delete `~/Library/Application Support/Transfer`, `~/Library/Caches/Transfer`, and `~/Library/Caches/com.github.shreeve.transfer`, run `defaults delete com.github.shreeve.transfer`, and remove the "Transfer" items in Keychain Access. Check first that no Live file has unsynced edits.
 
 ## Build and run
 
@@ -38,17 +82,17 @@ Transfer uses the `ssh` already on the Mac. One login is shared by every window 
 
 Which files open for editing is `editableExtensions` in `Support/config.json`. The first launch copies that file to `~/Library/Application Support/Transfer/config.json`, and Settings > Extensions edits the copy.
 
-## Updates
+## Releasing
 
-Installed copies update themselves through `Check for Updates…` in the app menu (Sparkle). To ship a version, from a clean, pushed `main`:
+Maintainers publish a version with one command from a clean, pushed `main`:
 
 ```bash
-Scripts/release.sh 0.2.0 --dry-run
-Scripts/release.sh 0.2.0
+Scripts/release.sh 0.1.1 --dry-run
+Scripts/release.sh 0.1.1
 ```
 
-The dry run builds everything under `.build/release-0.2.0` and publishes nothing; the real run also commits the version, tags `v0.2.0`, and publishes the GitHub release.
+`docs/RELEASING.md` explains the one-time setup, what the script checks and publishes, how to verify a release, and how to test an update before shipping it.
 
 ## For people changing it
 
-`PLAN.md` is the product spec. `HANDOFF.md` is how the current code actually works, including the window layout and the mistakes that already cost a day. `AGENTS.md` is the short rule list for an automated session.
+`PLAN.md` is the product spec. `HANDOFF.md` is how the current code actually works, including the window layout and the mistakes that already cost a day. `AGENTS.md` is the short rule list for an automated session. `docs/RELEASING.md` is how releases and updates work.
