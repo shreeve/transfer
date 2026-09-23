@@ -39,6 +39,8 @@
 	<string>27.0</string>
 	<key>LSMultipleInstancesProhibited</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Transfer asks Terminal or iTerm2 to open a shell on the server when you choose Open in Terminal.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>

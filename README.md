@@ -24,11 +24,15 @@ To install somewhere else, name the folder:
 curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | TRANSFER_DEST=~/Apps bash
 ```
 
-Transfer is not signed with an Apple Developer ID. Installed with the command above it opens normally, because files fetched by `curl` are not marked as downloaded from the internet. If you instead download `Transfer.zip` from the [releases page](https://github.com/shreeve/transfer/releases) in a browser, macOS will say it cannot verify the app. Either open System Settings → Privacy & Security and click **Open Anyway** once, or clear the mark in Terminal:
+Or with [Homebrew](https://brew.sh):
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Transfer.app
+brew install --cask shreeve/tap/transfer-sftp
 ```
+
+The cask is `transfer-sftp` because Homebrew's own `transfer` is a different app. Transfer updates itself, so `brew upgrade` leaves it alone.
+
+Transfer is signed with an Apple Developer ID and notarized by Apple, so it also opens normally when you download `Transfer.zip` from the [releases page](https://github.com/shreeve/transfer/releases) in a browser and drag the app to Applications.
 
 ## Update
 
