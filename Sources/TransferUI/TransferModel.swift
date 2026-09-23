@@ -962,14 +962,30 @@ public final class TransferModel {
         pinIsFolder[path] = target.kind == .directory
     }
 
-    /// Starred folders sit in the sidebar for one-click return.
-    public func setStarred(_ path: RemotePath, _ starred: Bool) async {
-        if starred { await session?.pin(path) } else { await session?.unpin(path); pinIsFolder[path] = nil }
+    /// Starred files and folders sit in the sidebar for one-click return.
+    public func setStarred(_ paths: [RemotePath], _ starred: Bool) async {
+        for path in paths {
+            if starred { await session?.pin(path) } else { await session?.unpin(path); pinIsFolder[path] = nil }
+        }
         await reloadSidebars()
     }
 
-    /// The star target: the selected item, or the current folder with nothing selected.
-    public var starTarget: RemotePath { primaryItem?.path ?? snapshot.path }
+    /// What View > Add to Starred acts on: the selection, or the current folder with nothing selected.
+    public var starTargets: [RemotePath] {
+        let selected = selectedItems.map(\.path)
+        return selected.isEmpty ? [snapshot.path] : selected
+    }
+
+    /// "Remove from Starred" when every one of `paths` is starred, else "Add to Starred".
+    public func starTitle(_ paths: [RemotePath]) -> String {
+        !paths.isEmpty && paths.allSatisfy(isStarred) ? "Remove from Starred" : "Add to Starred"
+    }
+
+    /// Unstars `paths` when all are starred, else stars the ones that are not.
+    public func toggleStar(_ paths: [RemotePath]) async {
+        let starred = !paths.isEmpty && paths.allSatisfy(isStarred)
+        await setStarred(starred ? paths : paths.filter { !isStarred($0) }, !starred)
+    }
 
     /// Opens a starred entry: a folder is entered, a file is revealed in its folder and opened.
     public func openStarred(_ path: RemotePath) async {
@@ -987,10 +1003,6 @@ public final class TransferModel {
         }
     }
 
-    public func toggleStar() async {
-        let path = starTarget
-        await setStarred(path, !isStarred(path))
-    }
 
     public func discardLive(_ path: RemotePath, force: Bool = false) async {
         guard let session else { return }

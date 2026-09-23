@@ -245,32 +245,7 @@ struct ListTable: NSViewRepresentable {
                 table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             }
             let menu = NSMenu()
-            let model = model
-            let item = row >= 0 && row < items.count ? items[row] : nil
-            func add(_ title: String, enabled: Bool = true, _ action: @escaping @MainActor () -> Void) {
-                let entry = ClosureMenuItem(title: title, action: action)
-                entry.isEnabled = enabled
-                menu.addItem(entry)
-            }
-            if let item {
-                add("Open") { Task { await model.open(item) } }
-                add("Open Live", enabled: item.kind == .file) { Task { await model.openLiveSelection() } }
-                add("Quick Look") { model.showPreview() }
-                menu.addItem(.separator())
-                add("Download Copy…") { Task { await model.downloadCopy() } }
-                add("Duplicate", enabled: item.kind == .file) { Task { await model.duplicateSelection() } }
-                add("Rename") { model.beginRename() }
-                add(model.isStarred(item.path) ? "Unstar" : "Star") { Task { await model.setStarred(item.path, !model.isStarred(item.path)) } }
-                add("Copy") { model.copySelection() }
-                add("Copy Remote URL") { model.copyRemoteURL() }
-                menu.addItem(.separator())
-                add("Delete…") { model.askToDelete() }
-            } else {
-                add("New Folder") { Task { await model.mkdir() } }
-                add("Upload…") { Task { await model.uploadFromPanel() } }
-                add("Paste", enabled: model.canPaste) { Task { await model.paste(moving: false) } }
-                add("Copy Remote URL") { model.copyRemoteURL() }
-            }
+            ItemMenu.fill(menu, item: row >= 0 && row < items.count ? items[row] : nil, model: model)
             return menu
         }
     }
@@ -308,6 +283,39 @@ final class RowMenuTableView: NSTableView {
             return
         }
         super.keyDown(with: event)
+    }
+}
+
+/// The right-click menu of the list and column views: for the clicked item, which the view has
+/// already made part of the selection, or with no item, for the current folder.
+@MainActor
+enum ItemMenu {
+    static func fill(_ menu: NSMenu, item: RemoteItem?, model: TransferModel) {
+        func add(_ title: String, enabled: Bool = true, _ action: @escaping @MainActor () -> Void) {
+            let entry = ClosureMenuItem(title: title, action: action)
+            entry.isEnabled = enabled
+            menu.addItem(entry)
+        }
+        guard let item else {
+            add("New Folder") { Task { await model.mkdir() } }
+            add("Upload…") { Task { await model.uploadFromPanel() } }
+            add("Paste", enabled: model.canPaste) { Task { await model.paste(moving: false) } }
+            add("Copy Remote URL") { model.copyRemoteURL() }
+            return
+        }
+        add("Open") { Task { await model.open(item) } }
+        add("Open Live", enabled: item.kind == .file) { Task { await model.openLiveSelection() } }
+        add("Quick Look") { model.showPreview() }
+        menu.addItem(.separator())
+        add("Download Copy…") { Task { await model.downloadCopy() } }
+        add("Duplicate", enabled: item.kind == .file) { Task { await model.duplicateSelection() } }
+        add("Rename") { model.beginRename() }
+        let targets = model.dragItems(including: item).map(\.path)
+        add(model.starTitle(targets)) { Task { await model.toggleStar(targets) } }
+        add("Copy") { model.copySelection() }
+        add("Copy Remote URL") { model.copyRemoteURL() }
+        menu.addItem(.separator())
+        add("Delete…") { model.askToDelete() }
     }
 }
 

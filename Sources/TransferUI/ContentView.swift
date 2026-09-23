@@ -66,7 +66,7 @@ struct SidebarColumn: View {
                             .onTapGesture(count: 2) { Task { await model.openStarred(path) } }
                             .contextMenu {
                                 Button("Open") { Task { await model.openStarred(path) } }
-                                Button("Unstar") { Task { await model.setStarred(path, false) } }
+                                Button("Remove from Starred") { Task { await model.setStarred([path], false) } }
                             }
                     }
                 }
@@ -234,7 +234,9 @@ struct DetailColumn: View {
             model.snapshot.selection = [item.path]
             model.beginRename()
         }
-        Button(model.isStarred(item.path) ? "Unstar" : "Star") { Task { await model.setStarred(item.path, !model.isStarred(item.path)) } }
+        Button(model.starTitle(model.dragItems(including: item).map(\.path))) {
+            Task { await model.toggleStar(model.dragItems(including: item).map(\.path)) }
+        }
         Button("Copy") {
             if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
             model.copySelection()

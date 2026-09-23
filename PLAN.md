@@ -220,8 +220,9 @@ Hidden by default. Command-Option-I toggles it. One selection shows name, icon, 
 | New Window | Command-N |
 | New Tab | Command-T |
 | Icon / List / Columns | Command-1 / 2 / 3 |
-| Sidebar | Command-Shift-S |
-| Inspector | Command-Shift-I |
+| Sidebar | Command-B |
+| Inspector | Command-I |
+| Add to Starred / Remove from Starred | Control-Command-T |
 | Hidden files | Command-Shift-Period |
 
 Download Copy, Upload, and Open in Terminal have no shortcut. There is no Command-J and no gallery shortcut.
