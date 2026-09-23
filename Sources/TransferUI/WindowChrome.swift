@@ -424,7 +424,11 @@ final class ChromeController: NSSplitViewController {
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
         toolbarInstalled = true
-        WindowFrames.place(window, among: Self.live.allObjects.compactMap { $0 === self ? nil : $0.view.window })
+        window.tabbingMode = .preferred
+        // A tab takes its window's frame; any other new window is placed.
+        if !NewTab.join(window) {
+            WindowFrames.place(window, among: Self.live.allObjects.compactMap { $0 === self ? nil : $0.view.window })
+        }
         // Watched only once placed: a new window becomes main at SwiftUI's default size first,
         // which would otherwise replace the last-used frame it is about to take.
         for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didBecomeMainNotification] {
@@ -433,7 +437,6 @@ final class ChromeController: NSSplitViewController {
             })
         }
         OpenShortcut.install()
-        window.tabbingMode = .preferred
         window.titlebarSeparatorStyle = .none
         // The opaque title bar over the content column draws its own bottom edge regardless of
         // the separator style; a transparent title bar has no edge, and the sidebar is already
@@ -580,6 +583,31 @@ public enum WindowFrames {
     static func remember(_ window: NSWindow) {
         guard window.isVisible, !window.isMiniaturized, !window.styleMask.contains(.fullScreen) else { return }
         UserDefaults.standard.set(window.frameDescriptor, forKey: key)
+    }
+}
+
+/// File > New Tab. SwiftUI opens the new window, and it would not become a tab on its own: its
+/// tabbing mode is set only once it is on screen, and `newWindowForTab:` only reaches SwiftUI's
+/// window opener. So the browser window that asked is remembered, and the next browser window
+/// to appear joins it as a tab.
+@MainActor
+public enum NewTab {
+    private static weak var host: NSWindow?
+
+    /// Call just before opening the window. Without a browser window in front, it is a new window.
+    public static func request() {
+        host = ChromeController.keyWindowController?.view.window
+    }
+
+    static func join(_ window: NSWindow) -> Bool {
+        guard let target = host, target !== window, target.isVisible else {
+            host = nil
+            return false
+        }
+        host = nil
+        target.addTabbedWindow(window, ordered: .above)
+        window.makeKeyAndOrderFront(nil)
+        return true
     }
 }
 
