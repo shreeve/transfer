@@ -10,43 +10,56 @@ A Mac with Apple silicon running macOS 27 or later.
 
 ## Install
 
-Paste this into Terminal:
+Transfer is signed with an Apple Developer ID and notarized by Apple, so it opens normally however you get it. Pick one of these; they all put the same `Transfer.app` in your Applications folder.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash
-```
-
-It downloads the newest release from GitHub, checks the app's signature, and puts `Transfer.app` in `/Applications` (or `~/Applications` if `/Applications` is not writable). Then open it from Launchpad, Spotlight, or with `open -a Transfer`.
-
-To install somewhere else, name the folder:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | TRANSFER_DEST=~/Apps bash
-```
-
-Or with [Homebrew](https://brew.sh):
+### Homebrew
 
 ```bash
 brew install --cask shreeve/tap/transfer-sftp
 ```
 
-The cask is `transfer-sftp` because Homebrew's own `transfer` is a different app. Transfer updates itself, so `brew upgrade` leaves it alone.
+This adds the `shreeve/tap` tap the first time. The cask is `transfer-sftp` because Homebrew's own `transfer` is a different app, which also installs a `Transfer.app`; the two cannot be installed together.
 
-Transfer is signed with an Apple Developer ID and notarized by Apple, so it also opens normally when you download `Transfer.zip` from the [releases page](https://github.com/shreeve/transfer/releases) in a browser and drag the app to Applications.
+### One-command installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash
+```
+
+It downloads the newest release from GitHub, checks the app's signature, and puts `Transfer.app` in `/Applications` (or `~/Applications` if `/Applications` is not writable). An existing copy is replaced only once the new one is ready, so a failed install leaves it in place. To install somewhere else, name the folder:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | TRANSFER_DEST=~/Apps bash
+```
+
+### Download
+
+Download `Transfer.zip` from the [latest release](https://github.com/shreeve/transfer/releases/latest), open it, and drag `Transfer.app` to Applications.
+
+The first time you open Transfer after a Homebrew install or a download, macOS asks you to confirm opening an app from the internet; that is normal. Then open it from Launchpad, Spotlight, or with `open -a Transfer`.
 
 ## Update
 
-Transfer updates itself. Choose **Transfer → Check for Updates…** at any time; a new version downloads, installs, and relaunches when you click **Install Update**. Settings → Updates turns automatic checks on or off and shows when it last checked.
+Transfer updates itself, however it was installed. Choose **Transfer → Check for Updates…** at any time; a new version downloads, installs, and relaunches when you click **Install Update**. Settings → Updates turns automatic checks on or off and shows when it last checked.
 
-Running the install command again also updates to the newest release, replacing the app in place.
+- **Homebrew:** `brew upgrade` skips Transfer, since the app keeps itself current, and `brew list --versions` may show the version first installed. `brew upgrade --greedy transfer-sftp` updates it through Homebrew instead.
+- **Installer:** running the install command again also updates to the newest release, replacing the app in place.
 
 ## Uninstall
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash -s -- --uninstall
-```
+Remove it the way you installed it. Each of these removes only the app: your saved servers, Live files, and settings stay, so a later install picks up where you left off.
 
-This removes only the app. Your saved servers, Live files, and settings stay, so a later install picks up where you left off.
+| Installed with | Uninstall |
+| --- | --- |
+| Homebrew | `brew uninstall --cask transfer-sftp` |
+| Installer | `curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh \| bash -s -- --uninstall` |
+| Download | Drag `Transfer.app` from Applications to the Trash |
+
+`brew uninstall --zap --cask transfer-sftp` also deletes your data: saved servers, Live file working copies, caches, and preferences, but not passwords in the Keychain. Check first that no Live file has unsynced edits. [Where your data lives](#where-your-data-lives) lists everything, for removing it by hand.
+
+### Switching between Homebrew and the installer
+
+Homebrew will not install over a `Transfer.app` it did not put there. To move to Homebrew, uninstall with the installer's `--uninstall` first, then `brew install`. To move from Homebrew to the installer, `brew uninstall --cask transfer-sftp` first, so Homebrew does not keep a record of an app it no longer manages. Your data carries over either way.
 
 ## Open a server folder from its terminal
 
@@ -91,6 +104,8 @@ eval "$(Scripts/local-sshd.sh)" && swift test; kill $TRANSFER_TEST_SSHD
 ```
 
 That starts an unprivileged server on 127.0.0.1:2222 and does not turn on Remote Login.
+
+A build from `Scripts/package-app.sh` runs from `.build/Transfer.app` and leaves an installed copy alone, so you can keep a release in Applications for daily use and open builds beside it. Both use the same saved servers, Live files, and settings, and only one runs at a time: quit one before opening the other. `sftp://` links open in whichever copy macOS registered last; open the installed copy once to send them back to it.
 
 ## How a connection works
 
