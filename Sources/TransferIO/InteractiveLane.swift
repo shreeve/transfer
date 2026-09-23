@@ -1,10 +1,9 @@
 import Foundation
 import TransferCore
 
-/// The one file the user is waiting on. A new preview, view, open, or save cancels the running job.
-/// A displaced preview is dropped, and a new preview drops any preview still queued. A displaced
-/// Live open or save stays pending and runs next, unless it had already finished: running a
-/// completed save again would upload it twice.
+/// The one file the user is waiting on, one job at a time, newest first. A preview replaces a
+/// running or queued preview. A Live open or save is never interrupted: a download or upload
+/// cancelled partway would only start over, so a preview waits behind it instead.
 actor InteractiveLane {
     /// `preview` is a Quick Look or inspector fetch, which the next one replaces. `open` is a Live
     /// file's download, which the user is waiting to edit. `save` is a Live file's upload.
@@ -14,7 +13,6 @@ actor InteractiveLane {
         let kind: Kind
         let body: @Sendable () async throws -> Void
         let finish: CheckedContinuation<Void, Error>
-        var preempted = false
 
         init(kind: Kind, body: @escaping @Sendable () async throws -> Void, finish: CheckedContinuation<Void, Error>) {
             self.kind = kind
@@ -41,8 +39,7 @@ actor InteractiveLane {
         }
         queue.insert(job, at: 0)
         if let running {
-            running.job.preempted = true
-            running.task.cancel()
+            if running.job.kind == .preview { running.task.cancel() }
         } else {
             pump()
         }
@@ -64,10 +61,7 @@ actor InteractiveLane {
 
     private func finished(_ job: Job, error: Error?) {
         running = nil
-        if job.preempted, job.kind != .preview, error != nil {
-            job.preempted = false
-            queue.insert(job, at: min(1, queue.count))
-        } else if let error {
+        if let error {
             job.finish.resume(throwing: error)
         } else {
             job.finish.resume(returning: ())

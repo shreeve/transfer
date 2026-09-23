@@ -43,7 +43,7 @@ import TransferCore
 
 /// A Live open displaced by a preview (the user clicks another file while it downloads) is not
 /// dropped: it runs again after the preview and completes.
-@Test func openDisplacedByAPreviewStillCompletes() async throws {
+@Test func aPreviewWaitsForARunningOpen() async throws {
     let lane = InteractiveLane()
     let runs = RunCount()
     let open = Task {
@@ -54,8 +54,9 @@ import TransferCore
     }
     try await Task.sleep(nanoseconds: 50_000_000)
     try await lane.submit(.preview) {}
+    // The preview ran only after the open finished, which neither restarted nor failed.
+    #expect(runs.value == 1)
     try await open.value
-    #expect(runs.value == 2)
 }
 
 /// Previews still displace each other: a queued preview is dropped by a newer one.
