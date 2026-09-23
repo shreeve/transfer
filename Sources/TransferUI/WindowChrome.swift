@@ -423,13 +423,15 @@ final class ChromeController: NSSplitViewController {
         separatorUpdateObserver = NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
+        toolbarInstalled = true
+        WindowFrames.place(window, among: Self.live.allObjects.compactMap { $0 === self ? nil : $0.view.window })
+        // Watched only once placed: a new window becomes main at SwiftUI's default size first,
+        // which would otherwise replace the last-used frame it is about to take.
         for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didBecomeMainNotification] {
             keyObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak window] _ in
                 MainActor.assumeIsolated { if let window { WindowFrames.remember(window) } }
             })
         }
-        toolbarInstalled = true
-        WindowFrames.place(window, among: Self.live.allObjects.compactMap { $0 === self ? nil : $0.view.window })
         OpenShortcut.install()
         window.tabbingMode = .preferred
         window.titlebarSeparatorStyle = .none
@@ -596,10 +598,14 @@ enum OpenShortcut {
         }
     }
 
+    /// Only for the content pane, or a window with nothing focused: in the sidebar or inspector,
+    /// Command-Down keeps its usual meaning. Held down, it opens once.
     private static func takes(_ event: NSEvent) -> Bool {
-        guard event.keyCode == 125, event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
+        guard event.keyCode == 125, !event.isARepeat, event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
               let window = event.window, window.isKeyWindow, window.attachedSheet == nil, !(window.firstResponder is NSText),
-              let model = ChromeController.keyWindowController?.model, model.plainKeysAvailable else { return false }
+              let controller = ChromeController.keyWindowController, let model = controller.model, model.plainKeysAvailable else { return false }
+        if let focused = window.firstResponder as? NSView, focused !== window.contentView,
+           !focused.isDescendant(of: controller.splitViewItems[1].viewController.view) { return false }
         Task { await model.openSelection() }
         return true
     }
