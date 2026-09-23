@@ -406,9 +406,13 @@ final class ChromeController: NSSplitViewController {
         view.subviews.forEach(redraw)
     }
 
-    override func viewDidAppear() {
-        super.viewDidAppear()
-        guard let window = view.window, !toolbarInstalled else { return }
+    /// Dresses the window the moment the chrome lands in it. SwiftUI orders a new window in before
+    /// it inserts the content, but nothing has been drawn yet, so the toolbar, the title bar, and a
+    /// new tab's place in its group are all in the first frame. Waiting for `viewDidAppear` showed
+    /// the window bare and on its own for a few frames, then tabbed, then with its toolbar.
+    func landed(in window: NSWindow) {
+        guard !toolbarInstalled else { return }
+        toolbarInstalled = true
         Self.live.add(self)
         separatorObservation = window.observe(\.titlebarSeparatorStyle, options: [.new]) { [weak self] _, _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
@@ -423,7 +427,6 @@ final class ChromeController: NSSplitViewController {
         separatorUpdateObserver = NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
-        toolbarInstalled = true
         window.tabbingMode = .preferred
         // A tab takes its window's frame; any other new window is placed.
         if !NewTab.join(window) {
@@ -742,6 +745,11 @@ final class ChromeContainer: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let window { controller.landed(in: window) }
+    }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
