@@ -21,20 +21,20 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0.1.0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>27.0</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
-	<key>LSMultipleInstancesProhibited</key>
-	<true/>
+	<key>SUEnableInstallerLauncherService</key>
+	<false/>
 	<key>SUFeedURL</key>
 	<string>https://github.com/shreeve/transfer/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>YG6je6jUi4/f6LsqbgO1yP9n1CRwR+qWn8BGIp973M0=</string>
-	<key>SUEnableInstallerLauncherService</key>
-	<false/>
 </dict>
 </plist>
