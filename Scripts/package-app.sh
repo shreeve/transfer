@@ -23,23 +23,22 @@ sparkle="$(find "$root/.build/artifacts" -type d -name Sparkle.framework -path '
 cp -R "$sparkle" "$app/Contents/Frameworks/Sparkle.framework"
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$app/Contents/MacOS/Transfer"
 
-# Ad-hoc signing, releases included, as DuckTable ships: the installer fetches with curl, which
-# sets no quarantine, so Gatekeeper never judges the bundle, and Sparkle accepts an update whose
-# code signature is valid and whose EdDSA signature matches. SIGN="Developer ID Application: …"
-# signs with a real identity instead, inner components first. The hardened runtime is only for
+# Local builds are ad-hoc signed. Releases pass SIGN="Developer ID Application: …" (release.sh
+# does), which signs every piece with that identity, inner components first, with the hardened
+# runtime and a secure timestamp, as notarization requires. The hardened runtime is only for
 # real identities: with ad-hoc signatures its library validation refuses the framework because
 # neither side has a team.
 sign="${SIGN:--}"
-runtime=""
-if [ "$sign" != "-" ]; then runtime="--options=runtime"; fi
+options=()
+if [ "$sign" != "-" ]; then options=(--options=runtime --timestamp); fi
 framework="$app/Contents/Frameworks/Sparkle.framework"
-resign() { codesign --force --sign "$sign" $runtime "$@"; }
+resign() { codesign --force --sign "$sign" ${options[@]+"${options[@]}"} "$@"; }
 resign "$framework/Versions/B/XPCServices/Installer.xpc"
 resign --preserve-metadata=entitlements "$framework/Versions/B/XPCServices/Downloader.xpc"
 resign "$framework/Versions/B/Autoupdate"
 resign "$framework/Versions/B/Updater.app"
 resign "$framework"
-resign "$app"
+resign --entitlements "$root/Support/Transfer.entitlements" "$app"
 # macOS files permissions under the signing identifier, so every build signs as the bundle id.
 codesign --verify --deep --strict "$app"
 identifier=$( (codesign -dv "$app" 2>&1 || true) | sed -n 's/^Identifier=//p')

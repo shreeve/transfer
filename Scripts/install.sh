@@ -4,9 +4,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash
 #
-# Installs the newest GitHub release — no Developer ID, no notarization. curl never sets macOS's
-# quarantine attribute, so the app opens on first launch; the bundle is ad-hoc signed as
-# com.github.shreeve.transfer, and Sparkle updates it in place from then on.
+# Installs the newest GitHub release, signed with a Developer ID and notarized, so it opens on first
+# launch; Sparkle updates it in place from then on.
 #
 # The app lands in /Applications, or ~/Applications where that is not writable; TRANSFER_DEST
 # names another directory (... | TRANSFER_DEST=dir bash). An installed copy is replaced by
@@ -89,9 +88,8 @@ main() {
     # copy: nothing is written into an app once it is in place.
     rm -rf "$staged"
     mv "$tmp/Transfer.app" "$staged"
-    # Belt and suspenders: if anything tagged the download, untag it. This
-    # script only ever installs the zip it fetched itself, and curl sets no
-    # quarantine, so there is no browser-downloaded bundle to refuse here.
+    # curl sets no quarantine, and a notarized app would pass with one, but
+    # releases before 0.1.5 were ad-hoc signed and would not: untag it anyway.
     xattr -dr com.apple.quarantine "$staged" 2>/dev/null || true
     # A damaged download stops here, with the installed app still standing.
     codesign --verify --deep --strict "$staged" 2>/dev/null \
