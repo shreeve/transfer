@@ -33,7 +33,10 @@ struct TransferApp: App {
                     .disabled(model == nil)
                 Button("New Window") { openWindow(id: "browser") }
                     .keyboardShortcut("n")
-                Button("New Tab") { NSApp.sendAction(#selector(NSWindow.newWindowForTab(_:)), to: nil, from: nil) }
+                Button("New Tab") {
+                    NewTab.request()
+                    openWindow(id: "browser")
+                }
                     .keyboardShortcut("t")
                 Divider()
                 Button("Open") { Task { await model?.openSelection() } }
