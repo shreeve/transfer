@@ -95,6 +95,9 @@ public final class TransferModel {
     var pendingCollision: CheckedContinuation<NameCollisionChoice, Never>?
     var applyToAll: NameCollisionChoice?
 
+    /// Where a connection made from an `sftp://` link's filled-in sheet lands.
+    @ObservationIgnored private var pendingLanding: RemotePath?
+    @ObservationIgnored private var connecting = false
     private var backStack: [RemotePath] = []
     private var forwardStack: [RemotePath] = []
     private var listener: Task<Void, Never>?
@@ -167,15 +170,29 @@ public final class TransferModel {
         connections.first { $0.id == snapshot.connectionID }
     }
 
-    public func connect(_ connection: SavedConnection) async {
+    /// Logs in and shows the start folder, or `landing` when given: that folder, or the file
+    /// selected in its folder.
+    public func connect(_ connection: SavedConnection, landing: RemotePath? = nil) async {
         status = "Connecting to \(connection.displayName)…"
+        connecting = true
+        defer { connecting = false }
         do {
             let session = try await provider.session(for: connection.id)
             self.session = session
             listen(to: session)
-            let path = try await session.connect(prompts: prompts)
+            let start = try await session.connect(prompts: prompts)
+            var path = start
+            var selection: Set<RemotePath> = []
+            var missing: RemotePath?
+            if let landing {
+                if let found = await Self.landing(landing, session: session) {
+                    (path, selection) = found
+                } else {
+                    missing = landing
+                }
+            }
             snapshot.connectionID = connection.id
-            snapshot.selection = []
+            snapshot.selection = selection
             backStack.removeAll()
             forwardStack.removeAll()
             columns.removeAll()
@@ -186,9 +203,37 @@ public final class TransferModel {
             columnRoot = path
             await refresh()
             await reloadSidebars()
+            if let missing { status = "No such file or folder: \(missing.display)" }
         } catch {
             status = error.localizedDescription
         }
+    }
+
+    /// Where a link to `path` lands: the folder itself, or a file's folder with the file selected.
+    /// A link to a link follows one hop. Nil when there is nothing at `path`.
+    private static func landing(_ path: RemotePath, session: any RemoteSession) async -> (RemotePath, Set<RemotePath>)? {
+        guard let item = try? await session.stat(path), let target = try? await resolveLink(item, session: session) else { return nil }
+        if target.kind == .directory { return (path, []) }
+        guard let parent = path.parent else { return nil }
+        return (parent, [path])
+    }
+
+    /// True while this window shows no server and asks nothing, so a link can open here rather
+    /// than in a new tab.
+    public var isIdle: Bool { snapshot.connectionID == nil && sheet == nil && !connecting }
+
+    /// Opens an `sftp://` link here: the saved server it names, at its folder or with its file
+    /// selected. A server not in the library opens the New Connection sheet, filled in from the
+    /// link; nothing is saved until Connect.
+    public func open(link: SftpLink) async {
+        if let connection = await provider.connection(matching: link) {
+            await connect(connection, landing: link.path)
+            return
+        }
+        draft = SavedConnection(name: "", host: link.host, user: link.user ?? "", port: link.port ?? "")
+        draftIsEdit = false
+        pendingLanding = link.path
+        sheet = .connection
     }
 
     public func disconnect() async {
@@ -202,6 +247,7 @@ public final class TransferModel {
     }
 
     public func newConnection() {
+        pendingLanding = nil
         draft = SavedConnection(name: "", host: "")
         draftIsEdit = false
         sheet = .connection
@@ -221,7 +267,9 @@ public final class TransferModel {
             try await provider.save(connection)
             await reloadConnections()
             sheet = nil
-            if !wasEdit { await connect(connection) }
+            let landing = pendingLanding
+            pendingLanding = nil
+            if !wasEdit { await connect(connection, landing: landing) }
         } catch {
             status = error.localizedDescription
         }

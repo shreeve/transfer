@@ -110,6 +110,8 @@ public protocol SessionProvider: Sendable {
     /// Refuses with `TransferError.liveUnsynced` while the connection has unsynced Live bytes.
     func removeConnection(_ id: ConnectionID) async throws
     func session(for id: ConnectionID) async throws -> any RemoteSession
+    /// The saved server an `sftp://` link means, or nil when none does.
+    func connection(matching link: SftpLink) async -> SavedConnection?
     var unsyncedLiveCount: Int { get async }
     func unsyncedLiveCount(for id: ConnectionID) async -> Int
     func disconnectAll() async

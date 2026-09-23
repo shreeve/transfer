@@ -44,6 +44,18 @@ curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/insta
 
 This removes only the app. Your saved servers, Live files, and settings stay, so a later install picks up where you left off.
 
+## Open a server folder from its terminal
+
+Transfer opens `sftp://` links. A link to a folder opens it in a new tab; a link to a file selects it in its folder. The server is found among your saved servers by name, by the host name `~/.ssh/config` gives it, or by address; a server not yet saved opens the New Connection sheet, filled in.
+
+`Tools/xfer` prints such a link from a shell on the server, for Command-click in Ghostty or any terminal that shows OSC 8 links. Install it on each server, with the name the Mac uses for that server:
+
+```bash
+ssh live 'mkdir -p ~/bin ~/.config/transfer && cat > ~/bin/xfer && chmod 755 ~/bin/xfer && echo live > ~/.config/transfer/host' < Tools/xfer
+```
+
+Then run `xfer` (this folder) or `xfer some/path` on the server and Command-click what it prints.
+
 ## Where your data lives
 
 | What | Where |

@@ -1,0 +1,44 @@
+#!/bin/sh
+# xfer [path]: print a link that opens path (default: here) in Transfer on the Mac.
+# Command-click it in Ghostty, or any terminal that shows OSC 8 links.
+#
+# The link names this machine the way the Mac does, from the first of:
+#   $LC_TRANSFER_HOST        (SetEnv LC_TRANSFER_HOST=name in the Mac's ~/.ssh/config)
+#   ~/.config/transfer/host  (one line: the Mac's ssh alias for this machine)
+#   the address this ssh session arrived on
+# Transfer matches it to a saved server by alias, by `ssh -G` host name, or by address.
+set -e
+
+path=$(realpath -- "${1:-.}")
+host=${LC_TRANSFER_HOST:-}
+[ -n "$host" ] || host=$(head -n 1 "$HOME/.config/transfer/host" 2>/dev/null || true)
+[ -n "$host" ] || host=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $3}')
+if [ -z "$host" ]; then
+  echo "xfer: not in an ssh session; put this machine's name in ~/.config/transfer/host" >&2
+  exit 1
+fi
+case $host in *:*) host="[$host]" ;; esac
+
+# Percent-encode everything but unreserved characters and slashes.
+encode() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"
+  else
+    printf '%s\n' "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'
+  fi
+}
+
+url="sftp://$(encode "$(id -un)")@$host$(encode "$path")"
+link=$(printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$host:$path")
+
+# tmux before 3.4 drops OSC 8, so it goes through tmux's passthrough. Later tmux keeps links
+# itself when its terminal-features name hyperlinks, and passes through only when
+# allow-passthrough is on.
+if [ -n "${TMUX:-}" ]; then
+  passthrough=$(tmux show -gv allow-passthrough 2>/dev/null || echo old)
+  if [ "$passthrough" != off ]; then
+    esc=$(printf '\033')
+    link=$(printf '\033Ptmux;%s\033\\' "$(printf '%s' "$link" | sed "s/$esc/$esc$esc/g")")
+  fi
+fi
+printf '%s\n' "$link"

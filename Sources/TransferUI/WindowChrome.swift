@@ -437,6 +437,7 @@ final class ChromeController: NSSplitViewController {
             })
         }
         OpenShortcut.install()
+        if let model { LinkInbox.take(into: model) }
         window.titlebarSeparatorStyle = .none
         // The opaque title bar over the content column draws its own bottom edge regardless of
         // the separator style; a transparent title bar has no edge, and the sidebar is already
@@ -505,6 +506,13 @@ final class ChromeController: NSSplitViewController {
     static var keyWindowController: ChromeController? {
         guard let key = NSApp.keyWindow else { return nil }
         return live.allObjects.first { $0.view.window === key }
+    }
+
+    /// Every browser window's controller, those on screen front to back first.
+    static var browsers: [ChromeController] {
+        let all = live.allObjects
+        let ordered = NSApp.orderedWindows.compactMap { window in all.first { $0.view.window === window } }
+        return ordered + all.filter { controller in !ordered.contains { $0 === controller } }
     }
 
     @objc func copy(_ sender: Any?) {
@@ -596,7 +604,7 @@ public enum NewTab {
 
     /// Call just before opening the window. Without a browser window in front, it is a new window.
     public static func request() {
-        host = ChromeController.keyWindowController?.view.window
+        host = (ChromeController.keyWindowController ?? ChromeController.browsers.first)?.view.window
     }
 
     static func join(_ window: NSWindow) -> Bool {
@@ -608,6 +616,56 @@ public enum NewTab {
         target.addTabbedWindow(window, ordered: .above)
         window.makeKeyAndOrderFront(nil)
         return true
+    }
+}
+
+/// `sftp://` links from other apps, such as a Command-click on a link a terminal shows. A link
+/// opens in a browser window that shows no server yet, the key window first; otherwise in a new
+/// tab of the front window. At launch it waits for the first window to appear.
+@MainActor
+public enum LinkInbox {
+    private static var pending: [SftpLink] = []
+    /// Opens a new browser window. Set by each browser window as it appears, since only a view
+    /// can reach SwiftUI's window opener.
+    public static var openWindow: (() -> Void)?
+
+    public static func deliver(_ link: SftpLink) {
+        NSApp.activate()
+        let browsers = ChromeController.browsers
+        let idle = browsers.first { $0 === ChromeController.keyWindowController && $0.model?.isIdle == true }
+            ?? browsers.first { $0.model?.isIdle == true }
+        if let idle, let model = idle.model {
+            idle.view.window?.makeKeyAndOrderFront(nil)
+            Task { await model.open(link: link) }
+            return
+        }
+        pending.append(link)
+        if browsers.isEmpty {
+            // Launched by the link, or every window closed: open one, and it takes the link as it
+            // appears. A window restored at launch may already be on its way and take it first.
+            newWindow()
+        } else {
+            NewTab.request()
+            newWindow()
+        }
+    }
+
+    /// SwiftUI's window opener once a browser window has lent it; before that, the responder
+    /// chain's `newWindowForTab:`, which reaches SwiftUI's own opener.
+    private static func newWindow() {
+        if let openWindow { return openWindow() }
+        NSApp.sendAction(#selector(NSResponder.newWindowForTab(_:)), to: nil, from: nil)
+    }
+
+    /// A browser window that just appeared takes the oldest waiting link.
+    static func take(into model: TransferModel) {
+        guard model.isIdle, !pending.isEmpty else { return }
+        let link = pending.removeFirst()
+        Task { await model.open(link: link) }
+        if !pending.isEmpty {
+            NewTab.request()
+            newWindow()
+        }
     }
 }
 
@@ -824,3 +882,4 @@ final class SearchToolbarView: NSView {
         }
     }
 }
+

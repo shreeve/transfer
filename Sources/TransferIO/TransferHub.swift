@@ -57,6 +57,27 @@ public actor TransferHub: SessionProvider {
         return session
     }
 
+    public func connection(matching link: SftpLink) async -> SavedConnection? {
+        let saved = store.connections()
+        // An address in the link is compared with each server's resolved addresses; a name is not.
+        let byAddress = SSHResolver.isAddress(link.host)
+        let candidates = await withTaskGroup(of: SftpLinkMatch.Candidate?.self) { group in
+            for connection in saved {
+                group.addTask {
+                    guard let output = await SSHResolver.config(for: connection) else { return nil }
+                    let hostName = SSHConfigValues.parse(output)["hostname"] ?? connection.host
+                    let addresses = byAddress ? SSHResolver.addresses(of: hostName) : []
+                    return SftpLinkMatch.Candidate(connection: connection, sshConfigOutput: output, addresses: addresses)
+                }
+            }
+            var found: [SavedConnection.ID: SftpLinkMatch.Candidate] = [:]
+            for await candidate in group { if let candidate { found[candidate.connection.id] = candidate } }
+            // In library order, so the first saved server wins a tie.
+            return saved.compactMap { found[$0.id] }
+        }
+        return SftpLinkMatch.best(link, among: candidates)
+    }
+
     public var unsyncedLiveCount: Int { get async { await live.unsyncedCount() } }
 
     public func unsyncedLiveCount(for id: ConnectionID) async -> Int {
