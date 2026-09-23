@@ -34,7 +34,10 @@ public enum SidebarItem: Hashable {
 public final class TransferModel {
     public let provider: any SessionProvider
     public private(set) var session: (any RemoteSession)?
-    public var connections: [SavedConnection] = []
+    /// Starts from the list the last window loaded, so a new window or tab shows its servers in
+    /// its first frame instead of an empty sidebar that fills in a moment later.
+    public var connections: [SavedConnection] = TransferModel.lastConnections
+    private static var lastConnections: [SavedConnection] = []
     public var snapshot = BrowserSnapshot()
     public var items: [RemoteItem] = []
     public var columns: [RemotePath: [RemoteItem]] = [:]
@@ -163,7 +166,9 @@ public final class TransferModel {
     // MARK: Servers
 
     public func reloadConnections() async {
-        connections = (try? await provider.savedConnections()) ?? []
+        let loaded = (try? await provider.savedConnections()) ?? []
+        Self.lastConnections = loaded
+        if connections != loaded { connections = loaded }
     }
 
     public var currentConnection: SavedConnection? {
