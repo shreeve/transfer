@@ -172,6 +172,7 @@ struct UpdateSettings: View {
 /// One window or tab. Each has its own model; sessions are shared through the provider.
 struct BrowserWindow: View {
     @State private var model: TransferModel
+    @Environment(\.openWindow) private var openWindow
 
     init(provider: any SessionProvider) {
         _model = State(initialValue: TransferModel(provider: provider))
@@ -179,6 +180,10 @@ struct BrowserWindow: View {
 
     var body: some View {
         ContentView(model: model)
+            .onAppear { LinkInbox.openWindow = { openWindow(id: "browser") } }
+            // An open window takes each `sftp://` link, so SwiftUI opens a window for one only
+            // when none is open. The app delegate decides where the link goes.
+            .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
     }
 }
 
@@ -229,6 +234,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WindowFrames.launchFinished()
         let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String ?? ""
         if !key.isEmpty { updater.startUpdater() }
+    }
+
+    /// `sftp://` links, such as a Command-click on one a terminal shows.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            if let link = SftpLink(url: url) { LinkInbox.deliver(link) }
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
