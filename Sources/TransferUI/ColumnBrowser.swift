@@ -28,6 +28,9 @@ struct ColumnBrowser: NSViewRepresentable {
         browser.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
         // The stack keeps the browser at least as wide as its columns, so it never scrolls sideways.
         browser.hasHorizontalScroller = false
+        let menu = NSMenu()
+        menu.delegate = context.coordinator
+        browser.menu = menu
         let stack = ColumnStack(browser: browser)
         context.coordinator.browser = browser
         context.coordinator.stack = stack
@@ -41,7 +44,7 @@ struct ColumnBrowser: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSBrowserDelegate {
+    final class Coordinator: NSObject, NSBrowserDelegate, NSMenuDelegate {
         var model: TransferModel
         weak var browser: NSBrowser?
         weak var stack: ColumnStack?
@@ -218,6 +221,29 @@ struct ColumnBrowser: NSViewRepresentable {
             let items = selected.compactMap { browser.item(atRow: $0, inColumn: column) as? RemoteItem }
             let parent = path(forColumn: column) ?? model.snapshot.path
             model.selectInColumns(items, parent: parent)
+        }
+
+        // MARK: Context menu
+
+        /// The right-clicked row joins the selection first, as a click would select it, so every
+        /// entry acts on what the menu was opened over. The `..` row and the empty area below the
+        /// rows get the folder's menu.
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            guard let browser else { return }
+            let column = browser.clickedColumn
+            let row = browser.clickedRow
+            var clicked: RemoteItem?
+            if column >= 0, column <= browser.lastColumn, row >= 0, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem {
+                clicked = item
+                if !model.snapshot.selection.contains(item.path) {
+                    if browser.lastColumn > column { browser.lastColumn = column }
+                    browser.selectRowIndexes(IndexSet(integer: row), inColumn: column)
+                    if item.kind == .directory { browser.addColumn() }
+                    selectionChanged(nil)
+                }
+            }
+            ItemMenu.fill(menu, item: clicked, model: model)
         }
 
         @objc func doubleClicked(_ sender: Any?) {

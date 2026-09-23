@@ -116,16 +116,19 @@ struct TransferApp: App {
                     .keyboardShortcut(.space, modifiers: [])
                     .disabled(primary == nil || !plainKeys)
                 Divider()
-                Button("Sidebar") { model?.sidebarCollapsed.toggle() }
-                    .keyboardShortcut("s", modifiers: [.command, .shift])
-                Button("Inspector") { model?.showsInspector.toggle() }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
+                // Command-B as in VS Code and Cursor; Command-I is Finder's Get Info, which the
+                // inspector shows.
+                Button(model?.sidebarCollapsed == true ? "Show Sidebar" : "Hide Sidebar") { model?.sidebarCollapsed.toggle() }
+                    .keyboardShortcut("b")
+                Button(model?.showsInspector == true ? "Hide Inspector" : "Show Inspector") { model?.showsInspector.toggle() }
+                    .keyboardShortcut("i")
                 Button("Transfers") { model?.showsShelf.toggle() }
                 Divider()
-                Button(model.map { $0.isStarred($0.starTarget) } == true ? "Unstar" : "Star") {
-                    Task { await model?.toggleStar() }
+                // Finder's Add to Sidebar key.
+                Button(model.map { $0.starTitle($0.starTargets) } ?? "Add to Starred") {
+                    Task { await model?.toggleStar(model?.starTargets ?? []) }
                 }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .keyboardShortcut("t", modifiers: [.command, .control])
                 .disabled(!connected)
                 Button("Clear Preview Cache") { Task { await model?.clearPreviewCache() } }
             }
