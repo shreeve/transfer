@@ -68,7 +68,8 @@ public final class Clipboard {
             }
         }, forMode: .common)
         // No responder gets Escape as cancelOperation when a button or the window has focus, so it
-        // is watched here, except in text fields, sheets, and non-browser windows.
+        // is watched here, except in text fields, sheets, and non-browser windows. An open rename
+        // bar goes first: Escape cancels it wherever focus is, and the clip stays.
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             MainActor.assumeIsolated { Clipboard.shared.takesEscape(event) } ? nil : event
         }
@@ -76,9 +77,14 @@ public final class Clipboard {
     }
 
     private func takesEscape(_ event: NSEvent) -> Bool {
-        guard event.keyCode == 53, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty, clip != nil,
+        guard event.keyCode == 53, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty,
               let window = event.window, window.isKeyWindow, window.attachedSheet == nil,
-              ChromeController.keyWindowController != nil, !(window.firstResponder is NSText) else { return false }
+              let controller = ChromeController.keyWindowController, !(window.firstResponder is NSText) else { return false }
+        if let model = controller.model, model.renaming {
+            model.renaming = false
+            return true
+        }
+        guard clip != nil else { return false }
         clear()
         return true
     }

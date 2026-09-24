@@ -715,6 +715,10 @@ private func closeButton(help: LocalizedStringKey, label: LocalizedStringKey, ac
 }
 
 /// The rename field. Focus state has to live inside the hosted detail subtree, so this is its own view.
+///
+/// With Full Keyboard Access on, SwiftUI gave the bar's focus to the default button, not the
+/// field, so typing went nowhere (measured on macOS 27). The buttons take no focus, the field is
+/// the bar's default focus, and it is focused once more a turn after the bar appears.
 private struct RenameBar: View {
     @Bindable var model: TransferModel
     @FocusState private var focused: Bool
@@ -728,10 +732,16 @@ private struct RenameBar: View {
                 .onExitCommand { model.renaming = false }
             Button("Rename") { Task { await model.renameSelection(to: model.renameText) } }
                 .keyboardShortcut(.defaultAction)
+                .focusable(false)
             Button("Cancel") { model.renaming = false }
+                .focusable(false)
         }
         .padding(8)
-        .onAppear { focused = true }
+        .defaultFocus($focused, true)
+        .onAppear {
+            focused = true
+            DispatchQueue.main.async { focused = true }
+        }
         .onChange(of: focused) { model.textEditing = focused }
         .onDisappear { model.textEditing = false }
     }

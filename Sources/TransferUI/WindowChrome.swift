@@ -182,9 +182,13 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
 
         func searchFieldDidStartSearching(_ sender: NSSearchField) { model.textEditing = true }
 
+        /// Sent when the text becomes empty, by typing or the clear button. A field still being
+        /// edited keeps its focus, as Finder's does, and so keeps Return and Space; one that is
+        /// not folds back to the magnifier.
         func searchFieldDidEndSearching(_ sender: NSSearchField) {
-            model.textEditing = false
             model.filter = ""
+            guard sender.currentEditor() == nil else { return }
+            model.textEditing = false
             searchView?.collapse()
         }
 
