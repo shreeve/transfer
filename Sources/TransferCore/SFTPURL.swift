@@ -17,21 +17,51 @@ public struct SFTPURL: Hashable, Sendable {
         self.path = path
     }
 
-    /// Nil for anything but an `sftp://` URL with a host. The path is percent-decoded. A user or
-    /// host that ssh could read as an option, or that holds spaces or control characters, is no
-    /// link: they come from other apps, and they end up on ssh's command line. Nor is a path
-    /// with a control character: a NUL on the wire ends the SFTP channel.
+    /// Nil for anything but an `sftp://` URL with a host. The path is percent-decoded to the exact
+    /// bytes, UTF-8 or not. A user or host that ssh could read as an option, or that holds spaces
+    /// or control characters, is no link: they come from other apps, and they end up on ssh's
+    /// command line. Nor is a path with a control character (a NUL on the wire ends the SFTP
+    /// channel) or a broken escape: opening the start folder instead would be the wrong place.
     public init?(url: URL) {
         guard url.scheme?.lowercased() == "sftp", let host = url.host(percentEncoded: false),
               Self.isPlainName(host) else { return nil }
         let user = url.user(percentEncoded: false).flatMap { $0.isEmpty ? nil : $0 }
         if let user, !Self.isPlainName(user) { return nil }
-        let path = url.path(percentEncoded: false)
-        guard !path.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return nil }
+        guard let path = Self.decode(url.path(percentEncoded: true)), !Self.hasControl(path) else { return nil }
         self.host = host
         self.user = user
         port = url.port.map(String.init)
-        self.path = path.isEmpty ? nil : RemotePath(string: path)
+        self.path = path.isEmpty ? nil : RemotePath(bytes: path)
+    }
+
+    /// The bytes `%XX` escapes stand for; nil for a `%` not followed by two hex digits.
+    private static func decode(_ text: String) -> [UInt8]? {
+        var bytes: [UInt8] = []
+        var input = Array(text.utf8)[...]
+        while let byte = input.popFirst() {
+            guard byte == UInt8(ascii: "%") else {
+                bytes.append(byte)
+                continue
+            }
+            guard input.count >= 2, let high = hexValue(input.popFirst()!), let low = hexValue(input.popFirst()!) else { return nil }
+            bytes.append(high << 4 | low)
+        }
+        return bytes
+    }
+
+    private static func hexValue(_ byte: UInt8) -> UInt8? {
+        switch byte {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): byte - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): byte - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): byte - UInt8(ascii: "A") + 10
+        default: nil
+        }
+    }
+
+    /// C0 controls, DEL, and C1 controls as UTF-8 writes them (C2 80 to C2 9F).
+    private static func hasControl(_ bytes: [UInt8]) -> Bool {
+        bytes.contains { $0 < 0x20 || $0 == 0x7F }
+            || zip(bytes, bytes.dropFirst()).contains { $0 == 0xC2 && (0x80...0x9F).contains($1) }
     }
 
     private static func isPlainName(_ name: String) -> Bool {
@@ -39,27 +69,29 @@ public struct SFTPURL: Hashable, Sendable {
             && !name.unicodeScalars.contains { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }
     }
 
-    /// The link to `path` on `connection`, as Copy Remote URL writes it. An IPv6 address goes in
+    /// The link to `path` on `connection`, as Copy Remote URL writes it: the path's exact bytes,
+    /// escaped, so a name that is not UTF-8 opens the same file. An IPv6 address goes in
     /// brackets, as `xfer` writes it, so the port after it still parses.
     public static func string(connection: SavedConnection, path: RemotePath) -> String {
         var host = connection.host
         if host.contains(":"), !host.hasPrefix("[") {
             host = "[\(host.replacingOccurrences(of: "%", with: "%25"))]"
+        } else if !host.hasPrefix("[") {
+            host = host.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? host
         }
         if !connection.port.isEmpty { host += ":\(connection.port)" }
         let user = connection.user.trimmingCharacters(in: .whitespaces)
-        let authority = user.isEmpty ? host : "\(percent(user))@\(host)"
-        let encoded = path.display.split(separator: "/", omittingEmptySubsequences: false).map {
-            percent(String($0))
-        }.joined(separator: "/")
+        let authority = user.isEmpty ? host : "\(percent(Array(user.utf8)))@\(host)"
+        let encoded = percent(path.bytes, keeping: "/")
         let suffix = encoded.hasPrefix("/") ? encoded : "/" + encoded
         return "sftp://\(authority)\(suffix)"
     }
 
-    private static func percent(_ value: String) -> String {
-        var allowed = CharacterSet.urlPathAllowed
-        allowed.remove(charactersIn: "/@:?#[]")
-        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    /// `bytes` with every byte but the unreserved characters, the sub-delimiters, and `keeping`
+    /// written as `%XX`.
+    private static func percent(_ bytes: [UInt8], keeping: String = "") -> String {
+        let plain = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=".utf8).union(keeping.utf8)
+        return bytes.map { plain.contains($0) ? String(UnicodeScalar($0)) : String(format: "%%%02X", $0) }.joined()
     }
 
     /// Which saved server an `sftp://` link means.

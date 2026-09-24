@@ -194,16 +194,17 @@ struct DetailColumn: View {
                 }
             }
         case .delete:
+            // What this sheet warns about is all the delete may discard.
             let unsynced = model.unsyncedInSelection
             SheetForm(title: deleteTitle, detail: "The delete is permanent. There is no trash on the server.", onCancel: { model.sheet = nil }) {
-                if unsynced > 0 {
-                    Text("\(unsynced) Live file\(unsynced == 1 ? " has" : "s have") unsynced edits that will be discarded.")
+                if !unsynced.isEmpty {
+                    Text("\(unsynced.count) Live file\(unsynced.count == 1 ? " has" : "s have") unsynced edits that will be discarded.")
                         .foregroundStyle(.red)
                 }
             } actions: {
                 Button("Delete") {
                     model.sheet = nil
-                    Task { await model.deleteSelection() }
+                    Task { await model.deleteSelection(warned: unsynced) }
                 }
             }
         case .collision(let name, _):

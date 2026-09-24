@@ -23,14 +23,20 @@ public enum TransferError: Error, Equatable, Sendable, LocalizedError {
         case .cancelled: "Cancelled"
         case .hostKeyRejected: "The host key was not trusted"
         case .authenticationFailed(let text): text.isEmpty ? "Login failed" : text
-        case .permissionDenied(let text): "Permission denied: \(text)"
-        case .noSuchFile(let text): "No such file: \(text)"
+        case .permissionDenied(let text): Self.labeled("Permission denied", text)
+        case .noSuchFile(let text): Self.labeled("No such file", text)
         case .failed(let text): text
         case .typeMismatch(let text): "A file and a folder share the name \(text)"
         case .connectionLost(let text): "Connection lost: \(text)"
         case .timeout(let text): "Timed out: \(text)"
         case .liveUnsynced(let count): "\(count) Live file\(count == 1 ? " has" : "s have") unsynced edits"
         }
+    }
+
+    /// `label: text`, or `text` alone when it already says it, as a server's own message does.
+    private static func labeled(_ label: String, _ text: String) -> String {
+        if text.isEmpty { return label }
+        return text.lowercased().hasPrefix(label.lowercased()) ? text : "\(label): \(text)"
     }
 }
 
@@ -182,7 +188,11 @@ public protocol RemoteSession: Sendable {
     func resolve(_ path: RemotePath) async throws -> RemoteItem
     func mkdir(_ path: RemotePath) async throws
     func rename(_ source: RemotePath, to destination: RemotePath) async throws
-    func remove(_ path: RemotePath) async throws
+    /// Removes a file or a folder tree. While a Live file under `path` holds bytes the server
+    /// lacks, it refuses with `TransferError.liveUnsynced` and removes nothing, unless `force`:
+    /// the user was warned and chose to discard those edits. Even then a Live file is forgotten
+    /// only after the server's delete succeeded, so a failed delete keeps every edit.
+    func remove(_ path: RemotePath, force: Bool) async throws
     func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func openKind(fileName: String) async -> OpenKind
@@ -223,6 +233,11 @@ public enum SessionEvent: Sendable {
 }
 
 public extension RemoteSession {
+    /// A removal that never discards unsynced Live edits.
+    func remove(_ path: RemotePath) async throws {
+        try await remove(path, force: false)
+    }
+
     /// The whole tree `walkTree` streams, by key.
     func tree(_ root: RemotePath) async throws -> [TreeKey: TreeEntry] {
         var entries: [TreeKey: TreeEntry] = [:]

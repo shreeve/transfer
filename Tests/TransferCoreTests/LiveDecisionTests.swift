@@ -245,3 +245,15 @@ private func present(size: UInt64 = 10, at date: Date = t0, digest: String? = ni
     #expect(!file(uploading: true).isSynced)
     #expect(!file(conflict: true).isSynced)
 }
+
+// Keep Remote with no file on the server
+
+@Test func keepRemoteForgetsOnlyWhatTheConflictShowed() {
+    #expect(LiveDecision.keepRemoteForgets(.removed, server: .missing))
+    #expect(LiveDecision.keepRemoteForgets(.notAFile, server: .notFile(.directory)))
+    #expect(!LiveDecision.keepRemoteForgets(.changed(other), server: .missing))
+    #expect(!LiveDecision.keepRemoteForgets(.changed(other), server: .notFile(.directory)))
+    #expect(!LiveDecision.keepRemoteForgets(.removed, server: .notFile(.directory)))
+    #expect(!LiveDecision.keepRemoteForgets(.notAFile, server: .missing))
+    #expect(!LiveDecision.keepRemoteForgets(nil, server: .missing))
+}

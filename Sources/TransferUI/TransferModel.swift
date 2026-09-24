@@ -1260,8 +1260,10 @@ public final class TransferModel {
         }
     }
 
-    public var unsyncedInSelection: Int {
-        liveFiles.filter { live in live.dirty && snapshot.selection.contains { live.path.isInside($0) } }.count
+    /// The Live files under the selection whose edits a delete would discard: what the delete
+    /// sheet warns about, and all a confirmed delete may discard.
+    public var unsyncedInSelection: Set<RemotePath> {
+        Set(liveFiles.filter { live in !live.isSynced && snapshot.selection.contains { live.path.isInside($0) } }.map(\.path))
     }
 
     public func askToDelete() {
@@ -1269,30 +1271,39 @@ public final class TransferModel {
         sheet = .delete
     }
 
-    /// Deletes the selection; failures are reported and stay selected. Live files under it are
-    /// discarded first, as the sheet warned: the session will not remove a path holding one.
-    public func deleteSelection() async {
+    /// Deletes the selection; failures are reported and stay selected. An item is deleted with
+    /// its Live files' unsynced edits discarded only when the sheet the user confirmed named every
+    /// one of them (`warned`); the session discards them only once the server's delete worked.
+    /// An item holding edits the sheet did not name is kept, and the sheet comes back naming them.
+    public func deleteSelection(warned: Set<RemotePath>) async {
         guard let context else { return }
         let paths = snapshot.selection.sorted { $0.display < $1.display }
-        let live = liveFiles
+        let live = await context.session.liveFiles()
         var removed: [RemotePath] = []
         var failures: [(name: String, error: any Error)] = []
+        var unwarned: [(name: String, error: any Error)] = []
         for path in paths {
+            let unsynced = live.filter { !$0.isSynced && $0.path.isInside(path) }.map(\.path)
             do {
-                for file in live where file.path.isInside(path) {
-                    try await context.session.discardLiveFile(file.path, force: true)
-                }
-                try await context.session.remove(path)
+                try await context.session.remove(path, force: !unsynced.isEmpty && unsynced.allSatisfy(warned.contains))
                 removed.append(path)
+            } catch TransferError.liveUnsynced(let count) {
+                unwarned.append((path.name, TransferError.liveUnsynced(count)))
             } catch {
                 failures.append((path.name, error))
             }
         }
         guard isCurrent(context) else { return }
-        reportFailures("delete", failures, of: paths.count)
         snapshot.selection.subtract(removed)
         await stepOut(of: removed)
         await reloadSidebars()
+        guard isCurrent(context) else { return }
+        if !unwarned.isEmpty, sheet == nil {
+            sheet = .delete
+        } else {
+            failures += unwarned
+        }
+        reportFailures("delete", failures, of: paths.count)
     }
 
     /// After `gone` left their places: a window standing in one of them moves up to its parent,

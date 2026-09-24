@@ -20,8 +20,7 @@ public actor SSHConnection: RemoteSession {
     private var scratch: [URL] = []
     private var startPath: RemotePath?
     /// The one login in flight. Every `connect` meanwhile joins it rather than starting another.
-    private var login: Task<RemotePath, Error>?
-    private var loginWaiters = (waiting: 0, cancelled: 0)
+    private var login: Login?
     /// The latest release of a master and its channels. The next login waits for it, so an old
     /// master never exits, unlinking the socket, after a new one has bound it.
     private var releasing: Task<Void, Never>?
@@ -68,14 +67,18 @@ public actor SSHConnection: RemoteSession {
     /// How long a login may take, prompts included, before it gives up.
     static let loginTimeout: Duration = .seconds(300)
 
-    /// `live` is the hub's one `LiveSync`, shared by every connection.
-    init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync, sshConfigFile: String? = nil) {
+    /// `live` is the hub's one `LiveSync`, shared by every connection. `replacing` is the session
+    /// for this server that this one takes over from, as when its settings changed: it disconnects
+    /// now, and this one's first login waits for that, since both use one socket path.
+    init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync, sshConfigFile: String? = nil,
+         replacing previous: SSHConnection? = nil) {
         self.connection = connection
         self.store = store
         self.editableExtensions = editableExtensions
         self.live = live
         self.sshConfigFile = sshConfigFile
         socketPath = store.root.appendingPathComponent("ssh/\(connection.id.socketName)").path
+        releasing = previous.map { old in Task { await old.disconnect() } }
     }
 
     public nonisolated func events() -> AsyncStream<SessionEvent> { pipe.stream() }
@@ -89,39 +92,51 @@ public actor SSHConnection: RemoteSession {
 
     // MARK: Login
 
-    /// Joins the login in flight when there is one, so two windows or a retry never log in twice.
-    /// The login stops once every caller waiting for it is cancelled.
-    public func connect(prompts: any PromptSink) async throws -> RemotePath {
-        if let startPath, master?.isRunning == true { return startPath }
+    /// A login in flight, and the callers waiting for it, who answer its questions.
+    private struct Login {
         let task: Task<RemotePath, Error>
-        if let login {
-            task = login
-        } else {
-            task = Task { try await self.logIn(prompts) }
-            login = task
-            loginWaiters = (0, 0)
+        let prompts: LoginPrompts
+    }
+
+    /// Joins the login in flight when there is one, so two windows or a retry never log in twice.
+    /// The login stops once every caller waiting for it is cancelled, or one of them answers a
+    /// question with Cancel. A login already stopping is waited out, not joined.
+    public func connect(prompts: any PromptSink) async throws -> RemotePath {
+        while true {
+            if let startPath, master?.isRunning == true { return startPath }
+            guard let stopping = login, stopping.task.isCancelled else { break }
+            _ = await stopping.task.result
+            if login?.task == stopping.task { login = nil }
         }
-        loginWaiters.waiting += 1
-        defer { if login == task { login = nil } }
+        let current: Login
+        if let login {
+            current = login
+        } else {
+            let relay = LoginPrompts()
+            current = Login(task: Task { try await self.logIn(relay) }, prompts: relay)
+            login = current
+        }
+        let caller = UUID()
+        current.prompts.join(caller, prompts)
+        defer { if login?.task == current.task { login = nil } }
         return try await withTaskCancellationHandler {
-            try await task.value
+            try await current.task.value
         } onCancel: {
-            Task { await self.loginWaiterCancelled(task) }
+            if current.prompts.leave(caller) { current.task.cancel() }
         }
     }
 
-    private func loginWaiterCancelled(_ task: Task<RemotePath, Error>) {
-        guard login == task else { return }
-        loginWaiters.cancelled += 1
-        if loginWaiters.cancelled >= loginWaiters.waiting { task.cancel() }
+    /// The user answered a login question with Cancel: the login stops, whoever else waits for it.
+    private func cancelLogin(_ prompts: LoginPrompts) {
+        if let login, login.prompts === prompts { login.task.cancel() }
     }
 
     /// Stops a login in flight and closes the session.
     public func disconnect() async {
         while let login {
             self.login = nil
-            login.cancel()
-            _ = await login.result
+            login.task.cancel()
+            _ = await login.task.result
         }
         await tearDown(reason: .cancelled)
     }
@@ -135,7 +150,7 @@ public actor SSHConnection: RemoteSession {
         var scratch: [URL] = []
     }
 
-    private func logIn(_ prompts: any PromptSink) async throws -> RemotePath {
+    private func logIn(_ prompts: LoginPrompts) async throws -> RemotePath {
         // Whatever an earlier login left, such as a master that died; also waits out any release.
         await tearDown(reason: .connectionLost("The SSH connection closed"))
         var held = Held()
@@ -161,7 +176,7 @@ public actor SSHConnection: RemoteSession {
 
     /// Starts the master and lets ssh check the host key against the user's own files. Only when
     /// ssh refuses the key does the user decide, and then the master starts once more.
-    private func start(_ prompts: any PromptSink, holding held: inout Held) async throws -> RemotePath {
+    private func start(_ prompts: LoginPrompts, holding held: inout Held) async throws -> RemotePath {
         let folder = (socketPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder)
@@ -173,9 +188,7 @@ public actor SSHConnection: RemoteSession {
         let ask = try prepareAskpass()
         held.scratch.append(ask)
         let deadline = ContinuousClock.now + Self.loginTimeout
-        let current = Locked<Process?>(nil)
-        let refused = Locked(false)
-        let poller = Task { await self.servePrompts(prompts, directory: ask, ssh: current, refused: refused) }
+        let poller = Task { await self.servePrompts(prompts, directory: ask) }
         defer { poller.cancel() }
         var hostKeyArguments: [String] = []
         var askedAboutHostKey = false
@@ -184,11 +197,10 @@ public actor SSHConnection: RemoteSession {
             let (process, errors) = try startMaster(hostKeyArguments, ask: ask)
             held.master = process
             held.errors = errors
-            current.value = process
             if try await waitForSocket(process, until: deadline) { break }
             await Self.stop(process)
             held.master = nil
-            if refused.value { throw TransferError.cancelled }
+            try Task.checkCancellation()
             if ContinuousClock.now >= deadline { throw TransferError.timeout("login") }
             await errors.waitForEnd()
             guard let failure = HostKeyFailure(sshErrors: errors.text) else {
@@ -466,14 +478,16 @@ public actor SSHConnection: RemoteSession {
 
     /// A data channel with room for `share`: an idle one, a new one while fewer than seven are
     /// open or opening, else the least loaded with room, else the next with room once others let
-    /// go. Callers queue in order and leave the queue when cancelled.
+    /// go. Callers queue in order and leave the queue when cancelled. While any wait, a newcomer
+    /// neither takes a channel nor opens one ahead of them, as when room opens again after the
+    /// server refused a channel, unless nothing is open or opening that could come back to them.
     private func acquire(_ share: Int) async throws -> SFTPChannel {
         while true {
             if waiters.isEmpty, let link = fitting(share, sharing: !canOpen) {
                 if let link = await hold(link, share) { return link }
                 continue
             }
-            if canOpen {
+            if canOpen, waiters.isEmpty || pool.isEmpty && opening == 0 {
                 guard let link = try await openData(share) else { continue }
                 return link
             }
@@ -604,8 +618,11 @@ public actor SSHConnection: RemoteSession {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         // With -s the subsystem name is the command argument, so it must follow the destination.
-        // BatchMode: if the master is gone, ssh falls back to a login of its own, which must not prompt.
-        process.arguments = configArguments + ["-S", socketPath, "-o", "Compression=no", "-o", "ControlMaster=no", "-o", "BatchMode=yes"]
+        // A passenger only joins the master. When the master is gone or refuses it, ssh would log in
+        // on its own instead, with none of the master's port, identity, or host-key answer:
+        // ProxyCommand makes that attempt fail at once, and BatchMode keeps it from prompting.
+        process.arguments = configArguments + ["-S", socketPath, "-o", "Compression=no", "-o", "ControlMaster=no", "-o", "BatchMode=yes",
+                                               "-o", "ProxyCommand=/usr/bin/false"]
             + Self.plainSession + ["-s", "--", connection.destination, "sftp"]
         let input = Pipe()
         let output = Pipe()
@@ -690,7 +707,8 @@ public actor SSHConnection: RemoteSession {
     /// file, asks, and returns arguments for the master's retry. Always Trust and Replace write the
     /// first user file `ssh -G` names; Trust Once gives the master the probe's file until disconnect.
     private func trustHostKey(_ failure: HostKeyFailure, prompts: any PromptSink, ask: URL, holding held: inout Held) async throws -> [String] {
-        let values = SSHConfigValues.parse(await SSHResolver.config(for: connection, configFile: sshConfigFile) ?? "")
+        let config = await SSHResolver.config(for: connection, configFile: sshConfigFile)
+        let values = SSHConfigValues.parse(config ?? "")
         let probeDirectory = store.root.appendingPathComponent(Self.loginScratchName("hostkey-"), isDirectory: true)
         try FileManager.default.createDirectory(at: probeDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         var keep = false
@@ -721,9 +739,11 @@ public actor SSHConnection: RemoteSession {
         }
         let event = HostKeyEvent(situation: failure == .changed ? .changed : .firstSeen, keyType: offered.keyType, fingerprint: Self.fingerprint(offered.key), line: offered.text)
         let decision = try await Self.untilCancelled({ await prompts.decideHostKey(event) })
-        if decision == .cancel { throw TransferError.hostKeyRejected }
-        let userFiles = (values["userknownhostsfile"] ?? "").split(separator: " ").map(String.init)
-        guard decision != .trustOnce, let target = userFiles.first, target != "/dev/null", target != "none" else {
+        // Declining a new server's key is a Cancel like any other; declining to replace a key
+        // that changed is a refusal of that key.
+        if decision == .cancel { throw failure == .changed ? TransferError.hostKeyRejected : TransferError.cancelled }
+        let target = decision == .trustOnce ? nil : try Self.knownHostsFile(sshConfig: config)
+        guard let target else {
             if decision != .trustOnce {
                 pipe.emit(.notice("Trusted for this login only: the SSH configuration names no known_hosts file to save the key in"))
             }
@@ -731,6 +751,7 @@ public actor SSHConnection: RemoteSession {
             held.scratch.append(probeDirectory)
             return Self.quotedOption("UserKnownHostsFile", probeFile.path)
         }
+        let userFiles = (values["userknownhostsfile"] ?? "").split(separator: " ").map(String.init)
         if failure == .changed {
             for file in userFiles where FileManager.default.fileExists(atPath: file) {
                 for host in offered.host.split(separator: ",") {
@@ -740,6 +761,19 @@ public actor SSHConnection: RemoteSession {
         }
         try Self.append(Self.knownHostsLines(offered, hashed: values["hashknownhosts"] == "yes"), to: target)
         return []
+    }
+
+    /// Where Always Trust and Replace save a key: the first user known-hosts file in `ssh -G`'s
+    /// output, or nil when it names none, so the key is trusted for this login only. Throws when
+    /// `ssh -G` failed: where the user keeps keys is then unknown, and a silent Trust Once is not
+    /// what they chose.
+    static func knownHostsFile(sshConfig: String?) throws -> String? {
+        guard let sshConfig else {
+            throw TransferError.failed("The host key was not saved: ssh could not read its configuration for this server. Trust Once still works.")
+        }
+        let files = (SSHConfigValues.parse(sshConfig)["userknownhostsfile"] ?? "").split(separator: " ").map(String.init)
+        guard let first = files.first, first != "/dev/null", first != "none" else { return nil }
+        return first
     }
 
     /// The lines for known_hosts, one per host name hashed as ssh's `HashKnownHosts` does when
@@ -774,25 +808,28 @@ public actor SSHConnection: RemoteSession {
         return "SHA256:" + Data(SHA256.hash(data: blob)).base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "="))
     }
 
-    /// `body`'s answer, or `.cancelled` as soon as the calling task is cancelled. A prompt sheet
-    /// cannot be withdrawn; its late answer is dropped.
+    /// `body`'s answer, or `.cancelled` as soon as the calling task is cancelled. Cancelling also
+    /// cancels `body`, which withdraws the window's sheet; an answer it gives anyway is dropped.
     private static func untilCancelled<T: Sendable>(_ body: @escaping @Sendable () async -> T) async throws -> T {
         let slot = Locked<CheckedContinuation<T, Error>?>(nil)
+        let asking = Locked<Task<Void, Never>?>(nil)
         let take: @Sendable () -> CheckedContinuation<T, Error>? = { slot.withLock { waiting in defer { waiting = nil }; return waiting } }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 slot.value = continuation
-                if Task.isCancelled {
-                    take()?.resume(throwing: TransferError.cancelled)
-                    return
-                }
-                Task {
+                asking.value = Task {
                     let answer = await body()
                     take()?.resume(returning: answer)
                 }
+                if Task.isCancelled {
+                    take()?.resume(throwing: TransferError.cancelled)
+                    asking.value?.cancel()
+                }
             }
         } onCancel: {
+            // Cancelled first, then asked to stop: `body` may answer at once, and that answer is dropped.
             take()?.resume(throwing: TransferError.cancelled)
+            asking.value?.cancel()
         }
     }
 
@@ -802,27 +839,24 @@ public actor SSHConnection: RemoteSession {
     /// host-key probes. `key-` is what 0.1.7 left for a fingerprint.
     static let loginScratchPrefixes = ["ask-", "hostkey-", "key-"]
 
-    /// A per-login folder's name: the prefix, then the id of the process that owns it.
     private static func loginScratchName(_ prefix: String) -> String {
-        "\(prefix)\(getpid())-\(UUID().uuidString)"
+        prefix + UUID().uuidString
     }
 
-    /// Removes per-login scratch under `root` that no running process owns: a copy of Transfer
-    /// crashed or was force-quit. The hub calls this at launch. Two copies can run at once on one
-    /// library (`open -n`, or a development build beside the installed app), so scratch named for
-    /// a live process, maybe mid-login, stays; a name with no owner is from 0.1.7.
+    /// Removes every per-login file and folder under `root`: at launch they are what a copy of
+    /// Transfer that crashed or was force-quit left. The hub calls this holding the library's
+    /// lock, so no other copy can be mid-login on this library.
     static func removeLoginScratch(in root: URL) {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
-        for name in names {
-            guard let prefix = loginScratchPrefixes.first(where: { name.hasPrefix($0) }) else { continue }
-            if let owner = pid_t(name.dropFirst(prefix.count).prefix { $0 != "-" }), owner > 0,
-               kill(owner, 0) == 0 || errno == EPERM { continue }
+        for name in names where loginScratchPrefixes.contains(where: name.hasPrefix) {
             try? FileManager.default.removeItem(at: root.appendingPathComponent(name))
         }
     }
 
     /// The folder with the helper ssh runs for each prompt. The helper gives up with the login
     /// (`loginTimeout`) or as soon as its folder is removed, so none outlives a login that ended.
+    /// It lets go of the stderr ssh hands it at once: a helper still waiting for a reply after its
+    /// ssh was stopped, as a cancelled host-key probe's is, must not hold open a pipe the app reads.
     private func prepareAskpass() throws -> URL {
         let directory = store.root.appendingPathComponent(Self.loginScratchName("ask-"), isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -832,6 +866,7 @@ public actor SSHConnection: RemoteSession {
             let ticks = Self.loginTimeout.components.seconds * 10
             let source = """
             #!/bin/sh
+            exec 2>/dev/null
             dir="$TRANSFER_ASK_DIR"
             umask 077
             printf '%s' "$1" > "$dir/prompt" || exit 1
@@ -864,32 +899,28 @@ public actor SSHConnection: RemoteSession {
 
     /// Answers ssh's prompts for one login. The Keychain secret answers only this server's own
     /// password prompt (or a key's passphrase), never a ProxyJump host's, and only once: a second
-    /// prompt means it was wrong, so the user is asked and may save a new one. Cancel stops ssh.
-    private func servePrompts(_ prompts: any PromptSink, directory: URL, ssh: Locked<Process?>, refused: Locked<Bool>) async {
+    /// prompt means it was wrong, so the user is asked and may save a new one. Cancel stops the
+    /// login, whichever ssh asked: the master, or the host-key probe.
+    private func servePrompts(_ prompts: LoginPrompts, directory: URL) async {
         let prompt = directory.appendingPathComponent("prompt")
         let reply = directory.appendingPathComponent("reply")
-        let account = connection.id.rawValue.uuidString
-        var storedTried = false
+        var storedTried: Set<KeychainStore.Kind> = []
         var target: (user: String, host: String)?
         while !Task.isCancelled {
             if let text = try? String(contentsOf: prompt, encoding: .utf8), !text.isEmpty {
                 try? FileManager.default.removeItem(at: prompt)
                 if target == nil { target = await passwordTarget() }
-                let secret = target.map { Self.takesStoredSecret(text, user: $0.user, host: $0.host) } ?? false
+                let kind = target.flatMap { Self.storedSecretKind(text, user: $0.user, host: $0.host) }
                 let answer: PromptReply
-                if secret, !storedTried, let stored = KeychainStore.load(account: account) {
-                    storedTried = true
+                if let kind, !storedTried.contains(kind), let stored = KeychainStore.load(connection.id, kind) {
+                    storedTried.insert(kind)
                     answer = PromptReply(text: stored)
                 } else {
-                    guard let asked = try? await Self.untilCancelled({ await prompts.answer(PromptRequest(text: text, offerKeychain: secret)) }) else { return }
+                    guard let asked = try? await Self.untilCancelled({ await prompts.answer(PromptRequest(text: text, offerKeychain: kind != nil)) }) else { return }
                     answer = asked
                 }
-                guard let text = answer.text else {
-                    refused.value = true
-                    ssh.value?.terminate()
-                    return
-                }
-                if answer.saveInKeychain { KeychainStore.save(account: account, secret: text) }
+                guard let text = answer.text else { return cancelLogin(prompts) }
+                if answer.saveInKeychain, let kind { KeychainStore.save(text, for: connection.id, kind) }
                 try? text.write(to: reply, atomically: true, encoding: .utf8)
             }
             try? await Task.sleep(for: .milliseconds(50))
@@ -904,11 +935,12 @@ public actor SSHConnection: RemoteSession {
         return (values["user"] ?? connection.user, alias ?? values["hostname"] ?? connection.host)
     }
 
-    /// Whether a stored secret may answer `prompt`: this server's own password prompt, or a
-    /// passphrase for a key, which never leaves the Mac.
-    static func takesStoredSecret(_ prompt: String, user: String, host: String) -> Bool {
-        if prompt.hasPrefix("Enter passphrase for") { return true }
-        return prompt.contains("\(user)@\(host)") && prompt.lowercased().contains("password")
+    /// Which stored secret may answer `prompt`: this server's own password prompt takes its
+    /// password; a key's passphrase prompt, which never leaves the Mac, its passphrase; nil for
+    /// anything else.
+    static func storedSecretKind(_ prompt: String, user: String, host: String) -> KeychainStore.Kind? {
+        if prompt.hasPrefix("Enter passphrase for") { return .passphrase }
+        return prompt.contains("\(user)@\(host)") && prompt.lowercased().contains("password") ? .password : nil
     }
 }
 
@@ -984,4 +1016,35 @@ final class EventPipe: Sendable {
     func emit(_ event: SessionEvent) {
         for target in subscribers.withLock({ Array($0.values) }) { target.yield(event) }
     }
+}
+
+/// Who answers a login's questions: the caller that joined it last and still waits, so a window
+/// that joined a login another window started, and then gave up on, is the one asked. A question
+/// already on screen stays with the window showing it.
+final class LoginPrompts: PromptSink {
+    private let callers = Locked<[(id: UUID, sink: any PromptSink)]>([])
+
+    func join(_ id: UUID, _ sink: any PromptSink) {
+        callers.withLock { $0.append((id, sink)) }
+    }
+
+    /// Whether nobody is left waiting.
+    func leave(_ id: UUID) -> Bool {
+        callers.withLock {
+            $0.removeAll { $0.id == id }
+            return $0.isEmpty
+        }
+    }
+
+    private var asked: (any PromptSink)? { callers.value.last?.sink }
+
+    func answer(_ request: PromptRequest) async -> PromptReply {
+        await asked?.answer(request) ?? PromptReply(text: nil)
+    }
+
+    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
+        await asked?.decideHostKey(event) ?? .cancel
+    }
+
+    func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
 }

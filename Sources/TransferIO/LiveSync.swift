@@ -12,8 +12,9 @@ protocol LiveServer: AnyObject, Sendable {
     /// Downloads `item` over `local` in one rename. `interactive` uses the lane the user waits on.
     func liveFetch(_ item: RemoteItem, to local: URL, interactive: Bool) async throws
     /// Uploads `snapshot` to `path` with temp-and-rename on the interactive lane. Just before the
-    /// rename the server must match `expecting` (or hold this save's own bytes, if the lane ran
-    /// it again), else it throws `LiveRemoteChanged`. Returns the server file's new fingerprint.
+    /// rename the server must match `expecting`, or hold a file with this save's size and
+    /// whole-second time (the lane ran it again after it landed), else it throws
+    /// `LiveRemoteChanged`. Returns the server file's new fingerprint.
     func liveSave(_ snapshot: URL, to path: RemotePath, expecting: ServerExpectation, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> Fingerprint
     func liveNames(in folder: RemotePath) async throws -> Set<String>
     func liveEmit(_ event: SessionEvent)
@@ -53,6 +54,9 @@ actor LiveSync {
         /// The digest of the bytes `state.pending` stamps, so adopting that upload never rereads
         /// a copy an editor may have saved since.
         var pendingDigest: String?
+        /// The working copy's digest at a stamp, so the Live list and counts, which every window
+        /// asks for often, read a large copy once per save rather than on every ask.
+        var measured: (stamp: LiveStamp, digest: String)?
         var attempts = 0
         /// The state of this file's row on the shelf, as last reported.
         var shown: OperationState?
@@ -183,13 +187,22 @@ actor LiveSync {
         entries = entries.filter { $0.value.connection != connection }
     }
 
-    /// Remove Server: `close`, but it refuses with `liveUnsynced`, changing nothing, while one of
-    /// the connection's files holds bytes the server lacks. Check and close are one call, so the
-    /// caller deletes the Live folder after it with nothing awaited in between.
+    /// Remove Server: `close`, and the connection's Live folder goes, but it refuses with
+    /// `liveUnsynced`, changing nothing, while one of its files holds bytes the server lacks.
+    /// Reading digests awaits, and meanwhile an editor may save or an open may finish, so the
+    /// last check reads no bytes: it runs in the same turn as the close and the delete, and when
+    /// a copy moved since its digest was read, everything is measured again.
     func closeIfSynced(_ connection: ConnectionID) async throws {
-        let unsynced = await unsyncedCount(on: connection)
-        if unsynced > 0 { throw TransferError.liveUnsynced(unsynced) }
+        while true {
+            if opening.values.contains(where: { $0.connection == connection }) { try await perform(on: connection) {} }
+            let unsynced = await unsyncedCount(on: connection)
+            if unsynced > 0 { throw TransferError.liveUnsynced(unsynced) }
+            guard !opening.values.contains(where: { $0.connection == connection }), let now = unsyncedNow(on: connection) else { continue }
+            if now > 0 { throw TransferError.liveUnsynced(now) }
+            break
+        }
         close(connection)
+        try? FileManager.default.removeItem(at: root.appendingPathComponent(connection.rawValue.uuidString, isDirectory: true))
     }
 
     /// Stops everything: the watcher and every worker. Tests end their `LiveSync` with it.
@@ -585,10 +598,12 @@ actor LiveSync {
     }
 
     /// Writes the "(server)" copy first, then marks the conflict and announces it together. An
-    /// older "(server)" copy goes first, so a failed fetch never leaves outdated bytes looking current.
-    private func raiseConflict(_ id: LiveFileID, kind: LiveConflictKind, item: RemoteItem?) async {
+    /// older "(server)" copy goes first, so a failed fetch never leaves outdated bytes looking
+    /// current, unless `keepingServerCopy`: the server's file is gone, and that copy is all that
+    /// is left of it.
+    private func raiseConflict(_ id: LiveFileID, kind: LiveConflictKind, item: RemoteItem?, keepingServerCopy: Bool = false) async {
         guard let entry = entries[id] else { return }
-        try? FileManager.default.removeItem(at: entry.serverCopy)
+        if !keepingServerCopy { try? FileManager.default.removeItem(at: entry.serverCopy) }
         if case .changed = kind, let item, let server = servers[entry.connection]?.server {
             try? await server.liveFetch(item, to: entry.serverCopy, interactive: false)
         }
@@ -706,7 +721,7 @@ actor LiveSync {
             guard let expecting = LiveDecision.keepLocalExpectation(entry.state, conflict: entry.conflict) else {
                 throw TransferError.typeMismatch(path.display)
             }
-            switch await save(id, expecting: expecting, settled: nil, via: server) {
+            switch await save(id, expecting: expecting, settled: try await stillStamp(entry), via: server) {
             case .done:
                 update(id) {
                     $0.conflict = nil
@@ -727,7 +742,7 @@ actor LiveSync {
             try await takeServerCopy(id, ifStill: before, via: try loggedIn(connection))
         case .keepBoth:
             let server = try loggedIn(connection)
-            guard let before else { throw TransferError.failed("The working copy of \(entry.name) is missing") }
+            guard let before = try await stillStamp(entry) else { throw TransferError.failed("The working copy of \(entry.name) is missing") }
             let snapshot = try Self.snapshot(of: entry.local)
             defer { try? FileManager.default.removeItem(at: snapshot) }
             guard Self.stamp(entry.local) == before else { throw TransferError.failed("\(entry.name) is still being written") }
@@ -738,7 +753,7 @@ actor LiveSync {
             } catch is LiveRemoteChanged {
                 throw TransferError.failed("Something named “\(name)” appeared on the server; try Keep Both again")
             }
-            try await takeServerCopy(id, ifStill: before, via: server)
+            try await takeServerCopy(id, ifStill: before, via: server, uploaded: true)
         }
         guard let resolved = entries[id] else { return }
         try? FileManager.default.removeItem(at: resolved.serverCopy)
@@ -748,17 +763,34 @@ actor LiveSync {
         if resolved.state.dirty { look(id) }
     }
 
-    /// Keep Remote, and the end of Keep Both: the server's file replaces the working copy, or the
-    /// record goes when there is none; either only while the copy still has the stamp the choice
-    /// was made on. A save since then stays, and so does the conflict.
-    private func takeServerCopy(_ id: LiveFileID, ifStill expected: LiveStamp?, via server: any LiveServer) async throws {
+    /// Keep Remote, and the end of Keep Both (`uploaded`): the server's file replaces the working
+    /// copy, only while the copy still has the stamp the choice was made on; a save since then
+    /// stays, and so does the conflict. When the server holds no file the record goes only if the
+    /// working copy is safe elsewhere (Keep Both uploaded it) or the conflict the user answered
+    /// already showed no file (`LiveDecision.keepRemoteForgets`). A file that vanished since the
+    /// choice leaves nothing to take: the conflict is raised again, both copies kept.
+    private func takeServerCopy(_ id: LiveFileID, ifStill expected: LiveStamp?, via server: any LiveServer, uploaded: Bool = false) async throws {
         guard let entry = entries[id] else { return }
-        if let item = try await server.liveLookup(entry.path), item.kind == .file, let print = Fingerprint(item: item) {
+        let item = try await server.liveLookup(entry.path)
+        if let item, item.kind == .file, let print = Fingerprint(item: item) {
             if try await placeServerBytes(item, print, for: id, ifStill: expected, via: server, interactive: false) { return }
+        } else if !uploaded, !LiveDecision.keepRemoteForgets(entry.conflict, server: item.map { .notFile($0.kind) } ?? .missing) {
+            await raiseConflict(id, kind: item == nil ? .removed : .notAFile, item: nil, keepingServerCopy: true)
+            throw TransferError.failed("\(entry.name) is no longer on the server as it was when you chose; its conflict stays")
         } else if Self.stamp(entry.local) == expected {
             return drop(entry)
         }
         throw TransferError.failed("\(entry.name) was saved again meanwhile; its conflict stays")
+    }
+
+    /// The working copy's stamp once it has held still for `settle`, as a pass requires of a copy
+    /// it uploads; nil when it is missing. Throws while it is still being written.
+    private func stillStamp(_ entry: Entry) async throws -> LiveStamp? {
+        guard let before = Self.stamp(entry.local) else { return nil }
+        let age = Duration.seconds(max(Date().timeIntervalSince(before.mtime), 0))
+        if age < Self.settle { try await Task.sleep(for: Self.settle - age) }
+        guard Self.stamp(entry.local) == before else { throw TransferError.failed("\(entry.name) is still being written") }
+        return before
     }
 
     private func compare(_ entry: Entry) async throws {
@@ -917,10 +949,33 @@ actor LiveSync {
     }
 
     /// How the copy compares with the last sync, nil when it is missing; bytes are read off the
-    /// actor, and only when the stamp alone cannot tell.
+    /// actor, only when the stamp alone cannot tell, and once per stamp (`measured`).
     private func localChange(of entry: Entry) async -> LiveLocalChange? {
         guard let stamp = Self.stamp(entry.local) else { return nil }
-        return LiveDecision.localChange(entry.state, stamp, digest: await Self.digestIfNeeded(entry.state, entry.local, stamp))
+        let change = LiveDecision.localChange(entry.state, stamp, digest: nil)
+        guard change == .needDigest else { return change }
+        if let measured = entries[entry.id]?.measured, measured.stamp == stamp {
+            return LiveDecision.localChange(entry.state, stamp, digest: measured.digest)
+        }
+        let digest = await Self.readDigest(entry.local) ?? Self.unreadable
+        // Bytes saved during the read are not the bytes of `stamp`.
+        if Self.stamp(entry.local) == stamp { mark(entry.id) { $0.measured = (stamp, digest) } }
+        return LiveDecision.localChange(entry.state, stamp, digest: digest)
+    }
+
+    /// `unsyncedCount` from what is known now, reading no bytes: nil when a copy's stamp has no
+    /// digest read for it yet.
+    private func unsyncedNow(on connection: ConnectionID) -> Int? {
+        var count = 0
+        for entry in entries.values where entry.connection == connection {
+            var change = Self.stamp(entry.local).map { LiveDecision.localChange(entry.state, $0, digest: nil) }
+            if change == .needDigest {
+                guard let measured = entry.measured, measured.stamp == Self.stamp(entry.local) else { return nil }
+                change = LiveDecision.localChange(entry.state, measured.stamp, digest: measured.digest)
+            }
+            if LiveDecision.isUnsynced(entry.state, change) { count += 1 }
+        }
+        return count
     }
 
     /// Size and full-precision mtime, read through FileManager: `URL.resourceValues` caches.

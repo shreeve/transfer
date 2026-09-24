@@ -24,7 +24,7 @@ public struct LiveFileID: Hashable, Sendable, RawRepresentable {
 /// A server path as bytes: names need not be UTF-8, and the bytes go back on the wire. Trailing
 /// slashes are dropped: `/srv/site/` is `/srv/site`, named `site`, and appending never makes `//`.
 public struct RemotePath: Hashable, Sendable {
-    public var bytes: [UInt8]
+    public private(set) var bytes: [UInt8]
 
     public init(bytes: [UInt8]) {
         var bytes = bytes
@@ -42,10 +42,11 @@ public struct RemotePath: Hashable, Sendable {
 
     public var isRoot: Bool { bytes == [0x2F] }
 
-    /// `name` as the last component. Leading slashes in `name` are ignored.
+    /// `name` as the last component. Leading slashes in `name` are ignored, and an empty path
+    /// stays relative: appending to it is `name` alone, never `/name` at the server's root.
     public func appending(name: [UInt8]) -> RemotePath {
         let name = name.drop { $0 == 0x2F }
-        return RemotePath(bytes: isRoot ? bytes + name : bytes + [0x2F] + name)
+        return RemotePath(bytes: isRoot || bytes.isEmpty ? bytes + name : bytes + [0x2F] + name)
     }
 
     public func appending(_ name: String) -> RemotePath {
@@ -109,9 +110,10 @@ public struct RemotePath: Hashable, Sendable {
         !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
     }
 
-    /// Where Go to Remote Folder goes for `text`: `/…` is absolute, `~` and `~/…` start at `home`
-    /// (the folder the login started in), and anything else is relative to `current`. `.` and
-    /// `..` are taken lexically, as `normalized` does. Nil when `text` is blank.
+    /// Where Go to Remote Folder goes for `text`: `/…` is absolute, `~` and `~/…` start at `home`,
+    /// the server's start folder (the saved server's folder, else the login's home), and anything
+    /// else is relative to `current`. `.` and `..` are taken lexically, as `normalized` does. Nil
+    /// when `text` is blank.
     public static func typed(_ text: String, from current: RemotePath, home: RemotePath) -> RemotePath? {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }

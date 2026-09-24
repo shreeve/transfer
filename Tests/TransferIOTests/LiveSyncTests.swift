@@ -326,6 +326,41 @@ struct LiveSyncTests {
         }
     }
 
+    /// Keep Remote chose the server's changed file; if that file is gone by the time the choice
+    /// runs, there is nothing to take, and neither the edits nor the "(server)" copy go (R-L4).
+    @Test func keepRemoteWhenTheChosenFileVanishedKeepsBothCopies() async throws {
+        try await withLive("keepremote-vanished") { h in
+            let (local, _) = try await conflicted(h, server: "theirs", local: "mine")
+            await h.fake.delete(note)
+            await #expect(throws: (any Error).self) {
+                try await h.live.resolve(note, on: h.connection, choice: .keepRemote)
+            }
+            #expect(read(local) == "mine")
+            #expect(read(serverCopy(local)) == "theirs")
+            #expect(await h.file()?.conflict == true)
+            #expect(h.store.liveFiles(connection: h.connection).first?.conflict == "removed")
+        }
+    }
+
+    /// Keep Local and Keep Both upload the copy only once it has held still, as a pass would:
+    /// one an editor is still writing is refused, and nothing reaches the server (R-L6).
+    @Test func conflictChoicesRefuseACopyStillBeingWritten() async throws {
+        for choice in [LiveConflictChoice.keepLocal, .keepBoth] {
+            try await withLive("unsettled") { h in
+                let (local, _) = try await conflicted(h, server: "theirs", local: "mine")
+                try Data("mine, half written".utf8).write(to: local)
+                let resolving = Task { try await h.live.resolve(note, on: h.connection, choice: choice) }
+                try await Task.sleep(for: .milliseconds(100))
+                try Data("mine, written in full".utf8).write(to: local)
+                await #expect(throws: TransferError.failed("note.txt is still being written")) { try await resolving.value }
+                #expect(await h.fake.saves == 0)
+                #expect(await h.fake.contents(note) == "theirs")
+                #expect(await h.file()?.conflict == true)
+                #expect(read(local) == "mine, written in full")
+            }
+        }
+    }
+
     @Test func keepBothSavesASiblingAndPicksAFreeName() async throws {
         try await withLive("keepboth") { h in
             let (local, id) = try await conflicted(h, server: "theirs", local: "mine")
@@ -633,6 +668,28 @@ struct LiveSyncTests {
         }
     }
 
+    /// Delete forces a removal only after warning about the edits it discards, and a server
+    /// delete that fails even then must not have discarded them (R-M1).
+    @Test func aForcedRemovalThatFailsOnTheServerKeepsTheEdits() async throws {
+        try await withLive("remove-forced-fails") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.live.setPaused(note, on: h.connection, paused: true)
+            try await edit(h, local, id, "unsynced edit")
+            #expect(await settled(h))
+            await #expect(throws: TransferError.permissionDenied("/srv")) {
+                try await h.live.remove(RemotePath(string: "/srv"), on: h.connection, force: true) {
+                    throw TransferError.permissionDenied("/srv")
+                }
+            }
+            #expect(read(local) == "unsynced edit")
+            #expect(await h.file()?.dirty == true)
+            #expect(h.store.liveFiles(connection: h.connection).count == 1)
+            await #expect(throws: TransferError.liveUnsynced(1)) {
+                try await h.live.remove(RemotePath(string: "/srv"), on: h.connection) {}
+            }
+        }
+    }
+
     @Test func removingAFolderAboveAnEditNoPassHasSeenRefuses() async throws {
         try await withLive("remove-unseen") { h in
             let (local, _) = try await openLive(h, note, "first")
@@ -699,6 +756,33 @@ struct LiveSyncTests {
             #expect(await waitUntil { await h.file()?.dirty == false })
             try await h.live.closeIfSynced(h.connection)
             #expect(await h.files().isEmpty)
+        }
+    }
+
+    /// Remove Server takes the server's Live folder too, in the same step as its check (R-L3).
+    @Test func removeServerDeletesTheLiveFolder() async throws {
+        try await withLive("close-folder") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            let folder = h.store.root.appendingPathComponent("Live/\(h.connection.rawValue.uuidString)", isDirectory: true)
+            #expect(local.path.hasPrefix(folder.path))
+            try await h.live.closeIfSynced(h.connection)
+            #expect(!FileManager.default.fileExists(atPath: folder.path))
+            #expect(await h.files().isEmpty)
+        }
+    }
+
+    /// A copy's digest is read once per stamp: every window asks for the Live list, and a large
+    /// copy must not be hashed on each ask. Here a copy touched (same bytes, new time) and then
+    /// made unreadable still counts as clean, from the digest read the first time (R-L7).
+    @Test func aCopysDigestIsReadOncePerStamp() async throws {
+        try await withLive("digest-once") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-30)], ofItemAtPath: local.path)
+            #expect(await h.file()?.dirty == false)
+            try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: local.path)
+            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: local.path) }
+            #expect(await h.file()?.dirty == false)
+            #expect(await h.live.unsyncedCount(on: h.connection) == 0)
         }
     }
 
@@ -1116,5 +1200,36 @@ actor FakeServer: LiveServer {
 
     nonisolated func liveEmit(_ event: SessionEvent) {
         log.withLock { $0.append(event) }
+    }
+}
+
+/// Delete through `SSHConnection.remove` against the local sshd (`ServerHarness`).
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
+struct LiveRemovalServerTests {
+    /// Unforced, a delete above unsynced Live edits refuses; forced, a delete the server refuses
+    /// keeps the working copy and its record; forced again once the server allows it, both go.
+    @Test func aDeleteDiscardsLiveEditsOnlyWhenForcedAndDone() async throws {
+        try await withHarness("liverm", connected: true) { h in
+            let folder = h.remote.appendingPathComponent("docs", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data("first".utf8).write(to: folder.appendingPathComponent("note.txt"))
+            let path = h.remotePath.appending(name: Array("docs".utf8)).appending(name: Array("note.txt".utf8))
+            let local = try await h.session.prepareLiveFile(path)
+            await h.session.setLivePaused(path, paused: true)
+            try Data("unsynced edit".utf8).write(to: local)
+
+            await #expect(throws: TransferError.liveUnsynced(1)) { try await h.session.remove(path) }
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: folder.path)
+            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path) }
+            await #expect(throws: (any Error).self) { try await h.session.remove(path, force: true) }
+            #expect(try Data(contentsOf: local) == Data("unsynced edit".utf8))
+            #expect(await h.session.liveFiles().map(\.path) == [path])
+
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path)
+            try await h.session.remove(path, force: true)
+            #expect(await h.session.liveFiles().isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: local.path))
+            #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent("note.txt").path))
+        }
     }
 }
