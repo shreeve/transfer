@@ -1,14 +1,19 @@
 #!/bin/bash
+# Builds Transfer.app and prints its path, the only thing on stdout; the build's output goes to
+# stderr. CONFIG=release for a release build; the default is a debug build for local work.
+# SCRATCH is the build folder (`.build` by default), for builds that must not share one.
 set -euo pipefail
 
+scratch="${SCRATCH:-}"
+[ -z "$scratch" ] || scratch="$(mkdir -p "$scratch" && cd "$scratch" && pwd)"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+scratch="${scratch:-$root/.build}"
 
-# CONFIG=release for a release build; the default is a debug build for local work.
 config="${CONFIG:-debug}"
-swift build -c "$config"
-bin_dir="$(swift build -c "$config" --show-bin-path)"
-app="$root/.build/Transfer.app"
+swift build -c "$config" --scratch-path "$scratch" >&2
+bin_dir="$(swift build -c "$config" --scratch-path "$scratch" --show-bin-path)"
+app="$scratch/Transfer.app"
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Frameworks"
@@ -19,7 +24,8 @@ cp "$root/Support/config.json" "$app/Contents/Resources/config.json"
 
 # Sparkle is a binary framework. SwiftPM links it from the build directory, so the app needs
 # its own copy and an rpath that finds it.
-sparkle="$(find "$root/.build/artifacts" -type d -name Sparkle.framework -path '*macos-arm64*' | head -1)"
+sparkle="$(find "$scratch/artifacts" -type d -name Sparkle.framework -path '*macos-arm64*' 2>/dev/null | head -1)"
+[ -n "$sparkle" ] || { echo "error: no Sparkle.framework for macos-arm64 under $scratch/artifacts" >&2; exit 1; }
 cp -R "$sparkle" "$app/Contents/Frameworks/Sparkle.framework"
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$app/Contents/MacOS/Transfer"
 
