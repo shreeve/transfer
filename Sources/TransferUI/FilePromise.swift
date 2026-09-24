@@ -104,6 +104,8 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
 struct DropAction {
     var sources: TransferRequest.Sources
     var folder: RemotePath
+    /// The server `folder` is on: the one the window showed when the drop landed.
+    var destination: ConnectionID
     var moving = false
 
     var operation: NSDragOperation { moving ? .move : .copy }
@@ -118,7 +120,7 @@ func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: Tr
     let pasteboard = info.draggingPasteboard
     guard pasteboard.types?.contains(remoteDragType) == true else {
         let urls = pasteboard.fileURLs
-        return urls.isEmpty ? nil : DropAction(sources: .mac(urls), folder: folder)
+        return urls.isEmpty ? nil : DropAction(sources: .mac(urls), folder: folder, destination: connection)
     }
     guard info.draggingSource != nil, let data = pasteboard.data(forType: remoteDragType),
           let payload = try? JSONDecoder().decode(RemoteDragPayload.self, from: data) else { return nil }
@@ -126,7 +128,7 @@ func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: Tr
     let mask = info.draggingSourceOperationMask
     guard let (paths, moving) = PasteRules.drop(payload.remotePaths, from: source, onto: folder, on: connection,
                                               canCopy: mask.contains(.copy), canMove: mask.contains(.move)) else { return nil }
-    return DropAction(sources: .server(source, paths), folder: folder, moving: moving)
+    return DropAction(sources: .server(source, paths), folder: folder, destination: connection, moving: moving)
 }
 
 /// One icon-grid cell, hosting its AppKit view.

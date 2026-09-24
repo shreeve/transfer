@@ -93,6 +93,8 @@ public final class TransferModel {
     private var context: ServerContext?
     /// The server this window shows; nil before the first login and while none is chosen.
     public var session: (any RemoteSession)? { context?.session }
+    /// The server the window shows, for work that must stay with it across an await.
+    var shownContext: ServerContext? { context }
     /// The server a connect is logging in to, until it lands or fails.
     public private(set) var connectingTo: SavedConnection?
     @ObservationIgnored private var connectGeneration = 0
@@ -627,9 +629,10 @@ public final class TransferModel {
             return true
         } catch {
             guard !Task.isCancelled, isCurrent(context) else { return false }
-            // What arrived is shown, marked incomplete, so the column stops asking for it and the
-            // next visit lists it again.
-            flush(complete: false)
+            // A complete listing already shown stays: a failed refresh must not empty a folder.
+            // Otherwise what arrived is shown, marked incomplete, so the column stops asking for
+            // it and the next visit lists it again.
+            if listings[path]?.complete != true { flush(complete: false) }
             if case .noSuchFile? = error as? TransferError {
                 // The server's text is just "No such file"; name the folder instead.
                 status = "No such folder: \(path.display)"
@@ -728,15 +731,16 @@ public final class TransferModel {
         guard let context else { return }
         await reporting {
             let path = try await context.session.connect(prompts: prompts.login(context.connection))
-            await navigate(path)
+            if isCurrent(context) { await navigate(path) }
         }
     }
 
     public func goToFolder(_ text: String) async {
         guard let context else { return }
+        let from = snapshot.path
         await reporting {
             let home = try await context.session.connect(prompts: prompts.login(context.connection))
-            guard let path = RemotePath.typed(text, from: snapshot.path, home: home) else { return }
+            guard isCurrent(context), let path = RemotePath.typed(text, from: from, home: home) else { return }
             await navigate(path)
         }
     }
@@ -851,12 +855,15 @@ public final class TransferModel {
     }
 
     /// Follows the double-click rule, or forces Live when asked. Folders navigate.
+    /// A file opens even if the window has moved on meanwhile, since it is the one the user chose;
+    /// a folder is entered only while the window still shows its server.
     public func open(_ item: RemoteItem, forceLive: Bool = false) async {
-        guard let session else { return }
+        guard let context else { return }
+        let session = context.session
         await reporting {
             let target = try await Self.resolveLink(item, session: session)
             if target.kind == .directory {
-                await navigate(target.path)
+                if isCurrent(context) { await navigate(target.path) }
                 return
             }
             guard target.kind == .file else { return }
@@ -1033,44 +1040,56 @@ public final class TransferModel {
 
     // MARK: Transfers
 
+    /// The panel is modal but the window's tasks still run under it, so a connect can land
+    /// meanwhile: what to download and from where is read before it opens.
     public func downloadCopy() async {
-        guard !selectedItems.isEmpty else { return }
+        let items = selectedItems
+        guard let context, !items.isEmpty else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.prompt = "Download"
-        guard panel.runModal() == .OK, let directory = panel.url, let session else { return }
-        for item in selectedItems {
+        guard panel.runModal() == .OK, let directory = panel.url, stillShows(context) else { return }
+        let session = context.session
+        for item in items {
             let destination = directory.appendingPathComponent(item.name)
             let path = item.path
-            enqueue(title: "Download \(item.name)", path: path) { progress in
+            enqueue(title: "Download \(item.name)", path: path, on: context) { progress in
                 try await session.download(path, to: destination, progress: progress)
             }
         }
     }
 
-    public func upload(urls: [URL]) async {
-        await transfer(.mac(urls), into: snapshot.path, moving: false)
-    }
-
     public func uploadFromPanel() async {
+        guard let context else { return }
+        let folder = snapshot.path
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.prompt = "Upload"
-        guard panel.runModal() == .OK else { return }
-        await upload(urls: panel.urls)
+        guard panel.runModal() == .OK, stillShows(context) else { return }
+        await transfer(.mac(panel.urls), into: folder, moving: false, on: context)
     }
 
+    /// A drop goes only to the server it was aimed at.
     func perform(_ action: DropAction) async {
-        await transfer(action.sources, into: action.folder, moving: action.moving)
+        guard let context, context.connection.id == action.destination else { return }
+        await transfer(action.sources, into: action.folder, moving: action.moving, on: context)
     }
 
-    /// Queues `body` against the server the window shows now; it stays with that server.
-    func enqueue(title: String, path: RemotePath, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
-        guard let context else { return }
+    /// False, saying why, when the window left `context`'s server while the user was choosing.
+    func stillShows(_ context: ServerContext) -> Bool {
+        guard !isCurrent(context) else { return true }
+        status = "Nothing was done: the window moved to another server meanwhile."
+        return false
+    }
+
+    /// Queues `body` against `context`'s server, or the one the window shows now; it stays with
+    /// that server.
+    func enqueue(title: String, path: RemotePath, on context: ServerContext? = nil, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
+        guard let context = context ?? self.context else { return }
         let id = UUID().uuidString
         operations.append(TransferOperation(id: id, title: title, state: .queued, path: path))
         runners[id] = Runner(body: body, prompts: operationPrompts(), connection: context.connection, session: context.session, task: nil)
@@ -1332,10 +1351,12 @@ public final class TransferModel {
         return target.kind == .directory
     }
 
+    /// Stars on the server whose paths these are, whatever the window shows by the time each lands.
     public func setStarred(_ paths: [RemotePath], _ starred: Bool) async {
+        guard let context else { return }
         for path in paths {
-            await session?.star(path, on: starred)
-            if !starred { starIsFolder[path] = nil }
+            await context.session.star(path, on: starred)
+            if !starred, isCurrent(context) { starIsFolder[path] = nil }
         }
         await reloadSidebars()
     }
@@ -1359,9 +1380,10 @@ public final class TransferModel {
 
     /// Opens a starred entry: a folder is entered, a file is revealed in its folder and opened.
     public func openStarred(_ path: RemotePath) async {
-        guard let session else { return }
+        guard let context else { return }
         await reporting {
-            let item = try await session.stat(path)
+            let item = try await context.session.stat(path)
+            guard isCurrent(context) else { return }
             if item.kind == .directory {
                 await navigate(path)
             } else {
@@ -1514,7 +1536,9 @@ public final class TransferModel {
             if snapshot.connectionID != id { await connect(connection) }
         case .star(let path):
             // A starred folder opens; a starred file is revealed in its folder. Its kind is asked once.
-            if let session, starIsFolder[path] == nil, let isFolder = await Self.isFolder(path, session: session) {
+            guard let context else { break }
+            if starIsFolder[path] == nil, let isFolder = await Self.isFolder(path, session: context.session) {
+                guard isCurrent(context) else { break }
                 starIsFolder[path] = isFolder
             }
             if starredIsFolder(path) { await navigate(path) } else { await reveal(path) }

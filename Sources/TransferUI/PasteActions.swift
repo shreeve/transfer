@@ -32,7 +32,8 @@ extension TransferModel {
 
     /// A move clears the clipboard only on success, so a refused or failed one can be tried again.
     public func paste(moving: Bool) async {
-        guard let session, let clip = Clipboard.shared.clip else { return }
+        guard let context = shownContext, let clip = Clipboard.shared.clip else { return }
+        let session = context.session
         var folder = snapshot.path
         let sources: TransferRequest.Sources
         switch clip.source {
@@ -61,21 +62,23 @@ extension TransferModel {
             sources = .mac(urls)
         }
         let clipID = clip.id
-        await transfer(sources, into: folder, moving: moving, bytes: clip.tally.complete ? clip.tally.bytes : nil) {
+        await transfer(sources, into: folder, moving: moving, on: context, bytes: clip.tally.complete ? clip.tally.bytes : nil) {
             if moving { Clipboard.shared.clear(ifStill: clipID) }
         }
     }
 
-    /// Queues a paste, a drop, or an upload as one operation. Items on another server log in there
-    /// first, with sheets that name that server, not this window's. `done` runs once it has succeeded.
+    /// Queues a paste, a drop, or an upload as one operation into `folder` on `context`'s server,
+    /// the one the user chose it on. Items on another server log in there first, with sheets that
+    /// name that server, not this window's. `done` runs once it has succeeded.
     func transfer(
         _ sources: TransferRequest.Sources,
         into folder: RemotePath,
         moving: Bool,
+        on context: ServerContext,
         bytes: UInt64? = nil,
         done: @escaping @MainActor @Sendable () -> Void = {}
     ) async {
-        guard let session else { return }
+        let session = context.session
         let names: [[UInt8]]
         var verb = moving ? "Move" : "Copy"
         var source: (any RemoteSession)?
@@ -92,6 +95,7 @@ extension TransferModel {
                     status = "Could not reach the server these items were copied from: \(error.localizedDescription)"
                     return
                 }
+                guard stillShows(context) else { return }
             }
         case .mac(let urls):
             names = urls.map { Array($0.lastPathComponent.utf8) }
@@ -102,7 +106,7 @@ extension TransferModel {
         let provider = provider
         // A row for one item names it and is matched to it.
         let one = names.count == 1 ? folder.appending(name: names[0]) : nil
-        enqueue(title: one.map { "\(verb) \($0.name)" } ?? "\(verb) \(names.count) items", path: one ?? folder) { progress in
+        enqueue(title: one.map { "\(verb) \($0.name)" } ?? "\(verb) \(names.count) items", path: one ?? folder, on: context) { progress in
             if let (source, sink) = login, !(await source.isConnected) { _ = try await source.connect(prompts: sink) }
             try await provider.transfer(request, progress: progress)
             await done()

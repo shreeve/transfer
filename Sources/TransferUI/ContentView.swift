@@ -177,7 +177,8 @@ struct DetailColumn: View {
         .dropDestination(for: URL.self) { urls, _ in
             let files = urls.filter(\.isFileURL)
             guard !files.isEmpty else { return false }
-            Task { await model.upload(urls: files) }
+            guard let context = model.shownContext else { return false }
+            Task { await model.transfer(.mac(files), into: model.snapshot.path, moving: false, on: context) }
             return true
         }
         .focusable()
