@@ -369,7 +369,7 @@ enum MoveCheck {
     private static func proven(_ source: TreeEntry, _ copy: TreeEntry) -> Bool {
         switch (source, copy) {
         case let (.file(size, time?), .file(copySize, copyTime?)): size == copySize && time == copyTime
-        case (.file, _): false
+        case (.file, _), (.other, _): false
         default: source == copy
         }
     }

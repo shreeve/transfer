@@ -418,13 +418,12 @@ enum LocalTree {
         return all
     }
 
-    /// A FIFO, socket, or device has no bytes to copy and no time a move could check, so it is a
-    /// file whose copy never proves complete: a move keeps its folder.
+    /// A FIFO, socket, or device is `.other`: nothing copies it, so a move keeps its folder.
     private static func entry(_ attributes: [FileAttributeKey: Any]) -> TreeEntry {
         let type = attributes[.type] as? FileAttributeType
         if type == .typeDirectory { return .directory }
         if type == .typeSymbolicLink { return .link }
-        guard type == .typeRegular else { return .file(size: 0, mtime: nil) }
+        guard type == .typeRegular else { return .other }
         let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
         return .file(size: size, mtime: (attributes[.modificationDate] as? Date).map(SFTPTime.seconds))
     }
