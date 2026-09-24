@@ -5,6 +5,9 @@ import TransferCore
 import TransferIO
 import TransferUI
 
+/// The app: its scenes and menus, and the delegate that opens the library, starts Sparkle, takes
+/// `sftp://` links, and guards Quit. The one target that sees both UI and IO; the windows reach
+/// the library only through `SessionProvider`.
 @main
 struct TransferApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
@@ -16,7 +19,11 @@ struct TransferApp: App {
             if let provider = delegate.provider {
                 BrowserWindow(provider: provider)
             } else {
-                ContentUnavailableView("Transfer could not open its library", systemImage: "externaldrive.badge.xmark")
+                ContentUnavailableView(
+                    "Transfer could not open its library",
+                    systemImage: "externaldrive.badge.xmark",
+                    description: Text(delegate.libraryError ?? "")
+                )
             }
         }
         .defaultSize(width: 960, height: 640)
@@ -25,7 +32,7 @@ struct TransferApp: App {
             let connected = model?.snapshot.connectionID != nil
             let plainKeys = model?.plainKeysAvailable == true
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesButton(updater: delegate.updater.updater)
+                CheckForUpdatesButton(state: delegate.updates)
             }
             CommandGroup(replacing: .newItem) {
                 Button("New Connection…") { model?.newConnection() }
@@ -192,11 +199,7 @@ struct BrowserWindow: View {
 
 /// "Check for Updates…" is enabled only while Sparkle can check.
 struct CheckForUpdatesButton: View {
-    @State private var state: UpdaterState
-
-    init(updater: SPUUpdater) {
-        _state = State(initialValue: UpdaterState(updater: updater))
-    }
+    let state: UpdaterState
 
     var body: some View {
         Button("Check for Updates…") { state.updater.checkForUpdates() }
@@ -204,6 +207,8 @@ struct CheckForUpdatesButton: View {
     }
 }
 
+/// Whether Sparkle can check now. One for the app, owned by the delegate: the menu's body runs
+/// on every focus change, and each run would otherwise start another observation.
 @MainActor
 @Observable
 final class UpdaterState {
@@ -223,18 +228,38 @@ final class UpdaterState {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let provider: TransferHub?
+    /// Why the library could not be opened, such as one written by a newer Transfer.
+    let libraryError: String?
     /// Sparkle reads SUFeedURL and SUPublicEDKey from Info.plist and checks on its own schedule.
     /// Until a public key is in the plist the updater stays off, so a development build never
     /// shows Sparkle's "not configured" alert at launch.
     let updater = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    let updates: UpdaterState
 
     override init() {
-        provider = try? TransferHub()
+        do {
+            provider = try TransferHub()
+            libraryError = nil
+        } catch {
+            provider = nil
+            libraryError = error.localizedDescription
+        }
+        updates = UpdaterState(updater: updater.updater)
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         WindowFrames.launchFinished()
+        if let libraryError {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Transfer could not open its library"
+            alert.informativeText = libraryError
+            alert.addButton(withTitle: "Quit")
+            alert.runModal()
+            NSApp.terminate(nil)
+            return
+        }
         let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String ?? ""
         if !key.isEmpty { updater.startUpdater() }
     }
@@ -246,16 +271,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Asks before quitting abandons work: Live edits not yet on the server, or transfers still
+    /// running. The Live count comes from the hub's actor, which may be busy (hashing a large
+    /// working copy, say), so it is awaited off the main thread with a time limit, and a count
+    /// that does not arrive in time asks too. Every master is disconnected before the reply.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let provider else { return .terminateNow }
-        let semaphore = DispatchSemaphore(value: 0)
-        let unsynced = Locked(0)
-        Task.detached {
-            unsynced.value = await provider.unsyncedLiveCount
-            semaphore.signal()
+        let running = TransferModel.unfinishedOperations
+        Task {
+            let unsynced = await Self.within(.seconds(3)) { await provider.unsyncedLiveCount }
+            if let question = QuitQuestion(unsynced: unsynced, running: running), !Self.ask(question) {
+                sender.reply(toApplicationShouldTerminate: false)
+                return
+            }
+            _ = await Self.within(.seconds(5)) { await provider.disconnectAll() }
+            sender.reply(toApplicationShouldTerminate: true)
         }
-        _ = semaphore.wait(timeout: .now() + 3)
-        return QuitGuard.mayQuit(unsynced: unsynced.value) ? .terminateNow : .terminateCancel
+        return .terminateLater
+    }
+
+    private static func ask(_ question: QuitQuestion) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = question.message
+        alert.informativeText = question.detail
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Quit Anyway")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    /// `work`'s result, or nil once `limit` passes first. The work is not waited for after that.
+    private static func within<T: Sendable>(_ limit: Duration, _ work: @escaping @Sendable () async -> T) async -> T? {
+        await withCheckedContinuation { continuation in
+            let pending = Locked<CheckedContinuation<T?, Never>?>(continuation)
+            let finish: @Sendable (T?) -> Void = { value in
+                pending.withLock { waiting in
+                    waiting?.resume(returning: value)
+                    waiting = nil
+                }
+            }
+            Task { finish(await work()) }
+            Task {
+                try? await Task.sleep(for: limit)
+                finish(nil)
+            }
+        }
     }
 
     // Last in the responder chain: Copy and Paste for a window whose content holds no focus.
@@ -269,14 +328,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         default: true
         }
     }
+}
 
-    func applicationWillTerminate(_ notification: Notification) {
-        guard let provider else { return }
-        let semaphore = DispatchSemaphore(value: 0)
-        Task.detached {
-            await provider.disconnectAll()
-            semaphore.signal()
+/// What Quit asks, or nil when quitting loses nothing. `unsynced` is nil when the Live count did
+/// not arrive in time: then it asks, since unsynced edits cannot be ruled out. Pure, so it can
+/// move to TransferCore with a test.
+struct QuitQuestion: Equatable {
+    var message: String
+    var detail: String
+
+    init?(unsynced: Int?, running: Int) {
+        let stops = running > 0 ? "\(ClipText.count(running, "transfer")) not yet finished will stop; a move keeps each original until its copy is complete." : nil
+        switch unsynced {
+        case nil:
+            message = "Transfer could not check its Live files"
+            detail = ["Some may have edits that have not reached the server. Quitting now leaves any such edits on this Mac until the next launch.", stops].compactMap(\.self).joined(separator: " ")
+        case let count? where count > 0:
+            message = TransferError.liveUnsynced(count).localizedDescription
+            detail = ["Uploads run only while Transfer is open. Quitting now leaves those edits on this Mac until the next launch.", stops].compactMap(\.self).joined(separator: " ")
+        default:
+            guard let stops else { return nil }
+            message = running == 1 ? "A transfer has not finished" : "\(running) transfers have not finished"
+            detail = stops
         }
-        _ = semaphore.wait(timeout: .now() + 5)
     }
 }
