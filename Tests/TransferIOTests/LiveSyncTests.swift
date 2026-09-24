@@ -762,26 +762,25 @@ struct LiveSyncTests {
 
     // MARK: Uploading only settled bytes (LIVE-05)
 
-    /// An in-place writer that starts while the pass looks the server up: its first chunk has not
-    /// held still, so it is not uploaded; the finished file is, once.
+    /// An in-place writer that starts while the pass looks the server up, as a chunked writer's
+    /// first chunk: those bytes are uploaded only once they have held still for the settle time,
+    /// never straight after the lookup, when the writer may be about to write the rest.
     @Test func aWriteDuringTheLookupWaitsToSettle() async throws {
         try await withLive("mid-lookup") { h in
             let (local, id) = try await openLive(h, note, "first")
             try Data("complete edit".utf8).write(to: local)
-            let first = Locked(true)
+            let written = Locked<Date?>(nil)
             await h.fake.setOnLookup {
-                guard first.withLock({ defer { $0 = false }; return $0 }) else { return }
+                guard written.value == nil else { return }
                 try? Data("PART".utf8).write(to: local)
-                Task {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                    try? Data("PART and the rest".utf8).write(to: local)
-                    await h.live.localChanged(id)
-                }
+                written.value = Date()
             }
             await h.live.localChanged(id)
-            #expect(await waitUntil { await h.fake.contents(note) == "PART and the rest" })
-            #expect(await settled(h))
-            #expect(await h.fake.savedContents == ["PART and the rest"])
+            #expect(await waitUntil { await h.fake.contents(note) == "PART" })
+            let saved = try #require(await h.fake.saveTimes.first)
+            let wrote = try #require(written.value)
+            #expect(saved.timeIntervalSince(wrote) >= 0.3, "uploaded \(saved.timeIntervalSince(wrote)) s after the write")
+            #expect(await h.fake.savedContents == ["PART"])
         }
     }
 
