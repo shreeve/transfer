@@ -102,6 +102,10 @@ struct ListTable: NSViewRepresentable {
             if autosaveConnection != model.snapshot.connectionID {
                 autosaveConnection = model.snapshot.connectionID
                 table.autosaveName = model.snapshot.connectionID.map { "transfer.list.\($0.rawValue.uuidString)" }
+                // An order saved before Name was kept first may have moved it.
+                if let name = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "name" }), name > 0 {
+                    table.moveColumn(name, toColumn: 0)
+                }
             }
             let hasParent = model.snapshot.path.parent != nil
             if nameHeader?.showsUp != hasParent {
@@ -194,6 +198,14 @@ struct ListTable: NSViewRepresentable {
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard !syncing, let table else { return }
             model.snapshot.selection = Set(table.selectedRowIndexes.compactMap { items.indices.contains($0) ? items[$0].path : nil })
+        }
+
+        /// Name stays the first column, as in Finder: the fitting in `RowMenuTableView.layout`,
+        /// the header's up arrow, and the row inset all measure column 0, and the first-column
+        /// autoresizing style gives the spare width to whichever column is first. AppKit asks with
+        /// a new index of -1 as a drag begins.
+        func tableView(_ tableView: NSTableView, shouldReorderColumn columnIndex: Int, toColumn newColumnIndex: Int) -> Bool {
+            columnIndex != 0 && newColumnIndex != 0
         }
 
         func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
