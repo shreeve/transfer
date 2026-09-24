@@ -33,9 +33,8 @@ actor SFTPChannel {
     private var watchdog: Task<Void, Never>?
     private(set) var isOpen = true
 
-    /// A server that answers nothing for this long while requests wait has hung; the channel
-    /// closes and its requests fail with a timeout, which a transfer retries on a new channel.
-    /// Replies arrive every 64 KB during a transfer, so only a dead server is this quiet.
+    /// A server silent this long while requests wait has hung: the channel closes and its requests
+    /// fail with a timeout, which a transfer retries on a new channel.
     private let stallLimit: Duration
     /// How long the server has to answer INIT.
     private let handshakeLimit: Duration
@@ -79,8 +78,7 @@ actor SFTPChannel {
         watchdog = Task { await self.watch() }
     }
 
-    /// Sends INIT and waits for VERSION, for at most `handshakeLimit`. Cancelling it closes the
-    /// channel.
+    /// Sends INIT and waits for VERSION, at most `handshakeLimit`; cancelling closes the channel.
     func handshake() async throws {
         handshakeStarted = .now
         transmit(SFTPWire.packet(type: SFTPCode.initialize) { $0.appendU32(3) })
@@ -278,12 +276,10 @@ actor SFTPChannel {
         }
     }
 
-    /// Copies a file on the server with OpenSSH's `copy-data` extension; no bytes cross the
-    /// network. The reply comes when the whole file is written. Callers check `extensions` first.
-    /// Two round trips: both OPENs go out together, then `copy-data`, `stamp` (the copy's mode
-    /// and time, set on its handle), and both CLOSEs, since a server carries out the requests on
-    /// one file in the order they came. Closing the written file can report a failed last write,
-    /// so that CLOSE is awaited; a `stamp` that did not take is not an error.
+    /// Copies a file on the server with OpenSSH's `copy-data` extension, which callers check for
+    /// first. Two round trips: both OPENs, then `copy-data`, `stamp` on the new file's handle, and
+    /// both CLOSEs, which the server carries out in order. The written file's CLOSE is awaited,
+    /// since it can report a failed last write; a `stamp` that did not take is not an error.
     func copyData(_ source: RemotePath, to destination: RemotePath, stamp: SFTPAttrs? = nil) async throws {
         try Task.checkCancellation()
         let opens = try [
@@ -360,11 +356,9 @@ actor SFTPChannel {
         try parts.finish()
     }
 
-    /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight (32 requests of
-    /// 64 KB), until nothing is left to ask for. Several channels may read into one `parts` at
-    /// once, each with a handle of its own; with `matching`, this one helps only if the file it
-    /// opened is still the one listed, so a file replaced meanwhile is never read in pieces from
-    /// two versions. Several small files may share the channel, each with its own call.
+    /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight, until nothing is
+    /// left to ask for. With `matching`, a second channel helps only if the file it opened is still
+    /// the one listed, so a file replaced meanwhile is never read in pieces from two versions.
     func receive(_ path: RemotePath, into parts: DownloadParts, matching print: Fingerprint? = nil) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxRead)
         defer { closeSoon([handle]) }
@@ -395,8 +389,7 @@ actor SFTPChannel {
         }
     }
 
-    /// Uploads `source` to `path` over this channel alone, creating or truncating it. With
-    /// `stamp`, the file's mode and time are set after the last write.
+    /// Uploads `source` to `path` over this channel alone, `stamp` set after the last write.
     func upload(
         _ source: URL,
         to path: RemotePath,
@@ -414,17 +407,15 @@ actor SFTPChannel {
         return try await handles(opening: [send(SFTPCode.open) { $0.openFields(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc) }])[0]
     }
 
-    /// Writes what `parts` hands out into `path`, which another channel created: a second
-    /// channel's share of one large upload.
+    /// Writes what `parts` hands out into `path`, which another channel created.
     func send(_ parts: UploadParts, into path: RemotePath) async throws {
         try await send(parts, to: try await openFile(path, flags: SFTPCode.fxWrite))
     }
 
-    /// Writes what `parts` hands out to `handle`, keeping 2 MB in flight, then closes the handle,
-    /// awaiting the close: a server may report a failed last write only there. The close goes
-    /// out right behind the last write, and `stamp` (mode and time) just before it, so both cost
-    /// no round trip of their own: a server carries out the requests on one file in the order
-    /// they came, so no write lands after the stamp. A stamp that did not take is not an error.
+    /// Writes what `parts` hands out to `handle`, keeping 2 MB in flight, then closes it, awaiting
+    /// the close: a server may report a failed last write only there. `stamp` and the close go out
+    /// right behind the last write, costing no round trip; the server carries out a file's
+    /// requests in order, so no write lands after the stamp. A stamp that did not take is no error.
     func send(_ parts: UploadParts, to handle: Data, stamp: SFTPAttrs? = nil) async throws {
         var writes: [(id: UInt32, count: UInt64)] = []
         var finishing: [UInt32] = []
@@ -526,8 +517,7 @@ actor SFTPChannel {
         }
     }
 
-    /// Sends one request and waits for the reply. A failure status throws; end of file throws
-    /// `EndOfFile`.
+    /// Sends one request and waits for the reply. A failure status throws, EOF as `EndOfFile`.
     private func call(
         _ type: UInt8,
         capacity: Int = 64,
@@ -538,9 +528,8 @@ actor SFTPChannel {
         return try await reply(send(type, capacity: capacity, long: long, fields))
     }
 
-    /// Sends one request now, its fields appended by `fields` after the id, and returns its id for
-    /// `reply`. Requests reach the server in the order they are sent, so a caller may send many
-    /// before awaiting any. Every id sent is awaited or abandoned.
+    /// Sends one request now and returns its id for `reply`. Requests reach the server in the order
+    /// they are sent, so a caller may send many before awaiting any; each is awaited or abandoned.
     private func send(
         _ type: UInt8,
         capacity: Int = 64,
@@ -695,9 +684,8 @@ actor SFTPChannel {
     }
 }
 
-/// Lets progress through at most ten times a second, and always the last value: the UI hops to
-/// the main actor for each report, and a fast transfer finishes a 64 KB request every few
-/// microseconds.
+/// Lets progress through at most ten times a second, and always the last value: each report is a
+/// hop to the main actor, and a fast transfer finishes a 64 KB request every few microseconds.
 struct ProgressPacer {
     private var last: ContinuousClock.Instant?
     private var held: TransferProgress?
@@ -721,11 +709,9 @@ struct ProgressPacer {
     }
 }
 
-/// One download's shared state: what is left to ask for (`ReadPlan`, which asks again for the
-/// rest of a short reply), the local file each reply is written into at its offset, and
-/// progress. Several channels may read into one download at once, each through its own handle,
-/// so a large file is not held to one channel's 2 MB window (PERF-07). A file with no listed
-/// size is read until the server says it ends.
+/// One download's shared state: what is left to ask for (`ReadPlan`), the local file each reply
+/// is written into at its offset, and progress. Several channels may read into one download at
+/// once, each through its own handle (PERF-07). A file with no listed size is read until EOF.
 final class DownloadParts: Sendable {
     private let size: UInt64?
     private let descriptor: Int32
@@ -781,10 +767,8 @@ final class DownloadParts: Sendable {
     }
 }
 
-/// One upload's shared state: the local file, read in order 64 KB at a time and handed to
-/// whichever channel asks next, up to the end the file has when it gets there, and progress.
-/// Several channels may write one upload at once, each through its own handle on the same remote
-/// file (PERF-07).
+/// One upload's shared state: the local file, read in order 64 KB at a time for whichever channel
+/// asks next, up to the end it has when it gets there, and progress (PERF-07).
 final class UploadParts: Sendable {
     let total: UInt64?
     private let descriptor: Int32
