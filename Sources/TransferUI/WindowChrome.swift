@@ -69,7 +69,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
 
         init(model: TransferModel) { self.model = model }
 
-
         func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
             [.toggleSidebar, .sidebarTrackingSeparator, ChromeItem.backForward, .flexibleSpace, ChromeItem.viewMode, ChromeItem.transfers, ChromeItem.search]
         }
@@ -240,9 +239,7 @@ final class ChromeController: NSSplitViewController {
 
     func install(sidebar: NSHostingController<AnyView>, detail: NSHostingController<AnyView>, inspector: NSHostingController<AnyView>) {
         // The split view decides the columns' sizes; the hosted SwiftUI content reports none.
-        for host in [sidebar, detail, inspector] {
-            host.sizingOptions = []
-        }
+        for host in [sidebar, detail, inspector] { host.sizingOptions = [] }
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
         // Finder's sidebar narrows to about this before a further drag snaps it closed.
         sidebarItem.minimumThickness = 150
@@ -363,7 +360,6 @@ final class ChromeController: NSSplitViewController {
         refreshHoverLine(animated: true)
     }
 
-
     /// AppKit hangs a scroll pocket, the macOS 26 scroll-edge effect, under the toolbar over each
     /// section of the window. Over the content section it draws a hard edge for the placeholder
     /// screen and for the inspector, and keeps that edge after the inspector collapses; it has no
@@ -417,19 +413,18 @@ final class ChromeController: NSSplitViewController {
         separatorObservation = window.observe(\.titlebarSeparatorStyle, options: [.new]) { [weak self] _, _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
-        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
-            windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refreshHoverLine(animated: true) }
-            })
+        func observe(_ names: NSNotification.Name..., run: @escaping @MainActor @Sendable () -> Void) {
+            for name in names {
+                windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { _ in
+                    MainActor.assumeIsolated(run)
+                })
+            }
         }
+        observe(NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification) { [weak self] in self?.refreshHoverLine(animated: true) }
         // The window posts this after every pass of event handling, so a style SwiftUI sets after
         // the last layout of an inspector animation is still caught before the next frame draws.
-        windowObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
-            MainActor.assumeIsolated { self?.keepSeparatorOff() }
-        })
-        windowObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: nil) { [weak self] _ in
-            MainActor.assumeIsolated { self?.windowWillClose() }
-        })
+        observe(NSWindow.didUpdateNotification) { [weak self] in self?.keepSeparatorOff() }
+        observe(NSWindow.willCloseNotification) { [weak self] in self?.windowWillClose() }
         window.tabbingMode = .preferred
         // A tab takes its window's frame; any other new window is placed.
         if !NewTab.join(window) {
@@ -438,10 +433,8 @@ final class ChromeController: NSSplitViewController {
         // Watched only once placed: a new window becomes main at SwiftUI's default size first,
         // which would otherwise replace the last-used frame it is about to take. A live resize
         // is written once, when it ends, not on every frame of the drag.
-        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didEndLiveResizeNotification, NSWindow.didBecomeMainNotification] {
-            windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak window] _ in
-                MainActor.assumeIsolated { if let window, !window.inLiveResize { WindowFrames.remember(window) } }
-            })
+        observe(NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didEndLiveResizeNotification, NSWindow.didBecomeMainNotification) { [weak window] in
+            if let window, !window.inLiveResize { WindowFrames.remember(window) }
         }
         ContentKeys.install()
         if let model { LinkInbox.take(into: model) }
@@ -630,11 +623,9 @@ public enum NewTab {
     }
 
     static func join(_ window: NSWindow) -> Bool {
-        guard let target = host, target !== window, target.isVisible else {
-            host = nil
-            return false
-        }
+        let target = host
         host = nil
+        guard let target, target !== window, target.isVisible else { return false }
         target.addTabbedWindow(window, ordered: .above)
         window.makeKeyAndOrderFront(nil)
         return true
@@ -829,10 +820,7 @@ final class BelowToolbarController: NSViewController {
 }
 
 final class BelowToolbarView: NSView {
-    let hosted: NSView
-
     init(hosted: NSView) {
-        self.hosted = hosted
         super.init(frame: .zero)
         hosted.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hosted)
@@ -898,37 +886,31 @@ final class SearchToolbarView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     func expand(focus: Bool) {
-        guard !isExpanded else {
-            if focus { window?.makeFirstResponder(field) }
-            return
+        if !isExpanded {
+            isExpanded = true
+            show(expanded: true)
         }
-        isExpanded = true
-        button.isHidden = true
-        field.isHidden = false
-        minWidth.constant = Self.expandedMinWidth
-        preferredWidth.constant = Self.expandedWidth
-        maxWidth.constant = Self.expandedWidth
-        remeasure()
         if focus { window?.makeFirstResponder(field) }
     }
 
     func collapse() {
         guard isExpanded else { return }
+        // First: resigning the field ends its editing, which calls collapse again.
         isExpanded = false
         field.stringValue = ""
         if window?.firstResponder === field.currentEditor() || window?.firstResponder === field {
             window?.makeFirstResponder(nil)
         }
-        field.isHidden = true
-        button.isHidden = false
-        minWidth.constant = Self.collapsedWidth
-        preferredWidth.constant = Self.collapsedWidth
-        maxWidth.constant = Self.collapsedWidth
-        remeasure()
+        show(expanded: false)
         onCollapse?()
     }
 
-    private func remeasure() {
+    private func show(expanded: Bool) {
+        button.isHidden = expanded
+        field.isHidden = !expanded
+        minWidth.constant = expanded ? Self.expandedMinWidth : Self.collapsedWidth
+        preferredWidth.constant = expanded ? Self.expandedWidth : Self.collapsedWidth
+        maxWidth.constant = expanded ? Self.expandedWidth : Self.collapsedWidth
         guard let item else { return }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.15
@@ -936,4 +918,3 @@ final class SearchToolbarView: NSView {
         }
     }
 }
-
