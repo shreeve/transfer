@@ -211,7 +211,7 @@ struct DetailColumn: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(operation.title).lineLimit(1).truncationMode(.middle)
                 if let detail = shelfDetail(operation) {
-                    Text(detail).font(.caption).foregroundStyle(operation.state == .failed ? .red : .secondary).lineLimit(2)
+                    Text(detail).font(.caption).foregroundStyle(operation.state == .failed && !model.isKept(operation) ? .red : .secondary).lineLimit(2)
                 }
             }
             Spacer()
@@ -251,7 +251,7 @@ struct DetailColumn: View {
 
     /// "12 transfers, 3 failed".
     private var shelfSummary: String {
-        let failed = model.operations.filter { $0.state == .failed }.count
+        let failed = model.operations.filter { $0.state == .failed && !model.isKept($0) }.count
         let count = ClipText.count(model.operations.count, "transfer")
         return failed == 0 ? count : "\(count), \(failed) failed"
     }
@@ -269,7 +269,7 @@ struct DetailColumn: View {
         case .queued: "Waiting"
         case .active: nil
         case .paused: operation.livePath == nil ? "Stopped" : "Paused"
-        case .failed: "Failed"
+        case .failed: model.isKept(operation) ? "Kept" : "Failed"
         case .succeeded: "Done"
         }
     }

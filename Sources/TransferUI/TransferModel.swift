@@ -203,6 +203,10 @@ public final class TransferModel {
     private var forwardStack: [RemotePath] = []
     private var previewTask: Task<Void, Never>?
     @ObservationIgnored private var runners: [String: Runner] = [:]
+    /// Rows whose move kept originals (`keep`).
+    private var keptRows: Set<String> = []
+    /// Transfer tasks running in every window, open or closed.
+    private(set) static var running = 0
     /// The session behind each Live row on the shelf, which the session's own events put there,
     /// so Pause and Resume reach that server whatever the window shows now.
     @ObservationIgnored private var liveRowSessions: [String: any RemoteSession] = [:]
@@ -256,8 +260,24 @@ public final class TransferModel {
         Task { await reloadConnections() }
     }
 
-    /// A closed window stops listening and listing. Its queued transfers run on without it, and
-    /// its waiting questions get the safe answer.
+    /// The window closed: it stops listening, listing, previewing, and logging in now, since
+    /// SwiftUI may keep the model a while, and its questions, now and later, get the safe answer.
+    /// Its queued transfers run on without it.
+    public func close() {
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers.removeAll()
+        // A connect still logging in lands nowhere.
+        connectGeneration &+= 1
+        loginPrompt?.retire()
+        loginPrompt = nil
+        context?.close()
+        sidebarReload?.cancel()
+        previewTask?.cancel()
+        for task in inspectorTasks { task.cancel() }
+        prompts.cancelAll()
+    }
+
+    /// As `close`, for a model released without it.
     isolated deinit {
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         context?.close()
@@ -1100,6 +1120,7 @@ public final class TransferModel {
     private func start(_ id: String) {
         guard let runner = runners[id] else { return }
         runner.task?.cancel()
+        keptRows.remove(id)
         update(id) { $0.state = .active; $0.message = nil }
         let body = runner.body
         let session = runner.session
@@ -1124,6 +1145,9 @@ public final class TransferModel {
             }
         }
         let task = Task { [weak self] in
+            // Counted for the quit question even after the window closes, which leaves it running.
+            Self.running += 1
+            defer { Self.running -= 1 }
             var attempt = 0
             while true {
                 do {
@@ -1134,7 +1158,12 @@ public final class TransferModel {
                     self?.finish(id, state: .succeeded, message: nil)
                     return
                 } catch {
-                    if Self.isCancellation(error) { return }
+                    // Stop cancels the task, and whatever the body threw then is not a failure.
+                    if Self.isCancellation(error) || Task.isCancelled { return }
+                    if let kept = error as? TransferKept {
+                        self?.keep(id, kept.localizedDescription)
+                        return
+                    }
                     if RetryPolicy.isRetryable(error), let delay = RetryPolicy.delay(afterAttempt: attempt) {
                         attempt += 1
                         self?.update(id) { $0.state = .queued; $0.message = "Retrying in \(Int(delay)) s" }
@@ -1149,6 +1178,18 @@ public final class TransferModel {
             }
         }
         runners[id]?.task = task
+    }
+
+    /// A move that kept some originals, because the user skipped them or a copy could not be
+    /// checked: nothing is lost, so the row says so without the failure's red and message bar.
+    private func keep(_ id: String, _ message: String) {
+        update(id) { $0.state = .failed; $0.message = message }
+        keptRows.insert(id)
+    }
+
+    /// Whether the row's move ended keeping originals, rather than failing.
+    public func isKept(_ operation: TransferOperation) -> Bool {
+        operation.state == .failed && keptRows.contains(operation.id)
     }
 
     private func update(_ id: String, _ change: (inout TransferOperation) -> Void) {
@@ -1204,6 +1245,7 @@ public final class TransferModel {
         runners[operation.id]?.task?.cancel()
         runners[operation.id] = nil
         liveRowSessions[operation.id] = nil
+        keptRows.remove(operation.id)
         operations.removeAll { $0.id == operation.id }
     }
 

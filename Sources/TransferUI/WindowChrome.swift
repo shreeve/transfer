@@ -432,9 +432,10 @@ final class ChromeController: NSSplitViewController {
     }
 
     /// A closed window is no browser: links and New Tab must not pick its controller while it
-    /// waits to be released, and its observers must not outlive it.
+    /// waits to be released, its observers must not outlive it, and its model stops its work.
     private func windowWillClose() {
         Self.live.remove(self)
+        model?.close()
         separatorObservation?.invalidate()
         separatorObservation = nil
         windowObservers.forEach(NotificationCenter.default.removeObserver)

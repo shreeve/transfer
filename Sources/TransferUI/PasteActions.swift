@@ -113,10 +113,11 @@ extension TransferModel {
         }
     }
 
-    /// Unfinished operations in all windows, for the quit guard (Live uploads are counted apart).
+    /// Unfinished operations, for the quit guard (Live uploads are counted apart): every transfer
+    /// running, including those of windows already closed, and the stopped rows of open windows.
     public static var unfinishedOperations: Int {
-        ChromeController.browsers.compactMap(\.model).reduce(0) { total, model in
-            total + model.operations.filter { $0.livePath == nil && [.queued, .active, .paused].contains($0.state) }.count
+        ChromeController.browsers.compactMap(\.model).reduce(running) { total, model in
+            total + model.operations.filter { $0.livePath == nil && $0.state == .paused }.count
         }
     }
 }
