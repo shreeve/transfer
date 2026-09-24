@@ -229,18 +229,21 @@ struct DetailColumn: View {
                     Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if let label = stateLabel(operation.state) {
+            if let label = stateLabel(operation) {
                 Text(label).font(.caption).foregroundStyle(.secondary)
             }
+            // A Live file's sync pauses and resumes. A transfer can only stop: it restarts from its
+            // first byte, since a stopped transfer's temp is removed.
+            let live = operation.livePath != nil
             switch operation.state {
             case .active:
-                Button("Pause") { Task { await model.pause(operation) } }
+                Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
             case .queued:
-                Button("Pause") { Task { await model.pause(operation) } }
-                if operation.livePath == nil { Button("Remove") { model.remove(operation) } }
+                Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
+                if !live { Button("Remove") { model.remove(operation) } }
             case .paused:
-                Button("Resume") { Task { await model.resume(operation) } }
-                if operation.livePath == nil { Button("Remove") { model.remove(operation) } }
+                Button(live ? "Resume" : "Restart") { Task { await model.resume(operation) } }
+                if !live { Button("Remove") { model.remove(operation) } }
             case .failed:
                 Button("Retry") { Task { await model.resume(operation) } }
                 Button("Remove") { model.remove(operation) }
@@ -266,11 +269,11 @@ struct DetailColumn: View {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    private func stateLabel(_ state: OperationState) -> String? {
-        switch state {
+    private func stateLabel(_ operation: TransferOperation) -> String? {
+        switch operation.state {
         case .queued: "Waiting"
         case .active: nil
-        case .paused: "Paused"
+        case .paused: operation.livePath == nil ? "Stopped" : "Paused"
         case .failed: "Failed"
         case .succeeded: "Done"
         }

@@ -204,11 +204,11 @@ public final class TransferModel {
     @ObservationIgnored private var sidebarReloadAgain = false
     @ObservationIgnored private var observers: [any NSObjectProtocol] = []
 
-    /// One queued transfer. It keeps the server it was queued for: a retry, a Resume, or a
+    /// One queued transfer. It keeps the server it was queued for: a retry, a Restart, or a
     /// Retry after a failure runs there even when the window has moved to another server.
     private struct Runner {
         var body: @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void
-        /// This operation's own prompts, kept across retries and Resume.
+        /// This operation's own prompts, kept across retries and Restart.
         var prompts: OperationPrompt
         let connection: SavedConnection
         let session: any RemoteSession
@@ -1189,6 +1189,8 @@ public final class TransferModel {
         return connections.first { $0.id == owner.id }?.displayName ?? owner.displayName
     }
 
+    /// Pauses a Live file's sync, or stops a transfer: a stopped transfer's temp is removed, so
+    /// `resume` restarts it from its first byte.
     public func pause(_ operation: TransferOperation) async {
         if let path = operation.livePath {
             await (liveRowSessions[operation.id] ?? session)?.setLivePaused(path, paused: true)
