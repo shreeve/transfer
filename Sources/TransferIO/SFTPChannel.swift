@@ -324,6 +324,7 @@ actor SFTPChannel {
         }
         // 32 requests of 64 KB keep 2 MB in flight.
         var plan = ReadPlan(size: limit)
+        var pacer = ProgressPacer(report: progress)
         var inFlight: [(offset: UInt64, length: UInt32, task: Task<Data, Error>)] = []
         defer { for read in inFlight { read.task.cancel() } }
         while true {
@@ -335,18 +336,23 @@ actor SFTPChannel {
             guard !inFlight.isEmpty else { break }
             let read = inFlight.removeFirst()
             do {
-                let chunk = try await read.task.value
+                let chunk = try await withTaskCancellationHandler {
+                    try await read.task.value
+                } onCancel: {
+                    read.task.cancel()
+                }
                 guard chunk.count <= Int(read.length) else { throw TransferError.failed("The server sent more than was asked for") }
                 if !chunk.isEmpty {
                     try output.seek(toOffset: read.offset)
                     try output.write(contentsOf: chunk)
                 }
                 plan.record(offset: read.offset, length: read.length, count: UInt32(chunk.count))
-                progress(TransferProgress(completed: plan.received, total: limit))
+                pacer.update(TransferProgress(completed: plan.received, total: limit))
             } catch is EndOfFile {
                 plan.endOfFile()
             }
         }
+        pacer.finish()
         guard plan.isComplete else { throw TransferError.failed("The file changed on the server while it downloaded") }
     }
 
@@ -354,6 +360,8 @@ actor SFTPChannel {
     /// is not the end; only EOF or a reply with no bytes is.
     private func downloadSequential(handle: Data, output: FileHandle, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         var offset: UInt64 = 0
+        var pacer = ProgressPacer(report: progress)
+        defer { pacer.finish() }
         while true {
             try Task.checkCancellation()
             let chunk: Data
@@ -365,7 +373,7 @@ actor SFTPChannel {
             if chunk.isEmpty { break }
             try output.write(contentsOf: chunk)
             offset += UInt64(chunk.count)
-            progress(TransferProgress(completed: offset))
+            pacer.update(TransferProgress(completed: offset))
         }
     }
 
@@ -393,28 +401,35 @@ actor SFTPChannel {
         let total = (try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(UInt64.init)
         var offset: UInt64 = 0
         var acknowledged: UInt64 = 0
+        var pacer = ProgressPacer(report: progress)
         var inFlight: [Task<UInt64, Error>] = []
+        var read = false
         do {
-            while true {
+            while !read || !inFlight.isEmpty {
                 try Task.checkCancellation()
-                let chunk = try input.read(upToCount: 65_536) ?? Data()
-                if chunk.isEmpty { break }
-                let at = offset
-                let count = UInt64(chunk.count)
-                offset += count
-                inFlight.append(Task {
-                    try await self.writeChunk(handle, offset: at, data: chunk)
-                    return count
-                })
-                if inFlight.count >= 32 {
-                    acknowledged += try await inFlight.removeFirst().value
-                    progress(TransferProgress(completed: acknowledged, total: total))
+                if !read, inFlight.count < 32 {
+                    let chunk = try input.read(upToCount: 65_536) ?? Data()
+                    read = chunk.isEmpty
+                    guard !read else { continue }
+                    let at = offset
+                    let count = UInt64(chunk.count)
+                    offset += count
+                    inFlight.append(Task {
+                        try await self.writeChunk(handle, offset: at, data: chunk)
+                        return count
+                    })
+                    continue
                 }
+                // Cancelling the upload cancels this wait, so a stalled server cannot hold it.
+                let oldest = inFlight.removeFirst()
+                acknowledged += try await withTaskCancellationHandler {
+                    try await oldest.value
+                } onCancel: {
+                    oldest.cancel()
+                }
+                pacer.update(TransferProgress(completed: acknowledged, total: total))
             }
-            while !inFlight.isEmpty {
-                acknowledged += try await inFlight.removeFirst().value
-                progress(TransferProgress(completed: acknowledged, total: total))
-            }
+            pacer.finish()
         } catch {
             for task in inFlight { task.cancel() }
             throw error
@@ -426,6 +441,35 @@ actor SFTPChannel {
             $0.appendBlob(handle)
             $0.appendU64(offset)
             $0.appendBlob(data)
+        }
+    }
+
+    /// Hands progress on at most ten times a second, and always the last value: the UI hops to
+    /// the main actor for each report, and a fast transfer finishes a 64 KB request every few
+    /// microseconds.
+    private struct ProgressPacer {
+        let report: @Sendable (TransferProgress) -> Void
+        private var last: ContinuousClock.Instant?
+        private var held: TransferProgress?
+
+        init(report: @escaping @Sendable (TransferProgress) -> Void) {
+            self.report = report
+        }
+
+        mutating func update(_ progress: TransferProgress) {
+            let now = ContinuousClock.now
+            if let last, now - last < .milliseconds(100) {
+                held = progress
+                return
+            }
+            last = now
+            held = nil
+            report(progress)
+        }
+
+        mutating func finish() {
+            if let held { report(held) }
+            held = nil
         }
     }
 

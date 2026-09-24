@@ -70,6 +70,69 @@ import TransferCore
         await server.stop()
     }
 
+    // MARK: Transfers
+
+    /// A server holding one file of `size` bytes, answering reads and writes when `answers`.
+    private static func holding(_ size: Int, answers: Bool = true) async throws -> ScriptedServer {
+        try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.open: return ScriptedServer.handle(request.id)
+            case SFTPCode.close: return ScriptedServer.ok(request.id)
+            case SFTPCode.read where answers:
+                var reader = ByteReader(request.body)
+                _ = try? reader.blob()
+                let offset = Int((try? reader.u64()) ?? 0)
+                let length = Int((try? reader.u32()) ?? 0)
+                guard offset < size else { return ScriptedServer.status(request.id, SFTPCode.eof) }
+                return ScriptedServer.data(request.id, Data(repeating: 1, count: min(length, size - offset)))
+            case SFTPCode.write where answers: return ScriptedServer.ok(request.id)
+            default: return nil
+            }
+        }
+    }
+
+    /// Progress reaches the caller at most ten times a second and always ends at the total: each
+    /// report is a hop to the main actor, and there is one 64 KB request every few microseconds.
+    @Test func progressIsPacedAndEndsAtTheTotal() async throws {
+        let size = 4 << 20
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("paced-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data(repeating: 2, count: size).write(to: file)
+        let server = try await Self.holding(size)
+        let reports = Locked<[TransferProgress]>([])
+        try await server.channel.upload(file, to: RemotePath(string: "/srv/up")) { progress in reports.withLock { $0.append(progress) } }
+        #expect(reports.value.count < 10)
+        #expect(reports.value.last?.completed == UInt64(size))
+        reports.value = []
+        try await server.channel.download(RemotePath(string: "/srv/down"), to: file, size: UInt64(size)) { progress in reports.withLock { $0.append(progress) } }
+        #expect(reports.value.count < 10)
+        #expect(reports.value.last?.completed == UInt64(size))
+        #expect(try Data(contentsOf: file) == Data(repeating: 1, count: size))
+        await server.stop()
+    }
+
+    /// A transfer cancelled while the server sits on its requests stops at once, not when the
+    /// channel's stall limit ends it.
+    @Test func aCancelledTransferStopsWithoutItsReplies() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("stuck-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data(repeating: 2, count: 1 << 20).write(to: file)
+        let server = try await Self.holding(1 << 20, answers: false)
+        let transfers = [
+            Task { try await server.channel.upload(file, to: RemotePath(string: "/srv/up")) { _ in } },
+            Task { try await server.channel.download(RemotePath(string: "/srv/down"), to: file.appendingPathExtension("down"), size: 1 << 20) { _ in } },
+        ]
+        #expect(await eventually { server.sent(SFTPCode.write).count == 16 && server.sent(SFTPCode.read).count == 16 })
+        let started = ContinuousClock.now
+        for transfer in transfers {
+            transfer.cancel()
+            await #expect(throws: (any Error).self) { try await transfer.value }
+        }
+        #expect(ContinuousClock.now - started < .seconds(5))
+        try? FileManager.default.removeItem(at: file.appendingPathExtension("down"))
+        await server.stop()
+    }
+
     /// A server whose folder /srv lists `names`, where LSTAT finds what `lookup` says, and which
     /// has posix-rename.
     private static func renaming(_ names: [String], lookup: @escaping @Sendable (String) -> UInt32?) async throws -> ScriptedServer {
