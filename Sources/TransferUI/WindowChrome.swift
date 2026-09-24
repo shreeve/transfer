@@ -628,6 +628,12 @@ public enum NewTab {
 @MainActor
 public enum LinkInbox {
     private static var pending: [SFTPURL] = []
+    /// Windows a link has been handed to. A window stays idle until its login starts, which is
+    /// after `ssh -G` and a DNS lookup, so without this a second link could pick it too and one
+    /// of the two would be lost.
+    private static var opening: Set<ObjectIdentifier> = []
+    /// A window was asked for and none has appeared since.
+    private static var requested = false
     /// Opens a new browser window. Set by each browser window as it appears, since only a view
     /// can reach SwiftUI's window opener.
     public static var openWindow: (() -> Void)?
@@ -635,40 +641,51 @@ public enum LinkInbox {
     public static func deliver(_ link: SFTPURL) {
         NSApp.activate()
         let browsers = ChromeController.browsers
-        let idle = browsers.first { $0 === ChromeController.keyWindowController && $0.model?.isIdle == true }
-            ?? browsers.first { $0.model?.isIdle == true }
-        if let idle, let model = idle.model {
-            idle.view.window?.makeKeyAndOrderFront(nil)
-            Task { await model.open(link: link) }
+        let free = browsers.first { $0 === ChromeController.keyWindowController && isFree($0.model) }
+            ?? browsers.first { isFree($0.model) }
+        if let free, let model = free.model {
+            free.view.window?.makeKeyAndOrderFront(nil)
+            open(link, in: model)
             return
         }
         pending.append(link)
-        if browsers.isEmpty {
-            // Launched by the link, or every window closed: open one, and it takes the link as it
-            // appears. A window restored at launch may already be on its way and take it first.
-            newWindow()
-        } else {
-            NewTab.request()
-            newWindow()
-        }
+        // With no browser window open (launched by the link, or every window closed), SwiftUI
+        // opens one for the link itself, and it takes the link as it appears; so may a window
+        // restored at launch. Otherwise one window is asked for at a time, and each that appears
+        // asks for the next, so every link gets exactly one.
+        if !requested, !browsers.isEmpty { requestWindow() }
     }
 
-    /// SwiftUI's window opener once a browser window has lent it; before that, the responder
-    /// chain's `newWindowForTab:`, which reaches SwiftUI's own opener.
-    private static func newWindow() {
-        if let openWindow { return openWindow() }
-        NSApp.sendAction(#selector(NSResponder.newWindowForTab(_:)), to: nil, from: nil)
-    }
-
-    /// A browser window that just appeared takes the oldest waiting link.
+    /// A browser window that just appeared takes the oldest waiting link, and asks for another
+    /// window while links still wait.
     static func take(into model: TransferModel) {
-        guard model.isIdle, !pending.isEmpty else { return }
-        let link = pending.removeFirst()
-        Task { await model.open(link: link) }
-        if !pending.isEmpty {
-            NewTab.request()
-            newWindow()
+        requested = false
+        guard !pending.isEmpty else { return }
+        if isFree(model) { open(pending.removeFirst(), in: model) }
+        if !pending.isEmpty { requestWindow() }
+    }
+
+    private static func isFree(_ model: TransferModel?) -> Bool {
+        guard let model else { return false }
+        return model.isIdle && !opening.contains(ObjectIdentifier(model))
+    }
+
+    private static func open(_ link: SFTPURL, in model: TransferModel) {
+        let id = ObjectIdentifier(model)
+        opening.insert(id)
+        Task {
+            await model.open(link: link)
+            opening.remove(id)
         }
+    }
+
+    /// A new tab of the front window, through SwiftUI's opener. Before any browser window has
+    /// lent the opener there is nothing to ask; the link waits for SwiftUI's own first window.
+    private static func requestWindow() {
+        guard let openWindow else { return }
+        requested = true
+        NewTab.request()
+        openWindow()
     }
 }
 
