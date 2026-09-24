@@ -411,7 +411,7 @@ struct ServerTests {
     }
 
     @Test func rejectedHostKeyNeverLogsIn() async throws {
-        try await withHarness("hostkey") { h in
+        try await withHarness("hostkey", knownHost: false) { h in
             h.prompts.hostDecision = .cancel
             await #expect(throws: TransferError.hostKeyRejected) {
                 _ = try await h.session.connect(prompts: h.prompts)

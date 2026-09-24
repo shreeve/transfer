@@ -84,7 +84,7 @@ struct SessionUnitTests {
 @Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct SessionServerTests {
     @Test func concurrentConnectsShareOneLogin() async throws {
-        try await withHarness("single") { h in
+        try await withHarness("single", knownHost: false) { h in
             let prompts = RecordingPrompts(.trustOnce)
             async let first = h.session.connect(prompts: prompts)
             async let second = h.session.connect(prompts: prompts)
@@ -101,7 +101,7 @@ struct SessionServerTests {
     /// A login held up by a question nobody answers stops when the session disconnects or when
     /// its only caller is cancelled, and leaves nothing running.
     @Test func aStalledLoginStops() async throws {
-        try await withHarness("stall") { h in
+        try await withHarness("stall", knownHost: false) { h in
             let prompts = StalledPrompts()
             let login = Task { try await h.session.connect(prompts: prompts) }
             #expect(await waitUntil { prompts.asked.value > 0 })
@@ -123,7 +123,7 @@ struct SessionServerTests {
     /// ssh checks the host key itself, so a key trusted only in a global file (as on managed Macs)
     /// logs in without a question.
     @Test func aKeyTrustedGloballyAsksNothing() async throws {
-        try await withHarness("global") { h in
+        try await withHarness("global", knownHost: false) { h in
             let global = h.base.appendingPathComponent("global_known_hosts")
             try "\(try hostPattern()) \(try ServerHarness.hostKey())\n".write(to: global, atomically: true, encoding: .utf8)
             try writeConfig(h, global: global.path)
@@ -134,7 +134,7 @@ struct SessionServerTests {
     }
 
     @Test func alwaysTrustHashesWhenAskedAndIsNotAskedAgain() async throws {
-        try await withHarness("hashed") { h in
+        try await withHarness("hashed", knownHost: false) { h in
             try writeConfig(h, extra: "HashKnownHosts yes")
             let prompts = RecordingPrompts(.alwaysTrust)
             _ = try await h.session.connect(prompts: prompts)
@@ -379,7 +379,6 @@ private func otherKey(_ h: ServerHarness) async throws -> String {
 
 /// Logs in with the server's key already in known_hosts, asking nothing.
 private func connectKnown(_ h: ServerHarness) async throws {
-    try h.trustHostKey()
     let prompts = RecordingPrompts(.cancel)
     _ = try await h.session.connect(prompts: prompts)
     #expect(prompts.events.isEmpty)

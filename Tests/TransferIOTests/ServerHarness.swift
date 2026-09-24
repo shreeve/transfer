@@ -10,6 +10,11 @@ import TransferCore
 ///
 /// Hermetic: ssh reads a config file written here (`-F`), never the developer's `~/.ssh/config`,
 /// known hosts, or agent, and host keys are trusted once, so nothing under `~/.ssh` is written.
+///
+/// The local sshd's key is in the harness's own known_hosts unless `knownHost` is false, so a
+/// login is one connection to sshd where a first contact takes three (refused, probe, master);
+/// many suites at once would otherwise crowd its MaxStartups. Only a test of the host-key
+/// questions themselves starts with an unknown key.
 struct ServerHarness {
     private static var environment: [String: String] { ProcessInfo.processInfo.environment }
     private static var port: String? { environment["TRANSFER_TEST_PORT"] }
@@ -33,7 +38,7 @@ struct ServerHarness {
 
     var remotePath: RemotePath { RemotePath(string: remote.path) }
 
-    init(_ name: String) throws {
+    init(_ name: String, knownHost: Bool = true) throws {
         guard let port = Self.port, let identity = Self.identity else {
             throw TransferError.failed("TRANSFER_REQUIRE_SERVER is set, but TRANSFER_TEST_PORT and TRANSFER_TEST_IDENTITY are not: start Scripts/local-sshd.sh")
         }
@@ -54,6 +59,9 @@ struct ServerHarness {
 
             """
             try config.write(to: configFile, atomically: true, encoding: .utf8)
+            if knownHost {
+                try "[127.0.0.1]:\(port) \(try Self.hostKey())\n".write(to: base.appendingPathComponent("known_hosts"), atomically: true, encoding: .utf8)
+            }
             store = try Store(root: root)
         } catch {
             try? FileManager.default.removeItem(at: base)
@@ -88,13 +96,6 @@ struct ServerHarness {
         await liveAgain.closeAll()
     }
 
-    /// Puts the local sshd's key in this harness's known_hosts, so a login is one connection to
-    /// sshd where a first contact takes three (refused, probe, master); many suites at once would
-    /// otherwise crowd its MaxStartups.
-    func trustHostKey() throws {
-        try "[127.0.0.1]:\(session.connection.port) \(try Self.hostKey())\n".write(to: base.appendingPathComponent("known_hosts"), atomically: true, encoding: .utf8)
-    }
-
     /// The public host key `local-sshd.sh` keeps beside the client key.
     static func hostKeyFile() throws -> URL {
         guard let identity else { throw TransferError.failed("TRANSFER_TEST_IDENTITY is not set") }
@@ -114,14 +115,13 @@ struct ServerHarness {
     }
 }
 
-/// Runs `body` with a fresh harness, logged in first when `connected` (with the server's key
-/// already known), and always awaits its cleanup, when it throws too. Its prompts answer for
-/// every operation, as a window's do.
-func withHarness(_ name: String, connected: Bool = false, _ body: (ServerHarness) async throws -> Void) async throws {
-    let h = try ServerHarness(name)
+/// Runs `body` with a fresh harness, logged in first when `connected`, and always awaits its
+/// cleanup, when it throws too. Its prompts answer for every operation, as a window's do.
+/// `knownHost: false` leaves the server's key unknown, for a test of the host-key questions.
+func withHarness(_ name: String, connected: Bool = false, knownHost: Bool = true, _ body: (ServerHarness) async throws -> Void) async throws {
+    let h = try ServerHarness(name, knownHost: knownHost)
     do {
         if connected {
-            try h.trustHostKey()
             _ = try await h.session.connect(prompts: h.prompts)
         }
         try await OperationPrompts.$current.withValue(h.prompts) { try await body(h) }
