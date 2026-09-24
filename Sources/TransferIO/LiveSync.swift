@@ -645,9 +645,9 @@ actor LiveSync {
         }
         let id = LiveFileID()
         let folder = root.appendingPathComponent("\(connection.rawValue.uuidString)/\(id.rawValue.uuidString)", isDirectory: true)
+        let file = try LocalPlacement.child(folder, name: item.name)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
-        let file = folder.appendingPathComponent(item.name)
         do {
             try await server.liveFetch(item, to: file, interactive: true)
         } catch {

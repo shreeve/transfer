@@ -116,6 +116,21 @@ struct LiveSyncTests {
         }
     }
 
+    /// The working copy was named by joining the server's name onto the Live folder, so a name
+    /// such as `..` or one holding NUL reached outside the copy's own folder.
+    @Test func aHostileServerNameNeverLeavesTheLiveFolder() async throws {
+        try await withLive("hostile") { h in
+            let live = h.store.root.appendingPathComponent("Live", isDirectory: true)
+            for bytes in [Array("/srv/..".utf8), Array("/srv/a".utf8) + [0] + Array("b".utf8)] {
+                let path = RemotePath(bytes: bytes)
+                await h.fake.put(path, "hostile", mtime: Self.serverNow)
+                await #expect(throws: TransferError.self) { _ = try await h.live.open(path, on: h.connection) }
+            }
+            #expect(await h.files().isEmpty)
+            try #expect(FileManager.default.subpathsOfDirectory(atPath: live.path) == [])
+        }
+    }
+
     @Test func touchOnlyDoesNotUpload() async throws {
         try await withLive("touch") { h in
             let (local, id) = try await openLive(h, note, "same bytes")
