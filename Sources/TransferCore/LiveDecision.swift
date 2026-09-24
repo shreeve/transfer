@@ -167,16 +167,9 @@ public enum LiveDecision {
     }
 
     public static func decide(_ state: LiveState, local: LiveLocal, server: LiveServerFact, intent: LiveIntent = .sync) -> LiveAction {
-        let stamp: LiveStamp
-        let digest: String?
-        switch local {
-        case .missing(again: false):
-            return .recheckMissing
-        case .missing(again: true):
+        guard case .present(let stamp, let digest) = local else {
+            if local == .missing(again: false) { return .recheckMissing }
             return state.dirty || state.conflict ? .failMissing : .forget
-        case .present(let found, let foundDigest):
-            stamp = found
-            digest = foundDigest
         }
         switch localChange(state, stamp, digest: digest) {
         case .needDigest:

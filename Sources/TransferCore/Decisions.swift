@@ -34,11 +34,7 @@ public enum EditableFile {
     public static func openKind(fileName: String, extensions: Set<String>) -> OpenKind {
         let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
         if extensions.contains(ext) { return .live }
-        if let type = UTType(filenameExtension: ext) {
-            if type.conforms(to: .plainText) || type.conforms(to: .sourceCode) {
-                return .live
-            }
-        }
+        if let type = UTType(filenameExtension: ext), type.conforms(to: .plainText) || type.conforms(to: .sourceCode) { return .live }
         return .view
     }
 }
@@ -169,8 +165,6 @@ public struct SortConfiguration: Hashable, Sendable, Codable {
         self.foldersFirst = foldersFirst
     }
 
-    private enum CodingKeys: String, CodingKey { case column, ascending, caseInsensitive, foldersFirst }
-
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         column = try container.decodeIfPresent(String.self, forKey: .column) ?? "name"
@@ -182,27 +176,13 @@ public struct SortConfiguration: Hashable, Sendable, Codable {
 
 public struct BrowserSnapshot: Hashable, Sendable {
     public var connectionID: ConnectionID?
-    public var path: RemotePath
-    public var selection: Set<RemotePath>
-    public var viewMode: ViewMode
-    public var sort: SortConfiguration
-    public var showsHidden: Bool
+    public var path = RemotePath(bytes: [0x2F])
+    public var selection: Set<RemotePath> = []
+    public var viewMode = ViewMode.list
+    public var sort = SortConfiguration()
+    public var showsHidden = false
 
-    public init(
-        connectionID: ConnectionID? = nil,
-        path: RemotePath = RemotePath(bytes: [0x2F]),
-        selection: Set<RemotePath> = [],
-        viewMode: ViewMode = .list,
-        sort: SortConfiguration = SortConfiguration(),
-        showsHidden: Bool = false
-    ) {
-        self.connectionID = connectionID
-        self.path = path
-        self.selection = selection
-        self.viewMode = viewMode
-        self.sort = sort
-        self.showsHidden = showsHidden
-    }
+    public init() {}
 }
 
 /// What the column view shows for a location: one column per folder from the root down to the
@@ -222,21 +202,12 @@ public enum ColumnTrail {
     }
 
     public static func columns(root: RemotePath, path: RemotePath, selection: Set<RemotePath>) -> [Column] {
-        var folders = [path]
-        if path.isInside(root) {
-            while let last = folders.last, last != root, let parent = last.parent { folders.append(parent) }
-            folders.reverse()
-        } else {
-            folders = [root]
+        var folders = [path.isInside(root) ? path : root]
+        while let last = folders.last, last != root, let parent = last.parent { folders.append(parent) }
+        folders.reverse()
+        return folders.enumerated().map { index, folder in
+            Column(folder: folder, selected: index + 1 < folders.count ? [folders[index + 1]] : selection.filter { $0.parent == folder })
         }
-        var columns: [Column] = []
-        for (index, folder) in folders.enumerated() {
-            let selected: Set<RemotePath> = index + 1 < folders.count
-                ? [folders[index + 1]]
-                : selection.filter { $0.parent == folder }
-            columns.append(Column(folder: folder, selected: selected))
-        }
-        return columns
     }
 }
 
@@ -462,10 +433,9 @@ public enum RetryPolicy {
     public static let delays: [Double] = [1, 2, 4]
 
     public static func isRetryable(_ error: Error) -> Bool {
-        guard let error = error as? TransferError else { return false }
-        switch error {
-        case .connectionLost, .timeout: return true
-        default: return false
+        switch error as? TransferError {
+        case .connectionLost?, .timeout?: true
+        default: false
         }
     }
 

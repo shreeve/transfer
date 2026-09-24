@@ -76,17 +76,8 @@ public struct ClipTally: Hashable, Sendable {
 
     /// A copied item.
     public mutating func add(root entry: TreeEntry) {
-        switch entry {
-        case .directory:
-            folders += 1
-        case .file(let size, _):
-            files += 1
-            allFiles += 1
-            bytes += size
-        case .link, .other:
-            files += 1
-            allFiles += 1
-        }
+        if entry == .directory { folders += 1 } else { files += 1 }
+        add(inside: entry)
     }
 
     /// Something inside a copied folder. Folders inside are not counted.
@@ -143,10 +134,7 @@ public enum PasteRules {
     /// `/srv/x/../site/sub` is inside `/srv/site`.
     public static func refusal(sources: [RemotePath], into folder: RemotePath) -> String? {
         let folder = folder.normalized
-        for source in sources where folder.isInside(source.normalized) {
-            return "“\(source.name)” cannot be pasted into itself."
-        }
-        return nil
+        return sources.first { folder.isInside($0.normalized) }.map { "“\($0.name)” cannot be pasted into itself." }
     }
 }
 
