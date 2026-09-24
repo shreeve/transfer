@@ -12,11 +12,6 @@ struct RemoteDragPayload: Codable {
 
     var remotePaths: [RemotePath] { paths.map(RemotePath.init(bytes:)) }
 
-    static func read(from pasteboard: NSPasteboard) -> RemoteDragPayload? {
-        guard let data = pasteboard.data(forType: remoteDragType) else { return nil }
-        return try? JSONDecoder().decode(RemoteDragPayload.self, from: data)
-    }
-
     /// The payload naming `items` on `session`'s server, for a drag or the clipboard.
     static func data(for items: [RemoteItem], session: any RemoteSession) -> Data {
         let payload = RemoteDragPayload(connection: session.connection.id.rawValue, paths: items.map(\.path.bytes))
@@ -118,30 +113,40 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
     }
 }
 
-/// What a drop landed on and what it carried.
-enum DropAction {
-    case uploadFiles([URL], into: RemotePath)
-    case moveRemote([RemotePath], into: RemotePath)
+/// What a drop carried, and whether it moves the items into the folder it landed on or copies them.
+struct DropAction {
+    var sources: TransferRequest.Sources
+    var folder: RemotePath
+    var moving = false
 
-    /// Files from outside copy in; remote items move.
-    var operation: NSDragOperation {
-        if case .uploadFiles = self { return .copy }
-        return .move
-    }
+    var operation: NSDragOperation { moving ? .move : .copy }
 }
 
-/// Decides a drop onto `folder` from the pasteboard. Nil when nothing usable is there.
+/// What a drop onto `folder` does, or nil to refuse it, in the list, column, and icon views.
+/// Remote paths are honored only from a drag that began in this app: any other app could put
+/// paths on a drag pasteboard and have a drop move them. As in Finder, a drag between folders of
+/// one server moves, and copies with Option held; a drag from another server's window copies.
 @MainActor
-func dropAction(from pasteboard: NSPasteboard, onto folder: RemotePath, connection: ConnectionID) -> DropAction? {
-    if let payload = RemoteDragPayload.read(from: pasteboard) {
-        guard payload.connection == connection.rawValue else { return nil }
-        let paths = payload.remotePaths.filter { path in
-            path != folder && path.parent != folder && !folder.isInside(path)
-        }
-        return paths.isEmpty ? nil : .moveRemote(paths, into: folder)
+func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: TransferModel) -> DropAction? {
+    guard let connection = model.snapshot.connectionID else { return nil }
+    let pasteboard = info.draggingPasteboard
+    guard pasteboard.types?.contains(remoteDragType) == true else {
+        let urls = pasteboard.fileURLs
+        return urls.isEmpty ? nil : DropAction(sources: .mac(urls), folder: folder)
     }
-    let urls = pasteboard.fileURLs
-    return urls.isEmpty ? nil : .uploadFiles(urls, into: folder)
+    guard info.draggingSource != nil, let data = pasteboard.data(forType: remoteDragType),
+          let payload = try? JSONDecoder().decode(RemoteDragPayload.self, from: data) else { return nil }
+    let source = ConnectionID(rawValue: payload.connection)
+    let mask = info.draggingSourceOperationMask
+    if source != connection {
+        return mask.contains(.copy) ? DropAction(sources: .server(source, payload.remotePaths), folder: folder) : nil
+    }
+    let moving = mask.contains(.move)
+    guard moving || mask.contains(.copy) else { return nil }
+    // A folder never goes into itself; a move into the folder an item is already in does nothing,
+    // but a copy there makes "name copy" beside it.
+    let paths = payload.remotePaths.filter { !folder.isInside($0) && !(moving && $0.parent == folder) }
+    return paths.isEmpty ? nil : DropAction(sources: .server(connection, paths), folder: folder, moving: moving)
 }
 
 /// The name under an icon in icon view. It starts drags out and takes drops onto folder tiles.
@@ -267,8 +272,8 @@ final class IconItemView: NSView, NSDraggingSource {
     }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        guard item.kind == .directory, let model, let connection = model.snapshot.connectionID else { return [] }
-        return dropAction(from: sender.draggingPasteboard, onto: item.path, connection: connection)?.operation ?? []
+        guard item.kind == .directory, let model else { return [] }
+        return dropAction(for: sender, onto: item.path, model: model)?.operation ?? []
     }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
@@ -276,8 +281,7 @@ final class IconItemView: NSView, NSDraggingSource {
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        guard item.kind == .directory, let model, let connection = model.snapshot.connectionID,
-              let action = dropAction(from: sender.draggingPasteboard, onto: item.path, connection: connection) else { return false }
+        guard item.kind == .directory, let model, let action = dropAction(for: sender, onto: item.path, model: model) else { return false }
         Task { await model.perform(action) }
         return true
     }

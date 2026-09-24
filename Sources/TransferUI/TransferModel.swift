@@ -1048,14 +1048,7 @@ public final class TransferModel {
     }
 
     public func upload(urls: [URL], into folder: RemotePath? = nil) async {
-        guard let session else { return }
-        let target = folder ?? snapshot.path
-        for url in urls {
-            let destination = target.appending(name: Array(url.lastPathComponent.utf8))
-            enqueue(title: "Upload \(url.lastPathComponent)", path: destination) { progress in
-                try await session.upload(url, to: destination, progress: progress)
-            }
-        }
+        await transfer(.mac(urls), into: folder ?? snapshot.path, moving: false)
     }
 
     public func uploadFromPanel() async {
@@ -1069,27 +1062,7 @@ public final class TransferModel {
     }
 
     func perform(_ action: DropAction) async {
-        switch action {
-        case .uploadFiles(let urls, let folder):
-            await upload(urls: urls, into: folder)
-        case .moveRemote(let paths, let folder):
-            await move(paths, into: folder)
-        }
-    }
-
-    /// One SFTP rename per item. Never copy-then-delete. The server's change events relist the
-    /// folders on screen.
-    public func move(_ paths: [RemotePath], into folder: RemotePath) async {
-        guard let session else { return }
-        var failures: [(name: String, error: any Error)] = []
-        for path in paths {
-            do {
-                try await session.rename(path, to: folder.appending(name: path.nameBytes))
-            } catch {
-                failures.append((path.name, error))
-            }
-        }
-        reportFailures("move", failures, of: paths.count)
+        await transfer(action.sources, into: action.folder, moving: action.moving)
     }
 
     /// Queues `body` against the server the window shows now; it stays with that server.

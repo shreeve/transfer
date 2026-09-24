@@ -286,20 +286,6 @@ final class RowDrag {
     }
 }
 
-/// What a drop onto `folder` does in the list and column views, or nil to refuse it. Remote paths
-/// are honored only from a drag that began in this app: any other app could put paths on a drag
-/// pasteboard and have a drop move them. A drag with Option held asks for a copy, and a drop here
-/// only moves remote items, so it is refused rather than turned into a move.
-@MainActor
-func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: TransferModel) -> DropAction? {
-    guard let connection = model.snapshot.connectionID else { return nil }
-    let pasteboard = info.draggingPasteboard
-    if pasteboard.types?.contains(remoteDragType) == true {
-        guard info.draggingSource != nil, info.draggingSourceOperationMask.contains(.move) else { return nil }
-    }
-    return dropAction(from: pasteboard, onto: folder, connection: connection)
-}
-
 /// Serves the coordinator's context menu for the row under the mouse.
 final class RowMenuTableView: NSTableView {
     weak var coordinator: ListTable.Coordinator?
