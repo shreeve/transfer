@@ -192,11 +192,6 @@ public enum ColumnTrail {
     public struct Column: Hashable, Sendable {
         public var folder: RemotePath
         public var selected: Set<RemotePath>
-
-        public init(folder: RemotePath, selected: Set<RemotePath>) {
-            self.folder = folder
-            self.selected = selected
-        }
     }
 
     public static func columns(root: RemotePath, path: RemotePath, selection: Set<RemotePath>) -> [Column] {

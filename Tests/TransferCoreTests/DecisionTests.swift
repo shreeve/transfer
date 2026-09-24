@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import TransferCore
+@testable import TransferCore
 
 @Test func columnTrailSelectsTheWayDownToASelectedFolder() {
     let root = RemotePath(string: "/home/u")
