@@ -5,9 +5,10 @@ import TransferCore
 @testable import TransferIO
 
 /// Live sync against the ways real editors save, with the real FSEvents watcher and the local
-/// sshd (`ServerHarness`). Each scenario prints one `MATRIX` line: uploads counted two ways, from
-/// `.succeeded` shelf events and from renames onto the server file (inode changes), plus every
-/// distinct server content seen along the way.
+/// sshd (`ServerHarness`). Each scenario checks uploads counted two ways, from `.succeeded` shelf
+/// events and from renames onto the server file (inode changes), and every distinct content the
+/// server held along the way. A tool that fails prints one `MATRIX` line. Waits are on the Live
+/// worker going idle, not on fixed sleeps, except where the timing is the scenario.
 @Suite(.serialized, .enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct EditorMatrix {
     private struct LiveCase {
@@ -28,8 +29,18 @@ struct EditorMatrix {
         return LiveCase(local: local, remoteFile: remoteFile, path: path, watch: ServerWatch(remoteFile))
     }
 
-    /// Waits for the server to hold `expected` and the file to be clean, then a further 1.5 s so a
-    /// late second upload is counted too. Returns the upload count from shelf events.
+    /// Waits out what the test just did: twice, one FSEvents delivery slot (0.3 s latency), then
+    /// until the Live worker has nothing queued, due, or running. An event caused by the first
+    /// round's work, such as an upload's snapshot being read, is handled by the second.
+    private func quiesce(_ h: ServerHarness) async {
+        for _ in 0..<2 {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            _ = await waitUntil { await h.session.live.workCount(on: h.session.connection.id) == 0 }
+        }
+    }
+
+    /// Waits for the server to hold `expected` and the file to be clean, then for everything
+    /// pending to run, so a late second upload is counted too. Returns the upload count from shelf events.
     @discardableResult
     private func expectSynced(_ label: String, _ h: ServerHarness, _ c: LiveCase, _ expected: Data, allowed: Set<String> = [],
                               maxUploads: Int? = 1, sourceLocation: SourceLocation = #_sourceLocation) async -> Int {
@@ -38,7 +49,7 @@ struct EditorMatrix {
             guard let file = await h.session.liveFiles().first(where: { $0.path == c.path }) else { return false }
             return !file.dirty && !file.uploading && !file.conflict
         }
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        await quiesce(h)
         c.watch.stop()
         let file = await h.session.liveFiles().first(where: { $0.path == c.path })
         let uploads = h.events.succeeded(c.path)
@@ -125,13 +136,13 @@ struct EditorMatrix {
             let c = try await open(h, "note.txt", vimText)
             let swap = c.local.deletingLastPathComponent().appendingPathComponent(".note.txt.swp")
             try Data(repeating: 0x55, count: 4096).write(to: swap)
-            try await Task.sleep(nanoseconds: 800_000_000)
+            await quiesce(h)
             // Swap churn before the write, as vim updates it while typing.
             for index in 0..<4 {
                 try Data(repeating: UInt8(index), count: 4096 * (index + 1)).write(to: swap)
                 try await Task.sleep(nanoseconds: 150_000_000)
             }
-            try await Task.sleep(nanoseconds: 1_000_000_000)
+            await quiesce(h)
             #expect(h.events.succeeded(c.path) == 0, "swap churn alone uploaded the file")
             try run("/usr/bin/vim", ["-Nu", "NONE", "-n", "-es", "-c", "%s/one/two/", "-c", "wq", c.local.path])
             try Data(repeating: 9, count: 100).write(to: swap)
@@ -190,7 +201,7 @@ struct EditorMatrix {
     }
 
     /// A writer that stalls longer than the settle time mid-file may have its partial bytes
-    /// uploaded, by design; the final bytes must still land.
+    /// uploaded, by design: only whole chunks, never a torn one. The final bytes must still land.
     @Test func inPlaceLargeWriteWithAStall() async throws {
         try await withHarness("stall", connected: true) { h in
             let c = try await open(h, "big.txt", bigData(4_000_000, seed: 3))
@@ -198,13 +209,10 @@ struct EditorMatrix {
             let source = h.staging.appendingPathComponent("final.bin")
             try final.write(to: source)
             try python(Self.chunkedWriter, [c.local.path, source.path, "10", "0.1", "4", "1.2"])
-            let landed = await waitUntil {
-                guard (try? Data(contentsOf: c.remoteFile)) == final else { return false }
-                return await h.session.liveFiles().first?.dirty == false
-            }
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            c.watch.stop()
-            #expect(landed)
+            let step = final.count / 10
+            let chunks = Set((1..<10).map { Self.digest(final.prefix($0 * step)) })
+            await expectSynced("3 in-place 5MB with a stall", h, c, final, allowed: chunks, maxUploads: nil)
+            noStrays("3 in-place 5MB with a stall", h, allowed: ["big.txt"])
         }
     }
 
@@ -313,13 +321,17 @@ struct EditorMatrix {
     @Test func touchChmodAndXattrUploadNothing() async throws {
         try await withHarness("meta", connected: true) { h in
             let c = try await open(h, "meta.txt", Data("unchanged\n".utf8))
-            try await Task.sleep(nanoseconds: 500_000_000)
+            await quiesce(h)
             try run("/usr/bin/touch", [c.local.path])
-            try await Task.sleep(nanoseconds: 1_200_000_000)
+            await quiesce(h)
+            // A pass saw the touch: it recorded the new time and uploaded nothing.
+            let touched = LiveSync.stamp(c.local)?.mtime.timeIntervalSinceReferenceDate
+            let rows = await h.session.store.liveFiles()
+            #expect(rows.first?.syncedMtime == touched, "no pass restamped the touched copy")
             try run("/bin/chmod", ["644", c.local.path])
-            try await Task.sleep(nanoseconds: 1_200_000_000)
+            await quiesce(h)
             try run("/usr/bin/xattr", ["-w", "com.test", "x", c.local.path])
-            try await Task.sleep(nanoseconds: 2_000_000_000)
+            await quiesce(h)
             c.watch.stop()
             let file = await h.session.liveFiles().first
             #expect(h.events.succeeded(c.path) == 0)
@@ -335,7 +347,7 @@ struct EditorMatrix {
     func deleteThenRecreate(_ gapMilliseconds: Int) async throws {
         try await withHarness("unlink", connected: true) { h in
             let c = try await open(h, "gone.txt", Data("before\n".utf8))
-            try await Task.sleep(nanoseconds: 500_000_000)
+            await quiesce(h)
             let final = Data("after the unlink, gap \(gapMilliseconds)\n".utf8)
             try FileManager.default.removeItem(at: c.local)
             try await Task.sleep(nanoseconds: UInt64(gapMilliseconds) * 1_000_000)
