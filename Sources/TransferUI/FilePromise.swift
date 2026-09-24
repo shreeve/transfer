@@ -111,8 +111,7 @@ struct DropAction {
 
 /// What a drop onto `folder` does in the list, column, and icon views, or nil to refuse it. Remote
 /// paths count only from a drag begun in this app: any other app could put paths on a drag
-/// pasteboard and have a drop move them. As in Finder, a drag within one server moves (copies with
-/// Option); a drag from another server's window copies.
+/// pasteboard and have a drop move them. `PasteRules.drop` decides the rest.
 @MainActor
 func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: TransferModel) -> DropAction? {
     guard let connection = model.snapshot.connectionID else { return nil }
@@ -125,15 +124,9 @@ func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: Tr
           let payload = try? JSONDecoder().decode(RemoteDragPayload.self, from: data) else { return nil }
     let source = ConnectionID(rawValue: payload.connection)
     let mask = info.draggingSourceOperationMask
-    if source != connection {
-        return mask.contains(.copy) ? DropAction(sources: .server(source, payload.remotePaths), folder: folder) : nil
-    }
-    let moving = mask.contains(.move)
-    guard moving || mask.contains(.copy) else { return nil }
-    // A folder never goes into itself; a move into an item's own folder does nothing, but a copy
-    // there makes "name copy" beside it.
-    let paths = payload.remotePaths.filter { !folder.isInside($0) && !(moving && $0.parent == folder) }
-    return paths.isEmpty ? nil : DropAction(sources: .server(connection, paths), folder: folder, moving: moving)
+    guard let (paths, moving) = PasteRules.drop(payload.remotePaths, from: source, onto: folder, on: connection,
+                                              canCopy: mask.contains(.copy), canMove: mask.contains(.move)) else { return nil }
+    return DropAction(sources: .server(source, paths), folder: folder, moving: moving)
 }
 
 /// One icon-grid cell, hosting its AppKit view.

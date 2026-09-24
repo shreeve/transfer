@@ -268,3 +268,26 @@ import TransferCore
     #expect(QuitQuestion(unsynced: 0, running: 3)?.message == "3 transfers have not finished")
     #expect(QuitQuestion(unsynced: 0, running: 1)?.message == "A transfer has not finished")
 }
+
+/// On one server a drag moves, or copies with Option; from another server it only copies. A
+/// folder never goes into itself, and moving an item into its own folder does nothing.
+@Test func aDropMovesOnOneServerAndCopiesFromAnother() {
+    let here = ConnectionID()
+    let there = ConnectionID()
+    let folder = RemotePath(string: "/srv/dest")
+    let file = RemotePath(string: "/srv/src/a.txt")
+    let beside = RemotePath(string: "/srv/dest/b.txt")
+    let above = RemotePath(string: "/srv")
+    func drop(_ paths: [RemotePath], from source: ConnectionID, copy: Bool, move: Bool) -> [RemotePath]? {
+        PasteRules.drop(paths, from: source, onto: folder, on: here, canCopy: copy, canMove: move).map(\.paths)
+    }
+    #expect(PasteRules.drop([file], from: here, onto: folder, on: here, canCopy: true, canMove: true)?.moving == true)
+    #expect(PasteRules.drop([file], from: here, onto: folder, on: here, canCopy: true, canMove: false)?.moving == false)
+    #expect(drop([file, beside, above, folder], from: here, copy: true, move: true) == [file])
+    #expect(drop([file, beside, above], from: here, copy: true, move: false) == [file, beside])
+    #expect(drop([beside], from: here, copy: true, move: true) == nil)
+    #expect(drop([file], from: here, copy: false, move: false) == nil)
+    #expect(drop([file, above], from: there, copy: true, move: true) == [file, above])
+    #expect(PasteRules.drop([file], from: there, onto: folder, on: here, canCopy: true, canMove: true)?.moving == false)
+    #expect(drop([file], from: there, copy: false, move: true) == nil)
+}

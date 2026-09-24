@@ -135,6 +135,18 @@ public enum PasteRules {
         let folder = folder.normalized
         return sources.first { folder.isInside($0.normalized) }.map { "“\($0.name)” cannot be pasted into itself." }
     }
+
+    /// What a drop of `paths`, dragged from a window on `source`, does in `folder` on `destination`,
+    /// or nil to refuse it. As in Finder, a drag within one server moves when it may (copies with
+    /// Option); from another server it copies. A folder never goes into itself, and a move into an
+    /// item's own folder does nothing, but a copy there makes "name copy" beside it.
+    public static func drop(_ paths: [RemotePath], from source: ConnectionID, onto folder: RemotePath, on destination: ConnectionID,
+                            canCopy: Bool, canMove: Bool) -> (paths: [RemotePath], moving: Bool)? {
+        guard source == destination else { return canCopy ? (paths, false) : nil }
+        guard canMove || canCopy else { return nil }
+        let kept = paths.filter { !folder.isInside($0) && !(canMove && $0.parent == folder) }
+        return kept.isEmpty ? nil : (kept, canMove)
+    }
 }
 
 /// Whether a move may remove its original: only when this move wrote a complete copy.
