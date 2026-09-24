@@ -175,6 +175,9 @@ public protocol RemoteSession: Sendable {
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error>
     func stat(_ path: RemotePath) async throws -> RemoteItem
     func readlink(_ path: RemotePath) async throws -> String
+    /// What `path` finally names, through any chain of links, as the server resolves it: the item
+    /// at the server's REALPATH of `path`. A loop or a dangling link throws.
+    func resolve(_ path: RemotePath) async throws -> RemoteItem
     func mkdir(_ path: RemotePath) async throws
     func rename(_ source: RemotePath, to destination: RemotePath) async throws
     func remove(_ path: RemotePath) async throws

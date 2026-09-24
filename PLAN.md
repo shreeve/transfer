@@ -263,7 +263,7 @@ The mapping remains after the editor closes, the window closes, quit, and reboot
 
 Save As outside the workspace is a detached file. A working file that disappears gets a second look a second later, as an editor may be between delete and write. If a clean one is still gone, drop the mapping. If a dirty one is, mark it failed and do not upload. File > Discard Live File removes a clean mapping immediately and asks before discarding unsynced bytes. It is disabled while an upload of that file is in flight.
 
-A symlink is listed as itself. Double-click, Open, and Quick Look follow one hop. A directory hop is navigated. A file hop is viewed or opened Live at the resolved path, so a save writes the file that was read. A loop or a second hop is an error. The inspector fetches the target when that row is selected.
+A symlink is listed as itself. Double-click, Open, and Quick Look follow the whole chain of links, as the server's REALPATH resolves it. A folder at the end is navigated. A file at the end is viewed or opened Live at the resolved path, so a save writes the file that was read. A loop or a dangling link is an error. The inspector fetches the target when that row is selected.
 
 ## 7. Collisions, conflicts, and delete
 

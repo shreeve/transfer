@@ -466,9 +466,9 @@ public final class TransferModel {
     }
 
     /// Where a link to `path` lands: the folder itself, or a file's folder with the file selected.
-    /// A link to a link follows one hop. Nil when there is nothing at `path`.
+    /// Links are followed to the end. Nil when there is nothing at `path`.
     private static func landing(_ path: RemotePath, session: any RemoteSession) async -> (RemotePath, Set<RemotePath>)? {
-        guard let item = try? await session.stat(path), let target = try? await resolveLink(item, session: session) else { return nil }
+        guard let target = try? await session.resolve(path) else { return nil }
         if target.kind == .directory { return (path, []) }
         guard let parent = path.parent else { return nil }
         return (parent, [path])
@@ -833,14 +833,9 @@ public final class TransferModel {
 
     // MARK: Open
 
-    /// One hop through a symlink. A second hop is an error.
+    /// What a link finally points at, through any chain; any other item is itself.
     private static func resolveLink(_ item: RemoteItem, session: any RemoteSession) async throws -> RemoteItem {
-        guard item.kind == .symlink else { return item }
-        let link = try await session.readlink(item.path)
-        let resolved = link.hasPrefix("/") ? RemotePath(string: link) : (item.path.parent ?? RemotePath(string: "/")).appending(name: Array(link.utf8))
-        let target = try await session.stat(resolved)
-        if target.kind == .symlink { throw TransferError.failed("\(item.name) points at another link") }
-        return target
+        item.kind == .symlink ? try await session.resolve(item.path) : item
     }
 
     /// Follows the double-click rule, or forces Live when asked. Folders navigate.
@@ -1370,7 +1365,7 @@ public final class TransferModel {
 
     /// Whether `path` is a folder, through a link; nil when the server cannot say.
     private static func isFolder(_ path: RemotePath, session: any RemoteSession) async -> Bool? {
-        guard let item = try? await session.stat(path), let target = try? await resolveLink(item, session: session) else { return nil }
+        guard let target = try? await session.resolve(path) else { return nil }
         return target.kind == .directory
     }
 

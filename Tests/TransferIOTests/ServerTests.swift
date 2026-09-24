@@ -115,6 +115,40 @@ struct ServerTests {
         }
     }
 
+    /// Links were followed one hop, so a chain such as /usr/bin/java → /etc/alternatives/java →
+    /// the JDK's binary would not open (UIM-19). The server's REALPATH follows the whole chain;
+    /// a loop or a dangling link fails with an error rather than hanging.
+    @Test func linkChainsResolveToTheirEnd() async throws {
+        try await withHarness("chain", connected: true) { h in
+            let fm = FileManager.default
+            try fm.createDirectory(at: h.remote.appendingPathComponent("jdk/bin"), withIntermediateDirectories: true)
+            try Data("java".utf8).write(to: h.remote.appendingPathComponent("jdk/bin/java"))
+            try fm.createDirectory(at: h.remote.appendingPathComponent("alternatives"), withIntermediateDirectories: true)
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("alternatives/java").path, withDestinationPath: "../jdk/bin/java")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("java").path, withDestinationPath: "alternatives/java")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("home").path, withDestinationPath: "alternatives/../jdk")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("here").path, withDestinationPath: "home")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("loop-a").path, withDestinationPath: "loop-b")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("loop-b").path, withDestinationPath: "loop-a")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("gone").path, withDestinationPath: "nowhere")
+            func path(_ name: String) -> RemotePath { h.remotePath.appending(name: Array(name.utf8)) }
+
+            let java = try await h.session.resolve(path("java"))
+            #expect(java.kind == .file)
+            #expect(java.size == 4)
+            #expect(java.path == RemotePath(string: h.remote.appendingPathComponent("jdk/bin/java").path))
+            let folder = try await h.session.resolve(path("here"))
+            #expect(folder.kind == .directory)
+            #expect(folder.path == path("jdk"))
+            #expect(try await h.session.resolve(path("jdk")).path == path("jdk"))
+            for name in ["loop-a", "gone"] {
+                let error = await #expect(throws: TransferError.self) { try await h.session.resolve(path(name)) }
+                #expect(error?.localizedDescription.contains(path(name).display) == true)
+            }
+            #expect(try await h.session.resolve(path("java")).kind == .file, "the channel still works")
+        }
+    }
+
     @Test func directoryCopyRoundTripsWithSymlinks() async throws {
         try await withHarness("tree") { h in
             _ = try await h.session.connect(prompts: h.prompts)

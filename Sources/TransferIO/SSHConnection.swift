@@ -318,6 +318,16 @@ public actor SSHConnection: RemoteSession {
         try await metadataLink().readlink(path)
     }
 
+    public func resolve(_ path: RemotePath) async throws -> RemoteItem {
+        let link = try await metadataLink()
+        do {
+            return try await link.lstat(link.realpath(path))
+        } catch TransferError.noSuchFile {
+            // OpenSSH answers a loop or a dangling link with a bare "No such file".
+            throw TransferError.noSuchFile(path.display)
+        }
+    }
+
     public func mkdir(_ path: RemotePath) async throws {
         try await metadataLink().mkdir(path)
         if let parent = path.parent { pipe.emit(.directoryChanged(parent)) }
