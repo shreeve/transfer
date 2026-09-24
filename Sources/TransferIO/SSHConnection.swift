@@ -945,7 +945,7 @@ extension SSHConnection: LiveServer {
         // Carries the fingerprint out of the lane's closure.
         let written = Locked<Fingerprint?>(nil)
         try await lane.submit(.save) {
-            written.value = try await self.uploadBytes(snapshot, to: path, interactive: true, expecting: expecting, measure: true, progress: progress)
+            written.value = try await self.saveBytes(snapshot, to: path, expecting: expecting, progress: progress)
         }
         guard let print = written.value else { throw TransferError.failed("The server did not report the saved file") }
         return print

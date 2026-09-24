@@ -339,9 +339,10 @@ struct TransferServerTests {
             try Data("note".utf8).write(to: note)
             try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: note.path)
 
-            try await h.session.duplicate(h.remotePath.appending(name: Array("site".utf8)))
-            try await h.session.duplicate(h.remotePath.appending(name: Array("note.txt".utf8)))
-            try await h.session.duplicate(h.remotePath.appending(name: Array("note.txt".utf8)))
+            // As TransferModel.duplicateSelection does it: a copy on the server to the next "copy" name.
+            for (name, copy) in [("site", "site copy"), ("note.txt", "note copy.txt"), ("note.txt", "note copy 2.txt")] {
+                try await h.session.copy(h.remotePath.appending(name), to: h.remotePath.appending(copy)) { _ in }
+            }
             let copy = h.remote.appendingPathComponent("site copy")
             #expect(try Data(contentsOf: copy.appendingPathComponent("a/deep.txt")) == Data("deep".utf8))
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: copy.appendingPathComponent("link").path) == "a")
@@ -400,7 +401,7 @@ struct TransferServerTests {
             try Data("new".utf8).write(to: source)
             let taken = h.remotePath.appending(name: Array("up".utf8)).appending(name: Array("taken.txt".utf8))
             await #expect(throws: TransferError.self) {
-                try await h.session.uploadBytes(source, to: taken, interactive: false, replacing: false) { _ in }
+                try await h.session.uploadBytes(source, to: taken, replacing: false) { _ in }
             }
             #expect(try Data(contentsOf: up.appendingPathComponent("taken.txt")) == Data("theirs".utf8))
             let leftovers = try FileManager.default.contentsOfDirectory(atPath: up.path).filter { $0.contains(".transfer-") }

@@ -108,63 +108,47 @@ extension SSHConnection {
         try await copyToServer(.mac(source), at: destination, tally: tally)
     }
 
-    /// Temp-and-rename onto the server. No collision check, but without `replacing` the rename
-    /// refuses a name that something took since it was looked up. A Live save passes
-    /// `expecting`, what the destination must still be just before the rename; anything else
-    /// throws `LiveRemoteChanged` and the temp is removed, so another person's edit is never
-    /// overwritten. With `measure`, returns the temp's fingerprint, which the rename carries onto
-    /// the destination: read from our own temp, it cannot pick up someone else's later edit.
-    @discardableResult
-    func uploadBytes(
-        _ source: URL,
-        to placed: RemotePath,
-        interactive: Bool,
-        replacing: Bool = true,
-        expecting: ServerExpectation? = nil,
-        measure: Bool = false,
-        progress: @escaping @Sendable (TransferProgress) -> Void
-    ) async throws -> Fingerprint? {
+    /// Temp-and-rename onto the server, over the data channels. No collision check, but without
+    /// `replacing` the rename refuses a name that something took since it was looked up.
+    func uploadBytes(_ source: URL, to placed: RemotePath, replacing: Bool, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+        let local = LiveSync.stamp(source)
+        let mode = ((try? FileManager.default.attributesOfItem(atPath: source.path))?[.posixPermissions] as? NSNumber)?.uint32Value
+        let stamp = SFTPAttrs.stamp(mode: mode, mtime: local?.fingerprint.mtime)
         try await withRemoteTemp(for: placed) { temp in
-            let attributes = try? FileManager.default.attributesOfItem(atPath: source.path)
-            let mode = (attributes?[.posixPermissions] as? NSNumber)?.uint32Value
-            let mtime = (attributes?[.modificationDate] as? Date).map(SFTPTime.seconds)
-            // A Live save keeps the server file's permissions, set below: the working copy is
-            // private (0600), and its mode would take a script's execute bit and make a web page
-            // unreadable. Any other upload carries the local file's mode, as a copy does.
-            let stamp = SFTPAttrs.stamp(mode: expecting == nil ? mode : nil, mtime: mtime)
-            let size = (attributes?[.size] as? NSNumber)?.uint64Value
-            guard interactive || measure || expecting != nil else {
-                // The temp is renamed on the channel that wrote it, once every write is acknowledged.
-                return try await withData(DataShare(size: size)) { link in
-                    try await self.send(source, size: size, to: temp, on: link, stamp: stamp, progress: progress)
-                    try await link.place(temp, onto: placed, replacing: replacing)
-                    return nil
-                }
+            // The temp is renamed on the channel that wrote it, once every write is acknowledged.
+            try await withData(DataShare(size: local?.size)) { link in
+                try await self.send(source, size: local?.size, to: temp, on: link, stamp: stamp, progress: progress)
+                try await link.place(temp, onto: placed, replacing: replacing)
             }
-            if interactive {
-                try await withInteractive { link in try await link.upload(source, to: temp, stamp: stamp, progress: progress) }
-            } else {
-                try await withData(DataShare(size: size)) { link in
-                    try await self.send(source, size: size, to: temp, on: link, stamp: stamp, progress: progress)
-                }
-            }
+        }
+    }
+
+    /// A Live save, on the interactive channel: `expecting` is what the destination must still be
+    /// just before the rename; anything else throws `LiveRemoteChanged` and the temp is removed,
+    /// so another person's edit is never overwritten. Returns the temp's fingerprint, which the
+    /// rename carries onto the destination: read from our own temp, it cannot pick up someone
+    /// else's later edit.
+    func saveBytes(_ source: URL, to placed: RemotePath, expecting: ServerExpectation, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> Fingerprint? {
+        // Only the time: a Live save keeps the server file's permissions, set below. The working
+        // copy is private (0600), and its mode would take a script's execute bit and make a web
+        // page unreadable.
+        let stamp = SFTPAttrs.stamp(mode: nil, mtime: LiveSync.stamp(source)?.fingerprint.mtime)
+        return try await withRemoteTemp(for: placed) { temp in
+            try await withInteractive { link in try await link.upload(source, to: temp, stamp: stamp, progress: progress) }
             let link = try await metadataLink()
-            var written: Fingerprint?
-            if measure || expecting != nil { written = Fingerprint(item: try await link.lstat(temp)) }
-            if let expecting {
-                let found = try await existing(placed, on: link)
-                let now = found.flatMap(Fingerprint.init(item:))
-                // "Absent" means nothing at all there: a folder or a link is not absent.
-                let matches = switch expecting {
-                case .file(let print): now == print
-                case .absent: found == nil
-                }
-                // A save that runs again after it already landed finds its own bytes there.
-                if !matches, now == nil || now != written { throw LiveRemoteChanged() }
-                // A new file keeps the mode the server gave the temp when it was created.
-                if let kept = found?.mode { try? await link.setstat(temp, SFTPAttrs(permissions: kept & 0o7777)) }
+            let written = Fingerprint(item: try await link.lstat(temp))
+            let found = try await existing(placed, on: link)
+            let now = found.flatMap(Fingerprint.init(item:))
+            // "Absent" means nothing at all there: a folder or a link is not absent.
+            let matches = switch expecting {
+            case .file(let print): now == print
+            case .absent: found == nil
             }
-            try await link.place(temp, onto: placed, replacing: replacing)
+            // A save that runs again after it already landed finds its own bytes there.
+            if !matches, now == nil || now != written { throw LiveRemoteChanged() }
+            // A new file keeps the mode the server gave the temp when it was created.
+            if let kept = found?.mode { try? await link.setstat(temp, SFTPAttrs(permissions: kept & 0o7777)) }
+            try await link.replace(temp, onto: placed)
             return written
         }
     }
@@ -175,9 +159,8 @@ extension SSHConnection {
     static let stripeSize: UInt64 = 8 << 20
     static let stripeWidth = 4
 
-    /// Reads the server's file into `file`: over one data channel, which a small file shares with
-    /// others, and for a large one over up to three more channels that are free now as well, each
-    /// reading parts of the file into their own offsets. Any part failing fails the whole file.
+    /// Reads the server's file into `file` over one data channel, which a small file shares with
+    /// others, and a large one also over the channels free now.
     private func receive(_ path: RemotePath, info: RemoteItem, into file: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         // A second channel opens the file again, and helps only when that is still the same file.
         guard let size = info.size, size >= Self.stripeSize, let print = Fingerprint(item: info) else {
@@ -188,21 +171,25 @@ extension SSHConnection {
         }
         try await withData(.whole) { link in
             let parts = try DownloadParts(file, size: size, progress: progress)
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask { try await link.receive(path, into: parts) }
-                for _ in 1..<Self.stripeWidth {
-                    group.addTask { _ = try await self.withSpareData { try await $0.receive(path, into: parts, matching: print) } }
-                }
-                try await group.waitForAll()
-            }
+            try await striped({ try await link.receive(path, into: parts) }) { try await $0.receive(path, into: parts, matching: print) }
             try parts.finish()
         }
     }
 
-    /// Writes `source`, of `size` bytes, into `temp`, a file it creates: over `link`, and for a
-    /// large file over up to three more channels that are free now as well, each writing parts of
-    /// the file at their offsets. `stamp` goes on once every part is in. Any part failing fails
-    /// the whole file.
+    /// Runs `first`, and `helper` on each of up to three more data channels free now, each taking
+    /// the parts of the file it asks for next, until all are done. Any failing fails the whole.
+    private func striped(_ first: @escaping @Sendable () async throws -> Void, helper: @escaping @Sendable (SFTPChannel) async throws -> Void) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask(operation: first)
+            for _ in 1..<Self.stripeWidth {
+                group.addTask { _ = try await self.withSpareData(helper) }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    /// Writes `source`, of `size` bytes, into `temp`, a file it creates, over `link`, and a large
+    /// one also over the channels free now. `stamp` goes on once every part is in.
     private func send(
         _ source: URL,
         size: UInt64?,
@@ -217,13 +204,7 @@ extension SSHConnection {
         }
         let parts = try UploadParts(source, progress: progress)
         let handle = try await link.create(temp)
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await link.send(parts, to: handle) }
-            for _ in 1..<Self.stripeWidth {
-                group.addTask { _ = try await self.withSpareData { try await $0.send(parts, into: temp) } }
-            }
-            try await group.waitForAll()
-        }
+        try await striped({ try await link.send(parts, to: handle) }) { try await $0.send(parts, into: temp) }
         try? await link.setstat(temp, stamp)
         parts.finish()
     }
@@ -255,7 +236,11 @@ extension SSHConnection {
     ) async throws {
         switch item.kind {
         case .directory:
-            guard let local = try await localFolder(named: name, in: folder, taken: taken) else { return }
+            guard let local = try await settleLocally(.folder, named: name, in: folder, taken: taken) else { return }
+            if local.found != .folder {
+                try LocalPlacement.makeFolder(local.url, replacing: local.found != nil)
+                LocalPlacement.quarantine(local.url)
+            }
             // Names this listing already used. A later one that folds the same (a duplicate, or two
             // names this Mac's disk takes for one) collides even before the first has landed.
             var used: Set<String> = []
@@ -263,13 +248,14 @@ extension SSHConnection {
                 try Task.checkCancellation()
                 let taken = !used.insert(Placement.fold(child.name)).inserted
                 do {
-                    try await placeDown(child, named: child.name, in: local, taken: taken, link: link, group: &group, tally: tally)
+                    try await placeDown(child, named: child.name, in: local.url, taken: taken, link: link, group: &group, tally: tally)
                 } catch {
                     try tally.failed(child.name, error)
                 }
             }
         case .symlink:
-            try await localLink(try await link.readlink(item.path), named: name, in: folder, taken: taken)
+            let target = try await link.readlink(item.path)
+            if let spot = try await settleLocally(.link(target), named: name, in: folder, taken: taken) { try LocalPlacement.makeLink(spot.url, target: target) }
             tally.finished()
         case .file:
             guard let placed = try await settleLocally(.file(Fingerprint(item: item)), named: name, in: folder, taken: taken) else {
@@ -293,39 +279,15 @@ extension SSHConnection {
     /// spot now; nil to skip it. What holds the name is read without following a link, and anything
     /// but the same file or link is asked about. `taken` says an earlier entry of the same listing
     /// claimed the name and may not have landed yet.
-    private func settleLocally(_ incoming: PlacedItem, named name: String, in folder: URL, taken: Bool = false) async throws -> (url: URL, found: PlacedItem?)? {
+    private func settleLocally(_ incoming: PlacedItem, named name: String, in folder: URL, taken: Bool) async throws -> (url: URL, found: PlacedItem?)? {
         let url = try LocalPlacement.child(folder, name: name)
         var found = try LocalPlacement.occupant(url)
         if taken, found == nil { found = .other }
-        switch Placement.settle(incoming, onto: found) {
-        case .write, .merge:
-            return (url, found)
-        case .skip:
-            return nil
-        case .typeMismatch:
-            throw TransferError.typeMismatch(name)
-        case .collide:
-            switch try await collisionChoice(for: name) {
-            case .skip: return nil
-            case .replace: return (url, found)
-            case .keepBoth: return (try LocalPlacement.keepBoth(url), nil)
-            }
+        switch try await settle(incoming, onto: found, named: name, shown: name) {
+        case .skip: return nil
+        case .replace: return (url, found)
+        case .keepBoth: return (try LocalPlacement.keepBoth(url), nil)
         }
-    }
-
-    /// The real folder a server folder named `name` merges into or is made as; nil to skip it.
-    private func localFolder(named name: String, in folder: URL, taken: Bool = false) async throws -> URL? {
-        guard let spot = try await settleLocally(.folder, named: name, in: folder, taken: taken) else { return nil }
-        if spot.found != .folder {
-            try LocalPlacement.makeFolder(spot.url, replacing: spot.found != nil)
-            LocalPlacement.quarantine(spot.url)
-        }
-        return spot.url
-    }
-
-    private func localLink(_ target: String, named name: String, in folder: URL, taken: Bool = false) async throws {
-        guard let spot = try await settleLocally(.link(target), named: name, in: folder, taken: taken) else { return }
-        try LocalPlacement.makeLink(spot.url, target: target)
     }
 
     // MARK: Copies onto the server
@@ -394,7 +356,8 @@ extension SSHConnection {
             guard let folder = try await remoteFolder(destination, found: found, tally: tally) else { return }
             // A folder just made holds nothing to collide with; one already there is listed once,
             // not looked up name by name, which cost a round trip per file (PERF-03).
-            let held = folder.made ? Holdings() : try await holdings(of: folder.path, link: link)
+            var held = Holdings()
+            if !folder.made { for try await item in await link.list(folder.path) { held.add(item) } }
             switch source {
             case .mac(let url):
                 for child in try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
@@ -415,7 +378,7 @@ extension SSHConnection {
                 do {
                     switch source {
                     case .mac(let url):
-                        try await self.uploadBytes(url, to: placed.path, interactive: false, replacing: replacing, progress: tally.file())
+                        try await self.uploadBytes(url, to: placed.path, replacing: replacing, progress: tally.file())
                         tally.finished()
                     case .server(let item):
                         try await self.copyFile(item, to: placed.path, replacing: replacing)
@@ -439,10 +402,9 @@ extension SSHConnection {
         group: inout ThrowingTaskGroup<Void, Error>,
         tally: CopyTally
     ) async throws {
-        let name: [UInt8]
-        switch source {
-        case .mac(let url): name = Array(url.lastPathComponent.utf8)
-        case .server(let item): name = item.path.nameBytes
+        let name = switch source {
+        case .mac(let url): Array(url.lastPathComponent.utf8)
+        case .server(let item): item.path.nameBytes
         }
         let destination = folder.appending(name: name)
         do {
@@ -483,26 +445,18 @@ extension SSHConnection {
             return try await settleRemotely(incoming, at: landed, found: try await existing(landed), tally: tally)
         }
         let there = try await placedItem(found)
-        switch Placement.settle(incoming, onto: there, moving: tally.moving && !tally.wrote(proposed)) {
-        case .write, .merge:
-            return (proposed, there)
+        let moving = tally.moving && !tally.wrote(proposed)
+        switch try await settle(incoming, onto: there, moving: moving, named: proposed.name, shown: proposed.display) {
         case .skip:
             return nil
-        case .typeMismatch:
-            throw TransferError.typeMismatch(proposed.display)
-        case .collide:
-            switch try await collisionChoice(for: proposed.name) {
-            case .skip:
-                return nil
-            case .replace:
-                return (proposed, there)
-            case .keepBoth:
-                let parent = proposed.parent ?? RemotePath(string: "/")
-                let name = Placement.keepBoth(proposed.name, among: try await listedNames(parent))
-                let landed = parent.appending(name: Array(name.utf8))
-                tally.record(landed, for: proposed)
-                return (landed, nil)
-            }
+        case .replace:
+            return (proposed, there)
+        case .keepBoth:
+            let parent = proposed.parent ?? RemotePath(string: "/")
+            let name = Placement.keepBoth(proposed.name, among: try await listedNames(parent))
+            let landed = parent.appending(name: Array(name.utf8))
+            tally.record(landed, for: proposed)
+            return (landed, nil)
         }
     }
 
@@ -517,13 +471,6 @@ extension SSHConnection {
         try await link.mkdir(spot.path)
         tally.record(spot.path)
         return (spot.path, true)
-    }
-
-    /// What `folder` holds, from one listing.
-    private func holdings(of folder: RemotePath, link: SFTPChannel) async throws -> Holdings {
-        var held = Holdings()
-        for try await item in await link.list(folder) { held.add(item) }
-        return held
     }
 
     /// A link is copied as a link, settled like a file: the same link is kept, anything else is
@@ -735,32 +682,29 @@ extension SSHConnection {
         }
     }
 
-    // MARK: Duplicate
-
-    /// A copy beside the item, file, link, or folder, made on the server like any other copy.
-    public func duplicate(_ path: RemotePath) async throws {
-        guard let parent = path.parent else { throw TransferError.failed("The root folder cannot be duplicated") }
-        let name = KeepBothName.duplicate(existing: try await listedNames(parent), original: path.name)
-        try await copy(path, to: parent.appending(name: Array(name.utf8))) { _ in }
-    }
-
     // MARK: Collisions
 
-    /// The operation's answer for a file that already has the name. Never the login sink, which
-    /// belongs to whichever window logged in; with nobody to ask, the operation fails.
-    private func collisionChoice(for name: String) async throws -> NameCollisionChoice {
-        guard let choice = await OperationPrompts.current?.resolveCollision(fileName: name) else {
-            throw TransferError.failed("“\(name)” already exists there, and there is no window to ask whether to replace it")
+    /// Where `incoming` goes when `found` holds its name, on either side: `.replace` writes there
+    /// (onto nothing, into a folder it merges with, or over what the user chose to replace),
+    /// `.keepBoth` beside it. A collision is the operation's question, never the login sink's,
+    /// which belongs to whichever window logged in; with nobody to ask, the operation fails.
+    /// `shown` names the item in a type mismatch.
+    private func settle(_ incoming: PlacedItem, onto found: PlacedItem?, moving: Bool = false, named name: String, shown: String) async throws -> NameCollisionChoice {
+        switch Placement.settle(incoming, onto: found, moving: moving) {
+        case .write, .merge: return .replace
+        case .skip: return .skip
+        case .typeMismatch: throw TransferError.typeMismatch(shown)
+        case .collide:
+            guard let choice = await OperationPrompts.current?.resolveCollision(fileName: name) else {
+                throw TransferError.failed("“\(name)” already exists there, and there is no window to ask whether to replace it")
+            }
+            return choice
         }
-        return choice
     }
 
     func listedNames(_ path: RemotePath) async throws -> Set<String> {
         var names: Set<String> = []
-        let link = try await metadataLink()
-        for try await item in await link.list(path) {
-            names.insert(item.name)
-        }
+        for try await item in try await metadataLink().list(path) { names.insert(item.name) }
         return names
     }
 }
