@@ -2,12 +2,6 @@ import CryptoKit
 import Foundation
 import TransferCore
 
-/// What the server must hold just before a save's rename. Anything else makes it a conflict.
-enum ServerExpectation: Sendable, Equatable {
-    case file(Fingerprint)
-    case absent
-}
-
 struct LiveRemoteChanged: Error {}
 
 /// What Live sync needs from a server. `SSHConnection` conforms; tests use a fake.
