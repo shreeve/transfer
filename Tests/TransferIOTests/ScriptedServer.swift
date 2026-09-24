@@ -33,15 +33,22 @@ final class ScriptedServer: @unchecked Sendable {
     private let buffer = Locked(Data())
 
     /// With `extensions`, INIT is answered with a VERSION that lists them and the handshake is done
-    /// before this returns. With nil, nothing is answered until the test sends it.
+    /// before this returns. With nil, nothing is answered until the test sends it. After answering a
+    /// request of type `stopReadingAfter`, the server reads nothing more, as a hung one, and the
+    /// channel's pipe fills.
     init(
         extensions: [String]? = [],
+        stopReadingAfter: UInt8? = nil,
+        stallLimit: Duration = .seconds(60),
+        handshakeLimit: Duration = .seconds(15),
         answer: @escaping @Sendable (Request) -> Data? = { _ in nil }
     ) async throws {
         channel = SFTPChannel(
             process: nil,
             input: toServer.fileHandleForWriting,
-            output: toChannel.fileHandleForReading
+            output: toChannel.fileHandleForReading,
+            stallLimit: stallLimit,
+            handshakeLimit: handshakeLimit
         )
         let replies = toChannel.fileHandleForWriting
         let (buffer, requests) = (buffer, requests)
@@ -54,7 +61,7 @@ final class ScriptedServer: @unchecked Sendable {
             let packets: [Request] = buffer.withLock { buffer in
                 buffer.append(data)
                 var packets: [Request] = []
-                while let packet = SFTPWire.popPacket(from: &buffer) {
+                while let packet = try? SFTPWire.popPacket(from: &buffer) {
                     var reader = ByteReader(packet.rest)
                     let id = (try? reader.u32()) ?? 0
                     packets.append(Request(type: packet.type, id: id, body: Data(packet.rest.dropFirst(4))))
@@ -66,6 +73,10 @@ final class ScriptedServer: @unchecked Sendable {
                 let reply = request.type == SFTPCode.initialize
                     ? extensions.map(Self.version) : answer(request)
                 if let reply { try? replies.write(contentsOf: reply) }
+                if request.type == stopReadingAfter {
+                    handle.readabilityHandler = nil
+                    return
+                }
             }
         }
         await channel.start()

@@ -5,20 +5,50 @@ actor SFTPChannel {
     /// The ssh passenger, ended on close. Nil for a channel a test drives over its own pipes.
     private let process: Process?
     private let input: FileHandle
+    /// Packets are written on this queue, not in the actor: uploads keep 2 MB in flight and ssh's
+    /// stdin pipe holds 64 KB, and a blocked write(2) would hold the actor, its reader included,
+    /// for as long as the server does not read, which for a hung server is forever.
+    private let writer = DispatchQueue(label: "SFTPChannel.writer")
     private let chunks: AsyncStream<Data>
     private let chunkSink: AsyncStream<Data>.Continuation
     private var buffer = Data()
     private var nextID: UInt32 = 1
     private var waiters: [UInt32: CheckedContinuation<SFTPMessage, Error>] = [:]
     private var versionWaiter: CheckedContinuation<UInt32, Error>?
+    /// Whether the server's VERSION has arrived. Anything else before it is not SFTP.
+    private var greeted = false
     /// The extensions the server named in its VERSION reply, such as `copy-data`.
     private(set) var extensions: Set<String> = []
     private var reader: Task<Void, Never>?
+    private var watchdog: Task<Void, Never>?
     private(set) var isOpen = true
 
-    init(process: Process?, input: FileHandle, output: FileHandle) {
+    /// A server that answers nothing for this long while requests wait has hung; the channel
+    /// closes and its requests fail with a timeout, which a transfer retries on a new channel.
+    /// Replies arrive every 64 KB during a transfer, so only a dead server is this quiet.
+    private let stallLimit: Duration
+    /// How long the server has to answer INIT.
+    private let handshakeLimit: Duration
+    private var lastHeard = ContinuousClock.now
+    private var handshakeStarted: ContinuousClock.Instant?
+    /// Requests the server may rightly take minutes over, such as `copy-data`, which answers when
+    /// the whole file is written. While one waits, silence is not a stall.
+    private var longCalls = 0
+
+    init(
+        process: Process?,
+        input: FileHandle,
+        output: FileHandle,
+        stallLimit: Duration = .seconds(60),
+        handshakeLimit: Duration = .seconds(15)
+    ) {
         self.process = process
         self.input = input
+        self.stallLimit = stallLimit
+        self.handshakeLimit = handshakeLimit
+        // A write after the server has gone fails with EPIPE, which closes the channel; the default
+        // SIGPIPE would end the whole app first.
+        _ = fcntl(input.fileDescriptor, F_SETNOSIGPIPE, 1)
         let (chunks, sink) = AsyncStream<Data>.makeStream()
         self.chunks = chunks
         chunkSink = sink
@@ -36,14 +66,26 @@ actor SFTPChannel {
 
     func start() {
         reader = Task { await self.readLoop() }
+        watchdog = Task { await self.watch() }
     }
 
+    /// Sends INIT and waits for VERSION, for at most `handshakeLimit`. Cancelling it closes the
+    /// channel.
     func handshake() async throws {
         var body = Data()
         body.appendU32(3)
-        try write(SFTPWire.packet(type: SFTPCode.initialize, body: body))
-        let version: UInt32 = try await withCheckedThrowingContinuation { continuation in
-            versionWaiter = continuation
+        handshakeStarted = .now
+        send(SFTPWire.packet(type: SFTPCode.initialize, body: body))
+        let version: UInt32 = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if isOpen {
+                    versionWaiter = continuation
+                } else {
+                    continuation.resume(throwing: TransferError.connectionLost("SSH channel closed"))
+                }
+            }
+        } onCancel: {
+            Task { await self.shutDown(.cancelled) }
         }
         if version < 3 {
             throw TransferError.failed("Server SFTP version \(version) is too old")
@@ -232,7 +274,7 @@ actor SFTPChannel {
                 body.appendU64(0)
                 body.appendBlob(to)
                 body.appendU64(0)
-                _ = try await call(SFTPCode.extended, body: body)
+                _ = try await call(SFTPCode.extended, body: body, long: true)
             } catch {
                 try? await close(to)
                 throw error
@@ -381,16 +423,36 @@ actor SFTPChannel {
     }
 
     func closeLink() {
+        shutDown(.cancelled)
+    }
+
+    /// Closes the channel for good: ends ssh, and fails the handshake and every waiting request
+    /// with `error`. Later calls fail as a closed channel.
+    private func shutDown(_ error: TransferError) {
+        guard isOpen else { return }
         isOpen = false
         process?.terminate()
         reader?.cancel()
+        watchdog?.cancel()
         chunkSink.finish()
-        for waiter in waiters.values {
-            waiter.resume(throwing: TransferError.cancelled)
-        }
-        waiters.removeAll()
-        versionWaiter?.resume(throwing: TransferError.cancelled)
+        versionWaiter?.resume(throwing: error)
         versionWaiter = nil
+        for waiter in waiters.values { waiter.resume(throwing: error) }
+        waiters.removeAll()
+    }
+
+    /// Ends a handshake past `handshakeLimit`, and a channel whose server has said nothing for
+    /// `stallLimit` while requests wait.
+    private func watch() async {
+        while isOpen {
+            try? await Task.sleep(for: (greeted ? stallLimit : min(stallLimit, handshakeLimit)) / 5)
+            let now = ContinuousClock.now
+            if versionWaiter != nil, let handshakeStarted, now - handshakeStarted > handshakeLimit {
+                shutDown(.timeout("The server did not start SFTP"))
+            } else if !waiters.isEmpty, longCalls == 0, now - lastHeard > stallLimit {
+                shutDown(.timeout("The server stopped answering"))
+            }
+        }
     }
 
     private func openDirectory(_ path: RemotePath) async throws -> Data {
@@ -433,24 +495,25 @@ actor SFTPChannel {
         _ = try await call(SFTPCode.close, body: body)
     }
 
-    private var cancelledIDs: Set<UInt32> = []
-
-    private func call(_ type: UInt8, body: Data) async throws -> SFTPMessage {
+    /// Sends one request and waits for its reply. The waiter is registered in the same actor turn
+    /// that sends the request, so no reply can arrive before it and a cancellation, which runs on
+    /// the actor after it, always finds it or finds it already answered.
+    private func call(_ type: UInt8, body: Data, long: Bool = false) async throws -> SFTPMessage {
         try Task.checkCancellation()
         guard isOpen else { throw TransferError.connectionLost("SSH channel closed") }
         let id = nextID
-        nextID += 1
+        nextID &+= 1
         var framed = Data()
         framed.appendU32(id)
         framed.append(body)
-        try write(SFTPWire.packet(type: type, body: framed))
+        // An idle channel's silence was not a stall; the clock starts with the first request.
+        if waiters.isEmpty { lastHeard = .now }
+        send(SFTPWire.packet(type: type, body: framed))
+        if long { longCalls += 1 }
+        defer { if long { longCalls -= 1 } }
         let message: SFTPMessage = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                if cancelledIDs.remove(id) != nil {
-                    continuation.resume(throwing: TransferError.cancelled)
-                } else {
-                    waiters[id] = continuation
-                }
+                waiters[id] = continuation
             }
         } onCancel: {
             Task { await self.cancelRequest(id) }
@@ -469,48 +532,56 @@ actor SFTPChannel {
     }
 
     private func cancelRequest(_ id: UInt32) {
-        if let waiter = waiters.removeValue(forKey: id) {
-            waiter.resume(throwing: TransferError.cancelled)
-        } else {
-            cancelledIDs.insert(id)
-        }
+        waiters.removeValue(forKey: id)?.resume(throwing: TransferError.cancelled)
     }
 
-    private func write(_ packet: Data) throws {
-        do {
-            try input.write(contentsOf: packet)
-        } catch {
-            throw TransferError.connectionLost("Broken SSH channel")
+    /// Queues `packet` for ssh's stdin, in order. A failed write means ssh is gone.
+    private func send(_ packet: Data) {
+        writer.async { [input] in
+            do {
+                try input.write(contentsOf: packet)
+            } catch {
+                Task { await self.shutDown(.connectionLost("Broken SSH channel")) }
+            }
         }
     }
 
     private func readLoop() async {
         for await chunk in chunks {
+            lastHeard = .now
             buffer.append(chunk)
-            while let packet = SFTPWire.popPacket(from: &buffer) {
-                if packet.type == SFTPCode.version {
-                    let version = packet.rest.prefix(4).loadU32()
-                    var reader = ByteReader(Data(packet.rest.dropFirst(4)))
-                    while let name = try? reader.utf8(), (try? reader.blob()) != nil {
-                        extensions.insert(name)
-                    }
-                    versionWaiter?.resume(returning: version)
-                    versionWaiter = nil
-                    continue
+            do {
+                while let packet = try SFTPWire.popPacket(from: &buffer) {
+                    try receive(packet)
                 }
-                guard packet.rest.count >= 4 else { continue }
-                let id = packet.rest.prefix(4).loadU32()
-                let rest = packet.rest.dropFirst(4)
-                let message = SFTPMessage(type: packet.type, rest: Data(rest))
-                waiters.removeValue(forKey: id)?.resume(returning: message)
+            } catch {
+                shutDown(greeted
+                    ? .connectionLost("The server sent a malformed SFTP packet")
+                    : .failed(SFTPWire.notSFTP(buffer)))
+                return
             }
         }
-        isOpen = false
-        let error = TransferError.connectionLost("SSH channel closed")
-        versionWaiter?.resume(throwing: error)
-        versionWaiter = nil
-        for waiter in waiters.values { waiter.resume(throwing: error) }
-        waiters.removeAll()
+        shutDown(.connectionLost("SSH channel closed"))
+    }
+
+    /// The server's VERSION first, then replies, each matched to its waiter by id. A reply
+    /// nobody waits for answers a cancelled request and is dropped.
+    private func receive(_ packet: SFTPMessage) throws {
+        var reader = ByteReader(packet.rest)
+        guard greeted else {
+            guard packet.type == SFTPCode.version else { throw SFTPWire.BadFrame() }
+            let version = try reader.u32()
+            while let name = try? reader.utf8(), (try? reader.blob()) != nil {
+                extensions.insert(name)
+            }
+            greeted = true
+            versionWaiter?.resume(returning: version)
+            versionWaiter = nil
+            return
+        }
+        let id = try reader.u32()
+        let message = SFTPMessage(type: packet.type, rest: Data(packet.rest.dropFirst(4)))
+        waiters.removeValue(forKey: id)?.resume(returning: message)
     }
 
     private func handle(in message: SFTPMessage) throws -> Data {

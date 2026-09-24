@@ -109,16 +109,41 @@ enum SFTPWire {
         return framed
     }
 
-    static func popPacket(from buffer: inout Data) -> SFTPMessage? {
+    /// The longest packet accepted, as in OpenSSH's own client (SFTP_MAX_MSG_LENGTH). The largest
+    /// reply this app asks for is a 64 KB READ; a longer length is garbage or hostile, and waiting
+    /// for that many bytes would buffer without bound.
+    static let maxPacket = 256 * 1024
+
+    /// A frame that cannot be SFTP: a length of zero or over `maxPacket`, a reply too short to
+    /// hold its id, or anything but VERSION first.
+    struct BadFrame: Error {}
+
+    /// The next whole packet off the front of `buffer`, or nil until one has arrived.
+    static func popPacket(from buffer: inout Data) throws -> SFTPMessage? {
         guard buffer.count >= 4 else { return nil }
-        let length = buffer.prefix(4).loadU32()
-        let total = 4 + Int(length)
-        guard buffer.count >= total, length > 0 else { return nil }
+        let length = Int(buffer.prefix(4).loadU32())
+        guard length > 0, length <= maxPacket else { throw BadFrame() }
+        let total = 4 + length
+        guard buffer.count >= total else { return nil }
         let payload = buffer.subdata(in: 4..<total)
         buffer.removeSubrange(0..<total)
         let type = payload[payload.startIndex]
         let rest = payload.dropFirst()
         return SFTPMessage(type: type, rest: Data(rest))
+    }
+
+    /// Why a channel's first bytes were not SFTP, for the person connecting. Usually the server's
+    /// shell printed text as it started (an `echo` in .bashrc), and its first four characters read
+    /// as a length of hundreds of megabytes. A real frame's first byte is zero.
+    static func notSFTP(_ bytes: Data) -> String {
+        let firstLine = String(decoding: bytes.prefix(200), as: UTF8.self)
+            .split(whereSeparator: \.isNewline).first ?? ""
+        let printable = String(String.UnicodeScalarView(firstLine.unicodeScalars.filter {
+            $0.properties.generalCategory != .control
+        })).trimmingCharacters(in: .whitespaces)
+        guard bytes.first != 0, !printable.isEmpty else { return "The server did not answer in SFTP" }
+        let shown = printable.count > 60 ? printable.prefix(60) + "…" : printable
+        return "The server printed “\(shown)” before SFTP started. Remove that output from the shell startup files on the server, such as .bashrc."
     }
 }
 
