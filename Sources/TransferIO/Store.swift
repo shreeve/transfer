@@ -37,13 +37,13 @@ final class Store: @unchecked Sendable {
     /// `Caches` under the custom root, so a test or dev build never reads or evicts the user's.
     let cacheRoot: URL
 
-    /// `root` defaults to `~/Library/Application Support/Transfer`.
     /// `~/Library/Application Support/Transfer`, the library when no other root is given.
     static var standardRoot: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Transfer", isDirectory: true)
     }
 
+    /// `root` defaults to `standardRoot`.
     init(root customRoot: URL? = nil) throws {
         let standard = Self.standardRoot
         let base = customRoot ?? standard
@@ -74,8 +74,9 @@ final class Store: @unchecked Sendable {
     static let schemaVersion = 3
 
     private func open() throws {
-        // A development build and the installed app can have the same library open; a write
-        // waits for the other's lock instead of failing at once.
+        // Two copies of this Transfer never share a library (the hub's lock), but an older
+        // Transfer, which takes no lock, may have it open; a write waits for its lock instead
+        // of failing at once.
         sqlite3_busy_timeout(db, 5_000)
         while try transaction(migrateOneStep) {}
         // WAL makes a commit one log append, not a rollback journal's create, write, fsync, and
@@ -106,20 +107,13 @@ final class Store: @unchecked Sendable {
         case 0:
             try adoptReleasedSchema()
         case 1:
-            // Recents were written and never read. A Live file's remote path is the server's exact
-            // bytes, which need not be UTF-8; earlier builds stored it as text, and a text row
-            // converts to the same bytes.
-            try execute("""
-            DROP TABLE IF EXISTS recents;
-            UPDATE live_files SET path = CAST(path AS BLOB) WHERE typeof(path) = 'text';
-            """)
+            // Recents were written and never read.
+            try execute("DROP TABLE IF EXISTS recents")
         case 2:
-            // Stars and remote temps are server paths too. A text row and a blob of the same bytes
-            // are different keys, so a row one of them already holds is replaced, not doubled.
-            try execute("""
-            UPDATE OR REPLACE pins SET path = CAST(path AS BLOB) WHERE typeof(path) = 'text';
-            UPDATE OR REPLACE temps SET path = CAST(path AS BLOB) WHERE typeof(path) = 'text';
-            """)
+            // Paths became exact bytes (`StoredPath`): text when they are UTF-8, a blob when not.
+            // Every path an older Transfer stored is UTF-8 text, so no row changes; a blob would
+            // not match the text an older Transfer compares with, and its Unstar would fail.
+            break
         default:
             preconditionFailure("No migration from library schema \(version)")
         }
@@ -212,8 +206,9 @@ final class Store: @unchecked Sendable {
 
     // MARK: Stars
 
-    // Paths in `pins` and `temps` are blobs of their exact bytes. They are matched and read as
-    // blobs, so a text row an older Transfer writes to the same library is the same path.
+    // Paths are stored as `StoredPath` and matched and read cast to blobs, so a path is the same
+    // whichever storage class a row has, and the rows an older Transfer writes and matches as
+    // text are the same paths.
 
     /// Starred paths live in the `pins` table, named before the sidebar called them Starred.
     func stars(connection: ConnectionID) -> [RemotePath] {
@@ -223,7 +218,7 @@ final class Store: @unchecked Sendable {
 
     func star(connection: ConnectionID, path: RemotePath, on: Bool) {
         if on {
-            write("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, path.bytes)
+            write("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, StoredPath(path.bytes))
         } else {
             write("DELETE FROM pins WHERE connection_id = ? AND CAST(path AS BLOB) = ?", connection.rawValue.uuidString, path.bytes)
         }
@@ -232,11 +227,11 @@ final class Store: @unchecked Sendable {
     // MARK: Temps
 
     func rememberTemp(_ path: RemotePath, connection: ConnectionID) {
-        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", path.bytes, connection.rawValue.uuidString)
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(path.bytes), connection.rawValue.uuidString)
     }
 
     func rememberTemp(local url: URL) {
-        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", Array(url.path.utf8), "")
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(Array(url.path.utf8)), "")
     }
 
     func forgetTemp(_ path: RemotePath) {
@@ -294,7 +289,7 @@ final class Store: @unchecked Sendable {
     func saveLive(_ row: LiveRow) {
         write(
             "INSERT OR REPLACE INTO live_files (\(Self.liveColumns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            row.id.rawValue.uuidString, row.connection.rawValue.uuidString, row.path.bytes,
+            row.id.rawValue.uuidString, row.connection.rawValue.uuidString, StoredPath(row.path.bytes),
             row.baseSize.map { Int64(bitPattern: $0) }, row.baseMtime.map { Int64($0) }, row.localPath,
             Int64(row.dirty ? 1 : 0), Int64(row.paused ? 1 : 0), row.conflict,
             row.conflictSize.map { Int64(bitPattern: $0) }, row.conflictMtime.map { Int64($0) },
@@ -402,6 +397,22 @@ extension [UInt8]: SQLValue {
             guard let base = bytes.baseAddress else { return sqlite3_bind_zeroblob(statement, index, 0) }
             return sqlite3_bind_blob(statement, index, base, Int32(bytes.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         }
+    }
+}
+
+/// A path as the library stores it: UTF-8 text, as every Transfer before the byte-exact paths
+/// wrote it and still matches it (`path = ?`, bound as text), or a blob of the exact bytes when
+/// they are not UTF-8 or hold a NUL, which text would cut short.
+private struct StoredPath: SQLValue {
+    let bytes: [UInt8]
+
+    init(_ bytes: [UInt8]) {
+        self.bytes = bytes
+    }
+
+    fileprivate func bind(_ statement: OpaquePointer?, _ index: Int32) -> Int32 {
+        guard !bytes.contains(0), let text = String(validating: bytes, as: UTF8.self) else { return bytes.bind(statement, index) }
+        return text.bind(statement, index)
     }
 }
 
