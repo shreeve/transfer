@@ -284,7 +284,7 @@ public final class Clipboard {
 /// two can be compared before a move removes the original.
 enum LocalTree {
     static func walk(_ root: URL, visit: (String, TreeEntry) -> Void) {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey]
         guard let rootEntry = entry(root, keys: keys) else { return }
         visit("", rootEntry)
         guard rootEntry == .directory,
@@ -306,7 +306,7 @@ enum LocalTree {
         guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
         if values.isSymbolicLink == true { return .link }
         if values.isDirectory == true { return .directory }
-        return .file(size: UInt64(values.fileSize ?? 0))
+        return .file(size: UInt64(values.fileSize ?? 0), mtime: values.contentModificationDate.map(SFTPTime.seconds))
     }
 }
 

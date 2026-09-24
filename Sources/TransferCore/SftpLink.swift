@@ -16,14 +16,24 @@ public struct SftpLink: Hashable, Sendable {
         self.path = path
     }
 
-    /// Nil for anything but an `sftp://` URL with a host. The path is percent-decoded.
+    /// Nil for anything but an `sftp://` URL with a host. The path is percent-decoded. A user or
+    /// host that ssh could read as an option, or that holds spaces or control characters, is no
+    /// link: they come from other apps, and they end up on ssh's command line.
     public init?(url: URL) {
-        guard url.scheme?.lowercased() == "sftp", let host = url.host(percentEncoded: false), !host.isEmpty else { return nil }
+        guard url.scheme?.lowercased() == "sftp", let host = url.host(percentEncoded: false),
+              Self.isPlainName(host) else { return nil }
+        let user = url.user(percentEncoded: false).flatMap { $0.isEmpty ? nil : $0 }
+        if let user, !Self.isPlainName(user) { return nil }
         self.host = host
-        user = url.user(percentEncoded: false).flatMap { $0.isEmpty ? nil : $0 }
+        self.user = user
         port = url.port.map(String.init)
         let path = url.path(percentEncoded: false)
         self.path = path.isEmpty ? nil : RemotePath(string: path)
+    }
+
+    private static func isPlainName(_ name: String) -> Bool {
+        !name.isEmpty && !name.hasPrefix("-")
+            && !name.unicodeScalars.contains { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }
     }
 }
 

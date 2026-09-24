@@ -38,6 +38,8 @@ actor SFTPLink {
         output.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
+                // At end of file the handler would otherwise keep firing with nothing to read.
+                handle.readabilityHandler = nil
                 chunks.finish()
             } else {
                 chunks.yield(data)
@@ -132,8 +134,21 @@ actor SFTPLink {
         _ = try await call(SFTPCode.mkdir, body: body)
     }
 
+    /// A rename or move the user asked for. It never replaces what is already at `destination`:
+    /// `posix-rename` would, and plain RENAME refuses a file there but on OpenSSH replaces an empty
+    /// folder, so the destination is looked up first. A change of case alone within one folder
+    /// skips the lookup, which on a case-insensitive disk finds the source itself.
     func rename(_ source: RemotePath, to destination: RemotePath) async throws {
-        if await posixRename(source, to: destination) { return }
+        let caseOnly = source.parent == destination.parent && source != destination
+            && source.name.lowercased() == destination.name.lowercased()
+        if caseOnly {
+            if await posixRename(source, to: destination) { return }
+            try await plainRename(source, to: destination)
+            return
+        }
+        if (try? await lstat(destination)) != nil {
+            throw TransferError.failed("“\(destination.name)” already exists there")
+        }
         try await plainRename(source, to: destination)
     }
 
@@ -260,37 +275,40 @@ actor SFTPLink {
             try await downloadSequential(handle: handle, output: output, progress: progress)
             return
         }
-        var next: UInt64 = 0
-        var received: UInt64 = 0
-        var inFlight: [(offset: UInt64, task: Task<Data, Error>)] = []
-        while received < limit || !inFlight.isEmpty {
+        // 32 requests of 64 KB keep 2 MB in flight.
+        var plan = ReadPlan(size: limit)
+        var inFlight: [(offset: UInt64, length: UInt32, task: Task<Data, Error>)] = []
+        defer { for read in inFlight { read.task.cancel() } }
+        while true {
             try Task.checkCancellation()
-            while inFlight.count < 32, next < limit {
-                let offset = next
-                let ask = UInt32(min(65_536, limit - next))
-                next += UInt64(ask)
-                let request = Task { try await self.readChunk(handle, offset: offset, length: ask) }
-                inFlight.append((offset, request))
+            while inFlight.count < 32, let request = plan.nextRequest() {
+                let task = Task { try await self.readChunk(handle, offset: request.offset, length: request.length) }
+                inFlight.append((request.offset, request.length, task))
             }
-            let nextRead = inFlight.removeFirst()
-            let chunk: Data
+            guard !inFlight.isEmpty else { break }
+            let read = inFlight.removeFirst()
             do {
-                chunk = try await nextRead.task.value
+                let chunk = try await read.task.value
+                guard chunk.count <= Int(read.length) else { throw TransferError.failed("The server sent more than was asked for") }
+                if !chunk.isEmpty {
+                    try output.seek(toOffset: read.offset)
+                    try output.write(contentsOf: chunk)
+                }
+                plan.record(offset: read.offset, length: read.length, count: UInt32(chunk.count))
+                progress(TransferProgress(completed: plan.received, total: limit))
             } catch TransferError.failed(let text) where text == "EOF" {
-                break
+                plan.endOfFile()
             }
-            if chunk.isEmpty { break }
-            try output.seek(toOffset: nextRead.offset)
-            try output.write(contentsOf: chunk)
-            received += UInt64(chunk.count)
-            progress(TransferProgress(completed: received, total: limit))
-            if chunk.count < 65_536, nextRead.offset + UInt64(chunk.count) >= limit { break }
         }
+        guard plan.isComplete else { throw TransferError.failed("The file changed on the server while it downloaded") }
     }
 
+    /// For a file with no listed size: reads in order until the server says EOF. A short reply
+    /// is not the end; only EOF or a reply with no bytes is.
     private func downloadSequential(handle: Data, output: FileHandle, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         var offset: UInt64 = 0
         while true {
+            try Task.checkCancellation()
             let chunk: Data
             do {
                 chunk = try await readChunk(handle, offset: offset, length: 65_536)
@@ -301,7 +319,6 @@ actor SFTPLink {
             try output.write(contentsOf: chunk)
             offset += UInt64(chunk.count)
             progress(TransferProgress(completed: offset))
-            if chunk.count < 65_536 { break }
         }
     }
 

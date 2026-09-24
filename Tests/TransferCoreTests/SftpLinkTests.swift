@@ -23,6 +23,15 @@ struct SftpLinkTests {
         #expect(SftpLink(url: URL(string: "sftp:///home")!) == nil)
     }
 
+    /// A user or host ssh could take for an option never reaches the New Connection sheet.
+    @Test func aUserOrHostThatLooksLikeAnOptionIsNoLink() {
+        #expect(SftpLink(url: URL(string: "sftp://-oProxyCommand=sh%20-c%20id@example.com/")!) == nil)
+        #expect(SftpLink(url: URL(string: "sftp://-oProxyCommand=id/")!) == nil)
+        #expect(SftpLink(url: URL(string: "sftp://a%20b@example.com/")!) == nil)
+        #expect(SftpLink(url: URL(string: "sftp://me%0A@example.com/")!) == nil)
+        #expect(SftpLink(url: URL(string: "sftp://me-too@my-host/")!)?.user == "me-too")
+    }
+
     /// The link that Copy Remote URL writes opens the same place.
     @Test func copyRemoteURLRoundTrips() throws {
         let saved = SavedConnection(name: "Live", host: "live", user: "shreeve")

@@ -137,6 +137,15 @@ import TransferCore
     #expect(id.socketName.count == 12)
 }
 
+/// A file dated before 1970 or after 2106 once crashed an upload and a Live stamp.
+@Test func sftpTimesClampInsteadOfTrapping() {
+    #expect(SFTPTime.seconds(Date(timeIntervalSince1970: 1_700_000_000.9)) == 1_700_000_000)
+    #expect(SFTPTime.seconds(Date(timeIntervalSince1970: -86_400)) == 0)
+    #expect(SFTPTime.seconds(Date.distantPast) == 0)
+    #expect(SFTPTime.seconds(Date.distantFuture) == UInt32.max)
+    #expect(LiveStamp(size: 1, mtime: Date(timeIntervalSince1970: -1)).fingerprint.mtime == 0)
+}
+
 @Test func directoriesAlwaysSortAboveFiles() {
     let items = [
         RemoteItem(path: RemotePath(string: "/b.txt"), kind: .file, size: 5, mtime: 9),
@@ -244,4 +253,14 @@ import TransferCore
     partial["sub/b"] = nil
     partial["extra"] = .file(size: 1)
     #expect(TreeCheck.missing(source: source, destination: partial) == ["a.txt", "sub/b"])
+}
+
+/// A move whose collision was skipped once compared the source with the file already there, and
+/// removed the source when name and size matched.
+@Test func treeCheckTellsAFileAlreadyThereFromTheCopy() {
+    let source: [String: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
+    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4, mtime: 1_700_000_000)]).isEmpty)
+    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4, mtime: 1_600_000_000)]) == [""])
+    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4)]).isEmpty)
+    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 5, mtime: 1_700_000_000)]) == [""])
 }

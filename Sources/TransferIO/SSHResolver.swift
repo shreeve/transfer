@@ -8,7 +8,7 @@ enum SSHResolver {
     static func config(for connection: SavedConnection) async -> String? {
         var arguments = ["-G"]
         if !connection.port.isEmpty { arguments += ["-p", connection.port] }
-        arguments.append(connection.destination)
+        arguments += ["--", connection.destination]
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         process.arguments = arguments
