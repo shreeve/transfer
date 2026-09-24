@@ -317,10 +317,17 @@ final class UpEntry: NSObject {}
 /// draws on top. This view's bounds are the visible region, the content pane's safe area, so each
 /// frame of the inspector or sidebar animation arrives as a new width and the whole stack moves
 /// as one piece: still while the columns fit, then abutting the inspector once they do not.
+///
+/// Columns left of the visible region are reached by panning the whole stack to the right, with
+/// Shift and a mouse wheel or a sideways swipe (`ColumnPan`), as far as the first column's left
+/// edge. A column that appears or resizes slides the stack back to rest.
 final class ColumnStack: NSView {
     let browser: TiledBrowser
     private var lastWidth: CGFloat = 0
     private var lastColumns: CGFloat = 0
+    /// How far right of its resting place the stack sits: 0 keeps the last column on this view's
+    /// right edge.
+    private var pan: CGFloat = 0
 
     init(browser: TiledBrowser) {
         self.browser = browser
@@ -329,6 +336,7 @@ final class ColumnStack: NSView {
         browser.translatesAutoresizingMaskIntoConstraints = true
         browser.autoresizingMask = []
         addSubview(browser)
+        ColumnPan.install()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -350,13 +358,15 @@ final class ColumnStack: NSView {
         let (columns, measured) = columnsWidth
         if !measured { DispatchQueue.main.async { [weak self] in self?.needsLayout = true } }
         let width = max(columns, visible)
-        let target = NSRect(x: visible - width, y: 0, width: width, height: bounds.height)
         // A column that appears or resizes while the pane is at rest slides the stack, as Finder
         // does. While the pane itself is animating, each frame is placed directly and the split
         // view's timing rules.
         let slide = visible == lastWidth && columns != lastColumns && lastColumns > 0 && window != nil
+        if columns != lastColumns { pan = 0 }
+        pan = min(pan, width - visible)
         lastWidth = visible
         lastColumns = columns
+        let target = NSRect(x: visible - width + pan, y: 0, width: width, height: bounds.height)
         if browser.frame != target {
             if slide {
                 NSAnimationContext.runAnimationGroup { context in
@@ -368,6 +378,58 @@ final class ColumnStack: NSView {
             }
         }
         if browser.firstVisibleColumn > 0 { browser.scrollColumnToVisible(0) }
+    }
+
+    /// Pans by `delta` points, positive toward the first column. False when every column already
+    /// fits, so the scroll goes on to the column under the pointer.
+    func panSideways(by delta: CGFloat) -> Bool {
+        let spare = max(columnsWidth.width, bounds.width) - bounds.width
+        guard spare > 0 else { return false }
+        let moved = min(max(pan + delta, 0), spare)
+        if moved != pan {
+            pan = moved
+            needsLayout = true
+            layoutSubtreeIfNeeded()
+        }
+        return true
+    }
+}
+
+/// Sideways scrolling over the column view: Shift with a mouse wheel, or a swipe on a trackpad or
+/// Magic Mouse whose sideways motion outweighs its vertical. Each column is its own vertical
+/// scroll view and the browser never scrolls sideways, so nothing else would take these. One
+/// monitor for the app, as `OpenShortcut` is; vertical scrolling goes on to the columns.
+@MainActor
+enum ColumnPan {
+    private static var monitor: Any?
+    /// A mouse wheel reports lines, not points: one row of the column view per line.
+    private static let lineWidth: CGFloat = 22
+
+    static func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            MainActor.assumeIsolated { takes(event) } ? nil : event
+        }
+    }
+
+    private static func takes(_ event: NSEvent) -> Bool {
+        var sideways = event.scrollingDeltaX
+        let vertical = event.scrollingDeltaY
+        // macOS turns Shift and a wheel into a sideways scroll itself; should it not, the wheel's
+        // vertical motion is the sideways one.
+        if sideways == 0, event.modifierFlags.contains(.shift) { sideways = vertical }
+        else if abs(sideways) <= abs(vertical) { return false }
+        guard sideways != 0, let stack = stack(under: event) else { return false }
+        return stack.panSideways(by: event.hasPreciseScrollingDeltas ? sideways : sideways * lineWidth)
+    }
+
+    /// The column stack under the pointer, if the pointer is over one. The sidebar and inspector
+    /// float above the stack, so a scroll over them finds their own views instead.
+    private static func stack(under event: NSEvent) -> ColumnStack? {
+        guard let frame = event.window?.contentView?.superview else { return nil }
+        var view = frame.hitTest(frame.convert(event.locationInWindow, from: nil))
+        while let current = view, !(current is ColumnStack) { view = current.superview }
+        return view as? ColumnStack
     }
 }
 
