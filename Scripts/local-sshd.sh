@@ -31,6 +31,8 @@ Subsystem sftp /usr/libexec/sftp-server
 # Each login's host-key probe connects without authenticating; repeated test runs would trip
 # OpenSSH's per-source penalty and have every connection dropped for 15 s or more.
 PerSourcePenalties no
+# Many suites log in at once; the default 10:30:100 drops unauthenticated connections early.
+MaxStartups 100:30:200
 CONF
 
 # The watcher runs sshd as its child, so `wait` returns as soon as either sshd exits or the

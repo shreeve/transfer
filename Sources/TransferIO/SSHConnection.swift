@@ -43,7 +43,6 @@ public actor SSHConnection: RemoteSession {
     let lane = InteractiveLane()
     /// Live files are `LiveSync`'s; this connection is its `LiveServer` and forwards the Live API.
     let live: LiveSync
-    private let ownsLive: Bool
     /// A config file every ssh this connection runs reads with `-F` in place of `~/.ssh/config`.
     /// Nil in the app. Tests set it so they never read the developer's config or known hosts.
     private let sshConfigFile: String?
@@ -53,14 +52,12 @@ public actor SSHConnection: RemoteSession {
     /// How long a login may take, prompts included, before it gives up.
     static let loginTimeout: Duration = .seconds(300)
 
-    /// The hub passes its one `LiveSync`. Without one, as in tests, the connection makes its own
-    /// and closes it on disconnect.
-    init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync? = nil, sshConfigFile: String? = nil) {
+    /// `live` is the hub's one `LiveSync`, shared by every connection.
+    init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync, sshConfigFile: String? = nil) {
         self.connection = connection
         self.store = store
         self.editableExtensions = editableExtensions
-        self.live = live ?? LiveSync(store: store)
-        ownsLive = live == nil
+        self.live = live
         self.sshConfigFile = sshConfigFile
         socketPath = store.root.appendingPathComponent("ssh/\(connection.id.socketName)").path
     }
@@ -250,7 +247,7 @@ public actor SSHConnection: RemoteSession {
         generation += 1
         for waiter in waiters { waiter.continuation.resume(throwing: reason) }
         waiters.removeAll()
-        if ownsLive { await live.closeAll() } else { await live.disconnected(connection.id, server: self) }
+        await live.disconnected(connection.id, server: self)
         await release(held, reason: reason)
     }
 

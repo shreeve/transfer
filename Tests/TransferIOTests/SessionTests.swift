@@ -125,7 +125,7 @@ struct SessionServerTests {
     @Test func aKeyTrustedGloballyAsksNothing() async throws {
         try await withHarness("global") { h in
             let global = h.base.appendingPathComponent("global_known_hosts")
-            try "\(try hostPattern()) \(try hostKey())\n".write(to: global, atomically: true, encoding: .utf8)
+            try "\(try hostPattern()) \(try ServerHarness.hostKey())\n".write(to: global, atomically: true, encoding: .utf8)
             try writeConfig(h, global: global.path)
             let prompts = RecordingPrompts(.cancel)
             _ = try await h.session.connect(prompts: prompts)
@@ -140,7 +140,7 @@ struct SessionServerTests {
             _ = try await h.session.connect(prompts: prompts)
             let event = try #require(prompts.events.first)
             #expect(event.situation == .firstSeen)
-            let listed = try await Subprocess.run("/usr/bin/ssh-keygen", ["-lf", hostKeyFile().path], timeout: .seconds(5))
+            let listed = try await Subprocess.run("/usr/bin/ssh-keygen", ["-lf", ServerHarness.hostKeyFile().path], timeout: .seconds(5))
             #expect(event.fingerprint == listed.stdout.split(separator: " ")[1].description)
             let known = try String(contentsOf: knownHosts(h), encoding: .utf8)
             #expect(known.hasPrefix("|1|"))
@@ -162,13 +162,13 @@ struct SessionServerTests {
             #expect(prompts.events.map(\.situation) == [.changed])
             let known = try String(contentsOf: knownHosts(h), encoding: .utf8)
             #expect(!known.contains(other))
-            #expect(known.contains(try hostKey()))
+            #expect(known.contains(try ServerHarness.hostKey()))
         }
     }
 
     @Test func aRevokedKeyIsRefusedWithoutAQuestion() async throws {
         try await withHarness("revoked") { h in
-            try "@revoked \(try hostPattern()) \(try hostKey())\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
+            try "@revoked \(try hostPattern()) \(try ServerHarness.hostKey())\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
             let prompts = RecordingPrompts(.alwaysTrust)
             await #expect(throws: TransferError.hostKeyRejected) { _ = try await h.session.connect(prompts: prompts) }
             #expect(prompts.events.isEmpty)
@@ -354,16 +354,6 @@ private final class StalledPrompts: PromptSink {
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
 }
 
-private func hostKeyFile() throws -> URL {
-    let identity = try #require(ProcessInfo.processInfo.environment["TRANSFER_TEST_IDENTITY"])
-    return URL(fileURLWithPath: identity).deletingLastPathComponent().appendingPathComponent("host_key.pub")
-}
-
-/// The local sshd's host key, as `type base64`.
-private func hostKey() throws -> String {
-    try String(contentsOf: hostKeyFile(), encoding: .utf8).split(separator: " ").prefix(2).joined(separator: " ")
-}
-
 private func hostPattern() throws -> String {
     "[127.0.0.1]:\(try #require(ProcessInfo.processInfo.environment["TRANSFER_TEST_PORT"]))"
 }
@@ -371,7 +361,7 @@ private func hostPattern() throws -> String {
 /// How many channels the local sshd has refused for MaxSessions, from the log `local-sshd.sh`
 /// writes beside the keys.
 private func sessionRefusals() throws -> Int {
-    let log = try hostKeyFile().deletingLastPathComponent().appendingPathComponent("sshd.log")
+    let log = try ServerHarness.hostKeyFile().deletingLastPathComponent().appendingPathComponent("sshd.log")
     let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
     return text.components(separatedBy: "no more sessions").count - 1
 }
@@ -387,11 +377,9 @@ private func otherKey(_ h: ServerHarness) async throws -> String {
     return try String(contentsOf: file.appendingPathExtension("pub"), encoding: .utf8).split(separator: " ").prefix(2).joined(separator: " ")
 }
 
-/// Logs in with the server's key already in known_hosts: one connection, where a first contact
-/// takes three (refused, probe, master), which many suites at once would crowd into sshd's
-/// MaxStartups.
+/// Logs in with the server's key already in known_hosts, asking nothing.
 private func connectKnown(_ h: ServerHarness) async throws {
-    try "\(try hostPattern()) \(try hostKey())\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
+    try h.trustHostKey()
     let prompts = RecordingPrompts(.cancel)
     _ = try await h.session.connect(prompts: prompts)
     #expect(prompts.events.isEmpty)

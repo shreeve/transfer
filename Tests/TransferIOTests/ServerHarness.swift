@@ -19,6 +19,8 @@ struct ServerHarness {
     static var available: Bool { (port != nil && identity != nil) || environment["TRANSFER_REQUIRE_SERVER"] == "1" }
 
     let session: SSHConnection
+    /// The session's Live files, as the hub's one `LiveSync` in the app; closed by `cleanUp`.
+    let live: LiveSync
     /// Holds the library, the served folder, and a staging folder; removed by `cleanUp`.
     let base: URL
     let root: URL
@@ -58,7 +60,8 @@ struct ServerHarness {
             throw error
         }
         let saved = SavedConnection(name: name, host: "127.0.0.1", user: NSUserName(), port: port, identityFile: identity, remotePath: remote.path)
-        let session = SSHConnection(connection: saved, store: store, editableExtensions: TransferConfig.builtIn.extensionSet, sshConfigFile: configFile.path)
+        live = LiveSync(store: store)
+        let session = SSHConnection(connection: saved, store: store, editableExtensions: TransferConfig.builtIn.extensionSet, live: live, sshConfigFile: configFile.path)
         let events = EventRecorder()
         let stream = session.events()
         self.session = session
@@ -66,33 +69,61 @@ struct ServerHarness {
         logger = Task { for await event in stream { events.record(event) } }
     }
 
-    /// Another connection to the same server on the same library, as after a relaunch. `body`
-    /// always has it disconnected, when it throws too.
+    /// Another connection to the same server on the same library, as after a relaunch: the first
+    /// one's Live stops, and the second has its own. `body` always has it disconnected and its
+    /// Live closed, when it throws too.
     func withSecondSession(_ body: (SSHConnection) async throws -> Void) async throws {
+        await live.closeAll()
         let store = try Store(root: root)
-        let again = SSHConnection(connection: session.connection, store: store, editableExtensions: TransferConfig.builtIn.extensionSet, sshConfigFile: configFile.path)
+        let liveAgain = LiveSync(store: store)
+        let again = SSHConnection(connection: session.connection, store: store, editableExtensions: TransferConfig.builtIn.extensionSet, live: liveAgain, sshConfigFile: configFile.path)
         do {
             try await body(again)
         } catch {
             await again.disconnect()
+            await liveAgain.closeAll()
             throw error
         }
         await again.disconnect()
+        await liveAgain.closeAll()
+    }
+
+    /// Puts the local sshd's key in this harness's known_hosts, so a login is one connection to
+    /// sshd where a first contact takes three (refused, probe, master); many suites at once would
+    /// otherwise crowd its MaxStartups.
+    func trustHostKey() throws {
+        try "[127.0.0.1]:\(session.connection.port) \(try Self.hostKey())\n".write(to: base.appendingPathComponent("known_hosts"), atomically: true, encoding: .utf8)
+    }
+
+    /// The public host key `local-sshd.sh` keeps beside the client key.
+    static func hostKeyFile() throws -> URL {
+        guard let identity else { throw TransferError.failed("TRANSFER_TEST_IDENTITY is not set") }
+        return URL(fileURLWithPath: identity).deletingLastPathComponent().appendingPathComponent("host_key.pub")
+    }
+
+    /// The local sshd's host key, as `type base64`.
+    static func hostKey() throws -> String {
+        try String(contentsOf: hostKeyFile(), encoding: .utf8).split(separator: " ").prefix(2).joined(separator: " ")
     }
 
     func cleanUp() async {
         logger.cancel()
         await session.disconnect()
+        await live.closeAll()
         try? FileManager.default.removeItem(at: base)
     }
 }
 
-/// Runs `body` with a fresh harness, logged in first when `connected`, and always awaits its
-/// cleanup, when it throws too. Its prompts answer for every operation, as a window's do.
+/// Runs `body` with a fresh harness, logged in first when `connected` (with the server's key
+/// already known), and always awaits its cleanup, when it throws too. Its prompts answer for
+/// every operation, as a window's do.
 func withHarness(_ name: String, connected: Bool = false, _ body: (ServerHarness) async throws -> Void) async throws {
     let h = try ServerHarness(name)
     do {
-        if connected { _ = try await h.session.connect(prompts: h.prompts) }
+        if connected {
+            try h.trustHostKey()
+            _ = try await h.session.connect(prompts: h.prompts)
+        }
         try await OperationPrompts.$current.withValue(h.prompts) { try await body(h) }
     } catch {
         await h.cleanUp()

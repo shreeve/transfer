@@ -184,7 +184,7 @@ actor LiveSync {
         close(connection)
     }
 
-    /// Stops everything: the watcher and every worker. For a `LiveSync` owned by one connection.
+    /// Stops everything: the watcher and every worker. Tests end their `LiveSync` with it.
     func closeAll() {
         for connection in Set(workers.keys).union(servers.keys) { close(connection) }
         watching?.cancel()
