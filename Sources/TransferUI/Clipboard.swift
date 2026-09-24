@@ -49,7 +49,6 @@ public final class Clipboard {
     @ObservationIgnored private var seenChangeCount = -1
     @ObservationIgnored private var written: (payload: Data, text: String)?
     @ObservationIgnored private var work: Task<Void, Never>?
-    @ObservationIgnored private var poller: Timer?
     @ObservationIgnored private var observers: [any NSObjectProtocol] = []
     @ObservationIgnored private var escapeMonitor: Any?
 
@@ -63,14 +62,13 @@ public final class Clipboard {
         observers.append(center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { Clipboard.shared.leave() }
         })
-        // The pasteboard posts no change notification; its change count is cheap to read.
-        let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
+        // The pasteboard posts no change notification; its change count is cheap to read. The run
+        // loop keeps the timer.
+        RunLoop.main.add(Timer(timeInterval: 0.5, repeats: true) { _ in
             MainActor.assumeIsolated {
                 if NSApp.isActive { Clipboard.shared.poll() }
             }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        poller = timer
+        }, forMode: .common)
         // Escape reaches no single responder: a toolbar button or the window itself may hold the
         // focus, and neither turns Escape into cancelOperation. So it is watched here, and left
         // alone for text fields, sheets, and any window that is not a browser.
@@ -273,13 +271,7 @@ public final class Clipboard {
         let folder = Self.stagingFolder(id)
         let total = max(clip.tally.bytes, 1)
         let done = Locked<UInt64>(0)
-        let ticker = Task {
-            while !Task.isCancelled {
-                let fraction = min(Double(done.value) / Double(total), 0.99)
-                update(id) { $0.finder = .preparing(fraction) }
-                try? await Task.sleep(for: .milliseconds(200))
-            }
-        }
+        let ticker = ticking { self.update(id) { $0.finder = .preparing(min(Double(done.value) / Double(total), 0.99)) } }
         defer { ticker.cancel() }
         var urls: [URL] = []
         do {
@@ -302,17 +294,20 @@ public final class Clipboard {
 
     /// Runs `body` while copying the box's tally into the clip every 0.2 s, and once at the end.
     private func publishing(_ box: Locked<ClipTally>, to id: UUID, _ body: () async -> Void) async {
-        let ticker = Task {
+        let ticker = ticking { self.update(id) { $0.tally = box.value } }
+        await body()
+        ticker.cancel()
+        update(id) { $0.tally = box.value }
+    }
+
+    /// Runs `tick` now and every 0.2 s until the task it returns is cancelled.
+    private func ticking(_ tick: @escaping @MainActor () -> Void) -> Task<Void, Never> {
+        Task {
             while !Task.isCancelled {
-                let tally = box.value
-                update(id) { $0.tally = tally }
+                tick()
                 try? await Task.sleep(for: .milliseconds(200))
             }
         }
-        await body()
-        ticker.cancel()
-        let tally = box.value
-        update(id) { $0.tally = tally }
     }
 
     private func update(_ id: UUID, _ change: (inout Clip) -> Void) {
