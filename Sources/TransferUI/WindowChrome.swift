@@ -182,9 +182,13 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
 
         func searchFieldDidStartSearching(_ sender: NSSearchField) { model.textEditing = true }
 
+        /// Sent when the text becomes empty, by typing or the clear button. A field still being
+        /// edited keeps its focus, as Finder's does, and so keeps Return and Space; one that is
+        /// not folds back to the magnifier.
         func searchFieldDidEndSearching(_ sender: NSSearchField) {
-            model.textEditing = false
             model.filter = ""
+            guard sender.currentEditor() == nil else { return }
+            model.textEditing = false
             searchView?.collapse()
         }
 
@@ -428,9 +432,10 @@ final class ChromeController: NSSplitViewController {
     }
 
     /// A closed window is no browser: links and New Tab must not pick its controller while it
-    /// waits to be released, and its observers must not outlive it.
+    /// waits to be released, its observers must not outlive it, and its model stops its work.
     private func windowWillClose() {
         Self.live.remove(self)
+        model?.close()
         separatorObservation?.invalidate()
         separatorObservation = nil
         windowObservers.forEach(NotificationCenter.default.removeObserver)
@@ -674,8 +679,10 @@ enum ContentKeys {
         }
     }
 
-    /// Only for the content pane or a window with nothing focused: text fields, sheets, sidebar,
-    /// inspector, and non-browser windows keep the keys. Held down, a key acts once.
+    /// Only for the browser itself (its table, column browser, or icon grid) or a window with
+    /// nothing focused. Text fields, buttons (the shelf's and the message bar's take Space with
+    /// Full Keyboard Access), sheets, sidebar, inspector, and non-browser windows keep the keys.
+    /// Held down, a key acts once.
     private static func takes(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let open = event.keyCode == 125 && modifiers == .command
@@ -684,7 +691,7 @@ enum ContentKeys {
               let window = event.window, window.isKeyWindow, window.attachedSheet == nil, !(window.firstResponder is NSText),
               let controller = ChromeController.keyWindowController, let model = controller.model, model.plainKeysAvailable else { return false }
         if let focused = window.firstResponder as? NSView, focused !== window.contentView,
-           !focused.isDescendant(of: controller.splitViewItems[1].viewController.view) { return false }
+           !(focused.isDescendant(of: controller.splitViewItems[1].viewController.view) && isBrowser(focused)) { return false }
         guard !event.isARepeat else { return true }
         if open {
             Task { await model.openSelection() }
@@ -692,6 +699,16 @@ enum ContentKeys {
             model.togglePreview()
         }
         return true
+    }
+
+    /// A list or column view, or inside one (a column's table), or the icon grid.
+    private static func isBrowser(_ view: NSView) -> Bool {
+        var current: NSView? = view
+        while let candidate = current {
+            if candidate is NSTableView || candidate is NSBrowser || candidate is IconItemView || candidate is IconGridBackgroundView { return true }
+            current = candidate.superview
+        }
+        return false
     }
 }
 

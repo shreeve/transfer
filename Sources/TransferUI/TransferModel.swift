@@ -93,9 +93,13 @@ public final class TransferModel {
     private var context: ServerContext?
     /// The server this window shows; nil before the first login and while none is chosen.
     public var session: (any RemoteSession)? { context?.session }
+    /// The server the window shows, for work that must stay with it across an await.
+    var shownContext: ServerContext? { context }
     /// The server a connect is logging in to, until it lands or fails.
     public private(set) var connectingTo: SavedConnection?
     @ObservationIgnored private var connectGeneration = 0
+    /// The sheets of the login a connect is waiting on, until it lands or fails.
+    @ObservationIgnored private var loginPrompt: OperationPrompt?
     /// Seeded from the last window's list, so a new window or tab has servers in its first frame.
     public var connections: [SavedConnection] = TransferModel.lastConnections
     private static var lastConnections: [SavedConnection] = []
@@ -139,15 +143,14 @@ public final class TransferModel {
     @ObservationIgnored private var comparableConflicts: [RemotePath: Bool] = [:]
     /// Conflicts that arrived while another sheet was up, shown in turn once it closes.
     @ObservationIgnored private var waitingConflicts: [RemotePath] = []
+    /// Conflicts the user answered Later, until they are resolved.
+    @ObservationIgnored private var putOffConflicts: Set<RemotePath> = []
     /// The Keep Local or Keep Remote press waiting for its confirming second press.
     public var conflictConfirm: LiveConflictChoice?
     public var filter = "" {
         didSet { if filter != oldValue { refreshItems() } }
     }
     public var filterFocusTick = 0
-    /// When an icon cell last took a mouse down (system uptime), so the grid's background tap for
-    /// that click keeps the cell's selection. A time, not a flag: a drag never gets the tap.
-    @ObservationIgnored public var itemClickTime: TimeInterval = 0
     /// True while a text field in the window has focus, so Space and Return stay with the field.
     public var textEditing = false
     public var folderText = ""
@@ -172,8 +175,11 @@ public final class TransferModel {
     public var draft = SavedConnection(name: "", host: "")
     public var draftIsEdit = false
     public var sheet: AppSheet? {
-        didSet { sheetChanged() }
+        didSet { sheetChanged(from: oldValue) }
     }
+    /// The window's own sheets that came while another was up, shown in turn.
+    @ObservationIgnored private var waitingSheets: [AppSheet] = []
+    @ObservationIgnored private var restoringSheet = false
     public var promptSecure = ""
     public var saveSecret = false
     public var renaming = false
@@ -194,6 +200,10 @@ public final class TransferModel {
     private var forwardStack: [RemotePath] = []
     private var previewTask: Task<Void, Never>?
     @ObservationIgnored private var runners: [String: Runner] = [:]
+    /// Rows whose move kept originals (`keep`).
+    private var keptRows: Set<String> = []
+    /// Transfer tasks running in every window, open or closed.
+    private(set) static var running = 0
     /// The session behind each Live row on the shelf, which the session's own events put there,
     /// so Pause and Resume reach that server whatever the window shows now.
     @ObservationIgnored private var liveRowSessions: [String: any RemoteSession] = [:]
@@ -247,8 +257,24 @@ public final class TransferModel {
         Task { await reloadConnections() }
     }
 
-    /// A closed window stops listening and listing. Its queued transfers run on without it, and
-    /// its waiting questions get the safe answer.
+    /// The window closed: it stops listening, listing, previewing, and logging in now, since
+    /// SwiftUI may keep the model a while, and its questions, now and later, get the safe answer.
+    /// Its queued transfers run on without it.
+    public func close() {
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers.removeAll()
+        // A connect still logging in lands nowhere.
+        connectGeneration &+= 1
+        loginPrompt?.retire()
+        loginPrompt = nil
+        context?.close()
+        sidebarReload?.cancel()
+        previewTask?.cancel()
+        for task in inspectorTasks { task.cancel() }
+        prompts.cancelAll()
+    }
+
+    /// As `close`, for a model released without it.
     isolated deinit {
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         context?.close()
@@ -370,10 +396,27 @@ public final class TransferModel {
         connectGeneration &+= 1
         let generation = connectGeneration
         connectingTo = connection
+        // The last server's message is not about this one.
+        status = nil
+        // A login the window moved away from takes back its sheets and asks nothing more here;
+        // a second connect to the same server shares the first one's.
+        let login: OperationPrompt
+        if let current = loginPrompt, current.serverID == connection.id {
+            login = current
+        } else {
+            loginPrompt?.retire()
+            login = prompts.login(connection)
+            loginPrompt = login
+        }
         var pending: ServerContext?
         defer {
             if let pending, pending !== context { pending.close() }
-            if generation == connectGeneration { connectingTo = nil }
+            if generation == connectGeneration {
+                connectingTo = nil
+                loginPrompt = nil
+                // A failed or cancelled login leaves the sidebar on the server still shown.
+                syncSidebarSelection()
+            }
         }
         do {
             let session = try await provider.session(for: connection.id)
@@ -382,7 +425,7 @@ public final class TransferModel {
             pending = fresh
             // Listening before the login catches the notices the login itself raises.
             listen(fresh)
-            let start = try await session.connect(prompts: prompts.login(connection))
+            let start = try await session.connect(prompts: login)
             var path = start
             var selection: Set<RemotePath> = []
             var missing: RemotePath?
@@ -399,7 +442,8 @@ public final class TransferModel {
             scheduleSidebarReload()
             if let missing { status = "No such file or folder: \(missing.display)" }
         } catch {
-            guard generation == connectGeneration else { return }
+            // A login the user cancelled, at a password or a host key, fails quietly.
+            guard generation == connectGeneration, !login.declined else { return }
             report(error)
         }
     }
@@ -439,8 +483,11 @@ public final class TransferModel {
         stars = []
         liveFiles = []
         waitingConflicts.removeAll()
+        putOffConflicts.removeAll()
         comparableConflicts.removeAll()
-        if case .conflict = sheet { sheet = nil }
+        // A sheet about the server left behind would act on the next one.
+        waitingSheets.removeAll(where: \.isServerBound)
+        if sheet?.isServerBound == true { sheet = nil }
         dropLiveRows(keeping: id)
     }
 
@@ -482,7 +529,10 @@ public final class TransferModel {
         sheet = .connection
     }
 
+    /// With a sheet up, the connection form would wait behind it and a draft already open would
+    /// be overwritten, so the command does nothing.
     public func newConnection() {
+        guard sheet == nil else { return NSSound.beep() }
         pendingLanding = nil
         draft = SavedConnection(name: "", host: "")
         draftIsEdit = false
@@ -490,6 +540,7 @@ public final class TransferModel {
     }
 
     public func editConnection(_ connection: SavedConnection) {
+        guard sheet == nil else { return NSSound.beep() }
         draft = connection
         draftIsEdit = true
         sheet = .connection
@@ -595,9 +646,10 @@ public final class TransferModel {
             return true
         } catch {
             guard !Task.isCancelled, isCurrent(context) else { return false }
-            // What arrived is shown, marked incomplete, so the column stops asking for it and the
-            // next visit lists it again.
-            flush(complete: false)
+            // A complete listing already shown stays: a failed refresh must not empty a folder.
+            // Otherwise what arrived is shown, marked incomplete, so the column stops asking for
+            // it and the next visit lists it again.
+            if listings[path]?.complete != true { flush(complete: false) }
             if case .noSuchFile? = error as? TransferError {
                 // The server's text is just "No such file"; name the folder instead.
                 status = "No such folder: \(path.display)"
@@ -696,15 +748,16 @@ public final class TransferModel {
         guard let context else { return }
         await reporting {
             let path = try await context.session.connect(prompts: prompts.login(context.connection))
-            await navigate(path)
+            if isCurrent(context) { await navigate(path) }
         }
     }
 
     public func goToFolder(_ text: String) async {
         guard let context else { return }
+        let from = snapshot.path
         await reporting {
             let home = try await context.session.connect(prompts: prompts.login(context.connection))
-            guard let path = RemotePath.typed(text, from: snapshot.path, home: home) else { return }
+            guard isCurrent(context), let path = RemotePath.typed(text, from: from, home: home) else { return }
             await navigate(path)
         }
     }
@@ -819,12 +872,15 @@ public final class TransferModel {
     }
 
     /// Follows the double-click rule, or forces Live when asked. Folders navigate.
+    /// A file opens even if the window has moved on meanwhile, since it is the one the user chose;
+    /// a folder is entered only while the window still shows its server.
     public func open(_ item: RemoteItem, forceLive: Bool = false) async {
-        guard let session else { return }
+        guard let context else { return }
+        let session = context.session
         await reporting {
             let target = try await Self.resolveLink(item, session: session)
             if target.kind == .directory {
-                await navigate(target.path)
+                if isCurrent(context) { await navigate(target.path) }
                 return
             }
             guard target.kind == .file else { return }
@@ -1001,44 +1057,56 @@ public final class TransferModel {
 
     // MARK: Transfers
 
+    /// The panel is modal but the window's tasks still run under it, so a connect can land
+    /// meanwhile: what to download and from where is read before it opens.
     public func downloadCopy() async {
-        guard !selectedItems.isEmpty else { return }
+        let items = selectedItems
+        guard let context, !items.isEmpty else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.prompt = "Download"
-        guard panel.runModal() == .OK, let directory = panel.url, let session else { return }
-        for item in selectedItems {
+        guard panel.runModal() == .OK, let directory = panel.url, stillShows(context) else { return }
+        let session = context.session
+        for item in items {
             let destination = directory.appendingPathComponent(item.name)
             let path = item.path
-            enqueue(title: "Download \(item.name)", path: path) { progress in
+            enqueue(title: "Download \(item.name)", path: path, on: context) { progress in
                 try await session.download(path, to: destination, progress: progress)
             }
         }
     }
 
-    public func upload(urls: [URL]) async {
-        await transfer(.mac(urls), into: snapshot.path, moving: false)
-    }
-
     public func uploadFromPanel() async {
+        guard let context else { return }
+        let folder = snapshot.path
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.prompt = "Upload"
-        guard panel.runModal() == .OK else { return }
-        await upload(urls: panel.urls)
+        guard panel.runModal() == .OK, stillShows(context) else { return }
+        await transfer(.mac(panel.urls), into: folder, moving: false, on: context)
     }
 
+    /// A drop goes only to the server it was aimed at.
     func perform(_ action: DropAction) async {
-        await transfer(action.sources, into: action.folder, moving: action.moving)
+        guard let context, context.connection.id == action.destination else { return }
+        await transfer(action.sources, into: action.folder, moving: action.moving, on: context)
     }
 
-    /// Queues `body` against the server the window shows now; it stays with that server.
-    func enqueue(title: String, path: RemotePath, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
-        guard let context else { return }
+    /// False, saying why, when the window left `context`'s server while the user was choosing.
+    func stillShows(_ context: ServerContext) -> Bool {
+        guard !isCurrent(context) else { return true }
+        status = "Nothing was done: the window moved to another server meanwhile."
+        return false
+    }
+
+    /// Queues `body` against `context`'s server, or the one the window shows now; it stays with
+    /// that server.
+    func enqueue(title: String, path: RemotePath, on context: ServerContext? = nil, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
+        guard let context = context ?? self.context else { return }
         let id = UUID().uuidString
         operations.append(TransferOperation(id: id, title: title, state: .queued, path: path))
         runners[id] = Runner(body: body, prompts: operationPrompts(), connection: context.connection, session: context.session, task: nil)
@@ -1049,6 +1117,7 @@ public final class TransferModel {
     private func start(_ id: String) {
         guard let runner = runners[id] else { return }
         runner.task?.cancel()
+        keptRows.remove(id)
         update(id) { $0.state = .active; $0.message = nil }
         let body = runner.body
         let session = runner.session
@@ -1073,6 +1142,9 @@ public final class TransferModel {
             }
         }
         let task = Task { [weak self] in
+            // Counted for the quit question even after the window closes, which leaves it running.
+            Self.running += 1
+            defer { Self.running -= 1 }
             var attempt = 0
             while true {
                 do {
@@ -1083,7 +1155,12 @@ public final class TransferModel {
                     self?.finish(id, state: .succeeded, message: nil)
                     return
                 } catch {
-                    if Self.isCancellation(error) { return }
+                    // Stop cancels the task, and whatever the body threw then is not a failure.
+                    if Self.isCancellation(error) || Task.isCancelled { return }
+                    if let kept = error as? TransferKept {
+                        self?.keep(id, kept.localizedDescription)
+                        return
+                    }
                     if RetryPolicy.isRetryable(error), let delay = RetryPolicy.delay(afterAttempt: attempt) {
                         attempt += 1
                         self?.update(id) { $0.state = .queued; $0.message = "Retrying in \(Int(delay)) s" }
@@ -1098,6 +1175,18 @@ public final class TransferModel {
             }
         }
         runners[id]?.task = task
+    }
+
+    /// A move that kept some originals, because the user skipped them or a copy could not be
+    /// checked: nothing is lost, so the row says so without the failure's red and message bar.
+    private func keep(_ id: String, _ message: String) {
+        update(id) { $0.state = .failed; $0.message = message }
+        keptRows.insert(id)
+    }
+
+    /// Whether the row's move ended keeping originals, rather than failing.
+    public func isKept(_ operation: TransferOperation) -> Bool {
+        operation.state == .failed && keptRows.contains(operation.id)
     }
 
     private func update(_ id: String, _ change: (inout TransferOperation) -> Void) {
@@ -1153,6 +1242,7 @@ public final class TransferModel {
         runners[operation.id]?.task?.cancel()
         runners[operation.id] = nil
         liveRowSessions[operation.id] = nil
+        keptRows.remove(operation.id)
         operations.removeAll { $0.id == operation.id }
     }
 
@@ -1300,10 +1390,12 @@ public final class TransferModel {
         return target.kind == .directory
     }
 
+    /// Stars on the server whose paths these are, whatever the window shows by the time each lands.
     public func setStarred(_ paths: [RemotePath], _ starred: Bool) async {
+        guard let context else { return }
         for path in paths {
-            await session?.star(path, on: starred)
-            if !starred { starIsFolder[path] = nil }
+            await context.session.star(path, on: starred)
+            if !starred, isCurrent(context) { starIsFolder[path] = nil }
         }
         await reloadSidebars()
     }
@@ -1327,9 +1419,10 @@ public final class TransferModel {
 
     /// Opens a starred entry: a folder is entered, a file is revealed in its folder and opened.
     public func openStarred(_ path: RemotePath) async {
-        guard let session else { return }
+        guard let context else { return }
         await reporting {
-            let item = try await session.stat(path)
+            let item = try await context.session.stat(path)
+            guard isCurrent(context) else { return }
             if item.kind == .directory {
                 await navigate(path)
             } else {
@@ -1339,14 +1432,17 @@ public final class TransferModel {
         }
     }
 
-    public func discardLive(_ path: RemotePath, force: Bool = false) async {
-        guard let session else { return }
+    /// Discards the Live file at `path` on the server shown, or only on `server` when named, as
+    /// by the sheet that warned about its edits.
+    public func discardLive(_ path: RemotePath, force: Bool = false, on server: ConnectionID? = nil) async {
+        guard let context, server == nil || server == context.connection.id else { return }
         do {
-            try await session.discardLiveFile(path, force: force)
+            try await context.session.discardLiveFile(path, force: force)
+            guard isCurrent(context) else { return }
             waitingConflicts.removeAll { $0 == path }
             await reloadSidebars()
         } catch TransferError.liveUnsynced {
-            sheet = .discardLive(path)
+            if isCurrent(context) { sheet = .discardLive(path, context.connection.id) }
         } catch {
             report(error)
         }
@@ -1419,6 +1515,7 @@ public final class TransferModel {
         conflictConfirm = nil
         if choice != .compare {
             waitingConflicts.removeAll { $0 == path }
+            putOffConflicts.remove(path)
             sheet = nil
         }
         do {
@@ -1439,10 +1536,33 @@ public final class TransferModel {
         sheet = .conflict(path, comparable: comparableConflicts[path] ?? false)
     }
 
-    /// A sheet came or went: a waiting question goes first, then a waiting conflict.
-    private func sheetChanged() {
+    /// A sheet came or went. One sheet never replaces another: a question's would get the safe
+    /// answer, and a form would lose what was typed, so the newcomer waits. When the window is
+    /// free, a waiting question goes first, then a waiting sheet, then a waiting conflict.
+    private func sheetChanged(from old: AppSheet?) {
+        guard !restoringSheet else { return }
+        if let old, let new = sheet, old.id != new.id {
+            restoringSheet = true
+            defer { restoringSheet = false }
+            waitingSheets.append(new)
+            sheet = old
+            return
+        }
         prompts.sheetChanged()
-        if sheet == nil, !waitingConflicts.isEmpty { showConflict(waitingConflicts.removeFirst()) }
+        guard sheet == nil else { return }
+        if !waitingSheets.isEmpty {
+            sheet = waitingSheets.removeFirst()
+        } else if !waitingConflicts.isEmpty {
+            showConflict(waitingConflicts.removeFirst())
+        }
+    }
+
+    /// Later on the conflict sheet. The conflict stays in the sidebar, and the same conflict
+    /// announced again does not bring the sheet back; a click on its row does.
+    public func putOffConflict() {
+        if case .conflict(let path, _) = sheet { putOffConflicts.insert(path) }
+        conflictConfirm = nil
+        sheet = nil
     }
 
     // MARK: Sidebar
@@ -1455,7 +1575,9 @@ public final class TransferModel {
             if snapshot.connectionID != id { await connect(connection) }
         case .star(let path):
             // A starred folder opens; a starred file is revealed in its folder. Its kind is asked once.
-            if let session, starIsFolder[path] == nil, let isFolder = await Self.isFolder(path, session: session) {
+            guard let context else { break }
+            if starIsFolder[path] == nil, let isFolder = await Self.isFolder(path, session: context.session) {
+                guard isCurrent(context) else { break }
                 starIsFolder[path] = isFolder
             }
             if starredIsFolder(path) { await navigate(path) } else { await reveal(path) }
@@ -1496,6 +1618,7 @@ public final class TransferModel {
         guard isCurrent(context) else { return }
         if stars != starred { stars = starred }
         if liveFiles != live { liveFiles = live }
+        putOffConflicts.formIntersection(conflicts)
         let unknown = starred.filter { starIsFolder[$0] == nil }
         guard !unknown.isEmpty else { return }
         let learned = await withTaskGroup(of: (RemotePath, Bool)?.self) { group in
@@ -1548,7 +1671,7 @@ public final class TransferModel {
             status = text
         case .conflict(let path, let comparable):
             comparableConflicts[path] = comparable
-            showConflict(path)
+            if !putOffConflicts.contains(path) { showConflict(path) }
         case .liveChanged:
             scheduleSidebarReload()
         case .directoryChanged(let path):
@@ -1621,7 +1744,8 @@ public enum AppSheet: Identifiable {
     case conflict(RemotePath, comparable: Bool)
     case goToFolder
     case removeServer(SavedConnection)
-    case discardLive(RemotePath)
+    /// Discarding a Live file's unsynced edits, on the server it names.
+    case discardLive(RemotePath, ConnectionID)
 
     public var id: String {
         switch self {
@@ -1634,6 +1758,15 @@ public enum AppSheet: Identifiable {
         case .goToFolder: "goto"
         case .removeServer: "remove"
         case .discardLive: "discard"
+        }
+    }
+
+    /// Whether the sheet acts on the server the window shows, so it goes when the window leaves
+    /// that server. A question belongs to its login or operation, which go on without the window.
+    var isServerBound: Bool {
+        switch self {
+        case .delete, .conflict, .goToFolder, .discardLive: true
+        case .connection, .prompt, .hostKey, .collision, .removeServer: false
         }
     }
 
@@ -1658,10 +1791,15 @@ public final class SheetPrompts {
     private var shown: Int?
     private var lastAsk = 0
 
+    /// Set once the window closes: every question then gets the safe answer at once.
+    private var closed = false
+
     private struct Ask {
         let id: Int
         let sheet: AppSheet
         let waiting: Waiting
+        /// The prompt sink that asked, so a retired login's questions can be taken back.
+        var owner: ObjectIdentifier?
     }
 
     private enum Waiting {
@@ -1696,20 +1834,24 @@ public final class SheetPrompts {
         case collision(NameCollisionChoice, toAll: Bool)
     }
 
-    func answer(_ request: PromptRequest, server: String? = nil) async -> PromptReply {
-        guard model != nil else { return PromptReply(text: nil) }
-        return await ask { id, continuation in Ask(id: id, sheet: .prompt(request, server: server, ask: id), waiting: .login(continuation)) }
+    func answer(_ request: PromptRequest, server: String? = nil, owner: ObjectIdentifier? = nil) async -> PromptReply {
+        guard model != nil, !closed else { return PromptReply(text: nil) }
+        return await ask { id, continuation in
+            Ask(id: id, sheet: .prompt(request, server: server, ask: id), waiting: .login(continuation), owner: owner)
+        }
     }
 
-    func decideHostKey(_ event: HostKeyEvent, server: String? = nil) async -> HostKeyDecision {
-        guard model != nil else { return .cancel }
-        return await ask { id, continuation in Ask(id: id, sheet: .hostKey(event, server: server, ask: id), waiting: .hostKey(continuation)) }
+    func decideHostKey(_ event: HostKeyEvent, server: String? = nil, owner: ObjectIdentifier? = nil) async -> HostKeyDecision {
+        guard model != nil, !closed else { return .cancel }
+        return await ask { id, continuation in
+            Ask(id: id, sheet: .hostKey(event, server: server, ask: id), waiting: .hostKey(continuation), owner: owner)
+        }
     }
 
     /// Shows the collision sheet, with Apply to All unchecked. The choice, and whether it covers
     /// the rest of the operation; nil when nobody answered.
     func askCollision(_ fileName: String) async -> (choice: NameCollisionChoice, toAll: Bool)? {
-        guard model != nil else { return nil }
+        guard model != nil, !closed else { return nil }
         return await ask { id, continuation in Ask(id: id, sheet: .collision(fileName, ask: id), waiting: .collision(continuation)) }
     }
 
@@ -1756,6 +1898,11 @@ public final class SheetPrompts {
         }
     }
 
+    /// Takes back every question `owner` asked, with the safe answer.
+    func withdrawAll(from owner: ObjectIdentifier) {
+        for ask in queue where ask.owner == owner { withdraw(ask.id) }
+    }
+
     /// The answer to the question on screen, from its sheet's buttons.
     func finish(_ answer: Answer) {
         guard let shown, let index = queue.firstIndex(where: { $0.id == shown }), queue[index].waiting.resume(answer) else { return }
@@ -1764,8 +1911,9 @@ public final class SheetPrompts {
         model?.sheet = nil
     }
 
-    /// The window closed: every waiting question gets the safe answer.
+    /// The window closed: every waiting question gets the safe answer, and so does every later one.
     func cancelAll() {
+        closed = true
         let waiting = queue
         queue.removeAll()
         shown = nil
@@ -1774,8 +1922,8 @@ public final class SheetPrompts {
 
     /// This window's sheets for one server's login. They name that server, so a password or host
     /// key is never typed for the wrong one.
-    func login(_ connection: SavedConnection) -> any PromptSink {
-        OperationPrompt(window: self, server: connection.displayName)
+    func login(_ connection: SavedConnection) -> OperationPrompt {
+        OperationPrompt(window: self, server: connection.displayName, serverID: connection.id)
     }
 }
 
@@ -1788,20 +1936,38 @@ final class OperationPrompt: PromptSink {
     private let window: SheetPrompts
     /// The server a login's sheets name.
     private let server: String?
+    /// The server a login's sheets are for.
+    let serverID: ConnectionID?
     private var applyToAll: NameCollisionChoice?
     private var asking: Task<(choice: NameCollisionChoice, toAll: Bool)?, Never>?
+    /// A login the window moved away from: it asks nothing more, and gets the safe answers.
+    private var retired = false
+    /// Whether a login question got the safe answer (Cancel, or taken back), which makes the
+    /// login's failure the user's own choice rather than something to report.
+    private(set) var declined = false
 
-    init(window: SheetPrompts, server: String? = nil) {
+    init(window: SheetPrompts, server: String? = nil, serverID: ConnectionID? = nil) {
         self.window = window
         self.server = server
+        self.serverID = serverID
     }
 
     func answer(_ request: PromptRequest) async -> PromptReply {
-        await window.answer(request, server: server)
+        let reply = retired ? PromptReply(text: nil) : await window.answer(request, server: server, owner: ObjectIdentifier(self))
+        if reply.text == nil { declined = true }
+        return reply
     }
 
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        await window.decideHostKey(event, server: server)
+        let decision = retired ? .cancel : await window.decideHostKey(event, server: server, owner: ObjectIdentifier(self))
+        if decision == .cancel { declined = true }
+        return decision
+    }
+
+    /// Takes back this login's questions: the window has moved on to another server.
+    func retire() {
+        retired = true
+        window.withdrawAll(from: ObjectIdentifier(self))
     }
 
     func resolveCollision(fileName: String) async -> NameCollisionChoice? {

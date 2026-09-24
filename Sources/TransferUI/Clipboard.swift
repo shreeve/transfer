@@ -51,8 +51,8 @@ public final class Clipboard {
     @ObservationIgnored private var escapeMonitor: Any?
 
     private init() {
-        // Makes this process's folder, and removes those of processes that have ended.
-        _ = Self.processFolder
+        // Empties what an earlier run left.
+        _ = Self.stagingRoot
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { Clipboard.shared.poll() }
@@ -68,7 +68,8 @@ public final class Clipboard {
             }
         }, forMode: .common)
         // No responder gets Escape as cancelOperation when a button or the window has focus, so it
-        // is watched here, except in text fields, sheets, and non-browser windows.
+        // is watched here, except in text fields, sheets, and non-browser windows. An open rename
+        // bar goes first: Escape cancels it wherever focus is, and the clip stays.
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             MainActor.assumeIsolated { Clipboard.shared.takesEscape(event) } ? nil : event
         }
@@ -76,9 +77,14 @@ public final class Clipboard {
     }
 
     private func takesEscape(_ event: NSEvent) -> Bool {
-        guard event.keyCode == 53, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty, clip != nil,
+        guard event.keyCode == 53, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty,
               let window = event.window, window.isKeyWindow, window.attachedSheet == nil,
-              ChromeController.keyWindowController != nil, !(window.firstResponder is NSText) else { return false }
+              let controller = ChromeController.keyWindowController, !(window.firstResponder is NSText) else { return false }
+        if let model = controller.model, model.renaming {
+            model.renaming = false
+            return true
+        }
+        guard clip != nil else { return false }
         clear()
         return true
     }
@@ -145,7 +151,7 @@ public final class Clipboard {
         clip = nil
     }
 
-    /// Quitting removes this process's folder, so the pasteboard keeps only the copied paths as
+    /// Quitting removes the staging folder, so the pasteboard keeps only the copied paths as
     /// text, for a terminal, and no file URL into it.
     private func leave() {
         work?.cancel()
@@ -154,7 +160,7 @@ public final class Clipboard {
             pasteboard.clearContents()
             pasteboard.setString(written.text, forType: .string)
         }
-        try? FileManager.default.removeItem(at: Self.processFolder)
+        try? FileManager.default.removeItem(at: Self.stagingRoot)
     }
 
     /// The first item carries the remote paths for a paste inside Transfer and as text; once
@@ -320,42 +326,28 @@ public final class Clipboard {
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Transfer", isDirectory: true)
     }
 
-    /// This process's folder under `Staging`, for its clips. Two copies of Transfer can run at once
-    /// (`open -n`, or a development build beside the installed app), so neither may remove the
-    /// other's. Each holds an exclusive lock on `<its folder>.lock`, which the kernel drops when
-    /// the process ends, crash or not; a launch removes only folders whose lock it can take.
-    nonisolated static let processFolder: URL = {
+    /// `Staging`, the clips' folder, emptied at launch. Only one copy of Transfer runs on a library
+    /// (the hub's lock on `transfer.lock`; a second copy is refused before any window, and so
+    /// before this, exists), and each library has its own cache root, so whatever is here was
+    /// left by an earlier run.
+    nonisolated static let stagingRoot: URL = {
         let manager = FileManager.default
         // What 0.1.7 and earlier left at the top level.
         for old in ["Clipboard", "Paste"] { try? manager.removeItem(at: cacheRoot.appendingPathComponent(old, isDirectory: true)) }
         let root = cacheRoot.appendingPathComponent("Staging", isDirectory: true)
+        try? manager.removeItem(at: root)
         try? manager.createDirectory(at: root, withIntermediateDirectories: true)
-        let names = Set((try? manager.contentsOfDirectory(atPath: root.path)) ?? [])
-        for name in names where !name.hasSuffix(".lock") && !names.contains(name + ".lock") {
-            try? manager.removeItem(at: root.appendingPathComponent(name))
-        }
-        for lock in names where lock.hasSuffix(".lock") {
-            let path = root.appendingPathComponent(lock).path
-            let held = open(path, O_RDONLY | O_EXLOCK | O_NONBLOCK | O_CLOEXEC)
-            guard held >= 0 else { continue }
-            try? manager.removeItem(at: root.appendingPathComponent(String(lock.dropLast(5))))
-            unlink(path)
-            close(held)
-        }
-        let id = UUID().uuidString
-        // Kept open, and so locked, for the life of the process.
-        _ = open(root.appendingPathComponent("\(id).lock").path, O_CREAT | O_RDONLY | O_EXLOCK | O_NONBLOCK | O_CLOEXEC, 0o600)
-        return root.appendingPathComponent(id, isDirectory: true)
+        return root
     }()
 
     private static func stagingFolder(_ id: UUID) -> URL {
-        processFolder.appendingPathComponent("clip-\(id.uuidString)", isDirectory: true)
+        stagingRoot.appendingPathComponent("clip-\(id.uuidString)", isDirectory: true)
     }
 
     /// Whether the disk that staging folders live on treats `README` and `readme` as one name, as
     /// a Mac's disk does unless formatted case-sensitive. When it cannot be told, yes.
     nonisolated static var diskIgnoresCase: Bool {
-        let values = try? processFolder.deletingLastPathComponent().resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+        let values = try? stagingRoot.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
         return values?.volumeSupportsCaseSensitiveNames != true
     }
 }
