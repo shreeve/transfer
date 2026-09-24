@@ -28,6 +28,9 @@ public struct TransferConfig: Codable, Equatable, Sendable {
 }
 
 public enum EditableFile {
+    /// How much of a text file the inspector shows, and so all of it that is fetched.
+    public static let previewHead = 64 << 10
+
     public static func openKind(fileName: String, extensions: Set<String>) -> OpenKind {
         let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
         if extensions.contains(ext) { return .live }

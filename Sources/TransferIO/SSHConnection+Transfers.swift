@@ -539,16 +539,35 @@ extension SSHConnection {
     // MARK: View and preview
 
     public func prepareViewFile(_ path: RemotePath) async throws -> URL {
-        try await cachedCopy(path, lane: .view)
+        try await cachedCopy(stat(path), lane: .view)
     }
 
     public func prepareInspectorPreview(_ path: RemotePath) async throws -> URL {
-        try await cachedCopy(path, lane: .preview)
+        let item = try await stat(path)
+        let head = UInt64(EditableFile.previewHead)
+        guard EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live,
+              let print = Fingerprint(item: item), print.size > head else {
+            return try await cachedCopy(item, lane: .preview)
+        }
+        // Only the head of a text file is shown, so only the head is fetched. The copy is named for
+        // the file's size and time, so an unchanged file reuses it.
+        let file = try previewURL(path, ext: (item.name as NSString).pathExtension, version: "head \(print.size):\(print.mtime)")
+        if FileManager.default.fileExists(atPath: file.path) { return file }
+        try await fetchHead(path, limit: head, to: file)
+        trimPreviewCache()
+        return file
+    }
+
+    /// The first `limit` bytes of `path`, on the preview lane.
+    private func fetchHead(_ path: RemotePath, limit: UInt64, to file: URL) async throws {
+        try await lane.submit(.preview) {
+            try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: limit), to: file, quarantine: true) { _ in }
+        }
     }
 
     /// The whole file in the preview cache, fetched on the lane as `kind`.
-    private func cachedCopy(_ path: RemotePath, lane kind: InteractiveLane.Kind) async throws -> URL {
-        let item = try await stat(path)
+    private func cachedCopy(_ item: RemoteItem, lane kind: InteractiveLane.Kind) async throws -> URL {
+        let path = item.path
         let ext = (item.name as NSString).pathExtension
         let file = try previewURL(path, ext: ext.isEmpty ? "bin" : ext)
         // The copy carries the remote size and mtime; the same pair means the same bytes.
@@ -569,20 +588,18 @@ extension SSHConnection {
             if print != nil, FileManager.default.fileExists(atPath: file.path) { return file }
             let part = try previewURL(path, ext: "part")
             let limit: UInt64 = 512 * 1024
-            try await lane.submit(.preview) {
-                try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: min(item.size ?? limit, limit)), to: part) { _ in }
-            }
+            try await fetchHead(path, limit: min(item.size ?? limit, limit), to: part)
             defer { try? FileManager.default.removeItem(at: part) }
             let data = try Data(contentsOf: part)
             guard let text = String(data: data, encoding: .utf8) else {
-                return try await cachedCopy(path, lane: .preview)
+                return try await cachedCopy(item, lane: .preview)
             }
             let html = SyntaxPreview.html(text: text, fileName: item.name)
             try html.write(to: file, atomically: true, encoding: .utf8)
             trimPreviewCache()
             return file
         }
-        return try await cachedCopy(path, lane: .preview)
+        return try await cachedCopy(item, lane: .preview)
     }
 
     public func clearPreviewCache() async {

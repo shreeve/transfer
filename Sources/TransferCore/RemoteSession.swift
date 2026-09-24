@@ -189,7 +189,8 @@ public protocol RemoteSession: Sendable {
     func prepareViewFile(_ path: RemotePath) async throws -> URL
     /// Quick Look's copy: a text file as highlighted HTML.
     func preparePreview(_ path: RemotePath) async throws -> URL
-    /// The inspector's copy, also used to prefetch; a newer preview cancels its fetch.
+    /// The inspector's copy, also used to prefetch; a newer preview cancels its fetch. For a text
+    /// file larger than `EditableFile.previewHead`, only that much of it.
     func prepareInspectorPreview(_ path: RemotePath) async throws -> URL
     func clearPreviewCache() async
     func discardLiveFile(_ path: RemotePath, force: Bool) async throws

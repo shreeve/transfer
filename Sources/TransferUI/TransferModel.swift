@@ -967,9 +967,10 @@ public final class TransferModel {
     private static func fetchPreview(_ item: RemoteItem, session: any RemoteSession) async -> InspectorPreview? {
         do {
             let target = try await Self.resolveLink(item, session: session)
-            guard target.kind == .file, (target.size ?? 0) <= inspectorPreviewLimit else { return nil }
-            let url = try await session.prepareInspectorPreview(target.path)
+            // Only a text file's head is fetched, so a large one previews too.
             let isText = await session.openKind(fileName: target.name) == .live
+            guard target.kind == .file, isText || (target.size ?? 0) <= inspectorPreviewLimit else { return nil }
+            let url = try await session.prepareInspectorPreview(target.path)
             let isPicture = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true
             let read = await Task.detached(priority: .userInitiated) { () -> InspectorPreview? in
                 if isText, let text = previewText(url) { return .text(text) }
@@ -1011,7 +1012,7 @@ public final class TransferModel {
 
     /// The first lines of a text file; nil when the bytes are not text after all.
     nonisolated private static func previewText(_ url: URL) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url), let data = try? handle.read(upToCount: 64 << 10) else { return nil }
+        guard let handle = try? FileHandle(forReadingFrom: url), let data = try? handle.read(upToCount: EditableFile.previewHead) else { return nil }
         if data.prefix(8 << 10).contains(0) { return nil }
         return String(decoding: data, as: UTF8.self)
     }

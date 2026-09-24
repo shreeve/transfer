@@ -115,6 +115,41 @@ struct ServerTests {
         }
     }
 
+    /// The inspector downloaded a whole text file, up to 8 MB, to show its first 64 KB (UIM-20).
+    /// It now fetches only that head, reused while the file's size and time are unchanged.
+    @Test func aTextPreviewFetchesOnlyTheHead() async throws {
+        try await withHarness("head", connected: true) { h in
+            let head = EditableFile.previewHead
+            let big = h.remote.appendingPathComponent("big.txt")
+            func put(_ fill: String, at time: TimeInterval) throws {
+                try Data(String(repeating: fill, count: 3 << 20).utf8).write(to: big)
+                try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: time)], ofItemAtPath: big.path)
+            }
+            try put("a", at: 1_700_000_000)
+            let remote = h.remotePath.appending(name: Array("big.txt".utf8))
+            func identity(_ url: URL) throws -> NSObject? {
+                try url.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier as? NSObject
+            }
+
+            let first = try await h.session.prepareInspectorPreview(remote)
+            #expect(try Data(contentsOf: first) == Data(String(repeating: "a", count: head).utf8))
+            let again = try await h.session.prepareInspectorPreview(remote)
+            #expect(again == first)
+            #expect(try identity(again) == identity(first), "an unchanged file's head is not fetched twice")
+
+            try put("b", at: 1_700_000_060)
+            let changed = try await h.session.prepareInspectorPreview(remote)
+            #expect(try Data(contentsOf: changed) == Data(String(repeating: "b", count: head).utf8))
+
+            // Viewing still fetches the whole file, and a file that is not text is previewed whole.
+            let whole = try await h.session.prepareViewFile(remote)
+            #expect(try Data(contentsOf: whole).count == 3 << 20)
+            try Data(count: 100_000).write(to: h.remote.appendingPathComponent("blob.bin"))
+            let blob = try await h.session.prepareInspectorPreview(h.remotePath.appending(name: Array("blob.bin".utf8)))
+            #expect(try Data(contentsOf: blob).count == 100_000)
+        }
+    }
+
     /// Links were followed one hop, so a chain such as /usr/bin/java → /etc/alternatives/java →
     /// the JDK's binary would not open (UIM-19). The server's REALPATH follows the whole chain;
     /// a loop or a dangling link fails with an error rather than hanging.
