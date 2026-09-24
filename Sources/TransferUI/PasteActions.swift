@@ -330,52 +330,6 @@ private extension Array where Element: Hashable {
     }
 }
 
-/// Whether a move may remove its original: only when this move wrote a complete copy.
-/// Pure, so it can move to TransferCore with its tests.
-enum MoveCheck {
-    enum Verdict: Equatable {
-        case remove
-        /// Files or links, by key, that the destination held before the move began. Their copy
-        /// cannot be told from what was there: a lookalike of the same size and time, or the
-        /// original itself reached through a second saved server.
-        case alreadyThere([String])
-        /// Entries, by key, that the copy lacks or holds differently.
-        case incomplete([String])
-    }
-
-    /// `source` is the original's tree walked after the copy, so anything added to it meanwhile
-    /// is missing from the copy and keeps it. `before` is the destination before the move reached
-    /// it, empty when nothing was there; `after` is the destination now. A folder that was already
-    /// there may be merged into; a file or link that was already there never counts as copied.
-    /// A file counts only with the same size and a known, equal time: every copy keeps the time,
-    /// and a time either side does not know proves nothing.
-    static func verdict(source: [String: TreeEntry], before: [String: TreeEntry], after: [String: TreeEntry]) -> Verdict {
-        guard !source.isEmpty else { return .incomplete([""]) }
-        var there: [String] = []
-        var missing: [String] = []
-        for (key, entry) in source {
-            if let old = before[key], !(entry == .directory && old == .directory) {
-                there.append(key)
-            } else if let copy = after[key], proven(entry, copy) {
-                continue
-            } else {
-                missing.append(key)
-            }
-        }
-        if !there.isEmpty { return .alreadyThere(there.sorted()) }
-        if !missing.isEmpty { return .incomplete(missing.sorted()) }
-        return .remove
-    }
-
-    private static func proven(_ source: TreeEntry, _ copy: TreeEntry) -> Bool {
-        switch (source, copy) {
-        case let (.file(size, time?), .file(copySize, copyTime?)): size == copySize && time == copyTime
-        case (.file, _), (.other, _): false
-        default: source == copy
-        }
-    }
-}
-
 /// Joins the progress of several copies, one after another, into one row on the shelf. The
 /// clip's count gives the total once it is known; a move between servers passes twice.
 private final class ProgressSum: Sendable {

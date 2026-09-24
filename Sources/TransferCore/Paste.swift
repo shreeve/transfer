@@ -118,28 +118,47 @@ public enum PasteRules {
     }
 }
 
-/// Whether a copy holds everything its source did, before a move removes the source.
-public enum TreeCheck {
-    /// The source entries that are missing from the destination or differ in kind, size, or
-    /// modification time. Every copy keeps a file's time, so a file of the same name and size
-    /// that was already there, left by a Skip or beside a Keep Both, does not pass for the copy.
-    /// A time either side does not know is not compared. A special file (`.other`) is never
-    /// held: what sits at its name in the copy is not the same FIFO, socket, or device.
-    public static func missing(source: [String: TreeEntry], destination: [String: TreeEntry]) -> [String] {
-        source.compactMap { key, entry in
-            destination[key].map { holds(entry, $0) } == true ? nil : key
-        }
-        .sorted()
+/// Whether a move may remove its original: only when this move wrote a complete copy.
+public enum MoveCheck {
+    public enum Verdict: Equatable, Sendable {
+        case remove
+        /// Files or links, by key, that the destination held before the move began. Their copy
+        /// cannot be told from what was there: a lookalike of the same size and time, or the
+        /// original itself reached through a second saved server.
+        case alreadyThere([String])
+        /// Entries, by key, that the copy lacks or holds differently.
+        case incomplete([String])
     }
 
-    private static func holds(_ source: TreeEntry, _ copy: TreeEntry) -> Bool {
+    /// `source` is the original's tree walked after the copy, so anything added to it meanwhile
+    /// is missing from the copy and keeps it. `before` is the destination before the move reached
+    /// it, empty when nothing was there; `after` is the destination now. A folder that was already
+    /// there may be merged into; a file or link that was already there never counts as copied.
+    /// A file counts only with the same size and a known, equal time: every copy keeps the time,
+    /// and a time either side does not know proves nothing.
+    public static func verdict(source: [String: TreeEntry], before: [String: TreeEntry], after: [String: TreeEntry]) -> Verdict {
+        guard !source.isEmpty else { return .incomplete([""]) }
+        var there: [String] = []
+        var missing: [String] = []
+        for (key, entry) in source {
+            if let old = before[key], !(entry == .directory && old == .directory) {
+                there.append(key)
+            } else if let copy = after[key], proven(entry, copy) {
+                continue
+            } else {
+                missing.append(key)
+            }
+        }
+        if !there.isEmpty { return .alreadyThere(there.sorted()) }
+        if !missing.isEmpty { return .incomplete(missing.sorted()) }
+        return .remove
+    }
+
+    private static func proven(_ source: TreeEntry, _ copy: TreeEntry) -> Bool {
         switch (source, copy) {
-        case let (.file(size, time), .file(copySize, copyTime)):
-            size == copySize && (time == nil || copyTime == nil || time == copyTime)
-        case (.other, _):
-            false
-        default:
-            source == copy
+        case let (.file(size, time?), .file(copySize, copyTime?)): size == copySize && time == copyTime
+        case (.file, _), (.other, _): false
+        default: source == copy
         }
     }
 }

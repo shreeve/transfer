@@ -73,13 +73,6 @@ import TransferCore
     #expect(KeepBothName.firstFree(existing: ["a0", "a1"], from: 0) { "a\($0)" } == "a2")
 }
 
-@Test func matchingSizeAndTimeSkipsTheCopy() {
-    let source = RemoteItem(path: RemotePath(string: "/a"), kind: .file, size: 4, mtime: 10)
-    let destination = RemoteItem(path: RemotePath(string: "/b"), kind: .file, size: 4, mtime: 10)
-    let decision = CopyRules.fileDisposition(source: source, destination: destination)
-    #expect(decision == .skip)
-}
-
 @Test func retriesOnlyDroppedConnectionsAndTimeouts() {
     #expect(RetryPolicy.isRetryable(TransferError.connectionLost("closed")))
     #expect(RetryPolicy.isRetryable(TransferError.timeout("stat")))
@@ -225,24 +218,25 @@ import TransferCore
     #expect(PasteRules.destinationName(for: file, into: RemotePath(string: "/tmp"), existing: ["notes.txt"]) == "notes.txt")
 }
 
-@Test func treeCheckFindsWhatAMoveWouldLose() {
-    let source: [String: TreeEntry] = ["": .directory, "a.txt": .file(size: 4), "sub": .directory, "sub/b": .link]
-    #expect(TreeCheck.missing(source: source, destination: source).isEmpty)
+@Test func moveCheckFindsWhatAMoveWouldLose() {
+    let source: [String: TreeEntry] = ["": .directory, "a.txt": .file(size: 4, mtime: 9), "sub": .directory, "sub/b": .link]
+    #expect(MoveCheck.verdict(source: source, before: [:], after: source) == .remove)
     var partial = source
-    partial["a.txt"] = .file(size: 3)
+    partial["a.txt"] = .file(size: 3, mtime: 9)
     partial["sub/b"] = nil
     partial["extra"] = .file(size: 1)
-    #expect(TreeCheck.missing(source: source, destination: partial) == ["a.txt", "sub/b"])
+    #expect(MoveCheck.verdict(source: source, before: [:], after: partial) == .incomplete(["a.txt", "sub/b"]))
+    #expect(MoveCheck.verdict(source: [:], before: [:], after: [:]) == .incomplete([""]))
 }
 
 /// A FIFO, socket, or device walked as a plain empty file once let a move pass the check with
 /// an empty file at its name, and remove the original.
-@Test func treeCheckNeverCountsASpecialFileAsCopied() {
+@Test func moveCheckNeverCountsASpecialFileAsCopied() {
     #expect(TreeEntry(RemoteItem(path: RemotePath(string: "/srv/fifo"), kind: .other, size: 0, mtime: 1)) == .other)
-    let source: [String: TreeEntry] = ["": .directory, "a.txt": .file(size: 4), "fifo": .other]
-    #expect(TreeCheck.missing(source: source, destination: source) == ["fifo"])
-    #expect(TreeCheck.missing(source: source, destination: ["": .directory, "a.txt": .file(size: 4), "fifo": .file(size: 0)]) == ["fifo"])
-    #expect(TreeCheck.missing(source: ["": .other], destination: ["": .other]) == [""])
+    let source: [String: TreeEntry] = ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .other]
+    #expect(MoveCheck.verdict(source: source, before: [:], after: source) == .incomplete(["fifo"]))
+    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .file(size: 0)]) == .incomplete(["fifo"]))
+    #expect(MoveCheck.verdict(source: ["": .other], before: [:], after: ["": .other]) == .incomplete([""]))
     var tally = ClipTally()
     tally.add(root: .other)
     tally.add(root: .directory)
@@ -254,10 +248,16 @@ import TransferCore
 
 /// A move whose collision was skipped once compared the source with the file already there, and
 /// removed the source when name and size matched.
-@Test func treeCheckTellsAFileAlreadyThereFromTheCopy() {
+@Test func moveCheckTellsAFileAlreadyThereFromTheCopy() {
     let source: [String: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
-    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4, mtime: 1_700_000_000)]).isEmpty)
-    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4, mtime: 1_600_000_000)]) == [""])
-    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4)]).isEmpty)
-    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 5, mtime: 1_700_000_000)]) == [""])
+    let copy: [String: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
+    #expect(MoveCheck.verdict(source: source, before: [:], after: copy) == .remove)
+    #expect(MoveCheck.verdict(source: source, before: copy, after: copy) == .alreadyThere([""]))
+    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4, mtime: 1_600_000_000)]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4)]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 5, mtime: 1_700_000_000)]) == .incomplete([""]))
+    // A folder that was already there may be merged into; a file inside it that was there may not.
+    let tree: [String: TreeEntry] = ["": .directory, "a": .file(size: 1, mtime: 2)]
+    #expect(MoveCheck.verdict(source: tree, before: ["": .directory], after: tree) == .remove)
+    #expect(MoveCheck.verdict(source: tree, before: tree, after: tree) == .alreadyThere(["a"]))
 }

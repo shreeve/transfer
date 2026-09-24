@@ -178,8 +178,8 @@ struct ServerTests {
             let copyURL = h.remote.appendingPathComponent("site copy")
             #expect(try Data(contentsOf: copyURL.appendingPathComponent("a/big.bin")) == big)
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: copyURL.appendingPathComponent("link").path) == "one.txt")
-            let copied = try await sizes(h.session.tree(copy))
-            #expect(TreeCheck.missing(source: entries, destination: copied).isEmpty)
+            let copied = try await h.session.tree(copy)
+            #expect(try await MoveCheck.verdict(source: h.session.tree(site), before: [:], after: copied) == .remove)
             let sourceTime = try FileManager.default.attributesOfItem(atPath: tree.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
             let copyTime = try FileManager.default.attributesOfItem(atPath: copyURL.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
             #expect(sourceTime.map { Int($0.timeIntervalSince1970) } == copyTime.map { Int($0.timeIntervalSince1970) })

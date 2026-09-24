@@ -93,27 +93,7 @@ public enum KeepBothName {
     }
 }
 
-public enum CopyDisposition: Equatable, Sendable {
-    case skip
-    case collide
-    case typeMismatch
-    case write
-}
-
 public enum CopyRules {
-    public static func fileDisposition(source: RemoteItem, destination: RemoteItem?) -> CopyDisposition {
-        guard let destination else { return .write }
-        if source.kind != destination.kind { return .typeMismatch }
-        if source.kind != .file { return .typeMismatch }
-        if let left = Fingerprint(item: source),
-           let right = Fingerprint(item: destination),
-           left.size == right.size,
-           left.mtime == right.mtime {
-            return .skip
-        }
-        return .collide
-    }
-
     public static func tempName(for basename: String, transferID: String) -> String {
         ".\(basename).transfer-\(transferID)"
     }
