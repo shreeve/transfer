@@ -73,7 +73,4 @@ final class LiveWatcher: @unchecked Sendable {
         FSEventStreamRelease(stream)
         continuation.finish()
     }
-
-    /// The stream retains the watcher, so this must be called for it to go.
-    deinit { stop() }
 }

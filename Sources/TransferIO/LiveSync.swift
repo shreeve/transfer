@@ -490,7 +490,7 @@ actor LiveSync {
             case .failRetryable(let reason): return retry(id, reason: reason)
             case .conflict(let kind): return await raiseConflict(id, kind: kind, item: item)
             case .upload(let base):
-                guard let saver = liveServer(for: entry.connection) else { return park(id) }
+                guard let saver = servers[entry.connection]?.server else { return park(id) }
                 switch await save(id, expecting: .file(base), settled: stamp, via: saver) {
                 case .done, .unstable, .missing, .failed: return
                 case .retry(let reason): return retry(id, reason: reason)
@@ -504,7 +504,7 @@ actor LiveSync {
 
     /// The server's file for `id`, or nil after parking the pass until the server is back.
     private func lookup(_ id: LiveFileID) async -> (RemoteItem?, LiveServerFact)? {
-        guard let entry = entries[id], ready.contains(entry.connection), let server = liveServer(for: entry.connection) else {
+        guard let entry = entries[id], ready.contains(entry.connection), let server = servers[entry.connection]?.server else {
             park(id)
             return nil
         }
@@ -589,7 +589,7 @@ actor LiveSync {
     private func raiseConflict(_ id: LiveFileID, kind: LiveConflictKind, item: RemoteItem?) async {
         guard let entry = entries[id] else { return }
         try? FileManager.default.removeItem(at: entry.serverCopy)
-        if case .changed = kind, let item, let server = liveServer(for: entry.connection) {
+        if case .changed = kind, let item, let server = servers[entry.connection]?.server {
             try? await server.liveFetch(item, to: entry.serverCopy, interactive: false)
         }
         guard let conflicted = update(id, {
@@ -606,12 +606,9 @@ actor LiveSync {
         case .removed: "Removed from the server"
         case .notAFile: "Replaced on the server by something that is not a file"
         }
-        var comparable = false
-        if case .changed = kind {
-            let hasCopy = FileManager.default.fileExists(atPath: conflicted.serverCopy.path)
-            comparable = FileManager.default.isExecutableFile(atPath: "/usr/bin/opendiff")
-                && Self.isUTF8(conflicted.local) && (!hasCopy || Self.isUTF8(conflicted.serverCopy))
-        }
+        let hasCopy = FileManager.default.fileExists(atPath: conflicted.serverCopy.path)
+        let comparable = kind.server != nil && FileManager.default.isExecutableFile(atPath: "/usr/bin/opendiff")
+            && Self.isUTF8(conflicted.local) && (!hasCopy || Self.isUTF8(conflicted.serverCopy))
         report(conflicted, .failed, message)
         emit(conflicted, .conflict(conflicted.path, comparable: comparable))
         emit(conflicted, .liveChanged)
@@ -766,7 +763,7 @@ actor LiveSync {
 
     private func compare(_ entry: Entry) async throws {
         if !FileManager.default.fileExists(atPath: entry.serverCopy.path) {
-            guard let server = liveServer(for: entry.connection), let item = try await server.liveLookup(entry.path), item.kind == .file else {
+            guard let server = servers[entry.connection]?.server, let item = try await server.liveLookup(entry.path), item.kind == .file else {
                 throw TransferError.noSuchFile(entry.path.display)
             }
             try await server.liveFetch(item, to: entry.serverCopy, interactive: true)
@@ -818,12 +815,8 @@ actor LiveSync {
         entries.values.first { $0.connection == connection && $0.path == path }?.id
     }
 
-    private func liveServer(for connection: ConnectionID) -> (any LiveServer)? {
-        servers[connection]?.server
-    }
-
     private func loggedIn(_ connection: ConnectionID) throws -> any LiveServer {
-        guard ready.contains(connection), let server = liveServer(for: connection) else { throw TransferError.notConnected }
+        guard ready.contains(connection), let server = servers[connection]?.server else { throw TransferError.notConnected }
         return server
     }
 

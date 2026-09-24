@@ -25,8 +25,7 @@ actor InteractiveLane {
         }
 
         func end(_ result: Result<Void, Error>) {
-            finish?.resume(with: result)
-            finish = nil
+            finish.take()?.resume(with: result)
         }
     }
 
@@ -62,29 +61,16 @@ actor InteractiveLane {
         pump()
     }
 
+    /// A job in no slot has already ended, so `end` does nothing to it.
     private func cancel(_ job: Job) {
-        if let running, running.job === job {
-            running.task.cancel()
-        } else if preview === job {
-            preview = nil
-            job.end(.failure(TransferError.cancelled))
-        } else if let index = ordered.firstIndex(where: { $0 === job }) {
-            ordered.remove(at: index)
-            job.end(.failure(TransferError.cancelled))
-        }
+        if let running, running.job === job { return running.task.cancel() }
+        if preview === job { preview = nil }
+        ordered.removeAll { $0 === job }
+        job.end(.failure(TransferError.cancelled))
     }
 
     private func pump() {
-        guard running == nil else { return }
-        let job: Job
-        if !ordered.isEmpty {
-            job = ordered.removeFirst()
-        } else if let waiting = preview {
-            preview = nil
-            job = waiting
-        } else {
-            return
-        }
+        guard running == nil, let job = ordered.isEmpty ? preview.take() : ordered.removeFirst() else { return }
         let task = Task {
             do {
                 try await job.body()

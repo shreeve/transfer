@@ -40,7 +40,7 @@ enum Subprocess {
                         stopped.withLock { $0.timedOut = true }
                         process.terminate()
                     }
-                    DispatchQueue.global().asyncAfter(deadline: .now() + Self.seconds(timeout), execute: watchdog)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout / .seconds(1), execute: watchdog)
                     let stderr = Locked(Data())
                     let reading = DispatchGroup()
                     DispatchQueue.global().async(group: reading) { stderr.value = errors.fileHandleForReading.readDataToEndOfFile() }
@@ -61,10 +61,6 @@ enum Subprocess {
         if stopped.value.cancelled { throw TransferError.cancelled }
         if stopped.value.timedOut { throw TransferError.timeout(name) }
         return result
-    }
-
-    static func seconds(_ duration: Duration) -> Double {
-        Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
     }
 }
 

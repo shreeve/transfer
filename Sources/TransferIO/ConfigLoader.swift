@@ -28,14 +28,11 @@ enum ConfigLoader {
     }
 
     private static func read(_ url: URL) -> TransferConfig? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(TransferConfig.self, from: data)
+        (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(TransferConfig.self, from: $0) }
     }
 
     private static func defaultFile() -> URL? {
-        if let bundled = Bundle.main.url(forResource: "config", withExtension: "json") {
-            return bundled
-        }
+        if let bundled = Bundle.main.url(forResource: "config", withExtension: "json") { return bundled }
         #if DEBUG
         // `swift run` and `swift test` have no bundle; the repo's copy stands in.
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)

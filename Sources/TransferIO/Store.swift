@@ -154,7 +154,7 @@ final class Store: @unchecked Sendable {
         ]
         for (table, column) in added {
             var present = false
-            try run("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", table, String(column.prefix { $0 != " " })) { _ in present = true }
+            try run("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", [table, String(column.prefix { $0 != " " })]) { _ in present = true }
             if !present { try execute("ALTER TABLE \(table) ADD COLUMN \(column)") }
         }
     }
@@ -162,11 +162,27 @@ final class Store: @unchecked Sendable {
     // MARK: Connections
 
     func connections() -> [SavedConnection] {
-        queue.sync { queryConnections() }
+        queue.sync {
+            var values: [SavedConnection] = []
+            report("read saved servers") {
+                try run("SELECT id, name, host, user, port, identity, remote_path FROM connections ORDER BY name") { row in
+                    values.append(SavedConnection(
+                        id: ConnectionID(rawValue: UUID(uuidString: row.text(0)) ?? UUID()),
+                        name: row.text(1),
+                        host: row.text(2),
+                        user: row.text(3),
+                        port: row.text(4),
+                        identityFile: row.text(5),
+                        remotePath: row.text(6)
+                    ))
+                }
+            }
+            return values
+        }
     }
 
     func connection(_ id: ConnectionID) -> SavedConnection? {
-        queue.sync { queryConnections().first { $0.id == id } }
+        connections().first { $0.id == id }
     }
 
     func save(_ connection: SavedConnection) {
@@ -183,9 +199,9 @@ final class Store: @unchecked Sendable {
             let key = id.rawValue.uuidString
             report("remove a saved server") {
                 try transaction {
-                    try run("DELETE FROM connections WHERE id = ?", key)
+                    try run("DELETE FROM connections WHERE id = ?", [key])
                     for table in ["pins", "live_files", "temps"] {
-                        try run("DELETE FROM \(table) WHERE connection_id = ?", key)
+                        try run("DELETE FROM \(table) WHERE connection_id = ?", [key])
                     }
                 }
             }
@@ -290,24 +306,6 @@ final class Store: @unchecked Sendable {
 
     // MARK: Plumbing
 
-    private func queryConnections() -> [SavedConnection] {
-        var values: [SavedConnection] = []
-        report("read saved servers") {
-            try run("SELECT id, name, host, user, port, identity, remote_path FROM connections ORDER BY name") { row in
-                values.append(SavedConnection(
-                    id: ConnectionID(rawValue: UUID(uuidString: row.text(0)) ?? UUID()),
-                    name: row.text(1),
-                    host: row.text(2),
-                    user: row.text(3),
-                    port: row.text(4),
-                    identityFile: row.text(5),
-                    remotePath: row.text(6)
-                ))
-            }
-        }
-        return values
-    }
-
     private func paths(_ sql: String, _ value: String? = nil) -> [[UInt8]] {
         queue.sync {
             var values: [[UInt8]] = []
@@ -325,13 +323,9 @@ final class Store: @unchecked Sendable {
         do { try body() } catch { Self.log.error("Could not \(action, privacy: .public): \(error.localizedDescription, privacy: .public)") }
     }
 
-    private func run(_ sql: String, _ values: (any SQLValue)?..., row: (Row) -> Void = { _ in }) throws {
-        try run(sql, values, row: row)
-    }
-
     /// The one way a statement runs: prepare, bind `values` in order, step to the end calling
     /// `row` for each result row, finalize. Any result other than a row or done throws.
-    private func run(_ sql: String, _ values: [(any SQLValue)?], row: (Row) -> Void = { _ in }) throws {
+    private func run(_ sql: String, _ values: [(any SQLValue)?] = [], row: (Row) -> Void = { _ in }) throws {
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
         try check(sqlite3_prepare_v2(db, sql, -1, &statement, nil))
