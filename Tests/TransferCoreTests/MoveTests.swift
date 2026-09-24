@@ -69,3 +69,9 @@ import Testing
     #expect(TransferKept.Reason(.remove) == nil)
     #expect(TransferKept.Reason(.alreadyThere(["x"])) == .alreadyThere)
 }
+
+/// A paste whose items could not be copied is a failure the user must see, not a grey "Kept".
+@Test func keptWithAFailedItemIsAFailure() {
+    #expect(!TransferKept([.init("a", .alreadyThere), .init("b", .live(1))], moving: true, place: "on this Mac").hasFailures)
+    #expect(TransferKept([.init("a", .failed("No such file")), .init("b", .alreadyThere)], moving: false, place: "on this Mac").hasFailures)
+}

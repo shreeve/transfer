@@ -314,6 +314,11 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
         self.place = place
     }
 
+    /// True when any item could not be copied: that is a failure, not an original kept safe.
+    public var hasFailures: Bool {
+        items.contains { if case .failed = $0.reason { true } else { false } }
+    }
+
     /// One sentence per reason: "Kept “a” and “b” on the other server: the copy is not complete."
     public var errorDescription: String? {
         var reasons: [Reason] = []

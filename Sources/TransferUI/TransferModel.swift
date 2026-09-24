@@ -1157,7 +1157,7 @@ public final class TransferModel {
                 } catch {
                     // Stop cancels the task, and whatever the body threw then is not a failure.
                     if Self.isCancellation(error) || Task.isCancelled { return }
-                    if let kept = error as? TransferKept {
+                    if let kept = error as? TransferKept, !kept.hasFailures {
                         self?.keep(id, kept.localizedDescription)
                         return
                     }
