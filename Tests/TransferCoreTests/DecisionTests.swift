@@ -89,8 +89,10 @@ import Testing
 @Test func everyMadeUpNameIsTheFirstFreeOne() {
     #expect(KeepBothName.untitledFolder(existing: []) == "untitled folder")
     #expect(KeepBothName.untitledFolder(existing: ["untitled folder", "untitled folder 2"]) == "untitled folder 3")
-    #expect(KeepBothName.fromThisMac(existing: ["note.txt"], original: "note.txt") == "note.txt (from this Mac)")
-    #expect(KeepBothName.fromThisMac(existing: ["note.txt (from this Mac)"], original: "note.txt") == "note.txt (from this Mac 2)")
+    // The extension stays last, so the sibling opens in the same editor as the file.
+    #expect(KeepBothName.fromThisMac(existing: ["note.txt"], original: "note.txt") == "note (from this Mac).txt")
+    #expect(KeepBothName.fromThisMac(existing: ["note (from this Mac).txt"], original: "note.txt") == "note (from this Mac 2).txt")
+    #expect(KeepBothName.fromThisMac(existing: [], original: "Makefile") == "Makefile (from this Mac)")
     #expect(KeepBothName.firstFree(existing: ["a0", "a1"], from: 0) { "a\($0)" } == "a2")
 }
 

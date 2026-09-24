@@ -330,7 +330,7 @@ struct LiveSyncTests {
         try await withLive("keepboth") { h in
             let (local, id) = try await conflicted(h, server: "theirs", local: "mine")
             try await h.live.resolve(note, on: h.connection, choice: .keepBoth)
-            let sibling = RemotePath(string: "/srv/note.txt (from this Mac)")
+            let sibling = RemotePath(string: "/srv/note (from this Mac).txt")
             #expect(await h.fake.contents(sibling) == "mine")
             #expect(await h.fake.contents(note) == "theirs")
             #expect(read(local) == "theirs")
@@ -341,7 +341,7 @@ struct LiveSyncTests {
             try await edit(h, local, id, "mine 2")
             #expect(await waitUntil { await h.file()?.conflict == true })
             try await h.live.resolve(note, on: h.connection, choice: .keepBoth)
-            #expect(await h.fake.contents(RemotePath(string: "/srv/note.txt (from this Mac 2)")) == "mine 2")
+            #expect(await h.fake.contents(RemotePath(string: "/srv/note (from this Mac 2).txt")) == "mine 2")
             #expect(await h.fake.contents(sibling) == "mine")
             #expect(read(local) == "theirs 2")
             #expect(await h.files().count == 1)
@@ -708,13 +708,13 @@ struct LiveSyncTests {
         try await withLive("keepboth-race") { h in
             let (local, _) = try await conflicted(h, server: "theirs", local: "mine")
             await h.fake.setOnSave { path in
-                if path.name.hasSuffix("(from this Mac)") { try? Data("mine, saved again".utf8).write(to: local) }
+                if path.name.hasSuffix("(from this Mac).txt") { try? Data("mine, saved again".utf8).write(to: local) }
             }
             await #expect(throws: (any Error).self) {
                 try await h.live.resolve(note, on: h.connection, choice: .keepBoth)
             }
             #expect(read(local) == "mine, saved again")
-            #expect(await h.fake.contents(RemotePath(string: "/srv/note.txt (from this Mac)")) == "mine")
+            #expect(await h.fake.contents(RemotePath(string: "/srv/note (from this Mac).txt")) == "mine")
             #expect(await h.fake.contents(note) == "theirs")
             #expect(await h.file()?.conflict == true)
             #expect(await h.file()?.dirty == true)
@@ -742,7 +742,7 @@ struct LiveSyncTests {
             try await edit(h, local, id, "mine")
             #expect(await waitUntil { await raised(h) })
             try await h.live.resolve(note, on: h.connection, choice: .keepBoth)
-            #expect(await h.fake.contents(RemotePath(string: "/srv/note.txt (from this Mac)")) == "mine")
+            #expect(await h.fake.contents(RemotePath(string: "/srv/note (from this Mac).txt")) == "mine")
             #expect(await h.files().isEmpty)
         }
     }

@@ -77,10 +77,12 @@ public enum KeepBothName {
         firstFree(existing: existing) { $0 == 1 ? "untitled folder" : "untitled folder \($0)" }
     }
 
-    /// Keep Both for a Live conflict, the Mac's copy beside the server's: "notes.txt (from this
-    /// Mac)", "notes.txt (from this Mac 2)", …
+    /// Keep Both for a Live conflict, the Mac's copy beside the server's: "notes (from this
+    /// Mac).txt", "notes (from this Mac 2).txt", …; the extension stays last, so the copy opens in
+    /// the same editor.
     public static func fromThisMac(existing: Set<String>, original: String) -> String {
-        firstFree(existing: existing) { $0 == 1 ? "\(original) (from this Mac)" : "\(original) (from this Mac \($0))" }
+        let split = splitExtension(original)
+        return firstFree(existing: existing) { $0 == 1 ? "\(split.base) (from this Mac)\(split.ext)" : "\(split.base) (from this Mac \($0))\(split.ext)" }
     }
 
     /// A folder has no extension, as in Finder: its name is all base.
