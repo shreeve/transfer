@@ -163,6 +163,12 @@ public protocol SessionProvider: Sendable {
     func editableExtensions() async -> [String]
     /// Rewrites the config file. Open sessions pick the list up at once.
     func setEditableExtensions(_ extensions: [String]) async throws
+    /// Runs a paste or drop. Items on the destination's own server are copied there, or renamed
+    /// when moving; items on another server pass through a scratch folder on this Mac; files from
+    /// this Mac upload. Both servers must be logged in. A move removes an original, or puts a file
+    /// from this Mac in the Trash, only once it has checked that this move wrote a complete copy
+    /// of it, and throws `TransferKept` for any it kept. Call again with the same request to retry.
+    func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
 }
 
 /// One saved server. Views reach the server only through this protocol.
@@ -207,7 +213,7 @@ public protocol RemoteSession: Sendable {
     func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     /// Walks `root` on the walker channel and streams every entry, the root first under the
     /// empty key, the rest by their path relative to it.
-    func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(String, TreeEntry), Error>
+    func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, TreeEntry), Error>
     /// `.compare` opens the diff tool itself and returns nil.
     func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws
     /// A shell command that joins the same SSH master and starts a login shell in `directory`.
@@ -225,8 +231,8 @@ public enum SessionEvent: Sendable {
 
 public extension RemoteSession {
     /// The whole tree `walkTree` streams, by key.
-    func tree(_ root: RemotePath) async throws -> [String: TreeEntry] {
-        var entries: [String: TreeEntry] = [:]
+    func tree(_ root: RemotePath) async throws -> [TreeKey: TreeEntry] {
+        var entries: [TreeKey: TreeEntry] = [:]
         for try await (key, entry) in walkTree(root) { entries[key] = entry }
         return entries
     }

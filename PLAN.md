@@ -281,18 +281,18 @@ Drag to Finder uses `NSFilePromiseProvider`, one promise per dragged root. A dir
 
 Drag from Finder uploads. The local original stays. A drop on the background uses the current directory. A drop on a folder row uses that folder. There is no spring-loading.
 
-A drag inside the browser, to another folder on the same server, is one SFTP rename. If rename fails, show the error. Do not copy-then-delete.
+A drag inside the browser, to another folder on the same server, is one SFTP rename. If rename fails, show the error. Do not copy-then-delete. With Option held it copies on the server instead, as Paste does, and into the items' own folder it makes `name copy`. A drag from a window showing another server copies the items between servers, as Paste does; it never moves them.
 
 Duplicate (Command-D) creates `name copy`, then `name copy 2`, through §4.1.
 
 With a selection and no text field focused, Command-C copies the items. Command-V pastes them into the current folder; Option-Command-V moves them there. Text fields keep their own Copy and Paste. Cut is disabled outside text fields. Copy Remote URL is Option-Command-C.
 
 - Within one server, Paste copies on the server with the `copy-data` extension when the server offers it, and through the Mac otherwise. Pasting into the folder the items came from makes `name copy` beside each one. A folder cannot be pasted into itself. Move is one SFTP rename per item, as a drag is.
-- Between servers, Paste downloads into a scratch folder and uploads from it. Move removes each original only after its copy holds every file the original did, by name and size.
+- Between servers, Paste downloads into a scratch folder and uploads from it. Move removes each original only after its copy holds every file the original did, by exact name, size, and time, and only what this move wrote counts: a file already at the destination with the same size and time is asked about, never skipped, and one the user did not replace keeps the original.
 - Files copied in Finder upload on Paste. Move sends each original to the Trash once the server holds all of it.
 - Items copied in Transfer paste in Finder as real files. Finder reads only file URLs from the clipboard, so Transfer downloads the items to a staging folder right after the copy and adds their URLs when they are complete. Copies over 1 GB are not staged.
 - A bar at the bottom of every window names what the clipboard holds, where it came from, and whether Finder can paste it yet, such as "Copied 3 files and 1 folder (31 files in all, 12 MB)". Escape clears the clipboard. Files copied in Finder show there too.
-- Collisions follow §4.1: matching size and time skip, others ask.
+- Collisions follow §4.1: matching size and time skip, others ask. In a move, matching ones ask too.
 
 The shelf is one row per top-level operation. A directory copy is one row, with byte and item progress. It is hidden when nothing is active, paused, failed, or in conflict. Successful rows disappear when they finish. Failed rows stay and offer Retry and Remove. Remove does not delete finished files. Pause applies to that one operation, including one Live upload. There is no global pause.
 

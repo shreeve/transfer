@@ -1,8 +1,36 @@
 import Foundation
 
-/// One entry of a walked tree. Trees are keyed by the path relative to the root, joined with
-/// `/`; the root itself is the empty key. A file's `mtime` is whole seconds, as SFTP keeps it,
-/// or nil where it is not known.
+/// A path inside a walked tree, relative to its root and joined with `/`, as the exact bytes of
+/// its names; the root is the empty key. Two names that read alike, such as the two Unicode forms
+/// of `café` or two that are not UTF-8, stay two keys, so a move never takes one for the other.
+public struct TreeKey: Hashable, Comparable, Sendable, ExpressibleByStringLiteral, CustomStringConvertible {
+    public var bytes: [UInt8]
+
+    public init(bytes: [UInt8]) {
+        self.bytes = bytes
+    }
+
+    public init(stringLiteral value: String) {
+        bytes = Array(value.utf8)
+    }
+
+    public var description: String { String(decoding: bytes, as: UTF8.self) }
+
+    /// The key of `name` inside this one.
+    public func appending(_ name: [UInt8]) -> TreeKey {
+        TreeKey(bytes: bytes.isEmpty ? name : bytes + [0x2F] + name)
+    }
+
+    /// The names from the root down; none for the root.
+    public var components: [[UInt8]] { bytes.split(separator: 0x2F).map(Array.init) }
+
+    public static func < (left: TreeKey, right: TreeKey) -> Bool {
+        left.bytes.lexicographicallyPrecedes(right.bytes)
+    }
+}
+
+/// One entry of a walked tree, under its `TreeKey`. A file's `mtime` is whole seconds, as SFTP
+/// keeps it, or nil where it is not known.
 public enum TreeEntry: Hashable, Sendable {
     case directory
     case file(size: UInt64, mtime: UInt32? = nil)
@@ -18,6 +46,16 @@ public extension TreeEntry {
         case .symlink: self = .link
         case .file: self = .file(size: item.size ?? 0, mtime: item.mtime)
         case .other: self = .other
+        }
+    }
+
+    /// An entry on this Mac, from its attributes read without following a link (`lstat`).
+    init(_ attributes: [FileAttributeKey: Any]) {
+        switch attributes[.type] as? FileAttributeType {
+        case .typeDirectory: self = .directory
+        case .typeSymbolicLink: self = .link
+        case .typeRegular: self = .file(size: (attributes[.size] as? NSNumber)?.uint64Value ?? 0, mtime: (attributes[.modificationDate] as? Date).map(SFTPTime.seconds))
+        default: self = .other
         }
     }
 }
@@ -110,38 +148,38 @@ public enum PasteRules {
         }
         return nil
     }
-
-    /// Pasting into the folder the item came from makes a copy beside it, as Finder does.
-    /// Anywhere else the item keeps its name, and collisions are settled file by file.
-    public static func destinationName(for source: RemotePath, into folder: RemotePath, existing: Set<String>) -> String {
-        source.parent == folder ? KeepBothName.duplicate(existing: existing, original: source.name) : source.name
-    }
 }
 
 /// Whether a move may remove its original: only when this move wrote a complete copy.
 public enum MoveCheck {
     public enum Verdict: Equatable, Sendable {
         case remove
-        /// Files or links, by key, that the destination held before the move began. Their copy
-        /// cannot be told from what was there: a lookalike of the same size and time, or the
-        /// original itself reached through a second saved server.
-        case alreadyThere([String])
+        /// Files or links, by key, that the destination held before the move began and the move
+        /// did not replace. Their copy cannot be told from what was there: a lookalike the user
+        /// chose to skip, or the original itself reached through a second saved server.
+        case alreadyThere([TreeKey])
         /// Entries, by key, that the copy lacks or holds differently.
-        case incomplete([String])
+        case incomplete([TreeKey])
     }
 
     /// `source` is the original's tree walked after the copy, so anything added to it meanwhile
     /// is missing from the copy and keeps it. `before` is the destination before the move reached
-    /// it, empty when nothing was there; `after` is the destination now. A folder that was already
-    /// there may be merged into; a file or link that was already there never counts as copied.
+    /// it, empty when nothing was there; `after` is the destination now; `written` holds the keys
+    /// the move itself wrote, over what was there when the user chose Replace. A folder that was
+    /// already there may be merged into; a file or link that was there counts only when replaced.
     /// A file counts only with the same size and a known, equal time: every copy keeps the time,
     /// and a time either side does not know proves nothing.
-    public static func verdict(source: [String: TreeEntry], before: [String: TreeEntry], after: [String: TreeEntry]) -> Verdict {
+    public static func verdict(
+        source: [TreeKey: TreeEntry],
+        before: [TreeKey: TreeEntry],
+        after: [TreeKey: TreeEntry],
+        written: Set<TreeKey> = []
+    ) -> Verdict {
         guard !source.isEmpty else { return .incomplete([""]) }
-        var there: [String] = []
-        var missing: [String] = []
+        var there: [TreeKey] = []
+        var missing: [TreeKey] = []
         for (key, entry) in source {
-            if let old = before[key], !(entry == .directory && old == .directory) {
+            if let old = before[key], !(entry == .directory && old == .directory), !written.contains(key) {
                 there.append(key)
             } else if let copy = after[key], proven(entry, copy) {
                 continue
@@ -160,5 +198,133 @@ public enum MoveCheck {
         case (.file, _), (.other, _): false
         default: source == copy
         }
+    }
+}
+
+/// Finds two names in a tree that one folder on this Mac cannot hold apart: `README` and `readme`
+/// on a disk that ignores case, the two Unicode spellings of `café` (APFS ignores that difference
+/// too), or two names that are not valid UTF-8 and decode alike. Fed each key once, so a key that
+/// folds like one seen before is a second name.
+public struct NameClash: Sendable {
+    public let ignoringCase: Bool
+    private var seen: [String: TreeKey] = [:]
+    /// The first two keys found to clash.
+    public private(set) var found: (TreeKey, TreeKey)?
+
+    public init(ignoringCase: Bool) {
+        self.ignoringCase = ignoringCase
+    }
+
+    public mutating func add(_ key: TreeKey) {
+        guard found == nil else { return }
+        let text = key.description.precomposedStringWithCanonicalMapping
+        let folded = ignoringCase ? text.lowercased() : text
+        if let other = seen[folded] { found = (other, key) } else { seen[folded] = key }
+    }
+}
+
+/// One paste or drop: items on a saved server, or files on this Mac, copied or moved into a folder
+/// on a saved server. Made once per operation and passed again on every retry, so a retry skips
+/// what an earlier attempt finished and reuses the names it chose.
+public final class TransferRequest: Sendable {
+    public enum Sources: Sendable {
+        case server(ConnectionID, [RemotePath])
+        case mac([URL])
+    }
+
+    public let sources: Sources
+    /// The server the items go to, and the folder there.
+    public let connection: ConnectionID
+    public let folder: RemotePath
+    public let moving: Bool
+    /// What the sources hold, when known, so progress can show a total.
+    public let bytes: UInt64?
+    /// The engine's memory across attempts.
+    package let memo = Locked(TransferMemo())
+
+    public init(_ sources: Sources, into folder: RemotePath, on connection: ConnectionID, moving: Bool, bytes: UInt64? = nil) {
+        self.sources = sources
+        self.folder = folder
+        self.connection = connection
+        self.moving = moving
+        self.bytes = bytes
+    }
+}
+
+/// What the attempts of one `TransferRequest` have done so far.
+package struct TransferMemo: Sendable {
+    /// Sources, by index, finished: copied, or moved and removed.
+    package var done: Set<Int> = []
+    /// Where each source goes, once chosen, by index.
+    package var targets: [Int: RemotePath] = [:]
+    /// Each destination's tree before the move first reached it, by index.
+    package var before: [Int: [TreeKey: TreeEntry]] = [:]
+    /// Whether the two ends of a move were proven to be different folders.
+    package var checked = false
+    /// Every file, link, and folder the copy wrote on the destination.
+    package var written: Set<RemotePath> = []
+    /// Where an item went in place of the path it was offered, after Keep Both.
+    package var landed: [RemotePath: RemotePath] = [:]
+
+    package init() {}
+}
+
+/// A paste that left some items where they were, and why; thrown once the rest are done.
+public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
+    public enum Reason: Hashable, Sendable {
+        /// Two names in the item that this Mac's disk, which it passes through, cannot hold apart.
+        case clash(String, String)
+        case alreadyThere
+        case incomplete
+        /// Live files under the original with edits not yet on the server.
+        case live(Int)
+
+        public init?(_ verdict: MoveCheck.Verdict) {
+            switch verdict {
+            case .remove: return nil
+            case .alreadyThere: self = .alreadyThere
+            case .incomplete: self = .incomplete
+            }
+        }
+    }
+
+    public struct Item: Equatable, Sendable {
+        public var name: String
+        public var reason: Reason
+
+        public init(_ name: String, _ reason: Reason) {
+            self.name = name
+            self.reason = reason
+        }
+    }
+
+    public var items: [Item]
+    public var moving: Bool
+    /// Where the kept items are: "on the other server", "on this Mac".
+    public var place: String
+
+    public init(_ items: [Item], moving: Bool, place: String) {
+        self.items = items
+        self.moving = moving
+        self.place = place
+    }
+
+    /// One sentence per reason: "Kept “a” and “b” on the other server: the copy is not complete."
+    public var errorDescription: String? {
+        var reasons: [Reason] = []
+        for item in items where !reasons.contains(item.reason) { reasons.append(item.reason) }
+        return reasons.map { reason in
+            let list = ListFormatter.localizedString(byJoining: items.filter { $0.reason == reason }.map { "“\($0.name)”" })
+            return switch reason {
+            case .clash(let first, let second):
+                "Did not \(moving ? "move" : "paste") \(list): “\(first)” and “\(second)” differ only in case or accents, and this Mac's disk, which the items pass through, cannot hold both."
+            case .alreadyThere:
+                "Kept \(list) \(place): something with that name was already at the destination and was not replaced, so this move cannot tell its own copy from it."
+            case .incomplete:
+                "Kept \(list) \(place): the copy is not complete."
+            case .live(let count):
+                "Kept \(list) \(place): \(TransferError.liveUnsynced(count).localizedDescription)."
+            }
+        }.joined(separator: " ")
     }
 }

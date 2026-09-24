@@ -203,9 +203,14 @@ public final class Clipboard {
                 // Off the main thread, and stopped when the clip is: copying a whole disk in
                 // Finder must not leave a walk running after the next copy replaces it.
                 let walk = Task.detached {
+                    let manager = FileManager.default
                     for url in urls {
-                        LocalTree.walk(url, stop: { Task.isCancelled }) { key, entry in
-                            if key.isEmpty { box.withLock { $0.add(root: entry) } } else { box.withLock { $0.add(inside: entry) } }
+                        guard let attributes = try? manager.attributesOfItem(atPath: url.path) else { continue }
+                        let root = TreeEntry(attributes)
+                        box.withLock { $0.add(root: root) }
+                        guard root == .directory, let enumerator = manager.enumerator(atPath: url.path) else { continue }
+                        while !Task.isCancelled, enumerator.nextObject() != nil {
+                            if let attributes = enumerator.fileAttributes { box.withLock { $0.add(inside: TreeEntry(attributes)) } }
                         }
                     }
                 }
@@ -226,12 +231,13 @@ public final class Clipboard {
         var clash = NameClash(ignoringCase: Self.diskIgnoresCase)
         var shown = ContinuousClock.now
         for item in items {
-            clash.add(item.name)
+            let root = TreeKey(bytes: item.path.nameBytes)
+            clash.add(root)
             guard item.kind == .directory else { continue }
             do {
-                for try await (key, entry) in session.walkTree(item.path) where !key.isEmpty {
+                for try await (key, entry) in session.walkTree(item.path) where !key.bytes.isEmpty {
                     tally.add(inside: entry)
-                    clash.add("\(item.name)/\(key)")
+                    clash.add(root.appending(key.bytes))
                     if shown.duration(to: .now) >= .milliseconds(200) {
                         update(id) { $0.tally = tally }
                         shown = .now
@@ -325,8 +331,7 @@ public final class Clipboard {
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Transfer", isDirectory: true)
     }
 
-    /// This process's own folder under `Staging`: its clips' staging folders and its pastes'
-    /// scratch folders. Two copies of Transfer can run at once (`open -n`, or a development build
+    /// This process's own folder under `Staging`, for its clips' staging folders. Two copies of Transfer can run at once (`open -n`, or a development build
     /// beside the installed app), so neither may remove what the other is using. Each holds an
     /// exclusive lock on `<its folder>.lock` while it runs, which the kernel drops when the
     /// process ends, crash or not; a launch removes only the folders whose lock it can take.
@@ -358,73 +363,10 @@ public final class Clipboard {
         processFolder.appendingPathComponent("clip-\(id.uuidString)", isDirectory: true)
     }
 
-    /// A fresh folder for a paste between servers, which travels through this Mac.
-    nonisolated static func scratchFolder() -> URL {
-        processFolder.appendingPathComponent("paste-\(UUID().uuidString)", isDirectory: true)
-    }
-
-    /// Whether the disk that staging and scratch folders live on treats `README` and `readme` as
-    /// one name, as a Mac's disk does unless formatted case-sensitive. When it cannot be told, yes.
+    /// Whether the disk that staging folders live on treats `README` and `readme` as one name, as
+    /// a Mac's disk does unless formatted case-sensitive. When it cannot be told, yes.
     nonisolated static var diskIgnoresCase: Bool {
         let values = try? processFolder.deletingLastPathComponent().resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
         return values?.volumeSupportsCaseSensitiveNames != true
-    }
-}
-
-/// Finds two names in a remote tree that one folder on this Mac cannot hold apart: `README` and
-/// `readme` on a disk that ignores case, the two Unicode spellings of `café` (APFS ignores that
-/// difference too), or two names that are not valid UTF-8 and decode alike. Fed each entry's key
-/// once, as `walkTree` yields it, so any key seen a second time was a second name.
-struct NameClash {
-    let ignoringCase: Bool
-    private var seen: [String: String] = [:]
-    /// The first two keys found to clash.
-    private(set) var found: (String, String)?
-
-    init(ignoringCase: Bool) {
-        self.ignoringCase = ignoringCase
-    }
-
-    /// Swift compares strings by canonical equivalence, so keys that differ only in Unicode
-    /// normalization already meet in `seen`.
-    mutating func add(_ key: String) {
-        guard found == nil else { return }
-        let folded = ignoringCase ? key.lowercased() : key
-        if let other = seen[folded] { found = (other, key) } else { seen[folded] = key }
-    }
-}
-
-/// Walks a local file or folder the way `RemoteSession.walkTree` walks a remote one, so the
-/// two can be compared before a move removes the original. Reads each entry with `lstat` through
-/// FileManager's attributes: `URL.resourceValues` caches per URL instance and can return the
-/// size and time from an earlier walk.
-enum LocalTree {
-    /// `stop` is asked before each entry, so a walk of a whole disk can be abandoned.
-    static func walk(_ root: URL, stop: () -> Bool = { false }, visit: (String, TreeEntry) -> Void) {
-        let manager = FileManager.default
-        guard let attributes = try? manager.attributesOfItem(atPath: root.path) else { return }
-        let rootEntry = entry(attributes)
-        visit("", rootEntry)
-        guard rootEntry == .directory, let enumerator = manager.enumerator(atPath: root.path) else { return }
-        while !stop(), let key = enumerator.nextObject() as? String {
-            guard let attributes = enumerator.fileAttributes else { continue }
-            visit(key, entry(attributes))
-        }
-    }
-
-    static func entries(_ root: URL) -> [String: TreeEntry] {
-        var all: [String: TreeEntry] = [:]
-        walk(root) { all[$0] = $1 }
-        return all
-    }
-
-    /// A FIFO, socket, or device is `.other`: nothing copies it, so a move keeps its folder.
-    private static func entry(_ attributes: [FileAttributeKey: Any]) -> TreeEntry {
-        let type = attributes[.type] as? FileAttributeType
-        if type == .typeDirectory { return .directory }
-        if type == .typeSymbolicLink { return .link }
-        guard type == .typeRegular else { return .other }
-        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        return .file(size: size, mtime: (attributes[.modificationDate] as? Date).map(SFTPTime.seconds))
     }
 }
