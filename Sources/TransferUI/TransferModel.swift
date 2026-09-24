@@ -1362,7 +1362,7 @@ public final class TransferModel {
         for item in selectedItems {
             guard let parent = item.path.parent else { continue }
             var existing = taken[parent] ?? Set(listings[parent]?.items.map(\.name) ?? [])
-            let name = KeepBothName.duplicate(existing: existing, original: item.name)
+            let name = KeepBothName.duplicate(existing: existing, original: item.name, isFolder: item.kind == .directory)
             existing.insert(name)
             taken[parent] = existing
             let source = item.path

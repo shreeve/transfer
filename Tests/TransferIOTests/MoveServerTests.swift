@@ -28,6 +28,8 @@ struct MoveServerTests {
                 #expect(try h.read("elsewhere/a.txt") == "a")
                 #expect(try h.read("elsewhere/sub/b.txt") == "b")
                 #expect(try h.names("site").isEmpty)
+                // The probe folders were recorded, as temps are, and forgotten once removed.
+                #expect(try Store(root: h.root).remoteTemps(connection: h.session.connection.id).isEmpty)
             }
         }
     }
@@ -81,6 +83,69 @@ struct MoveServerTests {
         }
     }
 
+    /// Two items of one move with the same name, p/VERSION and q/VERSION, alike in size and time:
+    /// the second passed for the first's copy, since the memo of what the move wrote was shared by
+    /// every item, and its original was removed unasked (R-T1). Now it is asked about; skipped, it
+    /// stays, as between servers so from this Mac.
+    @Test func twoItemsWithOneNameEachCountOnlyTheirOwnCopy() async throws {
+        try await withHarness("twins", connected: true) { h in
+            try await withAlias(h) { alias in
+                let from = try h.folder("from", files: ["p/VERSION": "one", "q/VERSION": "two"])
+                for path in ["from/p/VERSION", "from/q/VERSION"] { try h.setTime(path, 1_700_000_000) }
+                let destination = try h.folder("to")
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("p").appending("VERSION"), from.appending("q").appending("VERSION")]), into: destination, on: h.session.connection.id, moving: true)
+                let skip = Choosing(.skip)
+                await #expect(throws: TransferKept([.init("VERSION", .alreadyThere)], moving: true, place: "on the other server")) {
+                    try await OperationPrompts.$current.withValue(skip) { try await run(request, on: h.session, from: alias) }
+                }
+                #expect(skip.asked == 1)
+                #expect(try h.read("to/VERSION") == "one")
+                #expect(try h.names("from/p").isEmpty)
+                #expect(try h.read("from/q/VERSION") == "two")
+            }
+
+            let mac = h.staging.appendingPathComponent("mac")
+            for (folder, text) in [("p", "one"), ("q", "two")] {
+                let file = mac.appendingPathComponent(folder).appendingPathComponent("VERSION")
+                try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(text.utf8).write(to: file)
+                try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: file.path)
+            }
+            let sources = ["p", "q"].map { mac.appendingPathComponent($0).appendingPathComponent("VERSION") }
+            let trashed = Locked<[URL]>([])
+            let skip = Choosing(.skip)
+            await #expect(throws: TransferKept([.init("VERSION", .alreadyThere)], moving: true, place: "on this Mac")) {
+                try await OperationPrompts.$current.withValue(skip) {
+                    try await run(TransferRequest(.mac(sources), into: try h.folder("fromMac"), on: h.session.connection.id, moving: true), on: h.session, trash: { url in trashed.withLock { $0.append(url) } })
+                }
+            }
+            #expect(skip.asked == 1)
+            #expect(trashed.value == [sources[0]])
+            #expect(try h.read("fromMac/VERSION") == "one")
+        }
+    }
+
+    /// Keep Both for the first of two same-named items sent the second, unasked, to where the
+    /// first had landed, where the first's copy passed for its own (R-T1). Each item now settles
+    /// its own name.
+    @Test func keepBothForOneItemIsNotFollowedByAnother() async throws {
+        try await withHarness("kb2", connected: true) { h in
+            try await withAlias(h) { alias in
+                let from = try h.folder("from", files: ["p/k.txt": "p", "q/k.txt": "q"])
+                for path in ["from/p/k.txt", "from/q/k.txt"] { try h.setTime(path, 1_700_000_000) }
+                let destination = try h.folder("to", files: ["k.txt": "old"])
+                let keepBoth = Choosing(.keepBoth)
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("p").appending("k.txt"), from.appending("q").appending("k.txt")]), into: destination, on: h.session.connection.id, moving: true)
+                try await OperationPrompts.$current.withValue(keepBoth) { try await run(request, on: h.session, from: alias) }
+                #expect(keepBoth.asked == 2)
+                #expect(try h.read("to/k.txt") == "old")
+                #expect(try h.read("to/k 2.txt") == "p")
+                #expect(try h.read("to/k 3.txt") == "q")
+                #expect(try h.names("from/p").isEmpty && h.names("from/q").isEmpty)
+            }
+        }
+    }
+
     /// A retry ran the whole paste again: a move failed on items it had already moved, and a
     /// paste beside the original made "name copy 2" next to its own partial "name copy" (CLIP-18,
     /// TD-06). Also, a Keep Both name chosen before the failure is reused, not asked again.
@@ -127,6 +192,50 @@ struct MoveServerTests {
         }
     }
 
+    /// One item that failed ended the whole paste, and the items after it were never tried (R-T6).
+    /// Each has its turn now, on every route, and what failed is reported at the end: a single
+    /// failure as it came, several together.
+    @Test func aFailedItemDoesNotStopTheOthers() async throws {
+        try await withHarness("each", connected: true) { h in
+            let site = try h.folder("site", files: ["good.txt": "g", "also.txt": "a"])
+            let to = try h.folder("to")
+            let paste = TransferRequest(.server(h.session.connection.id, [site.appending("gone.txt"), site.appending("good.txt")]), into: to, on: h.session.connection.id, moving: false)
+            await #expect(throws: TransferError.self) { try await run(paste, on: h.session) }
+            #expect(try h.names("to") == ["good.txt"])
+
+            try await withAlias(h) { alias in
+                let move = TransferRequest(.server(alias.connection.id, [site.appending("gone.txt"), site.appending("missing.txt"), site.appending("also.txt")]), into: to, on: h.session.connection.id, moving: true)
+                do {
+                    try await run(move, on: h.session, from: alias)
+                    Issue.record("the two missing items were not reported")
+                } catch let kept as TransferKept {
+                    #expect(kept.items.map(\.name) == ["gone.txt", "missing.txt"])
+                }
+                #expect(try h.read("to/also.txt") == "a")
+                #expect(try h.names("site") == ["good.txt"])
+            }
+
+            let mac = h.staging.appendingPathComponent("mac.txt")
+            try Data("m".utf8).write(to: mac)
+            let upload = TransferRequest(.mac([h.staging.appendingPathComponent("gone.txt"), mac]), into: to, on: h.session.connection.id, moving: true)
+            let trashed = Locked<[URL]>([])
+            await #expect(throws: TransferError.self) { try await run(upload, on: h.session, trash: { url in trashed.withLock { $0.append(url) } }) }
+            #expect(try h.read("to/mac.txt") == "m")
+            #expect(trashed.value == [mac])
+        }
+    }
+
+    /// A folder pasted beside itself was named as a file is, at its last dot: "v1.2" became
+    /// "v1 copy.2" (R-C3).
+    @Test func aFolderPastedBesideItselfKeepsItsWholeName() async throws {
+        try await withHarness("vdup", connected: true) { h in
+            let site = try h.folder("site", files: ["v1.2/a.txt": "a", "notes.txt": "n"])
+            let id = h.session.connection.id
+            try await run(TransferRequest(.server(id, [site.appending("v1.2"), site.appending("notes.txt")]), into: site, on: id, moving: false), on: h.session)
+            #expect(try h.names("site") == ["notes copy.txt", "notes.txt", "v1.2", "v1.2 copy"])
+        }
+    }
+
     /// A move deleted a Live working copy's folder, edits and all, since the server's copy it
     /// compared was complete (CLIP-03).
     @Test func anUnsyncedLiveFileKeepsTheFolderItIsIn() async throws {
@@ -148,6 +257,52 @@ struct MoveServerTests {
                 #expect(try h.read("to/dir/note.txt") == "first")
                 #expect(try Data(contentsOf: local) == Data("edited here".utf8))
             }
+        }
+    }
+
+    /// Removing a moved original listed each folder again and removed all it held, so a file added
+    /// or changed after the copy was verified went too, and its only copy with it (R-T2). Only the
+    /// verified entries go now; what changed stays, with the folders holding it.
+    @Test func aMovedOriginalLosesOnlyWhatWasVerified() async throws {
+        try await withHarness("verified", connected: true) { h in
+            let dir = try h.folder("dir", files: ["a.txt": "a", "sub/b.txt": "b", "sub/c.txt": "c", "gone/d.txt": "d"])
+            let verified = try await h.session.tree(dir)
+            try h.write("dir/sub/new.txt", "added")
+            try h.write("dir/sub/c.txt", "changed")
+            #expect(try await h.session.removeMoved(dir, verified: verified, savedSince: await h.live.saveMark()) == false)
+            #expect(try h.names("dir") == ["sub"])
+            #expect(try h.names("dir/sub") == ["c.txt", "new.txt"])
+
+            let unchanged = try h.folder("unchanged", files: ["x/y.txt": "y"])
+            #expect(try await h.session.removeMoved(unchanged, verified: try await h.session.tree(unchanged), savedSince: 0))
+            #expect(try !h.names("").contains("unchanged"))
+        }
+    }
+
+    /// A Live save that landed after the move walked its original and before the removal left
+    /// the removal a clean Live file: the original, holding the newer bytes, was removed and the
+    /// working copy with it (R-L2). The save here keeps the size and whole-second time the walk
+    /// saw, so only the Live save count tells.
+    @Test func aLiveSaveAfterTheWalkKeepsTheOriginal() async throws {
+        try await withHarness("lsave", connected: true) { h in
+            let dir = try h.folder("dir", files: ["note.txt": "first"])
+            try h.setTime("dir/note.txt", 1_700_000_000)
+            let local = try await h.session.prepareLiveFile(dir.appending("note.txt"))
+            let mark = await h.live.saveMark()
+            let verified = try await h.session.tree(dir)
+
+            let saved = h.staging.appendingPathComponent("note.txt")
+            try Data("FIRST".utf8).write(to: saved)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000.5)], ofItemAtPath: saved.path)
+            #expect(rename(saved.path, local.path) == 0)
+            #expect(await waitUntil { (try? h.read("dir/note.txt")) == "FIRST" })
+            #expect(await waitUntil { await h.session.liveFiles().first?.dirty == false })
+            #expect(try await h.session.tree(dir) == verified)
+
+            #expect(try await h.session.removeMoved(dir, verified: verified, savedSince: mark) == false)
+            #expect(try h.read("dir/note.txt") == "FIRST")
+            #expect(try Data(contentsOf: local) == Data("FIRST".utf8))
+            #expect(await h.session.liveFiles().count == 1)
         }
     }
 

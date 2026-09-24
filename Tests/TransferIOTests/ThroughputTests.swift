@@ -111,10 +111,56 @@ import TransferCore
         let file = Self.scratchFile()
         defer { try? FileManager.default.removeItem(at: file) }
         let parts = try DownloadParts(file, size: UInt64(content.count)) { _ in }
-        try await server.channel.receive(Self.path, into: parts, matching: Fingerprint(size: 200_000, mtime: 8))
+        try await server.channel.receive(Self.path, into: parts, matching: Fingerprint(size: 200_000, mtime: 8), helping: true)
         #expect(server.sent(SFTPCode.read).isEmpty)
         #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
         #expect(parts.nextRequest()?.offset == 0)
+        await server.stop()
+    }
+
+    /// A file that grew since it was listed was read only up to its listed size and placed as
+    /// complete, cut short, when no second channel helped (R-T3). The channel that owns a download
+    /// checks the open file against the listing too; its check rides with the first READs (this
+    /// server answers it only once a READ is in), and fails the download before a byte is written.
+    @Test(arguments: [200_000, 300_000]) func theOwningChannelChecksTheFileAgainstItsListing(listed: Int) async throws {
+        let content = Self.content(300_000)
+        let check = Locked<UInt32?>(nil)
+        let server = try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.open: return ScriptedServer.handle(request.id)
+            case SFTPCode.close: return ScriptedServer.ok(request.id)
+            case SFTPCode.fstat:
+                check.value = request.id
+                return nil
+            case SFTPCode.read:
+                var reply = Data()
+                if let id = check.withLock({ id in defer { id = nil }; return id }) {
+                    reply = ScriptedServer.attrs(id, SFTPAttrs(size: UInt64(content.count), permissions: 0o100644, atime: 9, mtime: 9))
+                }
+                var reader = ByteReader(request.body)
+                _ = try? reader.blob()
+                let offset = Int((try? reader.u64()) ?? 0)
+                let length = Int((try? reader.u32()) ?? 0)
+                return reply + (offset < content.count
+                    ? ScriptedServer.data(request.id, content.subdata(in: offset..<min(offset + length, content.count)))
+                    : ScriptedServer.status(request.id, SFTPCode.eof))
+            default: return nil
+            }
+        }
+        let file = Self.scratchFile()
+        defer { try? FileManager.default.removeItem(at: file) }
+        let download = { try await server.channel.download(Self.path, to: file, size: UInt64(listed), matching: Fingerprint(size: UInt64(listed), mtime: 9)) { _ in } }
+        if listed == content.count {
+            try await download()
+            #expect(try Data(contentsOf: file) == content)
+        } else {
+            await #expect(throws: TransferError.failed("“file” changed on the server while it downloaded")) { try await download() }
+            #expect(try Data(contentsOf: file).isEmpty)
+        }
+        #expect(server.sent(SFTPCode.fstat).count == 1)
+        // The server answers in order, so once it has the CLOSE every READ reply is out, and none
+        // is written into a pipe `stop` has closed.
+        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
         await server.stop()
     }
 
@@ -322,6 +368,28 @@ struct ThroughputServerTests {
             #expect(try Data(contentsOf: down) == data)
             #expect(try FileManager.default.contentsOfDirectory(atPath: h.staging.path).sorted() == ["big.bin", "down.bin"])
             #expect(try FileManager.default.contentsOfDirectory(atPath: h.remote.path) == ["big.bin"])
+        }
+    }
+
+    /// A file listed before it grew, small or large enough to split across channels, was placed
+    /// cut to its listed size as if complete (R-T3). It now fails, and nothing is placed.
+    @Test(arguments: [100, Int(SSHConnection.stripeSize) + 1]) func aFileThatGrewSinceItWasListedIsNotPlacedShort(size: Int) async throws {
+        try await withHarness("stale", connected: true) { h in
+            let served = h.remote.appendingPathComponent("grows.bin")
+            try Data(count: size).write(to: served)
+            let path = h.remotePath.appending(name: Array("grows.bin".utf8))
+            let listed = try await h.session.stat(path)
+            let handle = try FileHandle(forWritingTo: served)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(count: 1000))
+            try handle.close()
+            let down = h.staging.appendingPathComponent("grows.bin")
+            await #expect(throws: TransferError.failed("“grows.bin” changed on the server while it downloaded")) {
+                try await h.session.fetch(path, info: listed, to: down) { _ in }
+            }
+            #expect(try FileManager.default.contentsOfDirectory(atPath: h.staging.path).isEmpty)
+            try await h.session.fetch(path, info: try await h.session.stat(path), to: down) { _ in }
+            #expect(try Data(contentsOf: down).count == size + 1000)
         }
     }
 

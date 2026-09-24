@@ -64,12 +64,35 @@ import Testing
     #expect(KeepBothName.next(existing: [], original: "Makefile") == "Makefile 2")
 }
 
+/// A temp added 47 bytes to its file's name, past the 255 a name may have when the name took more
+/// than 208 (R-T5). The name in it is cut to fit, never inside a character.
+@Test func aTempNameFitsTheNameLimit() {
+    let id = UUID().uuidString
+    #expect(CopyRules.tempName(for: "notes.txt", transferID: id) == ".notes.txt.transfer-\(id)")
+    for name in [String(repeating: "a", count: 255), String(repeating: "é", count: 127), String(repeating: "😀", count: 63)] {
+        let temp = CopyRules.tempName(for: name, transferID: id)
+        #expect(temp.utf8.count <= 255 && temp.utf8.count > 250)
+        #expect(temp.hasSuffix(".transfer-\(id)"))
+        #expect(name.hasPrefix(temp.dropFirst().dropLast(".transfer-\(id)".count)))
+    }
+}
+
+/// A folder has no extension: "v1.2" duplicated was "v1 copy.2", and kept both "v1 2.2" (R-C3).
+@Test func aFolderNameIsNotSplitAtItsLastDot() {
+    #expect(KeepBothName.duplicate(existing: ["v1.2"], original: "v1.2", isFolder: true) == "v1.2 copy")
+    #expect(KeepBothName.duplicate(existing: ["v1.2", "v1.2 copy"], original: "v1.2", isFolder: true) == "v1.2 copy 2")
+    #expect(KeepBothName.next(existing: ["site.d"], original: "site.d", isFolder: true) == "site.d 2")
+    #expect(KeepBothName.next(existing: ["site.d"], original: "site.d") == "site 2.d")
+}
+
 /// New Folder and a Live conflict's Keep Both named files with their own loops, outside Core.
 @Test func everyMadeUpNameIsTheFirstFreeOne() {
     #expect(KeepBothName.untitledFolder(existing: []) == "untitled folder")
     #expect(KeepBothName.untitledFolder(existing: ["untitled folder", "untitled folder 2"]) == "untitled folder 3")
-    #expect(KeepBothName.fromThisMac(existing: ["note.txt"], original: "note.txt") == "note.txt (from this Mac)")
-    #expect(KeepBothName.fromThisMac(existing: ["note.txt (from this Mac)"], original: "note.txt") == "note.txt (from this Mac 2)")
+    // The extension stays last, so the sibling opens in the same editor as the file.
+    #expect(KeepBothName.fromThisMac(existing: ["note.txt"], original: "note.txt") == "note (from this Mac).txt")
+    #expect(KeepBothName.fromThisMac(existing: ["note (from this Mac).txt"], original: "note.txt") == "note (from this Mac 2).txt")
+    #expect(KeepBothName.fromThisMac(existing: [], original: "Makefile") == "Makefile (from this Mac)")
     #expect(KeepBothName.firstFree(existing: ["a0", "a1"], from: 0) { "a\($0)" } == "a2")
 }
 

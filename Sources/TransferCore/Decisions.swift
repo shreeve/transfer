@@ -60,15 +60,15 @@ public enum KeepBothName {
         return candidate(n)
     }
 
-    /// Keep Both: "report 2.pdf", "report 3.pdf", …
-    public static func next(existing: Set<String>, original: String) -> String {
-        let split = splitExtension(original)
+    /// Keep Both: "report 2.pdf", "report 3.pdf", …; a folder's whole name is kept: "v1.2 2".
+    public static func next(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
+        let split = splitExtension(original, isFolder: isFolder)
         return firstFree(existing: existing, from: 2) { "\(split.base) \($0)\(split.ext)" }
     }
 
-    /// Duplicate: "notes copy.txt", "notes copy 2.txt", …
-    public static func duplicate(existing: Set<String>, original: String) -> String {
-        let split = splitExtension(original)
+    /// Duplicate: "notes copy.txt", "notes copy 2.txt", …; a folder's whole name is kept: "v1.2 copy".
+    public static func duplicate(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
+        let split = splitExtension(original, isFolder: isFolder)
         return firstFree(existing: existing) { $0 == 1 ? "\(split.base) copy\(split.ext)" : "\(split.base) copy \($0)\(split.ext)" }
     }
 
@@ -77,14 +77,17 @@ public enum KeepBothName {
         firstFree(existing: existing) { $0 == 1 ? "untitled folder" : "untitled folder \($0)" }
     }
 
-    /// Keep Both for a Live conflict, the Mac's copy beside the server's: "notes.txt (from this
-    /// Mac)", "notes.txt (from this Mac 2)", …
+    /// Keep Both for a Live conflict, the Mac's copy beside the server's: "notes (from this
+    /// Mac).txt", "notes (from this Mac 2).txt", …; the extension stays last, so the copy opens in
+    /// the same editor.
     public static func fromThisMac(existing: Set<String>, original: String) -> String {
-        firstFree(existing: existing) { $0 == 1 ? "\(original) (from this Mac)" : "\(original) (from this Mac \($0))" }
+        let split = splitExtension(original)
+        return firstFree(existing: existing) { $0 == 1 ? "\(split.base) (from this Mac)\(split.ext)" : "\(split.base) (from this Mac \($0))\(split.ext)" }
     }
 
-    private static func splitExtension(_ name: String) -> (base: String, ext: String) {
-        guard let dot = name.lastIndex(of: "."), dot != name.startIndex else {
+    /// A folder has no extension, as in Finder: its name is all base.
+    private static func splitExtension(_ name: String, isFolder: Bool = false) -> (base: String, ext: String) {
+        guard !isFolder, let dot = name.lastIndex(of: "."), dot != name.startIndex else {
             return (name, "")
         }
         return (String(name[..<dot]), String(name[dot...]))
@@ -92,8 +95,19 @@ public enum KeepBothName {
 }
 
 public enum CopyRules {
+    /// The hidden temp beside `basename`: ".notes.txt.transfer-<id>". The name in it is cut, never
+    /// inside a character, so the temp fits the 255 bytes a file name may take even when
+    /// `basename` nearly does.
     public static func tempName(for basename: String, transferID: String) -> String {
-        ".\(basename).transfer-\(transferID)"
+        let suffix = ".transfer-\(transferID)"
+        var room = 255 - 1 - suffix.utf8.count
+        var kept = String.UnicodeScalarView()
+        for scalar in basename.unicodeScalars {
+            room -= scalar.utf8.count
+            guard room >= 0 else { break }
+            kept.append(scalar)
+        }
+        return ".\(String(kept))\(suffix)"
     }
 }
 

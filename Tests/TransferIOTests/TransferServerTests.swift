@@ -377,6 +377,71 @@ struct TransferServerTests {
         }
     }
 
+    /// A folder copied onto a link asks about the link, and Replace removed whatever held the name
+    /// by then, even a file that took the link's place while the question was up (R-T7). Only what
+    /// the question was about goes.
+    @Test func replaceRemovesOnlyWhatWasAskedAbout() async throws {
+        try await withHarness("swap", connected: true) { h in
+            let tree = h.staging.appendingPathComponent("dir")
+            try FileManager.default.createDirectory(at: tree, withIntermediateDirectories: true)
+            try Data("a".utf8).write(to: tree.appendingPathComponent("a.txt"))
+            let held = h.remote.appendingPathComponent("dir")
+            try FileManager.default.createSymbolicLink(atPath: held.path, withDestinationPath: "elsewhere")
+            let swapping = ReplacingAfter {
+                try? FileManager.default.removeItem(at: held)
+                try? Data("precious".utf8).write(to: held)
+            }
+            await #expect(throws: TransferError.self) {
+                try await OperationPrompts.$current.withValue(swapping) {
+                    try await h.session.upload(tree, to: h.remotePath.appending(name: Array("dir".utf8))) { _ in }
+                }
+            }
+            #expect(try Data(contentsOf: held) == Data("precious".utf8))
+        }
+    }
+
+    /// A file a replace set aside (on a server without posix-rename), or a move's probe folder,
+    /// left behind by a dropped connection stayed hidden for good (R-T8). The next login puts the
+    /// file back, finishes a replace that got as far as its new file, and removes the probe.
+    @Test func theNextLoginPutsBackWhatAReplaceSetAside() async throws {
+        try await withHarness("aside") { h in
+            let folder = h.remotePath
+            try Data("mine".utf8).write(to: h.remote.appendingPathComponent(".transfer-old-1"))
+            try Data("old".utf8).write(to: h.remote.appendingPathComponent(".transfer-old-2"))
+            try Data("new".utf8).write(to: h.remote.appendingPathComponent("done.txt"))
+            try FileManager.default.createDirectory(at: h.remote.appendingPathComponent(".transfer-move-check-3"), withIntermediateDirectories: true)
+            let store = try Store(root: h.root)
+            let id = h.session.connection.id
+            store.rememberTemp(SSHConnection.asideRecord(folder.appending(".transfer-old-1"), folder.appending("notes.txt")), connection: id)
+            store.rememberTemp(SSHConnection.asideRecord(folder.appending(".transfer-old-2"), folder.appending("done.txt")), connection: id)
+            store.rememberTemp(folder.appending(".transfer-move-check-3"), connection: id)
+
+            _ = try await h.session.connect(prompts: h.prompts)
+            #expect(try FileManager.default.contentsOfDirectory(atPath: h.remote.path).sorted() == ["done.txt", "notes.txt"])
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("notes.txt")) == Data("mine".utf8))
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("done.txt")) == Data("new".utf8))
+            #expect(store.remoteTemps(connection: id).isEmpty)
+        }
+    }
+
+    /// A temp is named ".<name>.transfer-<UUID>", 47 bytes longer than the name, so a file whose
+    /// name took more than 208 of the 255 bytes a name may have could not be copied either way
+    /// (R-T5). The name in the temp is cut to fit, and a long name goes up and down whole.
+    @Test func aNameNearTheLimitGoesBothWays() async throws {
+        try await withHarness("long", connected: true) { h in
+            let name = String(repeating: "a", count: 246) + ".txt"
+            #expect(name.utf8.count == 250)
+            try Data("long".utf8).write(to: h.staging.appendingPathComponent(name))
+            let remote = h.remotePath.appending(name: Array(name.utf8))
+            try await h.session.upload(h.staging.appendingPathComponent(name), to: remote) { _ in }
+            #expect(try FileManager.default.contentsOfDirectory(atPath: h.remote.path) == [name])
+            let down = h.staging.appendingPathComponent("down")
+            try FileManager.default.createDirectory(at: down, withIntermediateDirectories: true)
+            try await h.session.download(remote, to: down.appendingPathComponent(name)) { _ in }
+            #expect(try Data(contentsOf: down.appendingPathComponent(name)) == Data("long".utf8))
+        }
+    }
+
     /// A copy into a folder already there decides from one listing of it (PERF-03), so a name the
     /// listing did not hold may be taken by the time the file lands: the rename then refuses
     /// instead of replacing it. A name held in another case on a case-insensitive disk is still
@@ -414,6 +479,23 @@ struct TransferServerTests {
             }
             #expect(try Data(contentsOf: local) == Data("local".utf8))
         }
+    }
+}
+
+/// Answers every collision with Replace, once `meanwhile` has run: someone else changing the
+/// server while the question is up.
+private final class ReplacingAfter: PromptSink {
+    let meanwhile: @Sendable () -> Void
+
+    init(_ meanwhile: @escaping @Sendable () -> Void) {
+        self.meanwhile = meanwhile
+    }
+
+    func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
+    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
+    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
+        meanwhile()
+        return .replace
     }
 }
 

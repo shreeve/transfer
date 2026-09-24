@@ -45,6 +45,14 @@ import Testing
     exact.add(TreeKey(bytes: Array("cafe\u{301}".utf8)))
     #expect(exact.found != nil)
 
+    // APFS folds case fully: these pairs are one name on a case-insensitive disk (R-C1).
+    for (first, second) in [("Straße", "STRASSE"), ("ΑΣ", "ας"), ("ﬁle", "FILE")] {
+        var folding = NameClash(ignoringCase: true)
+        folding.add(TreeKey(stringLiteral: first))
+        folding.add(TreeKey(stringLiteral: second))
+        #expect(folding.found != nil)
+    }
+
     var undecodable = NameClash(ignoringCase: false)
     undecodable.add(TreeKey(bytes: [0x61, 0xFF]))
     undecodable.add(TreeKey(bytes: [0x61, 0xFE]))
@@ -54,6 +62,10 @@ import Testing
 @Test func keptItemsAreNamedOnceForEachReason() {
     let kept = TransferKept([.init("a", .incomplete), .init("b", .incomplete), .init("c", .live(2))], moving: true, place: "on this Mac")
     #expect(kept.localizedDescription == "Kept “a” and “b” on this Mac: the copy is not complete. Kept “c” on this Mac: 2 Live files have unsynced edits.")
+    #expect(TransferKept([.init("d", .changed)], moving: true, place: "on the other server").localizedDescription
+        == "“d” changed during the move, and what changed was kept on the other server.")
+    #expect(TransferKept([.init("a", .failed("No such file")), .init("b", .alreadyThere)], moving: false, place: "on this Mac").localizedDescription
+        == "Could not copy “a”: No such file. Kept “b” on this Mac: something with that name was already at the destination and was not replaced, so this move cannot tell its own copy from it.")
     #expect(TransferKept.Reason(.remove) == nil)
     #expect(TransferKept.Reason(.alreadyThere(["x"])) == .alreadyThere)
 }

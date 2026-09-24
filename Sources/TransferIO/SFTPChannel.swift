@@ -205,41 +205,50 @@ actor SFTPChannel {
         }
     }
 
+    /// Where `replace` records the old file it sets aside, and the name it came from: remembered
+    /// before it steps aside, forgotten once it is back or removed. A connection that drops in
+    /// between leaves the record, and the next login puts the file back or finishes the replace.
+    struct AsideLog: Sendable {
+        let remember: @Sendable (_ aside: RemotePath, _ placed: RemotePath) -> Void
+        let forget: @Sendable (_ aside: RemotePath, _ placed: RemotePath) -> Void
+    }
+
     /// Puts `temp` in place of `placed`. With `posix-rename@openssh.com` the swap is atomic and a
     /// failure leaves `placed` untouched. Without it, SFTP v3 rename will not replace a file, so
-    /// `placed` steps aside under a hidden name first and comes back if `temp` cannot take its
-    /// place: a failure never leaves the server with neither the old file nor the new one. A
-    /// folder is never replaced, as posix-rename would refuse it.
-    func replace(_ temp: RemotePath, onto placed: RemotePath) async throws {
+    /// `placed` steps aside under a hidden name first, recorded in `log`, and comes back if `temp`
+    /// cannot take its place: a failure never leaves the server with neither the old file nor the
+    /// new one. A folder is never replaced, as posix-rename would refuse it.
+    func replace(_ temp: RemotePath, onto placed: RemotePath, log: AsideLog? = nil) async throws {
         if extensions.contains("posix-rename@openssh.com") {
             try await posixRename(temp, to: placed)
             return
         }
         // Once the old file has stepped aside, cancelling must not stop it coming back: the steps
         // run in a task of their own, which the caller's cancellation does not reach.
-        try await Task { try await self.replaceStepping(temp, onto: placed) }.value
+        try await Task { try await self.replaceStepping(temp, onto: placed, log: log) }.value
     }
 
-    private func replaceStepping(_ temp: RemotePath, onto placed: RemotePath) async throws {
+    private func replaceStepping(_ temp: RemotePath, onto placed: RemotePath, log: AsideLog?) async throws {
         guard let existing = try await lookup(placed) else { return try await plainRename(temp, to: placed) }
         guard existing.kind != .directory, let folder = placed.parent else { throw TransferError.typeMismatch(placed.name) }
         // Short, so a long name cannot push it past the server's name limit.
         let aside = folder.appending(name: Array(".transfer-old-\(UUID().uuidString)".utf8))
+        log?.remember(aside, placed)
         try await plainRename(placed, to: aside)
         do {
             try await plainRename(temp, to: placed)
         } catch {
-            try? await plainRename(aside, to: placed)
+            if (try? await plainRename(aside, to: placed)) != nil { log?.forget(aside, placed) }
             throw error
         }
-        try? await removeFile(aside)
+        if (try? await removeFile(aside)) != nil { log?.forget(aside, placed) }
     }
 
     /// Renames a finished temp file onto `placed`: replacing what is there, or refusing when
     /// anything is, so an item that appeared after the name was found free is never overwritten
     /// unasked. A file never replaces a folder, so plain RENAME is safe for a temp.
-    func place(_ temp: RemotePath, onto placed: RemotePath, replacing: Bool) async throws {
-        if replacing { return try await replace(temp, onto: placed) }
+    func place(_ temp: RemotePath, onto placed: RemotePath, replacing: Bool, log: AsideLog? = nil) async throws {
+        if replacing { return try await replace(temp, onto: placed, log: log) }
         try await plainRename(temp, to: placed)
     }
 
@@ -346,22 +355,33 @@ actor SFTPChannel {
         }
     }
 
-    /// Downloads `path` into `destination` over this channel alone.
-    func download(_ path: RemotePath, to destination: URL, size: UInt64?, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    /// Downloads `path` into `destination` over this channel alone; `matching` as for `receive`.
+    func download(_ path: RemotePath, to destination: URL, size: UInt64?, matching print: Fingerprint? = nil,
+                  progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let parts = try DownloadParts(destination, size: size, progress: progress)
-        try await receive(path, into: parts)
+        try await receive(path, into: parts, matching: print)
         try parts.finish()
     }
 
     /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight, until nothing is
-    /// left to ask for. With `matching`, a second channel helps only if the file it opened is still
-    /// the one listed, so a file replaced meanwhile is never read in pieces from two versions.
-    func receive(_ path: RemotePath, into parts: DownloadParts, matching print: Fingerprint? = nil) async throws {
+    /// left to ask for. With `matching`, the file opened must still be the one listed: the plan
+    /// stops at the listed size, so a file that grew would arrive cut short and look complete.
+    /// The channel that owns the download throws when it is not, checking with its first READs
+    /// and before writing a byte; one `helping` leaves it alone, so a file replaced meanwhile is
+    /// never read in pieces from two versions.
+    func receive(_ path: RemotePath, into parts: DownloadParts, matching print: Fingerprint? = nil, helping: Bool = false) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxRead)
         defer { closeSoon([handle]) }
-        if let print, try await fstat(handle) != print { return }
+        var check: UInt32?
+        if let print {
+            if helping {
+                if try await fstat(handle) != print { return }
+            } else {
+                check = try send(SFTPCode.fstat) { $0.appendBlob(handle) }
+            }
+        }
         var inFlight: [(offset: UInt64, length: UInt32, id: UInt32)] = []
-        defer { for read in inFlight { abandon(read.id) } }
+        defer { for id in inFlight.map(\.id) + (check.map { [$0] } ?? []) { abandon(id) } }
         while true {
             try Task.checkCancellation()
             while inFlight.count < 32, let request = parts.nextRequest() {
@@ -371,6 +391,12 @@ actor SFTPChannel {
                     $0.appendU32(request.length)
                 }
                 inFlight.append((request.offset, request.length, id))
+            }
+            if let id = check {
+                check = nil
+                guard Fingerprint(item: try item(path: path, message: await reply(id))) == print else {
+                    throw TransferError.failed("“\(path.name)” changed on the server while it downloaded")
+                }
             }
             guard !inFlight.isEmpty else { break }
             let read = inFlight.removeFirst()

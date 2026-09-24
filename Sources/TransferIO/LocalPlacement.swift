@@ -47,18 +47,19 @@ enum Placement: Equatable {
         }
     }
 
-    /// A name as a disk that ignores case and Unicode form sees it: two names that fold the same
-    /// may be one item there.
+    /// A name as a disk that ignores case and Unicode form sees it, folding case fully as APFS
+    /// does (`ß` as `ss`, `ﬁ` as `fi`, every sigma alike): two names that fold the same may be one
+    /// item there.
     static func fold(_ name: String) -> String {
-        name.precomposedStringWithCanonicalMapping.lowercased()
+        name.precomposedStringWithCanonicalMapping.folding(options: .caseInsensitive, locale: nil)
     }
 
     /// Keep Both's name for `name`: the next that no name in `names` folds to.
-    static func keepBoth(_ name: String, among names: Set<String>) -> String {
+    static func keepBoth(_ name: String, among names: Set<String>, isFolder: Bool = false) -> String {
         let folded = Set(names.map(fold))
         var taken = names
         while true {
-            let next = KeepBothName.next(existing: taken, original: name)
+            let next = KeepBothName.next(existing: taken, original: name, isFolder: isFolder)
             if !folded.contains(fold(next)) { return next }
             taken.insert(next)
         }
@@ -105,11 +106,11 @@ enum LocalPlacement {
 
     /// A free name beside `url` for Keep Both. The name is checked on disk too, since this Mac's
     /// disk may treat two names the listing tells apart as one.
-    static func keepBoth(_ url: URL) throws -> URL {
+    static func keepBoth(_ url: URL, isFolder: Bool) throws -> URL {
         let folder = url.deletingLastPathComponent()
         var taken = Set(try FileManager.default.contentsOfDirectory(atPath: folder.path))
         while true {
-            let name = Placement.keepBoth(url.lastPathComponent, among: taken)
+            let name = Placement.keepBoth(url.lastPathComponent, among: taken, isFolder: isFolder)
             let candidate = try child(folder, name: name)
             if try occupant(candidate) == nil { return candidate }
             taken.insert(name)
@@ -117,20 +118,35 @@ enum LocalPlacement {
     }
 
     /// Makes the folder `url`, or accepts a real folder already there. Never follows a link: one
-    /// in the way is removed only when `replacing` says the user chose Replace.
+    /// in the way, or a special file, is removed only when `replacing` says the user chose Replace
+    /// for it, and only if it still holds the name; anything else that took it since stays.
     static func makeFolder(_ url: URL, replacing: Bool) throws {
-        if replacing, unlink(url.path) != 0 {
-            let failure = posixError(url)
-            if failure.code != ENOENT { throw failure.error }
+        if replacing {
+            switch try occupant(url) {
+            case nil:
+                break
+            case .link?, .other?:
+                if unlink(url.path) != 0 {
+                    let failure = posixError(url)
+                    if failure.code != ENOENT { throw failure.error }
+                }
+            default:
+                throw TransferError.failed("“\(url.lastPathComponent)” changed while it was being replaced; nothing was removed")
+            }
         }
         if mkdir(url.path, 0o777) == 0 { return }
         let failure = posixError(url)
         guard failure.code == EEXIST, try occupant(url) == .folder else { throw failure.error }
     }
 
-    /// Makes a link at `url` pointing at `target`, in place of any file or link there. The link is
-    /// made beside it and renamed over it, which never removes a folder.
-    static func makeLink(_ url: URL, target: String) throws {
+    /// Makes a link at `url` pointing at `target`. Where nothing was (`replacing` false) it is made
+    /// at the name itself, which fails if something took the name since. In place of a file or
+    /// link it is made beside it and renamed over it, which never removes a folder.
+    static func makeLink(_ url: URL, target: String, replacing: Bool) throws {
+        guard replacing else {
+            guard symlink(target, url.path) == 0 else { throw posixError(url).error }
+            return
+        }
         let temp = url.deletingLastPathComponent().appendingPathComponent(CopyRules.tempName(for: url.lastPathComponent, transferID: UUID().uuidString))
         guard symlink(target, temp.path) == 0 else { throw posixError(url).error }
         guard rename(temp.path, url.path) == 0 else {

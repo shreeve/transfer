@@ -560,6 +560,8 @@ actor LiveSync {
             let print = try await server.liveSave(snapshot, to: entry.path, expecting: expecting) { [entry] progress in
                 server.liveEmit(.operation(Self.operation(entry, state: .active, progress: progress)))
             }
+            saves += 1
+            lastSave[id] = saves
             guard let saved = update(id, {
                 $0.uploading = false
                 $0.recordSync(print, before, digest)
@@ -805,6 +807,24 @@ actor LiveSync {
             default: drop(entry)
             }
         }
+    }
+
+    // MARK: Saves a move looks for
+
+    /// Live saves landed so far, and the count at each file's last one: a move's original is
+    /// verified by walking it, and a save that lands after the walk is not in the copy (R-L2).
+    private var saves: UInt64 = 0
+    private var lastSave: [LiveFileID: UInt64] = [:]
+
+    /// A mark to pass to `saved(under:on:since:)`, read before the walk.
+    func saveMark() -> UInt64 {
+        lastSave = lastSave.filter { entries[$0.key] != nil }
+        return saves
+    }
+
+    /// Whether a Live file under `path` on `connection` was saved to the server since `mark`.
+    func saved(under path: RemotePath, on connection: ConnectionID, since mark: UInt64) -> Bool {
+        under(path, on: connection).contains { lastSave[$0.id, default: 0] > mark }
     }
 
     // MARK: Records

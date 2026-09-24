@@ -199,10 +199,10 @@ public enum MoveCheck {
     }
 }
 
-/// Finds two names that one folder on this Mac cannot hold apart: `README` and `readme` on a
-/// case-insensitive disk, the two Unicode spellings of `café` (APFS ignores that too), or two
-/// invalid UTF-8 names that decode alike. Fed each key once; a key folding like an earlier one
-/// clashes.
+/// Finds two names that one folder on this Mac cannot hold apart: `README` and `readme`, or
+/// `Straße` and `STRASSE`, on a case-insensitive disk, which folds case fully as APFS does; the two
+/// Unicode spellings of `café` (APFS ignores that too); or two invalid UTF-8 names that decode
+/// alike. Fed each key once; a key folding like an earlier one clashes.
 public struct NameClash: Sendable {
     public let ignoringCase: Bool
     private var seen: [String: TreeKey] = [:]
@@ -216,7 +216,7 @@ public struct NameClash: Sendable {
     public mutating func add(_ key: TreeKey) {
         guard found == nil else { return }
         let text = key.description.precomposedStringWithCanonicalMapping
-        let folded = ignoringCase ? text.lowercased() : text
+        let folded = ignoringCase ? text.folding(options: .caseInsensitive, locale: nil) : text
         if let other = seen[folded] { found = (other, key) } else { seen[folded] = key }
     }
 }
@@ -255,14 +255,17 @@ package struct TransferMemo: Sendable {
     package var done: Set<Int> = []
     /// Where each source goes, once chosen, by index.
     package var targets: [Int: RemotePath] = [:]
-    /// Each destination's tree before the move first reached it, by index.
+    /// Each destination's tree just before that source's copy first reached it, by index: what
+    /// an earlier item wrote there is in it, and counts as already there.
     package var before: [Int: [TreeKey: TreeEntry]] = [:]
     /// Whether the two ends of a move were proven to be different folders.
     package var checked = false
-    /// Every file, link, and folder the copy wrote on the destination.
-    package var written: Set<RemotePath> = []
-    /// Where an item went in place of the path it was offered, after Keep Both.
-    package var landed: [RemotePath: RemotePath] = [:]
+    /// The files, links, and folders each source's copy wrote on the destination, by index. Only
+    /// an item's own writes are its copy: another item of the same name may land at the same path.
+    package var written: [Int: Set<RemotePath>] = [:]
+    /// Where each source's entries went in place of the path they were offered, after Keep Both,
+    /// by index.
+    package var landed: [Int: [RemotePath: RemotePath]] = [:]
 
     package init() {}
 }
@@ -276,6 +279,10 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
         case incomplete
         /// Live files under the original with edits not yet on the server.
         case live(Int)
+        /// Something in the original changed after its copy was verified: what changed stayed.
+        case changed
+        /// The item could not be copied, for this reason.
+        case failed(String)
 
         public init?(_ verdict: MoveCheck.Verdict) {
             switch verdict {
@@ -322,6 +329,10 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
                 "Kept \(list) \(place): the copy is not complete."
             case .live(let count):
                 "Kept \(list) \(place): \(TransferError.liveUnsynced(count).localizedDescription)."
+            case .changed:
+                "\(list) changed during the move, and what changed was kept \(place)."
+            case .failed(let reason):
+                "Could not \(moving ? "move" : "copy") \(list): \(reason)\(reason.hasSuffix(".") ? "" : ".")"
             }
         }.joined(separator: " ")
     }
