@@ -70,18 +70,11 @@ struct ListTable: NSViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
-        struct ColumnSpec {
-            var id: String
-            var title: String
-            var width: CGFloat
-            var minWidth: CGFloat
-        }
-
-        static let columns = [
-            ColumnSpec(id: "name", title: "Name", width: 280, minWidth: 120),
-            ColumnSpec(id: "mtime", title: "Date Modified", width: 170, minWidth: 120),
-            ColumnSpec(id: "size", title: "Size", width: 80, minWidth: 60),
-            ColumnSpec(id: "kind", title: "Kind", width: 120, minWidth: 80),
+        static let columns: [(id: String, title: String, width: CGFloat, minWidth: CGFloat)] = [
+            ("name", "Name", 280, 120),
+            ("mtime", "Date Modified", 170, 120),
+            ("size", "Size", 80, 60),
+            ("kind", "Kind", 120, 80),
         ]
 
         var model: TransferModel
@@ -259,9 +252,7 @@ struct ListTable: NSViewRepresentable {
             } else if !table.selectedRowIndexes.contains(row) {
                 table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             }
-            let menu = NSMenu()
-            ItemMenu.fill(menu, item: clicked, model: model)
-            return menu
+            return ItemMenu.fill(item: clicked, model: model)
         }
     }
 }
@@ -317,7 +308,8 @@ final class RowMenuTableView: NSTableView {
 /// has made the location with nothing selected.
 @MainActor
 enum ItemMenu {
-    static func fill(_ menu: NSMenu, item: RemoteItem?, model: TransferModel) {
+    @discardableResult
+    static func fill(_ menu: NSMenu = NSMenu(), item: RemoteItem?, model: TransferModel) -> NSMenu {
         func add(_ title: String, enabled: Bool = true, _ action: @escaping @MainActor () -> Void) {
             let entry = ClosureMenuItem(title: title, action: action)
             entry.isEnabled = enabled
@@ -328,7 +320,7 @@ enum ItemMenu {
             add("Upload…") { Task { await model.uploadFromPanel() } }
             add("Paste", enabled: model.canPaste) { Task { await model.paste(moving: false) } }
             add("Copy Remote URL") { model.copyRemoteURL() }
-            return
+            return menu
         }
         add("Open") { Task { await model.open(item) } }
         add("Open Live", enabled: item.kind == .file) { Task { await model.open(item, forceLive: true) } }
@@ -343,6 +335,7 @@ enum ItemMenu {
         add("Copy Remote URL") { model.copyRemoteURL() }
         menu.addItem(.separator())
         add("Delete…") { model.askToDelete() }
+        return menu
     }
 }
 

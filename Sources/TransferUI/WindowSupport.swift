@@ -3,18 +3,9 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
-/// What a browser window needs from AppKit beyond its views: the focused model for the menu
-/// commands and opening a downloaded file in its app.
-struct TransferModelKey: FocusedValueKey {
-    typealias Value = TransferModel
-}
-
 public extension FocusedValues {
     /// The model of the key window, for menu commands.
-    var transferModel: TransferModel? {
-        get { self[TransferModelKey.self] }
-        set { self[TransferModelKey.self] = newValue }
-    }
+    @Entry var transferModel: TransferModel?
 }
 
 /// Opens a downloaded file in its default app. When the extension has no default, asks once and

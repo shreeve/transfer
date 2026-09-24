@@ -516,7 +516,6 @@ final class TiledBrowser: NSBrowser {
     static let columnWidth: CGFloat = 260
 }
 
-
 /// Icons at 16 points, cached by kind and extension: every row of every view asks for one.
 @MainActor
 enum ItemIcon {
@@ -531,20 +530,14 @@ enum ItemIcon {
     }()
 
     static func image(for item: RemoteItem) -> NSImage {
-        var key: String
-        switch item.kind {
-        case .directory: key = "/dir"
-        case .symlink: key = "/link"
-        case .other: key = "/other"
-        case .file: key = (item.name as NSString).pathExtension.lowercased()
+        var (key, type): (String, UTType) = switch item.kind {
+        case .directory: ("/dir", .folder)
+        case .symlink: ("/link", .symbolicLink)
+        case .other: ("/other", .item)
+        case .file: ((item.name as NSString).pathExtension.lowercased(), .data)
         }
         if let cached = cache[key] { return cached }
-        let type: UTType
-        switch item.kind {
-        case .directory: type = .folder
-        case .symlink: type = .symbolicLink
-        case .other: type = .item
-        case .file:
+        if item.kind == .file {
             // Extensions come from the server. One the system does not know (`app.log.1`, …
             // `.100000`) gets the generic icon under one key, so they cannot grow the cache.
             if let known = UTType(filenameExtension: key), !known.isDynamic {
@@ -552,7 +545,6 @@ enum ItemIcon {
             } else {
                 key = "/data"
                 if let cached = cache[key] { return cached }
-                type = .data
             }
         }
         let icon = NSWorkspace.shared.icon(for: type)

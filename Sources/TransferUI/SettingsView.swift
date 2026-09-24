@@ -27,7 +27,6 @@ public struct GeneralSettings: View {
                     ForEach(ViewMode.allCases, id: \.rawValue) { Text($0.title).tag($0.rawValue) }
                 }
             }
-
         }
         .formStyle(.grouped)
     }
@@ -75,9 +74,7 @@ public struct ExtensionSettings: View {
 
     private func save() {
         let written = text
-        let list = written
-            .split(whereSeparator: { $0.isWhitespace || $0 == "," })
-            .map(String.init)
+        let list = written.split(whereSeparator: { $0.isWhitespace || $0 == "," }).map(String.init)
         Task {
             do {
                 try await provider.setEditableExtensions(list)

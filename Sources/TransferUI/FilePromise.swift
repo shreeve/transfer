@@ -39,14 +39,8 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
         self.session = session
         self.payload = payload
         self.prompts = prompts
-        let ext = (item.name as NSString).pathExtension
-        let type: UTType
-        if item.kind == .directory {
-            type = .folder
-        } else {
-            type = UTType(filenameExtension: ext) ?? .data
-        }
         super.init()
+        let type = item.kind == .directory ? .folder : UTType(filenameExtension: (item.name as NSString).pathExtension) ?? .data
         fileType = type.identifier
         delegate = self
     }
@@ -106,11 +100,6 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
         let data = RemoteDragPayload.data(for: items, session: session)
         return items.map { RemoteItemPromise(item: $0, session: session, payload: data, prompts: prompts) }
     }
-
-    /// One provider for `item`, whose payload names every item in `roots`, for row-based drags.
-    static func provider(for item: RemoteItem, among roots: [RemoteItem], session: any RemoteSession, prompts: any PromptSink) -> RemoteItemPromise {
-        RemoteItemPromise(item: item, session: session, payload: RemoteDragPayload.data(for: roots, session: session), prompts: prompts)
-    }
 }
 
 /// What a drop carried, and whether it moves the items into the folder it landed on or copies them.
@@ -149,7 +138,7 @@ func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: Tr
     return paths.isEmpty ? nil : DropAction(sources: .server(connection, paths), folder: folder, moving: moving)
 }
 
-/// The name under an icon in icon view. It starts drags out and takes drops onto folder tiles.
+/// One icon-grid cell, hosting its AppKit view.
 struct FilePromiseLabel: NSViewRepresentable {
     var item: RemoteItem
     var model: TransferModel
@@ -228,11 +217,7 @@ final class IconItemView: NSView, NSDraggingSource {
         model.itemClickTime = event.timestamp
         window?.makeFirstResponder(self)
         if event.modifierFlags.contains(.command) {
-            if model.snapshot.selection.contains(item.path) {
-                model.snapshot.selection.remove(item.path)
-            } else {
-                model.snapshot.selection.insert(item.path)
-            }
+            model.snapshot.selection.formSymmetricDifference([item.path])
         } else if !model.snapshot.selection.contains(item.path) {
             model.snapshot.selection = [item.path]
         }
@@ -248,9 +233,7 @@ final class IconItemView: NSView, NSDraggingSource {
         guard let model else { return nil }
         window?.makeFirstResponder(self)
         if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
-        let menu = NSMenu()
-        ItemMenu.fill(menu, item: item, model: model)
-        return menu
+        return ItemMenu.fill(item: item, model: model)
     }
 
     override func mouseDragged(with event: NSEvent) {

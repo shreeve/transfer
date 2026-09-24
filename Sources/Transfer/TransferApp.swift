@@ -266,9 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// `sftp://` links, such as a Command-click on one a terminal shows.
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls {
-            if let link = SFTPURL(url: url) { LinkInbox.deliver(link) }
-        }
+        urls.compactMap(SFTPURL.init(url:)).forEach(LinkInbox.deliver)
     }
 
     /// Asks before quitting abandons work: Live edits not yet on the server, or transfers still

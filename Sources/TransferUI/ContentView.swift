@@ -62,7 +62,7 @@ struct SidebarColumn: View {
             if !model.stars.isEmpty {
                 Section("Starred") {
                     ForEach(model.stars, id: \.self) { path in
-                        Label(folderName(path), systemImage: model.starredIsFolder(path) ? "star" : "star.fill")
+                        Label(path.isRoot ? "/" : path.name, systemImage: model.starredIsFolder(path) ? "star" : "star.fill")
                             .help(path.display)
                             .tag(SidebarItem.star(path))
                             // A double-click opens the item the way the browser would: Live or view for a
@@ -110,10 +110,6 @@ struct SidebarColumn: View {
         }
         .listStyle(.sidebar)
         .scrollEdgeEffectHidden(true, for: .top)
-    }
-
-    private func folderName(_ path: RemotePath) -> String {
-        path.isRoot ? "/" : path.name
     }
 }
 
@@ -295,7 +291,7 @@ struct DetailColumn: View {
         case .prompt(let request, let server, _):
             let reply = { PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret) }
             let cancel = { model.finishPrompt(PromptReply(text: nil), offered: false) }
-            SheetForm(title: server ?? "Log In", width: 380, onCancel: cancel) {
+            SheetForm(title: server ?? "Log In", width: 380, cancelKey: .cancelAction, onCancel: cancel) {
                 Text(request.text)
                 SecureField("Password", text: $model.promptSecure)
                     .textFieldStyle(.roundedBorder)
@@ -304,8 +300,6 @@ struct DetailColumn: View {
                     Toggle("Save in Keychain", isOn: $model.saveSecret)
                 }
             } actions: {
-                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
-                Spacer()
                 Button("Continue") { model.finishPrompt(reply(), offered: request.offerKeychain) }
                     .keyboardShortcut(.defaultAction)
             }
@@ -324,9 +318,6 @@ struct DetailColumn: View {
                     .font(.body.monospaced())
                     .textSelection(.enabled)
             } actions: {
-                Button("Cancel") { model.finishHost(.cancel) }
-                    .keyboardShortcut(.defaultAction)
-                Spacer()
                 if event.situation == .firstSeen {
                     Button("Trust Once") { model.finishHost(.trustOnce) }
                     Button("Always Trust") { model.finishHost(.alwaysTrust) }
@@ -342,8 +333,6 @@ struct DetailColumn: View {
                         .foregroundStyle(.red)
                 }
             } actions: {
-                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                Spacer()
                 Button("Delete") {
                     model.sheet = nil
                     Task { await model.deleteSelection() }
@@ -351,40 +340,32 @@ struct DetailColumn: View {
             }
         case .collision(let name, _):
             let skip = { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
-            SheetForm(title: "“\(name)” already exists", detail: "Keep Both saves the new file with a number before its extension.", onCancel: skip) {
+            SheetForm(title: "“\(name)” already exists", detail: "Keep Both saves the new file with a number before its extension.", cancel: "Skip", onCancel: skip) {
                 Toggle("Apply to all in this operation", isOn: $model.applyCollisionToAll)
             } actions: {
-                Button("Skip", action: skip).keyboardShortcut(.defaultAction)
-                Spacer()
                 Button("Keep Both") { model.finishCollision(.keepBoth, applyToAll: model.applyCollisionToAll) }
                 Button("Replace") { model.finishCollision(.replace, applyToAll: model.applyCollisionToAll) }
             }
         case .conflict(let path, let comparable):
             conflictSheet(path, comparable: comparable)
         case .goToFolder:
-            SheetForm(title: "Go to Remote Folder", width: 420, onCancel: { model.sheet = nil }) {
+            SheetForm(title: "Go to Remote Folder", width: 420, cancelKey: .cancelAction, onCancel: { model.sheet = nil }) {
                 TextField("Remote path", text: $model.folderText)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { goToFolder() }
             } actions: {
-                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
-                Spacer()
                 Button("Go") { goToFolder() }.keyboardShortcut(.defaultAction)
             }
         case .removeServer(let connection):
             SheetForm(title: "Remove “\(connection.displayName)”?", detail: "Only the saved connection is removed. Nothing on the server changes.", onCancel: { model.sheet = nil }) {
                 EmptyView()
             } actions: {
-                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                Spacer()
                 Button("Remove") { Task { await model.removeServer(connection) } }
             }
         case .discardLive(let path):
             SheetForm(title: "Discard unsynced edits to “\(path.name)”?", detail: "The working copy has changes that were not uploaded.", width: 420, onCancel: { model.sheet = nil }) {
                 EmptyView()
             } actions: {
-                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                Spacer()
                 Button("Discard") {
                     model.sheet = nil
                     Task { await model.discardLive(path, force: true) }
@@ -414,7 +395,8 @@ struct DetailColumn: View {
 
     private func conflictSheet(_ path: RemotePath, comparable: Bool) -> some View {
         let later = { model.sheet = nil; model.conflictConfirm = nil }
-        return SheetForm(title: "“\(path.name)” changed on the server", detail: "Neither version has been overwritten.", width: 520, onCancel: later) {
+        return SheetForm(title: "“\(path.name)” changed on the server", detail: "Neither version has been overwritten.", width: 520,
+                         cancel: "Later", cancelKey: .cancelAction, onCancel: later) {
             if let confirm = model.conflictConfirm {
                 Text(confirm == .keepLocal
                      ? "Keep Local overwrites the server copy with this Mac's edits. Press again to confirm."
@@ -433,10 +415,7 @@ struct DetailColumn: View {
                 }
                 Button("Keep Both") { Task { await model.chooseConflict(.keepBoth) } }
             }
-        } actions: {
-            Button("Later", action: later).keyboardShortcut(.cancelAction)
-            Spacer()
-        }
+        } actions: {}
     }
 
     private func goToFolder() {
@@ -447,11 +426,13 @@ struct DetailColumn: View {
 }
 
 /// The frame the small sheets share: a headline, an optional line under it, the content, and a
-/// row of buttons, with Escape doing what the sheet's cancel does.
+/// row of buttons: first `cancel`, which Escape presses too, then `actions` at the far end.
 private struct SheetForm<Content: View, Actions: View>: View {
     let title: String
     var detail: String?
     var width: CGFloat = 400
+    var cancel: LocalizedStringKey = "Cancel"
+    var cancelKey: KeyboardShortcut = .defaultAction
     let onCancel: () -> Void
     @ViewBuilder let content: Content
     @ViewBuilder let actions: Actions
@@ -461,7 +442,11 @@ private struct SheetForm<Content: View, Actions: View>: View {
             Text(title).font(.headline)
             if let detail { Text(detail).foregroundStyle(.secondary) }
             content
-            HStack { actions }
+            HStack {
+                Button(cancel, action: onCancel).keyboardShortcut(cancelKey)
+                Spacer()
+                actions
+            }
         }
         .padding()
         .frame(width: width)
@@ -560,7 +545,6 @@ struct InspectorColumn: View {
         }
     }
 
-
     /// Name, then kind against size, then the `ls -l` facts; the folder is already in the title
     /// bar. Actions live in the context menu and on double-click, as in the browser.
     private func facts(_ item: RemoteItem) -> some View {
@@ -608,8 +592,6 @@ struct InspectorColumn: View {
         return letters[Int(bits >> 6 & 7)] + letters[Int(bits >> 3 & 7)] + letters[Int(bits & 7)]
     }
 }
-
-
 
 struct ConnectionForm: View {
     @Bindable var model: TransferModel
@@ -696,8 +678,7 @@ private struct FolderMenu: View {
     let model: TransferModel
 
     var body: some View {
-        let menu = NSMenu()
-        ItemMenu.fill(menu, item: nil, model: model)
+        let menu = ItemMenu.fill(item: nil, model: model)
         return ForEach(Array(menu.items.enumerated()), id: \.offset) { _, entry in
             if entry.isSeparatorItem {
                 Divider()

@@ -1598,33 +1598,17 @@ public extension ViewMode {
 
 /// Every label, symbol, and tooltip for what a Live file is doing comes from here.
 public extension LiveFile.Status {
-    var label: String {
-        switch self {
-        case .conflict: "Conflict"
-        case .uploading: "Uploading"
-        case .paused: "Paused"
-        case .dirty: "Live, unsynced"
-        case .synced: "Live"
-        }
-    }
+    var label: String { words.label }
+    var symbolName: String { words.symbol }
+    var help: String { words.help }
 
-    var symbolName: String {
+    private var words: (label: String, symbol: String, help: String) {
         switch self {
-        case .conflict: "exclamationmark.triangle.fill"
-        case .uploading: "arrow.up.circle.fill"
-        case .paused: "pause.circle"
-        case .dirty: "pencil.circle.fill"
-        case .synced: "checkmark.circle"
-        }
-    }
-
-    var help: String {
-        switch self {
-        case .conflict: "Changed on the server; needs a decision"
-        case .uploading: "Uploading"
-        case .paused: "Paused"
-        case .dirty: "Edited here, not yet uploaded"
-        case .synced: "Synced; saves in the editor upload"
+        case .conflict: ("Conflict", "exclamationmark.triangle.fill", "Changed on the server; needs a decision")
+        case .uploading: ("Uploading", "arrow.up.circle.fill", "Uploading")
+        case .paused: ("Paused", "pause.circle", "Paused")
+        case .dirty: ("Live, unsynced", "pencil.circle.fill", "Edited here, not yet uploaded")
+        case .synced: ("Live", "checkmark.circle", "Synced; saves in the editor upload")
         }
     }
 }
