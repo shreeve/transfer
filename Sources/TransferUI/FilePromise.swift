@@ -165,6 +165,9 @@ final class IconItemView: NSView, NSDraggingSource {
         super.init(frame: frameRect)
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.translatesAutoresizingMaskIntoConstraints = false
+        // NSImageView registers for image and file drags even when not editable, then refuses
+        // them, so a drop over the glyph never reached the cell. The cell takes every drop.
+        icon.unregisterDraggedTypes()
         label.alignment = .center
         // Finder wraps a long name to two lines, then truncates the middle so the extension stays.
         label.maximumNumberOfLines = 2
