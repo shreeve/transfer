@@ -309,14 +309,6 @@ public final class TransferModel {
         return byName
     }
 
-    /// `sorted` with `page` merged in. Only the page is sorted; the standard library's sort finds
-    /// the two sorted runs and merges them in linear time, so a listing that streams in pages
-    /// never sorts what it already has. A Core merge helper is on its way; this is the stopgap.
-    private static func merged(_ sorted: [RemoteItem], _ page: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
-        let page = ListingSort.apply(page, sort: sort)
-        return sorted.isEmpty ? page : ListingSort.apply(sorted + page, sort: sort)
-    }
-
     /// Derives what the views draw from the location's listing, the filter, and hidden files.
     private func refreshItems() {
         let listing = listings[snapshot.path]
@@ -593,9 +585,9 @@ public final class TransferModel {
                 listOrder = ListingSort.apply(listOrder, sort: sort)
             }
             let byName = Self.nameOrder(sort)
-            listOrder = Self.merged(listOrder, page, sort: sort)
+            listOrder = ListingSort.merge(page, into: listOrder, sort: sort)
             // A list already in name order, as by default, serves the columns too.
-            nameOrder = byName == sort ? listOrder : Self.merged(nameOrder, page, sort: byName)
+            nameOrder = byName == sort ? listOrder : ListingSort.merge(page, into: nameOrder, sort: byName)
             page.removeAll()
             publish(FolderListing(items: listOrder, byName: nameOrder, columnItems: visible(nameOrder), complete: complete), for: path)
         }
@@ -1229,12 +1221,7 @@ public final class TransferModel {
     public func mkdir() async {
         guard let context else { return }
         let existing = Set((listings[snapshot.path]?.items ?? items).map(\.name))
-        var name = "untitled folder"
-        var n = 2
-        while existing.contains(name) {
-            name = "untitled folder \(n)"
-            n += 1
-        }
+        let name = KeepBothName.untitledFolder(existing: existing)
         let path = snapshot.path.appending(name: Array(name.utf8))
         await reporting {
             try await context.session.mkdir(path)
