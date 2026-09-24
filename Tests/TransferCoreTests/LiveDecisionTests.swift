@@ -227,3 +227,21 @@ private func present(size: UInt64 = 10, at date: Date = t0, digest: String? = ni
     #expect(LiveDecision.keepLocalExpectation(state(), conflict: nil) == .file(base))
     #expect(LiveDecision.keepLocalExpectation(LiveState(base: nil), conflict: nil) == .absent)
 }
+
+/// The shelf and sidebar show the most pressing status; Forget Synced Live Files takes only files
+/// with nothing unsynced, paused ones included.
+@Test func aLiveFilesStatusIsItsMostPressingState() {
+    func file(dirty: Bool = false, paused: Bool = false, conflict: Bool = false, uploading: Bool = false) -> LiveFile {
+        LiveFile(id: LiveFileID(), path: RemotePath(string: "/srv/note.txt"), dirty: dirty, paused: paused, conflict: conflict, uploading: uploading)
+    }
+    #expect(file(dirty: true, paused: true, conflict: true, uploading: true).status == .conflict)
+    #expect(file(dirty: true, paused: true, uploading: true).status == .uploading)
+    #expect(file(dirty: true, paused: true).status == .paused)
+    #expect(file(dirty: true).status == .dirty)
+    #expect(file().status == .synced)
+    #expect(file().isSynced)
+    #expect(file(paused: true).isSynced)
+    #expect(!file(dirty: true, paused: true).isSynced)
+    #expect(!file(uploading: true).isSynced)
+    #expect(!file(conflict: true).isSynced)
+}

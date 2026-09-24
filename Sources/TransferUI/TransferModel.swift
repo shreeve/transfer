@@ -803,7 +803,7 @@ public final class TransferModel {
 
     /// The inspector's line for a path: its Live state, or an active transfer.
     public func statusText(for path: RemotePath) -> String {
-        if let live = liveByPath[path] { return live.state.label }
+        if let live = liveByPath[path] { return live.status.label }
         if operations.contains(where: { $0.state == .active && $0.path == path }) {
             return "Transferring"
         }
@@ -1449,7 +1449,7 @@ public final class TransferModel {
     /// Live files with something happening: edited, uploading, paused, or in conflict. A synced
     /// mapping keeps working in the background but is not worth a sidebar row.
     public var activeLiveFiles: [LiveFile] {
-        liveFiles.filter { $0.state != .synced }
+        liveFiles.filter { $0.status != .synced }
     }
 
     public func liveFile(for path: RemotePath) -> LiveFile? {
@@ -1653,12 +1653,9 @@ public extension ViewMode {
     }
 }
 
-/// What a Live file is doing, the most pressing first: a conflict, then an upload, a pause, and
-/// unsynced edits. Every label, symbol, and tooltip for it comes from here.
-public enum LiveState: Equatable {
-    case conflict, uploading, paused, dirty, synced
-
-    public var label: String {
+/// Every label, symbol, and tooltip for what a Live file is doing comes from here.
+public extension LiveFile.Status {
+    var label: String {
         switch self {
         case .conflict: "Conflict"
         case .uploading: "Uploading"
@@ -1668,7 +1665,7 @@ public enum LiveState: Equatable {
         }
     }
 
-    public var symbolName: String {
+    var symbolName: String {
         switch self {
         case .conflict: "exclamationmark.triangle.fill"
         case .uploading: "arrow.up.circle.fill"
@@ -1678,7 +1675,7 @@ public enum LiveState: Equatable {
         }
     }
 
-    public var help: String {
+    var help: String {
         switch self {
         case .conflict: "Changed on the server; needs a decision"
         case .uploading: "Uploading"
@@ -1687,19 +1684,6 @@ public enum LiveState: Equatable {
         case .synced: "Synced; saves in the editor upload"
         }
     }
-}
-
-public extension LiveFile {
-    var state: LiveState {
-        if conflict { return .conflict }
-        if uploading { return .uploading }
-        if paused { return .paused }
-        return dirty ? .dirty : .synced
-    }
-
-    /// The working copy matches the server, so forgetting the mapping loses nothing. A paused
-    /// file with nothing unsynced counts.
-    var isSynced: Bool { !dirty && !uploading && !conflict }
 }
 
 public extension RemoteItem {

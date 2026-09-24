@@ -81,10 +81,10 @@ struct SidebarColumn: View {
                         Label {
                             Text(live.path.name)
                         } icon: {
-                            Image(systemName: live.state.symbolName)
+                            Image(systemName: live.status.symbolName)
                         }
-                        .help("\(live.path.display)\n\(live.state.help)")
-                        .accessibilityValue(live.state.label)
+                        .help("\(live.path.display)\n\(live.status.help)")
+                        .accessibilityValue(live.status.label)
                         .tag(SidebarItem.live(live.path))
                         .contextMenu {
                             if live.paused {

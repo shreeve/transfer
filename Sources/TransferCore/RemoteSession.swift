@@ -117,6 +117,22 @@ public struct LiveFile: Hashable, Sendable, Identifiable {
         self.conflict = conflict
         self.uploading = uploading
     }
+
+    /// What the file is doing, the most pressing first.
+    public enum Status: Equatable, Sendable {
+        case conflict, uploading, paused, dirty, synced
+    }
+
+    public var status: Status {
+        if conflict { return .conflict }
+        if uploading { return .uploading }
+        if paused { return .paused }
+        return dirty ? .dirty : .synced
+    }
+
+    /// The working copy matches the server, so forgetting the mapping loses nothing. A paused
+    /// file with nothing unsynced counts.
+    public var isSynced: Bool { !dirty && !uploading && !conflict }
 }
 
 /// A library root in place of `~/Library/Application Support/Transfer`, from the
