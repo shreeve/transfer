@@ -260,6 +260,23 @@ import TransferCore
     #expect(TreeCheck.missing(source: source, destination: partial) == ["a.txt", "sub/b"])
 }
 
+/// A FIFO, socket, or device walked as a plain empty file once let a move pass the check with
+/// an empty file at its name, and remove the original.
+@Test func treeCheckNeverCountsASpecialFileAsCopied() {
+    #expect(TreeEntry(RemoteItem(path: RemotePath(string: "/srv/fifo"), kind: .other, size: 0, mtime: 1)) == .other)
+    let source: [String: TreeEntry] = ["": .directory, "a.txt": .file(size: 4), "fifo": .other]
+    #expect(TreeCheck.missing(source: source, destination: source) == ["fifo"])
+    #expect(TreeCheck.missing(source: source, destination: ["": .directory, "a.txt": .file(size: 4), "fifo": .file(size: 0)]) == ["fifo"])
+    #expect(TreeCheck.missing(source: ["": .other], destination: ["": .other]) == [""])
+    var tally = ClipTally()
+    tally.add(root: .other)
+    tally.add(root: .directory)
+    tally.add(inside: .other)
+    #expect(tally.files == 1)
+    #expect(tally.allFiles == 2)
+    #expect(tally.bytes == 0)
+}
+
 /// A move whose collision was skipped once compared the source with the file already there, and
 /// removed the source when name and size matched.
 @Test func treeCheckTellsAFileAlreadyThereFromTheCopy() {

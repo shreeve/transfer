@@ -7,6 +7,8 @@ public enum TreeEntry: Hashable, Sendable {
     case directory
     case file(size: UInt64, mtime: UInt32? = nil)
     case link
+    /// A FIFO, socket, or device. No copy holds one, so a move never removes it.
+    case other
 }
 
 public extension TreeEntry {
@@ -14,18 +16,19 @@ public extension TreeEntry {
         switch item.kind {
         case .directory: self = .directory
         case .symlink: self = .link
-        case .file, .other: self = .file(size: item.size ?? 0, mtime: item.mtime)
+        case .file: self = .file(size: item.size ?? 0, mtime: item.mtime)
+        case .other: self = .other
         }
     }
 }
 
 /// What the clipboard holds: the roots that were copied, and every file inside their folders.
 public struct ClipTally: Hashable, Sendable {
-    /// Copied files and links, counted at the top level only.
+    /// Copied files, links, and special files, counted at the top level only.
     public var files = 0
     /// Copied folders, counted at the top level only.
     public var folders = 0
-    /// Every file and link, at the top level and inside the copied folders.
+    /// Every file, link, and special file, at the top level and inside the copied folders.
     public var allFiles = 0
     public var bytes: UInt64 = 0
     /// False until every copied folder has been walked.
@@ -42,7 +45,7 @@ public struct ClipTally: Hashable, Sendable {
             files += 1
             allFiles += 1
             bytes += size
-        case .link:
+        case .link, .other:
             files += 1
             allFiles += 1
         }
@@ -56,7 +59,7 @@ public struct ClipTally: Hashable, Sendable {
         case .file(let size, _):
             allFiles += 1
             bytes += size
-        case .link:
+        case .link, .other:
             allFiles += 1
         }
     }
@@ -120,7 +123,8 @@ public enum TreeCheck {
     /// The source entries that are missing from the destination or differ in kind, size, or
     /// modification time. Every copy keeps a file's time, so a file of the same name and size
     /// that was already there, left by a Skip or beside a Keep Both, does not pass for the copy.
-    /// A time either side does not know is not compared.
+    /// A time either side does not know is not compared. A special file (`.other`) is never
+    /// held: what sits at its name in the copy is not the same FIFO, socket, or device.
     public static func missing(source: [String: TreeEntry], destination: [String: TreeEntry]) -> [String] {
         source.compactMap { key, entry in
             destination[key].map { holds(entry, $0) } == true ? nil : key
@@ -132,6 +136,8 @@ public enum TreeCheck {
         switch (source, copy) {
         case let (.file(size, time), .file(copySize, copyTime)):
             size == copySize && (time == nil || copyTime == nil || time == copyTime)
+        case (.other, _):
+            false
         default:
             source == copy
         }
