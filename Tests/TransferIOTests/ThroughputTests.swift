@@ -158,6 +158,9 @@ import TransferCore
             #expect(try Data(contentsOf: file).isEmpty)
         }
         #expect(server.sent(SFTPCode.fstat).count == 1)
+        // The server answers in order, so once it has the CLOSE every READ reply is out, and none
+        // is written into a pipe `stop` has closed.
+        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
         await server.stop()
     }
 
