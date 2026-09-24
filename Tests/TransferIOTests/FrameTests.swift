@@ -175,7 +175,7 @@ import TransferCore
         try await Task.sleep(for: .seconds(1))
         server.send(ScriptedServer.ok(server.sent(SFTPCode.extended)[0].id))
         try await copy.value
-        #expect(server.sent(SFTPCode.close).count == 2)
+        #expect(await eventually { server.sent(SFTPCode.close).count == 2 })
         await server.stop()
     }
 

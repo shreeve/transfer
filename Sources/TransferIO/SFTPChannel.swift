@@ -109,32 +109,35 @@ actor SFTPChannel {
     }
 
     /// Keeps several READDIR requests in flight. OpenSSH answers each with about a hundred names,
-    /// so a large folder no longer pays one round trip per page.
+    /// so a large folder no longer pays one round trip per page. A listing its reader abandons
+    /// stops at once and still closes its handle on the server.
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     let handle = try await openDirectory(path)
-                    do {
-                        var inFlight: [Task<[RemoteItem]?, Error>] = []
-                        var finished = false
-                        while !finished || !inFlight.isEmpty {
-                            while !finished, inFlight.count < 4 {
-                                inFlight.append(Task { try await self.readDirectoryPage(handle, parent: path) })
-                            }
-                            let next = inFlight.removeFirst()
-                            guard let page = try await next.value else {
-                                finished = true
-                                continue
-                            }
-                            if page.isEmpty { finished = true }
-                            for item in page { continuation.yield(item) }
-                            try Task.checkCancellation()
+                    var inFlight: [Task<[RemoteItem]?, Error>] = []
+                    defer {
+                        for page in inFlight { page.cancel() }
+                        closeLater(handle)
+                    }
+                    var finished = false
+                    while !finished || !inFlight.isEmpty {
+                        while !finished, inFlight.count < 4 {
+                            inFlight.append(Task { try await self.readDirectoryPage(handle, parent: path) })
                         }
-                        try? await self.close(handle)
-                    } catch {
-                        try? await self.close(handle)
-                        throw error
+                        let next = inFlight.removeFirst()
+                        let page = try await withTaskCancellationHandler {
+                            try await next.value
+                        } onCancel: {
+                            next.cancel()
+                        }
+                        guard let page, !page.isEmpty else {
+                            finished = true
+                            continue
+                        }
+                        for item in page { continuation.yield(item) }
+                        try Task.checkCancellation()
                     }
                     continuation.finish()
                 } catch {
@@ -287,28 +290,24 @@ actor SFTPChannel {
     /// network. The reply comes when the whole file is written. Callers check `extensions` first.
     func copyData(_ source: RemotePath, to destination: RemotePath) async throws {
         let from = try await openFile(source, flags: SFTPCode.fxRead)
+        defer { closeLater(from) }
+        let to = try await openFile(destination, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
         do {
-            let to = try await openFile(destination, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
-            do {
-                var body = Data()
-                body.appendString("copy-data")
-                body.appendBlob(from)
-                body.appendU64(0)
-                // A length of zero copies to the end of the file.
-                body.appendU64(0)
-                body.appendBlob(to)
-                body.appendU64(0)
-                _ = try await call(SFTPCode.extended, body: body, long: true)
-            } catch {
-                try? await close(to)
-                throw error
-            }
-            try await close(to)
+            var body = Data()
+            body.appendString("copy-data")
+            body.appendBlob(from)
+            body.appendU64(0)
+            // A length of zero copies to the end of the file.
+            body.appendU64(0)
+            body.appendBlob(to)
+            body.appendU64(0)
+            _ = try await call(SFTPCode.extended, body: body, long: true)
         } catch {
-            try? await close(from)
+            closeLater(to)
             throw error
         }
-        try? await close(from)
+        // Closing the written file can report a failed last write, so this CLOSE is awaited.
+        try await close(to)
     }
 
     func setstat(_ path: RemotePath, mode: UInt32?, mtime: UInt32?) async throws {
@@ -331,7 +330,7 @@ actor SFTPChannel {
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxRead)
-        defer { Task { try? await self.close(handle) } }
+        defer { closeLater(handle) }
         FileManager.default.createFile(atPath: destination.path, contents: nil)
         let output = try FileHandle(forWritingTo: destination)
         defer { try? output.close() }
@@ -404,7 +403,7 @@ actor SFTPChannel {
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
-        defer { Task { try? await self.close(handle) } }
+        defer { closeLater(handle) }
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
         let total = (try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(UInt64.init)
@@ -511,6 +510,12 @@ actor SFTPChannel {
         body.append(SFTPAttrs().encoded())
         let message = try await call(SFTPCode.open, body: body)
         return try handle(in: message)
+    }
+
+    /// Closes `handle` in a task of its own, unawaited. Cleanup after a cancellation must still
+    /// reach the server, and `call` refuses to start in a cancelled task.
+    private nonisolated func closeLater(_ handle: Data) {
+        Task { try? await self.close(handle) }
     }
 
     private func close(_ handle: Data) async throws {

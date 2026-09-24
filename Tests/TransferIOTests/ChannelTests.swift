@@ -41,6 +41,35 @@ import TransferCore
         await server.stop()
     }
 
+    /// SFC-4: a cancelled listing (fast browsing cancels the last folder's) used to skip its
+    /// CLOSE, and the server kept every such directory handle open until the channel died.
+    @Test func aCancelledListingClosesItsHandle() async throws {
+        let server = try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.opendir: ScriptedServer.handle(request.id)
+            case SFTPCode.close: ScriptedServer.ok(request.id)
+            default: nil
+            }
+        }
+        let reader = Task {
+            for try await _ in await server.channel.list(RemotePath(string: "/srv")) {}
+        }
+        #expect(await eventually { !server.sent(SFTPCode.readdir).isEmpty })
+        reader.cancel()
+        _ = try? await reader.value
+        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        #expect(server.sent(SFTPCode.close).first?.paths == ["h"])
+        await server.stop()
+    }
+
+    /// A reader that stops early, as a lookup for one name does, also closes the handle.
+    @Test func aListingLeftEarlyClosesItsHandle() async throws {
+        let server = try await ScriptedServer(answer: Self.folder([Array("a".utf8), Array("b".utf8)]))
+        for try await _ in await server.channel.list(RemotePath(string: "/srv")) { break }
+        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        await server.stop()
+    }
+
     /// A server whose folder /srv lists `names`, where LSTAT finds what `lookup` says, and which
     /// has posix-rename.
     private static func renaming(_ names: [String], lookup: @escaping @Sendable (String) -> UInt32?) async throws -> ScriptedServer {
