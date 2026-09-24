@@ -52,7 +52,6 @@ public actor SSHConnection: RemoteSession {
     static let dataChannels = 7
     /// How long a login may take, prompts included, before it gives up.
     static let loginTimeout: Duration = .seconds(300)
-    static let handshakeTimeout: Duration = .seconds(15)
 
     /// The hub passes its one `LiveSync`. Without one, as in tests, the connection makes its own
     /// and closes it on disconnect.
@@ -523,8 +522,8 @@ public actor SSHConnection: RemoteSession {
         pool.removeAll { $0 === link }
     }
 
-    /// A passenger on the master. It gives up when the server has not started SFTP within 15 s,
-    /// as when a shell startup file prints text ahead of it, or when the caller is cancelled.
+    /// A passenger on the master. The channel itself gives up when the server has not started
+    /// SFTP within 15 s, or has printed text ahead of it, and when the caller is cancelled.
     private func openLink() async throws -> SFTPChannel {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
@@ -538,32 +537,17 @@ public actor SSHConnection: RemoteSession {
         process.standardInput = input
         process.standardOutput = output
         process.standardError = errors.pipe
-        // A channel whose ssh has exited makes the next write fail with EPIPE, which the link
-        // reports as a lost connection and a transfer retries; the default SIGPIPE would end
-        // the whole app before the write returned.
-        _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         try process.run()
         let link = SFTPChannel(process: process, input: input.fileHandleForWriting, output: output.fileHandleForReading)
         await link.start()
-        let timedOut = Locked(false)
-        let watchdog = Task {
-            try await Task.sleep(for: Self.handshakeTimeout)
-            timedOut.value = true
-            await link.closeLink()
-        }
-        defer { watchdog.cancel() }
         do {
-            try await withTaskCancellationHandler {
-                try await link.handshake()
-            } onCancel: {
-                Task { await link.closeLink() }
-            }
+            try await link.handshake()
         } catch {
             await link.closeLink()
-            if timedOut.value {
-                throw TransferError.failed("The server did not start SFTP within 15 s. A shell startup file that prints text can cause this.")
-            }
             if Task.isCancelled { throw TransferError.cancelled }
+            // Only a channel whose ssh exited has something to say on stderr; a timeout or a
+            // banner already says what went wrong.
+            guard case TransferError.connectionLost = error else { throw error }
             await errors.waitForEnd()
             let line = errors.lastLine
             throw line.isEmpty ? error : TransferError.connectionLost(line)
