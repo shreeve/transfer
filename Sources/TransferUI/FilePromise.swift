@@ -83,16 +83,28 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
         let session = session
         let prompts = prompts
         let finish = Locked(completionHandler)
-        Task {
+        // Published for the destination, so Finder draws the download's progress on the icon
+        // it is filling in and can cancel it.
+        let progress = Progress(totalUnitCount: item.kind == .directory ? -1 : Int64(item.size ?? 0))
+        progress.kind = .file
+        progress.fileOperationKind = .downloading
+        progress.fileURL = url
+        progress.isCancellable = true
+        progress.publish()
+        let task = Task {
             do {
                 try await OperationPrompts.$current.withValue(prompts) {
-                    try await session.download(path, to: url) { _ in }
+                    try await session.download(path, to: url) { done in
+                        progress.completedUnitCount = Int64(done.completed)
+                    }
                 }
                 finish.value(nil)
             } catch {
                 finish.value(error)
             }
+            progress.unpublish()
         }
+        progress.cancellationHandler = { task.cancel() }
     }
 
     static func providers(for items: [RemoteItem], session: any RemoteSession, prompts: any PromptSink) -> [RemoteItemPromise] {
@@ -149,7 +161,8 @@ struct FilePromiseLabel: NSViewRepresentable {
 }
 
 /// A whole icon-grid cell: the glyph and the name, both a drag source, so a drag can start
-/// anywhere on the cell as in Finder. Selection, open, and drop onto folders live here too.
+/// anywhere on the cell as in Finder. Selection, open, the right-click menu, and drop onto
+/// folders live here too.
 final class IconItemView: NSView, NSDraggingSource {
     private var item = RemoteItem(path: RemotePath(string: "/"), kind: .other)
     private weak var model: TransferModel?
@@ -224,13 +237,15 @@ final class IconItemView: NSView, NSDraggingSource {
         }
     }
 
-    /// Space opens Quick Look, as the grid itself does.
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
-            model?.togglePreview()
-            return
-        }
-        super.keyDown(with: event)
+    /// The list and column views' menu. The cell joins the selection first, as a click would
+    /// select it, so every entry acts on what the menu was opened over.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let model else { return nil }
+        window?.makeFirstResponder(self)
+        if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
+        let menu = NSMenu()
+        ItemMenu.fill(menu, item: item, model: model)
+        return menu
     }
 
     override func mouseDragged(with event: NSEvent) {
