@@ -49,27 +49,36 @@ public enum LiveConflictChoice: String, Sendable {
     case keepBoth
 }
 
+/// Every name the app makes up so as not to take an existing one.
 public enum KeepBothName {
-    public static func next(existing: Set<String>, original: String) -> String {
-        let split = splitExtension(original)
-        var n = 2
-        while true {
-            let candidate = "\(split.base) \(n)\(split.ext)"
-            if !existing.contains(candidate) { return candidate }
-            n += 1
-        }
+    /// The first of `candidate(first)`, `candidate(first + 1)`, … that `existing` lacks.
+    public static func firstFree(existing: Set<String>, from first: Int = 1, _ candidate: (Int) -> String) -> String {
+        var n = first
+        while existing.contains(candidate(n)) { n += 1 }
+        return candidate(n)
     }
 
+    /// Keep Both: "report 2.pdf", "report 3.pdf", …
+    public static func next(existing: Set<String>, original: String) -> String {
+        let split = splitExtension(original)
+        return firstFree(existing: existing, from: 2) { "\(split.base) \($0)\(split.ext)" }
+    }
+
+    /// Duplicate: "notes copy.txt", "notes copy 2.txt", …
     public static func duplicate(existing: Set<String>, original: String) -> String {
         let split = splitExtension(original)
-        let first = "\(split.base) copy\(split.ext)"
-        if !existing.contains(first) { return first }
-        var n = 2
-        while true {
-            let candidate = "\(split.base) copy \(n)\(split.ext)"
-            if !existing.contains(candidate) { return candidate }
-            n += 1
-        }
+        return firstFree(existing: existing) { $0 == 1 ? "\(split.base) copy\(split.ext)" : "\(split.base) copy \($0)\(split.ext)" }
+    }
+
+    /// New Folder: "untitled folder", "untitled folder 2", …
+    public static func untitledFolder(existing: Set<String>) -> String {
+        firstFree(existing: existing) { $0 == 1 ? "untitled folder" : "untitled folder \($0)" }
+    }
+
+    /// Keep Both for a Live conflict, the Mac's copy beside the server's: "notes.txt (from this
+    /// Mac)", "notes.txt (from this Mac 2)", …
+    public static func fromThisMac(existing: Set<String>, original: String) -> String {
+        firstFree(existing: existing) { $0 == 1 ? "\(original) (from this Mac)" : "\(original) (from this Mac \($0))" }
     }
 
     private static func splitExtension(_ name: String) -> (base: String, ext: String) {

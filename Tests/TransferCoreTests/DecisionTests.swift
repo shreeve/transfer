@@ -59,6 +59,18 @@ import TransferCore
 @Test func duplicateUsesCopySuffix() {
     let name = KeepBothName.duplicate(existing: ["notes.txt"], original: "notes.txt")
     #expect(name == "notes copy.txt")
+    #expect(KeepBothName.duplicate(existing: ["notes copy.txt", "notes copy 2.txt"], original: "notes.txt") == "notes copy 3.txt")
+    #expect(KeepBothName.duplicate(existing: [], original: ".env") == ".env copy")
+    #expect(KeepBothName.next(existing: [], original: "Makefile") == "Makefile 2")
+}
+
+/// New Folder and a Live conflict's Keep Both named files with their own loops, outside Core.
+@Test func everyMadeUpNameIsTheFirstFreeOne() {
+    #expect(KeepBothName.untitledFolder(existing: []) == "untitled folder")
+    #expect(KeepBothName.untitledFolder(existing: ["untitled folder", "untitled folder 2"]) == "untitled folder 3")
+    #expect(KeepBothName.fromThisMac(existing: ["note.txt"], original: "note.txt") == "note.txt (from this Mac)")
+    #expect(KeepBothName.fromThisMac(existing: ["note.txt (from this Mac)"], original: "note.txt") == "note.txt (from this Mac 2)")
+    #expect(KeepBothName.firstFree(existing: ["a0", "a1"], from: 0) { "a\($0)" } == "a2")
 }
 
 @Test func matchingSizeAndTimeSkipsTheCopy() {
