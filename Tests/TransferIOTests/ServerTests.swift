@@ -334,6 +334,57 @@ struct ServerTests {
         }
     }
 
+    /// A Live save once gave the server file the working copy's private 0600, so a script lost
+    /// its execute bit and a web page stopped being readable.
+    @Test func liveSaveKeepsTheServerFilesMode() async throws {
+        try await withHarness("mode") { h in
+            _ = try await h.session.connect(prompts: h.prompts)
+            let remoteFile = h.remote.appendingPathComponent("deploy.sh")
+            try Data("echo one\n".utf8).write(to: remoteFile)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: remoteFile.path)
+            let path = h.remotePath.appending(name: Array("deploy.sh".utf8))
+
+            let local = try await h.session.prepareLiveFile(path)
+            try Data("echo two\n".utf8).write(to: local)
+            let uploaded = await waitUntil { (try? Data(contentsOf: remoteFile)) == Data("echo two\n".utf8) }
+            #expect(uploaded)
+            let mode = try FileManager.default.attributesOfItem(atPath: remoteFile.path)[.posixPermissions] as? Int
+            #expect(mode == 0o755)
+
+            try await h.session.discardLiveFile(path, force: true)
+            await h.session.disconnect()
+        }
+    }
+
+    /// Rename and a move between folders once replaced whatever already had the name.
+    @Test func renameNeverReplacesAnExistingItem() async throws {
+        try await withHarness("rename") { h in
+            _ = try await h.session.connect(prompts: h.prompts)
+            try Data("A".utf8).write(to: h.remote.appendingPathComponent("a.txt"))
+            try Data("B".utf8).write(to: h.remote.appendingPathComponent("b.txt"))
+            try FileManager.default.createDirectory(at: h.remote.appendingPathComponent("full/inside"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: h.remote.appendingPathComponent("empty"), withIntermediateDirectories: true)
+            func remote(_ name: String) -> RemotePath { h.remotePath.appending(name: Array(name.utf8)) }
+
+            await #expect(throws: (any Error).self) { try await h.session.rename(remote("a.txt"), to: remote("b.txt")) }
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("a.txt")) == Data("A".utf8))
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("b.txt")) == Data("B".utf8))
+
+            // OpenSSH's plain rename would replace an empty folder.
+            await #expect(throws: (any Error).self) { try await h.session.rename(remote("full"), to: remote("empty")) }
+            #expect(FileManager.default.fileExists(atPath: h.remote.appendingPathComponent("full/inside").path))
+
+            // A change of case alone still renames, on this case-insensitive disk too.
+            try await h.session.rename(remote("a.txt"), to: remote("A.txt"))
+            let names = try FileManager.default.contentsOfDirectory(atPath: h.remote.path)
+            #expect(names.contains("A.txt") && !names.contains("a.txt"))
+
+            try await h.session.rename(remote("b.txt"), to: remote("c.txt"))
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("c.txt")) == Data("B".utf8))
+            await h.session.disconnect()
+        }
+    }
+
     @Test func liveMappingSurvivesRelaunch() async throws {
         try await withHarness("relaunch") { h in
             _ = try await h.session.connect(prompts: h.prompts)
@@ -392,9 +443,10 @@ private final class TreeBox: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: TreeEntry] = [:]
 
+    /// Files are kept by size alone; the times are the server's.
     func add(_ key: String, _ entry: TreeEntry) {
         lock.lock()
-        entries[key] = entry
+        if case .file(let size, _) = entry { entries[key] = .file(size: size) } else { entries[key] = entry }
         lock.unlock()
     }
 

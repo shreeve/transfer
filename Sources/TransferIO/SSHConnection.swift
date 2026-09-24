@@ -63,7 +63,7 @@ public actor SSHConnection: RemoteSession {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         socketPath = directory.appendingPathComponent(connection.id.socketName).path
         if FileManager.default.fileExists(atPath: socketPath) {
-            _ = try? await run(arguments: ["-S", socketPath, "-O", "exit", connection.destination], timeout: 3)
+            _ = try? await run(arguments: ["-S", socketPath, "-O", "exit", "--", connection.destination], timeout: 3)
             try? FileManager.default.removeItem(atPath: socketPath)
         }
         let hostKeyArguments = try await resolveHostKey(prompts)
@@ -142,7 +142,7 @@ public actor SSHConnection: RemoteSession {
             master.terminationHandler = nil
             if master.isRunning {
                 if !socketPath.isEmpty {
-                    _ = try? await run(arguments: ["-S", socketPath, "-O", "exit", connection.destination], timeout: 3)
+                    _ = try? await run(arguments: ["-S", socketPath, "-O", "exit", "--", connection.destination], timeout: 3)
                 }
                 master.terminate()
             }
@@ -316,9 +316,12 @@ public actor SSHConnection: RemoteSession {
             }
             let attributes = try? FileManager.default.attributesOfItem(atPath: source.path)
             let mode = (attributes?[.posixPermissions] as? NSNumber)?.uint32Value
-            let mtime = (attributes?[.modificationDate] as? Date).map { UInt32($0.timeIntervalSince1970) }
+            let mtime = (attributes?[.modificationDate] as? Date).map(SFTPTime.seconds)
             let link = try await metadataLink()
-            try? await link.setstat(temp, mode: mode, mtime: mtime)
+            // A Live save keeps the server file's permissions, set below: the working copy is
+            // private (0600), and its mode would take a script's execute bit and make a web page
+            // unreadable. Any other upload carries the local file's mode, as a copy does.
+            try? await link.setstat(temp, mode: expecting == nil ? mode : nil, mtime: mtime)
             var written: Fingerprint?
             if measure || expecting != nil { written = Fingerprint(item: try await link.lstat(temp)) }
             if let expecting {
@@ -331,6 +334,8 @@ public actor SSHConnection: RemoteSession {
                 }
                 // A save that runs again after it already landed finds its own bytes there.
                 if !matches, now == nil || now != written { throw LiveRemoteChanged() }
+                // A new file keeps the mode the server gave the temp when it was created.
+                if let kept = found?.mode { try? await link.setstat(temp, mode: kept & 0o7777, mtime: nil) }
             }
             try await link.replace(temp, onto: placed)
             store.forgetTemp(temp.display)
@@ -596,7 +601,7 @@ public actor SSHConnection: RemoteSession {
               let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
               let localSize = attributes[.size] as? UInt64,
               let localDate = attributes[.modificationDate] as? Date else { return false }
-        return localSize == size && UInt32(localDate.timeIntervalSince1970) == mtime
+        return localSize == size && SFTPTime.seconds(localDate) == mtime
     }
 
     public func preparePreview(_ path: RemotePath) async throws -> URL {
@@ -680,7 +685,7 @@ public actor SSHConnection: RemoteSession {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = (attributes[.size] as? NSNumber)?.uint64Value,
               let date = attributes[.modificationDate] as? Date else { return nil }
-        return LocalStamp(size: size, mtime: UInt32(date.timeIntervalSince1970))
+        return LocalStamp(size: size, mtime: SFTPTime.seconds(date))
     }
 
     // MARK: Sidebar data
@@ -723,7 +728,7 @@ public actor SSHConnection: RemoteSession {
     public func terminalCommand(directory: RemotePath) async -> String? {
         guard isConnected else { return nil }
         let remote = "cd \(Self.quote(directory.display)) && exec \"$SHELL\" -l"
-        return "/usr/bin/ssh -S \(Self.quote(socketPath)) -o Compression=no -t \(Self.quote(connection.destination)) \(Self.quote(remote))"
+        return "/usr/bin/ssh -S \(Self.quote(socketPath)) -o Compression=no -t -- \(Self.quote(connection.destination)) \(Self.quote(remote))"
     }
 
     private static func quote(_ value: String) -> String {
@@ -886,6 +891,10 @@ public actor SSHConnection: RemoteSession {
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
+        // A channel whose ssh has exited makes the next write fail with EPIPE, which the link
+        // reports as a lost connection and a transfer retries; the default SIGPIPE would end
+        // the whole app before the write returned.
+        _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         try process.run()
         let chunks = ChunkPipe()
         let link = SFTPLink(
@@ -951,14 +960,14 @@ public actor SSHConnection: RemoteSession {
         ]
         arguments += hostKeyArguments
         arguments += destinationArguments
-        arguments.append(connection.destination)
+        arguments += ["--", connection.destination]
         return arguments
     }
 
     /// Learns the offered key with a no-auth ssh run, compares it with the known-hosts files `ssh -G`
     /// reports, and asks the user when it is new or changed. Returns extra ssh arguments for the master.
     private func resolveHostKey(_ prompts: any PromptSink) async throws -> [String] {
-        let config = try await run(arguments: ["-G"] + destinationArguments + [connection.destination], timeout: 5)
+        let config = try await run(arguments: ["-G"] + destinationArguments + ["--", connection.destination], timeout: 5)
         let files = KnownHosts.files(sshConfigOutput: config.stdout)
         let probeDirectory = store.root.appendingPathComponent("hostkey-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: probeDirectory, withIntermediateDirectories: true)
@@ -977,7 +986,7 @@ public actor SSHConnection: RemoteSession {
                 "-o", "ControlPath=none",
                 "-o", "Compression=no",
                 "-o", "ConnectTimeout=15",
-            ] + destinationArguments + [connection.destination, "true"], timeout: 30)
+            ] + destinationArguments + ["--", connection.destination, "true"], timeout: 30)
         } catch {
             try? FileManager.default.removeItem(at: probeDirectory)
             throw error

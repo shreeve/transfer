@@ -27,6 +27,7 @@ Views talk to a `RemoteSession`. `SSHConnection` is the implementation. Do not p
 - Live files belong to `LiveSync`. Only its per-server worker changes a Live file's sync state; anything else (a conflict choice, discard, a rename or delete under a Live path) is a command on that worker. What a pass does is `LiveDecision` in TransferCore; change the rules there, with a test. Never write the working copy behind an open editor, and never rename it: a remote rename changes only the record's path. A Live open rides the interactive lane as `.open`, which a preview never drops.
 - Never let an Objective-C exception escape an `updateNSView` or a layout pass. AppKit catches it, and the Observation crash that follows lands somewhere else. Check `NSBrowser` column indices against `lastColumn` on every use.
 - Socket names use `ConnectionID.socketName` (12 hex digits). SSH option paths that contain spaces go through `-S`, `-i`, or a quoted `-o` value.
+- Every `ssh` command line puts `--` before the destination. A user or host from an `sftp://` link comes from another app, and without `--` one starting with `-` is an ssh option such as `-oProxyCommand`.
 - `SSH_FXP_SYMLINK` on OpenSSH is target, then link.
 
 ## Check

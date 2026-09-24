@@ -794,6 +794,7 @@ public final class TransferModel {
     }
 
     func enqueue(title: String, path: RemotePath, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
+        forgetCollisionChoiceWhenIdle()
         let id = UUID().uuidString
         operations.append(TransferOperation(id: id, title: title, state: .queued, path: path))
         runners[id] = Runner(body: body, task: nil)
@@ -854,7 +855,17 @@ public final class TransferModel {
             status = message
         }
         if operations.isEmpty { showsShelf = false }
+        forgetCollisionChoiceWhenIdle()
         Task { await refresh() }
+    }
+
+    /// "Apply to all" covers the operation it was chosen in. Operations can overlap and share
+    /// one prompt, so the choice is kept while any transfer is waiting or running, and forgotten
+    /// once none is: the next operation asks again, with the box unchecked.
+    private func forgetCollisionChoiceWhenIdle() {
+        guard !operations.contains(where: { $0.state == .active || $0.state == .queued }) else { return }
+        applyToAll = nil
+        applyCollisionToAll = false
     }
 
     public func pause(_ operation: TransferOperation) async {
@@ -879,6 +890,7 @@ public final class TransferModel {
         runners[operation.id] = nil
         operations.removeAll { $0.id == operation.id }
         if operations.isEmpty { showsShelf = false }
+        forgetCollisionChoiceWhenIdle()
     }
 
     // MARK: Edits

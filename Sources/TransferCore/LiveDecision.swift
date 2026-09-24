@@ -13,7 +13,7 @@ public struct LiveStamp: Hashable, Sendable {
 
     /// The whole-second view the server would record for these bytes.
     public var fingerprint: Fingerprint {
-        Fingerprint(kind: .file, size: size, mtime: UInt32(mtime.timeIntervalSince1970))
+        Fingerprint(kind: .file, size: size, mtime: SFTPTime.seconds(mtime))
     }
 }
 

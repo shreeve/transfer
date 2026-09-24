@@ -1,10 +1,11 @@
 import Foundation
 
 /// One entry of a walked tree. Trees are keyed by the path relative to the root, joined with
-/// `/`; the root itself is the empty key.
+/// `/`; the root itself is the empty key. A file's `mtime` is whole seconds, as SFTP keeps it,
+/// or nil where it is not known.
 public enum TreeEntry: Hashable, Sendable {
     case directory
-    case file(size: UInt64)
+    case file(size: UInt64, mtime: UInt32? = nil)
     case link
 }
 
@@ -13,7 +14,7 @@ public extension TreeEntry {
         switch item.kind {
         case .directory: self = .directory
         case .symlink: self = .link
-        case .file, .other: self = .file(size: item.size ?? 0)
+        case .file, .other: self = .file(size: item.size ?? 0, mtime: item.mtime)
         }
     }
 }
@@ -37,7 +38,7 @@ public struct ClipTally: Hashable, Sendable {
         switch entry {
         case .directory:
             folders += 1
-        case .file(let size):
+        case .file(let size, _):
             files += 1
             allFiles += 1
             bytes += size
@@ -52,7 +53,7 @@ public struct ClipTally: Hashable, Sendable {
         switch entry {
         case .directory:
             break
-        case .file(let size):
+        case .file(let size, _):
             allFiles += 1
             bytes += size
         case .link:
@@ -114,11 +115,23 @@ public enum PasteRules {
 
 /// Whether a copy holds everything its source did, before a move removes the source.
 public enum TreeCheck {
-    /// The source entries that are missing from the destination or differ in kind or size.
+    /// The source entries that are missing from the destination or differ in kind, size, or
+    /// modification time. Every copy keeps a file's time, so a file of the same name and size
+    /// that was already there, left by a Skip or beside a Keep Both, does not pass for the copy.
+    /// A time either side does not know is not compared.
     public static func missing(source: [String: TreeEntry], destination: [String: TreeEntry]) -> [String] {
         source.compactMap { key, entry in
-            destination[key] == entry ? nil : key
+            destination[key].map { holds(entry, $0) } == true ? nil : key
         }
         .sorted()
+    }
+
+    private static func holds(_ source: TreeEntry, _ copy: TreeEntry) -> Bool {
+        switch (source, copy) {
+        case let (.file(size, time), .file(copySize, copyTime)):
+            size == copySize && (time == nil || copyTime == nil || time == copyTime)
+        default:
+            source == copy
+        }
     }
 }

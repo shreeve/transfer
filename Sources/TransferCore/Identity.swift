@@ -111,6 +111,17 @@ public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
     public var isDotEntry: Bool { name == "." || name == ".." }
 }
 
+/// SFTP v3 keeps times as unsigned 32-bit seconds since 1970.
+public enum SFTPTime {
+    /// A date's whole seconds, clamped to what SFTP can hold: a date before 1970 is 0 and one after
+    /// February 2106 is the last second. `UInt32(_:)` would trap on either.
+    public static func seconds(_ date: Date) -> UInt32 {
+        let seconds = date.timeIntervalSince1970.rounded(.down)
+        if seconds.isNaN || seconds <= 0 { return 0 }
+        return seconds >= Double(UInt32.max) ? .max : UInt32(seconds)
+    }
+}
+
 public struct Fingerprint: Hashable, Sendable, Codable {
     public var kind: ItemKind
     public var size: UInt64
