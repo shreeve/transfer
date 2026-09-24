@@ -81,31 +81,13 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 guard let splitView = controller?.splitView else { return nil }
                 return NSTrackingSeparatorToolbarItem(identifier: identifier, splitView: splitView, dividerIndex: 0)
             case ChromeItem.backForward:
-                let group = NSToolbarItemGroup(
-                    itemIdentifier: identifier,
-                    images: [symbol("chevron.backward"), symbol("chevron.forward")],
-                    selectionMode: .momentary,
-                    labels: ["Back", "Forward"],
-                    target: self,
-                    action: #selector(navigate(_:))
-                )
+                let group = makeGroup(identifier, "Back/Forward", symbols: ["chevron.backward", "chevron.forward"],
+                                      labels: ["Back", "Forward"], mode: .momentary, action: #selector(navigate(_:)))
                 group.isNavigational = true
-                group.controlRepresentation = .expanded
-                group.visibilityPriority = .high
-                group.label = "Back/Forward"
                 return group
             case ChromeItem.viewMode:
-                let group = NSToolbarItemGroup(
-                    itemIdentifier: identifier,
-                    images: [symbol("square.grid.2x2"), symbol("list.bullet"), symbol("rectangle.split.3x1")],
-                    selectionMode: .selectOne,
-                    labels: ["Icons", "List", "Columns"],
-                    target: self,
-                    action: #selector(changeViewMode(_:))
-                )
-                group.controlRepresentation = .expanded
-                group.visibilityPriority = .high
-                group.label = "View"
+                let group = makeGroup(identifier, "View", symbols: ["square.grid.2x2", "list.bullet", "rectangle.split.3x1"],
+                                      labels: ["Icons", "List", "Columns"], mode: .selectOne, action: #selector(changeViewMode(_:)))
                 group.selectedIndex = index(of: model.snapshot.viewMode)
                 viewGroup = group
                 return group
@@ -143,6 +125,16 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
 
         private func symbol(_ name: String) -> NSImage {
             NSImage(systemSymbolName: name, accessibilityDescription: nil) ?? NSImage()
+        }
+
+        private func makeGroup(_ identifier: NSToolbarItem.Identifier, _ label: String, symbols: [String], labels: [String],
+                               mode: NSToolbarItemGroup.SelectionMode, action: Selector) -> NSToolbarItemGroup {
+            let group = NSToolbarItemGroup(itemIdentifier: identifier, images: symbols.map(symbol), selectionMode: mode,
+                                           labels: labels, target: self, action: action)
+            group.controlRepresentation = .expanded
+            group.visibilityPriority = .high
+            group.label = label
+            return group
         }
 
         private func index(of mode: ViewMode) -> Int {
