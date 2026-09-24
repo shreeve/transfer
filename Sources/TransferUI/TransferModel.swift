@@ -861,16 +861,18 @@ public final class TransferModel {
         showPreview()
     }
 
-    /// Quick Look on `item`, or on the primary selected item.
+    /// Quick Look on `item`, or on the primary selected item. A fetch that finishes after the
+    /// panel was put away leaves it closed.
     public func showPreview(_ item: RemoteItem? = nil) {
         guard let session, let item = item ?? primaryItem else { return }
         previewTask?.cancel()
+        let generation = PreviewPanel.shared.generation
         previewTask = Task { [weak self] in
             do {
                 let target = try await Self.resolveLink(item, session: session)
                 let url = try await session.preparePreview(target.path)
                 if Task.isCancelled { return }
-                PreviewPanel.shared.show(url)
+                PreviewPanel.shared.show(url, generation: generation)
             } catch {
                 self?.report(error)
             }
@@ -887,7 +889,9 @@ public final class TransferModel {
         if let item = primaryItem, item.kind == .symlink, let session {
             Task { [weak self] in
                 let target = try? await session.readlink(item.path)
-                self?.inspectorLinkTarget = target
+                // A reply for a link the selection has since left is dropped.
+                guard let self, primaryItem?.path == item.path else { return }
+                inspectorLinkTarget = target
             }
         }
     }
@@ -915,21 +919,19 @@ public final class TransferModel {
             inspectorWait = .icon
             return
         }
+        let timeline: [(at: Duration, step: @MainActor (TransferModel) -> Void)] = [
+            (PreviewTiming.hold, { $0.inspectorPreview = nil }),
+            (PreviewTiming.icon, { $0.inspectorWait = .icon }),
+            (PreviewTiming.spinner, { $0.inspectorWait = .spinner }),
+        ]
         inspectorTasks = [
+            // The wait, step by step, until the fetch lands and cancels it.
             Task { [weak self] in
-                try? await Task.sleep(for: PreviewTiming.hold)
-                guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
-                inspectorPreview = nil
-            },
-            Task { [weak self] in
-                try? await Task.sleep(for: PreviewTiming.icon)
-                guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
-                inspectorWait = .icon
-            },
-            Task { [weak self] in
-                try? await Task.sleep(for: PreviewTiming.spinner)
-                guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
-                inspectorWait = .spinner
+                for (at, step) in timeline {
+                    try? await Task.sleep(until: now + at)
+                    guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
+                    step(self)
+                }
             },
             Task { [weak self] in
                 if rapid { try? await Task.sleep(for: PreviewTiming.coalesce) }
@@ -944,21 +946,22 @@ public final class TransferModel {
         ]
     }
 
-    /// The preview for one file, ready to draw: text, a decoded picture, or a local copy for
-    /// Quick Look. Nil when it is not a small file after all.
+    /// The preview for one file, ready to draw: text, a decoded picture, or the local copy for
+    /// Quick Look. Nil when it is not a small file after all. The copy is read off the main
+    /// thread.
     private static func fetchPreview(_ item: RemoteItem, session: any RemoteSession) async -> InspectorPreview? {
         do {
             let target = try await Self.resolveLink(item, session: session)
             guard target.kind == .file, (target.size ?? 0) <= inspectorPreviewLimit else { return nil }
             let url = try await session.prepareViewFile(target.path)
-            if await session.openKind(fileName: target.name) == .live, let text = previewText(url) {
-                return .text(text)
-            }
-            if let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .image),
-               let picture = await Task.detached(priority: .userInitiated, operation: { decodePicture(url) }).value {
-                return .picture(picture)
-            }
-            return .file(try await session.preparePreview(target.path))
+            let isText = await session.openKind(fileName: target.name) == .live
+            let isPicture = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true
+            let read = await Task.detached(priority: .userInitiated) { () -> InspectorPreview? in
+                if isText, let text = previewText(url) { return .text(text) }
+                if isPicture, let picture = decodePicture(url) { return .picture(picture) }
+                return nil
+            }.value
+            return read ?? .file(url)
         } catch {
             return nil
         }
@@ -967,8 +970,8 @@ public final class TransferModel {
     /// Warms the cache for the files on either side of `item`, one at a time, so an arrow key
     /// lands on a copy that is already here. A newer selection cancels this like everything else.
     private func prefetchNeighbors(of item: RemoteItem, session: any RemoteSession, generation: Int) {
-        let list = items
-        guard let index = list.firstIndex(of: item) else { return }
+        let list = displayedItems
+        guard let index = displayedIndex[item.path] else { return }
         let neighbors = [index + 1, index - 1].filter(list.indices.contains).map { list[$0] }
             .filter { $0.kind == .file && ($0.size ?? 0) <= Self.inspectorPreviewLimit }
         guard !neighbors.isEmpty else { return }
@@ -992,7 +995,7 @@ public final class TransferModel {
     }
 
     /// The first lines of a text file; nil when the bytes are not text after all.
-    private static func previewText(_ url: URL) -> String? {
+    nonisolated private static func previewText(_ url: URL) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url), let data = try? handle.read(upToCount: 64 << 10) else { return nil }
         if data.prefix(8 << 10).contains(0) { return nil }
         return String(decoding: data, as: UTF8.self)
@@ -1946,20 +1949,27 @@ enum TerminalLauncher {
     }
 }
 
-final class PreviewPanel: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate, @unchecked Sendable {
+/// The Quick Look panel, one per app. Quick Look calls its data source and delegate on the main
+/// thread. `close` moves `generation` on, so a fetch that finishes after the user put the panel
+/// away does not bring it back.
+@MainActor
+final class PreviewPanel: NSObject, @MainActor QLPreviewPanelDataSource, @MainActor QLPreviewPanelDelegate {
     static let shared = PreviewPanel()
-    private let lock = NSLock()
     private var url: URL?
+    private(set) var generation = 0
 
-    @MainActor
+    private enum Key {
+        static let space: UInt16 = 49
+        static let escape: UInt16 = 53
+        static let arrows: ClosedRange<UInt16> = 123...126
+    }
+
     var isVisible: Bool { QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible }
 
-    @MainActor
-    func show(_ url: URL) {
-        lock.lock()
+    /// Shows `url`, unless the panel was closed since `generation` was read.
+    func show(_ url: URL, generation: Int) {
+        guard generation == self.generation, let panel = QLPreviewPanel.shared() else { return }
         self.url = url
-        lock.unlock()
-        guard let panel = QLPreviewPanel.shared() else { return }
         panel.dataSource = self
         panel.delegate = self
         if panel.isVisible {
@@ -1969,22 +1979,18 @@ final class PreviewPanel: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDele
         }
     }
 
-    @MainActor
     func close() {
+        generation &+= 1
         guard isVisible else { return }
         QLPreviewPanel.shared().orderOut(nil)
     }
 
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return url == nil ? 0 : 1
+        url == nil ? 0 : 1
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
-        lock.lock()
-        defer { lock.unlock() }
-        return (url ?? URL(fileURLWithPath: "/")) as NSURL
+        (url ?? URL(fileURLWithPath: "/")) as NSURL
     }
 
     /// Space and Escape put the panel away; the arrow keys go to the browser behind it, so the
@@ -1992,15 +1998,11 @@ final class PreviewPanel: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDele
     func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
         guard event.type == .keyDown else { return false }
         switch event.keyCode {
-        case 49, 53:
-            MainActor.assumeIsolated { close() }
+        case Key.space, Key.escape:
+            close()
             return true
-        case 123, 124, 125, 126:
-            // The panel calls this on the main thread; NSEvent just is not marked Sendable.
-            nonisolated(unsafe) let forwarded = event!
-            MainActor.assumeIsolated {
-                if let responder = NSApp.mainWindow?.firstResponder as? NSView { responder.keyDown(with: forwarded) }
-            }
+        case Key.arrows:
+            if let responder = NSApp.mainWindow?.firstResponder as? NSView { responder.keyDown(with: event) }
             return true
         default:
             return false
@@ -2008,7 +2010,7 @@ final class PreviewPanel: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDele
     }
 }
 
-public enum InspectorPreview: Equatable {
+public enum InspectorPreview: Equatable, Sendable {
     case file(URL)
     case text(String)
     case picture(CGImage)

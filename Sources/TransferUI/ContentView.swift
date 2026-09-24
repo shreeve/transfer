@@ -619,7 +619,7 @@ struct InspectorColumn: View {
             QuickLookPreview(url: url)
         case .text(let text):
             VStack(alignment: .trailing, spacing: 4) {
-                SourcePreview(html: SyntaxPreview.html(text: text, fileName: item.name, compact: true, wraps: wrapsPreview))
+                SourcePreview(text: text, fileName: item.name, wraps: wrapsPreview)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
                 Toggle("Wrap lines", isOn: $wrapsPreview)
@@ -828,30 +828,52 @@ struct QuickLookPreview: NSViewRepresentable {
     func updateNSView(_ view: QLPreviewView, context: Context) {
         if (view.previewItem as? NSURL) as URL? != url { view.previewItem = url as NSURL }
     }
+
+    /// A view that does not close with its window must be closed by hand, or each preview the
+    /// inspector drops keeps its Quick Look resources.
+    static func dismantleNSView(_ view: QLPreviewView, coordinator: ()) {
+        view.close()
+    }
 }
 
-/// Highlighted source in a web view, scrollable, with the pane's own background.
+/// Highlighted source in a web view, scrollable, with the pane's own background. The page is
+/// built only when the text, name, or wrapping changes, never on every redraw of the pane.
 struct SourcePreview: NSViewRepresentable {
-    let html: String
+    let text: String
+    let fileName: String
+    let wraps: Bool
 
     func makeNSView(context: Context) -> WKWebView {
-        let view = WKWebView()
+        let configuration = WKWebViewConfiguration()
+        // The text is escaped; with scripts off, nothing from the server runs even if some slipped through.
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        let view = WKWebView(frame: .zero, configuration: configuration)
         view.setValue(false, forKey: "drawsBackground")
-        view.loadHTMLString(html, baseURL: nil)
-        context.coordinator.html = html
+        load(into: view, context: context)
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
-        guard context.coordinator.html != html else { return }
-        context.coordinator.html = html
-        view.loadHTMLString(html, baseURL: nil)
+        load(into: view, context: context)
+    }
+
+    private func load(into view: WKWebView, context: Context) {
+        let page = Coordinator.Page(text: text, fileName: fileName, wraps: wraps)
+        guard context.coordinator.page != page else { return }
+        context.coordinator.page = page
+        view.loadHTMLString(SyntaxPreview.html(text: text, fileName: fileName, compact: true, wraps: wraps), baseURL: nil)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
-        var html = ""
+        struct Page: Equatable {
+            var text: String
+            var fileName: String
+            var wraps: Bool
+        }
+
+        var page: Page?
     }
 }
 
