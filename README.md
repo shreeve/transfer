@@ -76,7 +76,7 @@ ssh live 'mkdir -p ~/bin ~/.config/transfer && cat > ~/bin/xfer && chmod 755 ~/b
 | Saved servers, stars, Live file records | `~/Library/Application Support/Transfer/transfer.sqlite`, and the `-wal` and `-shm` files beside it (`transfer.lock` there keeps a second copy of Transfer out) |
 | Working copies of Live files | `~/Library/Application Support/Transfer/Live/` |
 | Editable file extensions | `~/Library/Application Support/Transfer/config.json` (Settings → Extensions) |
-| Passwords you chose to save | Keychain, service "Transfer" |
+| Passwords and passphrases you chose to save | Keychain, service "Transfer" |
 | Preview cache | `~/Library/Caches/Transfer/` |
 | Copy and paste staging | `~/Library/Caches/com.github.shreeve.transfer/` |
 | Preferences | `defaults read com.github.shreeve.transfer` |
@@ -94,7 +94,7 @@ swift test
 open --env TRANSFER_LIBRARY=/tmp/transfer-dev "$(Scripts/package-app.sh)"
 ```
 
-`Scripts/package-app.sh` builds `Transfer.app` (in `.build`, or in the folder `SCRATCH` names) and prints its path. `TRANSFER_LIBRARY` gives the build a library of its own, with its caches inside it, so it never touches your saved servers, Live files, or caches. Leave it out only on purpose: a build on the real library is a second copy of Transfer working on your Live files. Either way the build shares the installed app's preferences, and `sftp://` links open in whichever copy macOS registered last; open the installed copy once to send them back to it.
+`Scripts/package-app.sh` builds `Transfer.app` (in `.build`, or in the folder `SCRATCH` names) and prints its path. `TRANSFER_LIBRARY` gives the build a library of its own, with its caches inside it, so it never touches your saved servers, Live files, or caches. Leave it out only on purpose: without it the build opens your real library, and only one copy of Transfer opens a library at a time, so it quits while your installed copy is open and otherwise works on your saved servers and Live files. Either way the build shares the installed app's preferences, and `sftp://` links open in whichever copy macOS registered last; open the installed copy once to send them back to it.
 
 `swift test` needs no server. The tests that log in run against an unprivileged local `sshd`, never Remote Login or a real server:
 
