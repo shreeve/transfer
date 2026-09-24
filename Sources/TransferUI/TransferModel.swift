@@ -810,7 +810,7 @@ public final class TransferModel {
         }
     }
 
-    /// The Status column and inspector text for a path: Live state or an active transfer.
+    /// The inspector's line for a path: its Live state, or an active transfer.
     public func statusText(for path: RemotePath) -> String {
         if let live = liveByPath[path] { return live.state.label }
         if operations.contains(where: { $0.state == .active && $0.path == path }) {
@@ -864,7 +864,7 @@ public final class TransferModel {
             guard target.kind == .file else { return }
             let rule = await session.openKind(fileName: target.name)
             let url = forceLive || rule == .live ? try await session.prepareLiveFile(target.path) : try await session.prepareViewFile(target.path)
-            await FileOpener.open(url)
+            try await FileOpener.open(url)
             await reloadSidebars()
         }
     }
@@ -1564,7 +1564,7 @@ public final class TransferModel {
 
     public func openTerminal() async {
         guard let session, let command = await session.terminalCommand(directory: snapshot.path) else { return }
-        TerminalLauncher.open(command: command)
+        if let problem = await TerminalLauncher.open(command: command) { status = problem }
     }
 
     /// Reads the server's stars and Live files. A star whose kind is not known yet is published
@@ -2009,26 +2009,41 @@ enum TerminalLauncher {
         apps.contains { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0.bundle) != nil }
     }
 
-    /// A running Terminal, iTerm2, or Ghostty, otherwise the first installed one.
+    /// Runs `command` in a running Terminal, iTerm2, or Ghostty, otherwise the first installed
+    /// one. What went wrong, if anything, in words for the window.
     @MainActor
-    static func open(command: String) {
+    static func open(command: String) async -> String? {
         let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
         let choice = apps.first { running.contains($0.bundle) }
             ?? apps.first { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0.bundle) != nil }
-        guard let choice, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: choice.bundle) else { return }
+        guard let choice, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: choice.bundle) else {
+            return "Open in Terminal needs Terminal, iTerm2, or Ghostty."
+        }
+        let script: String
         switch choice.name {
         case "Terminal":
-            let script = "tell application \"Terminal\"\nactivate\ndo script \(appleScriptString(command))\nend tell"
-            NSAppleScript(source: script)?.executeAndReturnError(nil)
+            script = "tell application \"Terminal\"\nactivate\ndo script \(appleScriptString(command))\nend tell"
         case "iTerm2":
-            let script = "tell application \"iTerm\"\nactivate\ncreate window with default profile command \(appleScriptString(command))\nend tell"
-            NSAppleScript(source: script)?.executeAndReturnError(nil)
+            script = "tell application \"iTerm\"\nactivate\ncreate window with default profile command \(appleScriptString(command))\nend tell"
         default:
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.createsNewApplicationInstance = true
             configuration.arguments = ["-e", command]
-            NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+            do {
+                _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+                return nil
+            } catch {
+                return "\(choice.name) did not open: \(error.localizedDescription)"
+            }
         }
+        var error: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&error)
+        guard let error else { return nil }
+        // errAEEventNotPermitted: the user has not let Transfer control the app.
+        if error[NSAppleScript.errorNumber] as? Int == -1743 {
+            return "Transfer may not control \(choice.name). Allow it in System Settings > Privacy & Security > Automation."
+        }
+        return error[NSAppleScript.errorMessage] as? String ?? "\(choice.name) did not run the command."
     }
 
     private static func appleScriptString(_ value: String) -> String {

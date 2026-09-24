@@ -5,6 +5,9 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
+/// A browser window's SwiftUI content: the sidebar, the content pane with its message,
+/// rename, clipboard, and transfer bars and every sheet, and the inspector. `WindowChrome`
+/// hosts each column once and each observes the model itself (HANDOFF.md, Window chrome).
 public struct ContentView: View {
     let model: TransferModel
 
@@ -112,7 +115,6 @@ struct SidebarColumn: View {
     private func folderName(_ path: RemotePath) -> String {
         path.isRoot ? "/" : path.name
     }
-
 }
 
 /// The content column: browser, rename bar, shelf, and every sheet.
@@ -630,7 +632,6 @@ struct ConnectionForm: View {
     }
 }
 
-/// The rename field. Focus state has to live inside the hosted detail subtree, so this is its own view.
 /// What the clipboard holds, over the shelf in every window until it is cleared, replaced, or
 /// pasted with a move. Items copied in Transfer are made ready for Finder in the background.
 private struct ClipBar: View {
@@ -738,6 +739,7 @@ private struct MessageBar: View {
     }
 }
 
+/// The rename field. Focus state has to live inside the hosted detail subtree, so this is its own view.
 private struct RenameBar: View {
     @Bindable var model: TransferModel
     @FocusState private var focused: Bool
