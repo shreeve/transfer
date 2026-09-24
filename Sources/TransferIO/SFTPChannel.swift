@@ -106,7 +106,7 @@ actor SFTPChannel {
         return try item(path: path, message: message)
     }
 
-    /// Keeps several READDIR requests in flight. OpenSSH answers each with about a hundred names,
+    /// Keeps several READDIR requests in flight. OpenSSH answers each with at most a hundred names,
     /// so a large folder no longer pays one round trip per page. A listing its reader abandons
     /// stops at once and still closes its handle on the server.
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
@@ -120,8 +120,12 @@ actor SFTPChannel {
                         closeLater(handle)
                     }
                     var finished = false
+                    var pages = 0
                     while !finished || !inFlight.isEmpty {
-                        while !finished, inFlight.count < 4 {
+                        // Four pages at first, so a small folder asks for at most three pages
+                        // past its end; sixteen once four have come, so a large one pays about
+                        // one round trip per 1,600 names.
+                        while !finished, inFlight.count < (pages < 4 ? 4 : 16) {
                             inFlight.append(Task { try await self.readDirectoryPage(handle, parent: path) })
                         }
                         let next = inFlight.removeFirst()
@@ -134,6 +138,7 @@ actor SFTPChannel {
                             finished = true
                             continue
                         }
+                        pages += 1
                         for item in page { continuation.yield(item) }
                         try Task.checkCancellation()
                     }

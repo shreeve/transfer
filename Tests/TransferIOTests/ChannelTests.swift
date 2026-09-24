@@ -41,6 +41,33 @@ import TransferCore
         await server.stop()
     }
 
+    /// A large folder, read with up to sixteen pages in flight, still arrives whole and in order,
+    /// and a one-page folder asks for at most four pages past its end.
+    @Test func listingsArriveWholeAndInOrder() async throws {
+        for pageCount in [1, 25] {
+            let pages = Locked(0)
+            let server = try await ScriptedServer { request in
+                switch request.type {
+                case SFTPCode.opendir: return ScriptedServer.handle(request.id)
+                case SFTPCode.close: return ScriptedServer.ok(request.id)
+                case SFTPCode.readdir:
+                    let page = pages.withLock { count in
+                        count += 1
+                        return count
+                    }
+                    guard page <= pageCount else { return ScriptedServer.status(request.id, SFTPCode.eof) }
+                    return ScriptedServer.names(request.id, (0..<100).map { "f\((page - 1) * 100 + $0)" })
+                default: return nil
+                }
+            }
+            var names: [String] = []
+            for try await item in await server.channel.list(RemotePath(string: "/srv")) { names.append(item.name) }
+            #expect(names == (0..<(pageCount * 100)).map { "f\($0)" })
+            if pageCount == 1 { #expect(server.sent(SFTPCode.readdir).count <= 5) }
+            await server.stop()
+        }
+    }
+
     /// SFC-4: a cancelled listing (fast browsing cancels the last folder's) used to skip its
     /// CLOSE, and the server kept every such directory handle open until the channel died.
     @Test func aCancelledListingClosesItsHandle() async throws {
