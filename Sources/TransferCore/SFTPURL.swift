@@ -19,16 +19,18 @@ public struct SFTPURL: Hashable, Sendable {
 
     /// Nil for anything but an `sftp://` URL with a host. The path is percent-decoded. A user or
     /// host that ssh could read as an option, or that holds spaces or control characters, is no
-    /// link: they come from other apps, and they end up on ssh's command line.
+    /// link: they come from other apps, and they end up on ssh's command line. Nor is a path
+    /// with a control character: a NUL on the wire ends the SFTP channel.
     public init?(url: URL) {
         guard url.scheme?.lowercased() == "sftp", let host = url.host(percentEncoded: false),
               Self.isPlainName(host) else { return nil }
         let user = url.user(percentEncoded: false).flatMap { $0.isEmpty ? nil : $0 }
         if let user, !Self.isPlainName(user) { return nil }
+        let path = url.path(percentEncoded: false)
+        guard !path.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return nil }
         self.host = host
         self.user = user
         port = url.port.map(String.init)
-        let path = url.path(percentEncoded: false)
         self.path = path.isEmpty ? nil : RemotePath(string: path)
     }
 
@@ -37,9 +39,13 @@ public struct SFTPURL: Hashable, Sendable {
             && !name.unicodeScalars.contains { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }
     }
 
-    /// The link to `path` on `connection`, as Copy Remote URL writes it.
+    /// The link to `path` on `connection`, as Copy Remote URL writes it. An IPv6 address goes in
+    /// brackets, as `xfer` writes it, so the port after it still parses.
     public static func string(connection: SavedConnection, path: RemotePath) -> String {
         var host = connection.host
+        if host.contains(":"), !host.hasPrefix("[") {
+            host = "[\(host.replacingOccurrences(of: "%", with: "%25"))]"
+        }
         if !connection.port.isEmpty { host += ":\(connection.port)" }
         let user = connection.user.trimmingCharacters(in: .whitespaces)
         let authority = user.isEmpty ? host : "\(percent(user))@\(host)"
