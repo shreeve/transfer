@@ -314,151 +314,129 @@ struct DetailColumn: View {
         switch sheet {
         case .connection:
             ConnectionForm(model: model)
-        case .prompt(let request):
-            VStack(alignment: .leading, spacing: 12) {
-                Text(model.currentConnection?.displayName ?? model.draft.displayName).font(.headline)
+        case .prompt(let request, let server, _):
+            let reply = { PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret) }
+            let cancel = { model.finishPrompt(PromptReply(text: nil), offered: false) }
+            SheetForm(title: server ?? "Log In", width: 380, onCancel: cancel) {
                 Text(request.text)
                 SecureField("Password", text: $model.promptSecure)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.finishPrompt(PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret)) }
+                    .onSubmit { model.finishPrompt(reply(), offered: request.offerKeychain) }
                 if request.offerKeychain {
                     Toggle("Save in Keychain", isOn: $model.saveSecret)
                 }
-                HStack {
-                    Button("Cancel") { model.finishPrompt(PromptReply(text: nil)) }
-                        .keyboardShortcut(.cancelAction)
-                    Spacer()
-                    Button("Continue") {
-                        model.finishPrompt(PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret))
-                    }
+            } actions: {
+                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Continue") { model.finishPrompt(reply(), offered: request.offerKeychain) }
                     .keyboardShortcut(.defaultAction)
-                }
             }
-            .padding()
-            .frame(width: 380)
-            .onExitCommand { model.finishPrompt(PromptReply(text: nil)) }
-        case .hostKey(let event):
-            VStack(alignment: .leading, spacing: 12) {
-                Text(event.situation == .changed ? "The host key changed" : "First time connecting to this server")
-                    .font(.headline)
-                Text(event.situation == .changed
-                     ? "The server now presents a different key. Someone could be intercepting the connection."
-                     : "Check this fingerprint against one you got from the server's owner.")
-                    .foregroundStyle(.secondary)
+        case .hostKey(let event, let server, _):
+            SheetForm(
+                title: event.situation == .changed ? "The host key changed" : "First time connecting to this server",
+                detail: event.situation == .changed
+                    ? "The server now presents a different key. Someone could be intercepting the connection."
+                    : "Check this fingerprint against one you got from the server's owner.",
+                width: 460,
+                onCancel: { model.finishHost(.cancel) }
+            ) {
+                LabeledContent("Server", value: hostKeyServer(server, event))
                 LabeledContent("Key type", value: event.keyType)
                 LabeledContent("SHA256", value: event.fingerprint)
                     .font(.body.monospaced())
                     .textSelection(.enabled)
-                HStack {
-                    Button("Cancel") { model.finishHost(.cancel) }
-                        .keyboardShortcut(.defaultAction)
-                    Spacer()
-                    if event.situation == .firstSeen {
-                        Button("Trust Once") { model.finishHost(.trustOnce) }
-                        Button("Always Trust") { model.finishHost(.alwaysTrust) }
-                    } else {
-                        Button("Replace Trusted Key") { model.finishHost(.replace) }
-                    }
+            } actions: {
+                Button("Cancel") { model.finishHost(.cancel) }
+                    .keyboardShortcut(.defaultAction)
+                Spacer()
+                if event.situation == .firstSeen {
+                    Button("Trust Once") { model.finishHost(.trustOnce) }
+                    Button("Always Trust") { model.finishHost(.alwaysTrust) }
+                } else {
+                    Button("Replace Trusted Key") { model.finishHost(.replace) }
                 }
             }
-            .padding()
-            .frame(width: 460)
-            .onExitCommand { model.finishHost(.cancel) }
         case .delete:
-            let count = model.snapshot.selection.count
             let unsynced = model.unsyncedInSelection
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Delete \(count) item\(count == 1 ? "" : "s")?").font(.headline)
-                Text("The delete is permanent. There is no trash on the server.")
-                    .foregroundStyle(.secondary)
+            SheetForm(title: deleteTitle, detail: "The delete is permanent. There is no trash on the server.", onCancel: { model.sheet = nil }) {
                 if unsynced > 0 {
                     Text("\(unsynced) Live file\(unsynced == 1 ? " has" : "s have") unsynced edits that will be discarded.")
                         .foregroundStyle(.red)
                 }
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Delete") {
-                        model.sheet = nil
-                        Task { await model.deleteSelection() }
-                    }
+            } actions: {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Delete") {
+                    model.sheet = nil
+                    Task { await model.deleteSelection() }
                 }
             }
-            .padding()
-            .frame(width: 400)
-            .onExitCommand { model.sheet = nil }
-        case .collision(let name):
-            VStack(alignment: .leading, spacing: 12) {
-                Text("“\(name)” already exists").font(.headline)
-                Text("Keep Both saves the new file with a number before its extension.")
-                    .foregroundStyle(.secondary)
+        case .collision(let name, _):
+            let skip = { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
+            SheetForm(title: "“\(name)” already exists", detail: "Keep Both saves the new file with a number before its extension.", onCancel: skip) {
                 Toggle("Apply to all in this operation", isOn: $model.applyCollisionToAll)
-                HStack {
-                    Button("Skip") { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
-                        .keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Keep Both") { model.finishCollision(.keepBoth, applyToAll: model.applyCollisionToAll) }
-                    Button("Replace") { model.finishCollision(.replace, applyToAll: model.applyCollisionToAll) }
-                }
+            } actions: {
+                Button("Skip", action: skip).keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Keep Both") { model.finishCollision(.keepBoth, applyToAll: model.applyCollisionToAll) }
+                Button("Replace") { model.finishCollision(.replace, applyToAll: model.applyCollisionToAll) }
             }
-            .padding()
-            .frame(width: 400)
-            .onExitCommand { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
-        case .conflict:
-            conflictSheet
+        case .conflict(let path, let comparable):
+            conflictSheet(path, comparable: comparable)
         case .goToFolder:
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Go to Remote Folder").font(.headline)
+            SheetForm(title: "Go to Remote Folder", width: 420, onCancel: { model.sheet = nil }) {
                 TextField("Remote path", text: $model.folderText)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { goToFolder() }
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
-                    Spacer()
-                    Button("Go") { goToFolder() }.keyboardShortcut(.defaultAction)
-                }
+            } actions: {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Go") { goToFolder() }.keyboardShortcut(.defaultAction)
             }
-            .padding()
-            .frame(width: 420)
-            .onExitCommand { model.sheet = nil }
         case .removeServer(let connection):
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Remove “\(connection.displayName)”?").font(.headline)
-                Text("Only the saved connection is removed. Nothing on the server changes.")
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Remove") { Task { await model.removeServer(connection) } }
-                }
+            SheetForm(title: "Remove “\(connection.displayName)”?", detail: "Only the saved connection is removed. Nothing on the server changes.", onCancel: { model.sheet = nil }) {
+                EmptyView()
+            } actions: {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Remove") { Task { await model.removeServer(connection) } }
             }
-            .padding()
-            .frame(width: 400)
-            .onExitCommand { model.sheet = nil }
         case .discardLive(let path):
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Discard unsynced edits to “\(path.name)”?").font(.headline)
-                Text("The working copy has changes that were not uploaded.").foregroundStyle(.secondary)
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Discard") {
-                        model.sheet = nil
-                        Task { await model.discardLive(path, force: true) }
-                    }
+            SheetForm(title: "Discard unsynced edits to “\(path.name)”?", detail: "The working copy has changes that were not uploaded.", width: 420, onCancel: { model.sheet = nil }) {
+                EmptyView()
+            } actions: {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Discard") {
+                    model.sheet = nil
+                    Task { await model.discardLive(path, force: true) }
                 }
             }
-            .padding()
-            .frame(width: 420)
-            .onExitCommand { model.sheet = nil }
         }
     }
 
-    private var conflictSheet: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("“\(model.conflictPath?.name ?? "")” changed on the server")
-                .font(.headline)
-            Text("Neither version has been overwritten.").foregroundStyle(.secondary)
+    /// The server's name, and the host its key line names when that says more.
+    private func hostKeyServer(_ server: String?, _ event: HostKeyEvent) -> String {
+        let host = HostKeyLine(line: event.line)?.host
+        switch (server, host) {
+        case let (server?, host?) where host != server: return "\(server) (\(host))"
+        case let (server?, _): return server
+        case let (nil, host?): return host
+        case (nil, nil): return "Unknown"
+        }
+    }
+
+    /// "Delete “notes.txt”?" for one item, "Delete 3 items?" for more, so the sheet says what
+    /// goes, including a folder selected in column view.
+    private var deleteTitle: String {
+        let selection = model.snapshot.selection
+        if selection.count == 1, let path = selection.first { return "Delete “\(path.name)”?" }
+        return "Delete \(selection.count) items?"
+    }
+
+    private func conflictSheet(_ path: RemotePath, comparable: Bool) -> some View {
+        let later = { model.sheet = nil; model.conflictConfirm = nil }
+        return SheetForm(title: "“\(path.name)” changed on the server", detail: "Neither version has been overwritten.", width: 520, onCancel: later) {
             if let confirm = model.conflictConfirm {
                 Text(confirm == .keepLocal
                      ? "Keep Local overwrites the server copy with this Mac's edits. Press again to confirm."
@@ -467,7 +445,7 @@ struct DetailColumn: View {
             }
             HStack {
                 Button("Compare") { Task { await model.chooseConflict(.compare) } }
-                    .disabled(!model.conflictComparable)
+                    .disabled(!comparable)
                 Spacer()
                 Button(model.conflictConfirm == .keepLocal ? "Confirm Keep Local" : "Keep Local") {
                     Task { await model.chooseConflict(.keepLocal) }
@@ -477,15 +455,10 @@ struct DetailColumn: View {
                 }
                 Button("Keep Both") { Task { await model.chooseConflict(.keepBoth) } }
             }
-            HStack {
-                Button("Later") { model.sheet = nil; model.conflictConfirm = nil }
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
-            }
+        } actions: {
+            Button("Later", action: later).keyboardShortcut(.cancelAction)
+            Spacer()
         }
-        .padding()
-        .frame(width: 520)
-        .onExitCommand { model.sheet = nil; model.conflictConfirm = nil }
     }
 
     private func goToFolder() {
@@ -493,8 +466,29 @@ struct DetailColumn: View {
         model.sheet = nil
         Task { await model.goToFolder(text) }
     }
+}
 
+/// The frame the small sheets share: a headline, an optional line under it, the content, and a
+/// row of buttons, with Escape doing what the sheet's cancel does.
+private struct SheetForm<Content: View, Actions: View>: View {
+    let title: String
+    var detail: String?
+    var width: CGFloat = 400
+    let onCancel: () -> Void
+    @ViewBuilder let content: Content
+    @ViewBuilder let actions: Actions
 
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.headline)
+            if let detail { Text(detail).foregroundStyle(.secondary) }
+            content
+            HStack { actions }
+        }
+        .padding()
+        .frame(width: width)
+        .onExitCommand(perform: onCancel)
+    }
 }
 
 /// The inspector column.

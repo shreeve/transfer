@@ -128,8 +128,14 @@ public final class TransferModel {
         didSet { liveByPath = Dictionary(liveFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first }) }
     }
     @ObservationIgnored private var liveByPath: [RemotePath: LiveFile] = [:]
-    public var conflicts: [RemotePath] = []
-    public var conflictComparable = false
+    /// Live files the server changed under an edit, from the Live files themselves.
+    public var conflicts: [RemotePath] { liveFiles.filter(\.conflict).map(\.path) }
+    /// Whether Compare can open each conflict, as its event said. A conflict from before a
+    /// relaunch is not known to be comparable.
+    @ObservationIgnored private var comparableConflicts: [RemotePath: Bool] = [:]
+    /// Conflicts that arrived while another sheet was up, shown in turn once it closes.
+    @ObservationIgnored private var waitingConflicts: [RemotePath] = []
+    /// The Keep Local or Keep Remote press waiting for its confirming second press.
     public var conflictConfirm: LiveConflictChoice?
     public var filter = "" {
         didSet { if filter != oldValue { refreshItems() } }
@@ -161,21 +167,19 @@ public final class TransferModel {
     public var showsShelf = false
     public var draft = SavedConnection(name: "", host: "")
     public var draftIsEdit = false
-    public var sheet: AppSheet?
+    public var sheet: AppSheet? {
+        didSet { sheetChanged() }
+    }
     public var promptSecure = ""
     public var saveSecret = false
     public var renaming = false
     public var renameText = ""
-    public var conflictPath: RemotePath?
     public var applyCollisionToAll = false
     public var sidebarSelection: SidebarItem?
     public var inspectorLinkTarget: String?
     public var terminalAvailable = TerminalLauncher.anyInstalled()
 
     public private(set) var prompts: SheetPrompts
-    var pendingPrompt: CheckedContinuation<PromptReply, Never>?
-    var pendingHost: CheckedContinuation<HostKeyDecision, Never>?
-    var pendingCollision: CheckedContinuation<(choice: NameCollisionChoice, toAll: Bool)?, Never>?
 
     /// Where a connection made from an `sftp://` link's filled-in sheet lands.
     @ObservationIgnored private var pendingLanding: RemotePath?
@@ -219,6 +223,7 @@ public final class TransferModel {
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
         context?.close()
         sidebarReload?.cancel()
+        prompts.cancelAll()
     }
 
     /// Reads the global preferences at launch and whenever Settings changes them.
@@ -329,7 +334,7 @@ public final class TransferModel {
             pending = fresh
             // Listening before the login catches the notices the login itself raises.
             listen(fresh)
-            let start = try await session.connect(prompts: prompts)
+            let start = try await session.connect(prompts: prompts.login(connection))
             var path = start
             var selection: Set<RemotePath> = []
             var missing: RemotePath?
@@ -355,13 +360,29 @@ public final class TransferModel {
     /// Makes `fresh` the window's server in one step: its session, listener, location, and
     /// empty caches. The old server's listener and listings stop; its queued transfers go on.
     private func install(_ fresh: ServerContext, path: RemotePath, selection: Set<RemotePath>) {
-        let old = context
+        leaveServer(keepingRowsOf: fresh.connection.id)
         context = fresh
-        old?.close()
         snapshot.connectionID = fresh.connection.id
         snapshot.path = path
         snapshot.selection = selection
         columnRoot = path
+        loadPreferences(for: fresh.connection.id)
+        refreshItems()
+    }
+
+    /// Leaves the window showing no server.
+    private func uninstall() {
+        leaveServer(keepingRowsOf: nil)
+        snapshot.connectionID = nil
+        snapshot.selection = []
+        refreshItems()
+        status = "Not connected"
+    }
+
+    /// Forgets what the window knew about the server it showed, and stops listening to it.
+    private func leaveServer(keepingRowsOf id: ConnectionID?) {
+        context?.close()
+        context = nil
         backStack.removeAll()
         forwardStack.removeAll()
         listings.removeAll()
@@ -369,25 +390,10 @@ public final class TransferModel {
         starIsFolder.removeAll()
         stars = []
         liveFiles = []
-        dropLiveRows(keeping: fresh.connection.id)
-        loadPreferences(for: fresh.connection.id)
-        refreshItems()
-    }
-
-    /// Leaves the window showing no server.
-    private func uninstall() {
-        context?.close()
-        context = nil
-        snapshot.connectionID = nil
-        snapshot.selection = []
-        listings.removeAll()
-        listingUse.removeAll()
-        starIsFolder.removeAll()
-        stars = []
-        liveFiles = []
-        dropLiveRows(keeping: nil)
-        refreshItems()
-        status = "Not connected"
+        waitingConflicts.removeAll()
+        comparableConflicts.removeAll()
+        if case .conflict = sheet { sheet = nil }
+        dropLiveRows(keeping: id)
     }
 
     /// Live rows arrive from the shown server's events; once the window leaves that server
@@ -649,9 +655,9 @@ public final class TransferModel {
     }
 
     public func goHome() async {
-        guard let session else { return }
+        guard let context else { return }
         do {
-            let path = try await session.connect(prompts: prompts)
+            let path = try await context.session.connect(prompts: prompts.login(context.connection))
             await navigate(path)
         } catch {
             status = error.localizedDescription
@@ -1062,7 +1068,7 @@ public final class TransferModel {
         update(id) { $0.state = .active; $0.message = nil }
         let body = runner.body
         let session = runner.session
-        let prompts = prompts
+        let login = prompts.login(runner.connection)
         let operationPrompts = runner.prompts
         let report: @Sendable (TransferProgress) -> Void = { [weak self] progress in
             Task { @MainActor in self?.update(id) { $0.progress = progress } }
@@ -1072,7 +1078,7 @@ public final class TransferModel {
             while true {
                 do {
                     if !(await session.isConnected) {
-                        _ = try await session.connect(prompts: prompts)
+                        _ = try await session.connect(prompts: login)
                     }
                     try await OperationPrompts.$current.withValue(operationPrompts) { try await body(report) }
                     self?.finish(id, state: .succeeded, message: nil)
@@ -1284,7 +1290,7 @@ public final class TransferModel {
         guard let session else { return }
         do {
             try await session.discardLiveFile(path, force: force)
-            conflicts.removeAll { $0 == path }
+            waitingConflicts.removeAll { $0 == path }
             await reloadSidebars()
         } catch TransferError.liveUnsynced {
             sheet = .discardLive(path)
@@ -1337,32 +1343,51 @@ public final class TransferModel {
 
     // MARK: Conflicts
 
+    /// Keep Local and Keep Remote need a second press; each choice acts on the file its sheet
+    /// was opened for.
     public func chooseConflict(_ choice: LiveConflictChoice) async {
+        guard case .conflict(let path, _) = sheet else { return }
         switch choice {
         case .keepLocal, .keepRemote:
             if conflictConfirm == choice {
-                await resolveConflict(choice)
+                await resolveConflict(path, choice)
             } else {
                 conflictConfirm = choice
             }
         case .compare, .keepBoth:
-            await resolveConflict(choice)
+            await resolveConflict(path, choice)
         }
     }
 
-    private func resolveConflict(_ choice: LiveConflictChoice) async {
-        guard let path = conflictPath, let session else { return }
+    private func resolveConflict(_ path: RemotePath, _ choice: LiveConflictChoice) async {
+        guard let session else { return }
         conflictConfirm = nil
-        if choice != .compare { sheet = nil }
+        if choice != .compare {
+            waitingConflicts.removeAll { $0 == path }
+            sheet = nil
+        }
         do {
             try await session.resolveLive(path, choice: choice)
-            if choice != .compare {
-                conflicts.removeAll { $0 == path }
-                await refresh()
-            }
         } catch {
             status = error.localizedDescription
         }
+    }
+
+    /// Shows the conflict sheet for `path` now, or once the sheet on screen closes.
+    private func showConflict(_ path: RemotePath) {
+        if case .conflict(let shown, _) = sheet, shown == path { return }
+        guard sheet == nil else {
+            if !waitingConflicts.contains(path) { waitingConflicts.append(path) }
+            return
+        }
+        conflictConfirm = nil
+        sheet = .conflict(path, comparable: comparableConflicts[path] ?? false)
+    }
+
+    /// A sheet came or went: a waiting question goes first, then a waiting conflict.
+    private func sheetChanged() {
+        prompts.sheetChanged()
+        if sheet == nil, !waitingConflicts.isEmpty { showConflict(waitingConflicts.removeFirst()) }
     }
 
     // MARK: Sidebar
@@ -1380,8 +1405,7 @@ public final class TransferModel {
         case .live(let path):
             await reveal(path)
         case .conflict(let path):
-            conflictPath = path
-            sheet = .conflict
+            showConflict(path)
         }
     }
 
@@ -1460,11 +1484,8 @@ public final class TransferModel {
         case .notice(let text), .disconnected(let text):
             status = text
         case .conflict(let path, let comparable):
-            conflictPath = path
-            conflictComparable = comparable
-            conflictConfirm = nil
-            if !conflicts.contains(path) { conflicts.append(path) }
-            if sheet == nil { sheet = .conflict }
+            comparableConflicts[path] = comparable
+            showConflict(path)
         case .liveChanged:
             scheduleSidebarReload()
         case .directoryChanged(let path):
@@ -1511,11 +1532,14 @@ public extension RemoteItem {
 
 public enum AppSheet: Identifiable {
     case connection
-    case prompt(PromptRequest)
-    case hostKey(HostKeyEvent)
+    /// A login question, for the server named when it is known. `ask` ties the sheet to the
+    /// question waiting for it.
+    case prompt(PromptRequest, server: String?, ask: Int)
+    case hostKey(HostKeyEvent, server: String?, ask: Int)
     case delete
-    case collision(String)
-    case conflict
+    case collision(String, ask: Int)
+    /// A Live file changed on the server, and whether Compare can open it.
+    case conflict(RemotePath, comparable: Bool)
     case goToFolder
     case removeServer(SavedConnection)
     case discardLive(RemotePath)
@@ -1523,29 +1547,75 @@ public enum AppSheet: Identifiable {
     public var id: String {
         switch self {
         case .connection: "connection"
-        case .prompt: "prompt"
-        case .hostKey: "host"
+        case .prompt(_, _, let ask): "prompt-\(ask)"
+        case .hostKey(_, _, let ask): "host-\(ask)"
         case .delete: "delete"
-        case .collision: "collision"
-        case .conflict: "conflict"
+        case .collision(_, let ask): "collision-\(ask)"
+        case .conflict(let path, _): "conflict-\(path.display)"
         case .goToFolder: "goto"
         case .removeServer: "remove"
         case .discardLive: "discard"
         }
     }
+
+    /// The question this sheet answers, for the sheets that answer one.
+    var ask: Int? {
+        switch self {
+        case .prompt(_, _, let ask), .hostKey(_, _, let ask), .collision(_, let ask): ask
+        default: nil
+        }
+    }
 }
 
-/// Answers the session's prompts by showing sheets and parking the continuation until a button resolves it.
+/// Answers the questions sessions and operations ask, with sheets in this window. Questions
+/// wait in line and show one at a time, in the order they came, each once no other sheet is
+/// up; two at once never replace each other. A question whose sheet goes away unanswered, whose
+/// task is cancelled, or whose window closes gets the safe answer: no password, no trust, and no
+/// choice, which fails its operation rather than guess.
 @MainActor
 public final class SheetPrompts: PromptSink {
     weak var model: TransferModel?
+    private var queue: [Ask] = []
+    /// The question on screen, the first in the queue once shown.
+    private var shown: Int?
+    private var lastAsk = 0
+
+    private struct Ask {
+        let id: Int
+        let sheet: AppSheet
+        let waiting: Waiting
+    }
+
+    private enum Waiting {
+        case login(CheckedContinuation<PromptReply, Never>)
+        case hostKey(CheckedContinuation<HostKeyDecision, Never>)
+        case collision(CheckedContinuation<(choice: NameCollisionChoice, toAll: Bool)?, Never>)
+
+        func cancel() {
+            switch self {
+            case .login(let continuation): continuation.resume(returning: PromptReply(text: nil))
+            case .hostKey(let continuation): continuation.resume(returning: .cancel)
+            case .collision(let continuation): continuation.resume(returning: nil)
+            }
+        }
+    }
 
     public func answer(_ request: PromptRequest) async -> PromptReply {
-        guard let model else { return PromptReply(text: nil) }
-        return await withCheckedContinuation { continuation in
-            model.pendingPrompt = continuation
-            model.sheet = .prompt(request)
-        }
+        await answer(request, server: nil)
+    }
+
+    func answer(_ request: PromptRequest, server: String?) async -> PromptReply {
+        guard model != nil else { return PromptReply(text: nil) }
+        return await ask { id, continuation in Ask(id: id, sheet: .prompt(request, server: server, ask: id), waiting: .login(continuation)) }
+    }
+
+    public func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
+        await decideHostKey(event, server: nil)
+    }
+
+    func decideHostKey(_ event: HostKeyEvent, server: String?) async -> HostKeyDecision {
+        guard model != nil else { return .cancel }
+        return await ask { id, continuation in Ask(id: id, sheet: .hostKey(event, server: server, ask: id), waiting: .hostKey(continuation)) }
     }
 
     /// One answer, with no operation to remember Apply to All for; nil once the window is gone.
@@ -1554,32 +1624,130 @@ public final class SheetPrompts: PromptSink {
     }
 
     /// Shows the collision sheet, with Apply to All unchecked. The choice, and whether it covers
-    /// the rest of the operation; nil once the window is gone.
+    /// the rest of the operation; nil when nobody answered.
     func askCollision(_ fileName: String) async -> (choice: NameCollisionChoice, toAll: Bool)? {
-        guard let model else { return nil }
-        return await withCheckedContinuation { continuation in
-            model.pendingCollision = continuation
-            model.applyCollisionToAll = false
-            model.sheet = .collision(fileName)
+        guard model != nil else { return nil }
+        return await ask { id, continuation in Ask(id: id, sheet: .collision(fileName, ask: id), waiting: .collision(continuation)) }
+    }
+
+    private func ask<Answer>(_ make: (Int, CheckedContinuation<Answer, Never>) -> Ask) async -> Answer {
+        lastAsk += 1
+        let id = lastAsk
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                queue.append(make(id, continuation))
+                presentIfIdle()
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.withdraw(id) }
         }
     }
 
-    public func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        guard let model else { return .cancel }
-        return await withCheckedContinuation { continuation in
-            model.pendingHost = continuation
-            model.sheet = .hostKey(event)
+    /// Shows the first question once nothing else is on screen.
+    private func presentIfIdle() {
+        guard let model, model.sheet == nil, shown == nil, let first = queue.first else { return }
+        shown = first.id
+        model.applyCollisionToAll = false
+        model.sheet = first.sheet
+    }
+
+    /// The window's sheet changed. A question whose sheet was dismissed or replaced without an
+    /// answer gets the safe one, and the next question shows when the window is free.
+    func sheetChanged() {
+        guard let model else { return }
+        if let shown, model.sheet?.ask != shown, let index = queue.firstIndex(where: { $0.id == shown }) {
+            self.shown = nil
+            queue.remove(at: index).waiting.cancel()
         }
+        presentIfIdle()
+    }
+
+    /// Takes back a question whose task was cancelled, as when its transfer is paused.
+    private func withdraw(_ id: Int) {
+        guard let index = queue.firstIndex(where: { $0.id == id }) else { return }
+        let ask = queue.remove(at: index)
+        ask.waiting.cancel()
+        if shown == id {
+            shown = nil
+            if model?.sheet?.ask == id { model?.sheet = nil }
+        }
+    }
+
+    /// The first question's answer, from its sheet's buttons.
+    private func finish(_ answer: (Waiting) -> Bool) {
+        guard let shown, let index = queue.firstIndex(where: { $0.id == shown }), answer(queue[index].waiting) else { return }
+        queue.remove(at: index)
+        self.shown = nil
+        model?.sheet = nil
+    }
+
+    func finishLogin(_ reply: PromptReply) {
+        finish { waiting in
+            guard case .login(let continuation) = waiting else { return false }
+            continuation.resume(returning: reply)
+            return true
+        }
+    }
+
+    func finishHostKey(_ decision: HostKeyDecision) {
+        finish { waiting in
+            guard case .hostKey(let continuation) = waiting else { return false }
+            continuation.resume(returning: decision)
+            return true
+        }
+    }
+
+    func finishCollision(_ choice: NameCollisionChoice, toAll: Bool) {
+        finish { waiting in
+            guard case .collision(let continuation) = waiting else { return false }
+            continuation.resume(returning: (choice, toAll))
+            return true
+        }
+    }
+
+    /// The window closed: every waiting question gets the safe answer.
+    func cancelAll() {
+        let waiting = queue
+        queue.removeAll()
+        shown = nil
+        for ask in waiting { ask.waiting.cancel() }
+    }
+
+    /// This window's sheets for one server's login, which name that server.
+    func login(_ connection: SavedConnection) -> any PromptSink {
+        LoginPrompts(window: self, server: connection.displayName)
+    }
+}
+
+/// A login's questions, shown in the window that asked and naming the server they are for, so a
+/// password or host key is never typed for the wrong one.
+private struct LoginPrompts: PromptSink {
+    let window: SheetPrompts
+    let server: String
+
+    func answer(_ request: PromptRequest) async -> PromptReply {
+        await window.answer(request, server: server)
+    }
+
+    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
+        await window.decideHostKey(event, server: server)
+    }
+
+    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
+        await window.resolveCollision(fileName: fileName)
     }
 }
 
 /// One user operation's prompts: a download, upload, paste, drag, or clipboard staging. Sheets go
 /// to the window that started it, and Apply to All holds for this operation alone, never for
 /// another operation or window. Bound with `OperationPrompts.$current` around the operation.
+/// The operation's files that collide at once are asked about one at a time, so an Apply to All
+/// answers the ones still waiting too.
 @MainActor
 final class OperationPrompt: PromptSink {
     private let window: SheetPrompts
     private var applyToAll: NameCollisionChoice?
+    private var asking: Task<(choice: NameCollisionChoice, toAll: Bool)?, Never>?
 
     init(window: SheetPrompts) {
         self.window = window
@@ -1594,31 +1762,42 @@ final class OperationPrompt: PromptSink {
     }
 
     func resolveCollision(fileName: String) async -> NameCollisionChoice? {
+        while let current = asking {
+            _ = await current.value
+            if asking == current { asking = nil }
+        }
         if let applyToAll { return applyToAll }
-        guard let answer = await window.askCollision(fileName) else { return nil }
-        if answer.toAll { applyToAll = answer.choice }
-        return answer.choice
+        let window = window
+        // The question records Apply to All itself, before anyone waiting on it looks.
+        let question = Task { [weak self] in
+            let answer = await window.askCollision(fileName)
+            if let answer, answer.toAll { self?.applyToAll = answer.choice }
+            return answer
+        }
+        asking = question
+        let answer = await withTaskCancellationHandler { await question.value } onCancel: { question.cancel() }
+        if asking == question { asking = nil }
+        return answer?.choice
     }
 }
 
 extension TransferModel {
-    func finishPrompt(_ reply: PromptReply) {
-        pendingPrompt?.resume(returning: reply)
-        pendingPrompt = nil
+    /// Keychain saving applies only where the sheet offered it; a later question in the same
+    /// login, such as a one-time code, never replaces the saved password.
+    func finishPrompt(_ reply: PromptReply, offered: Bool) {
+        var reply = reply
+        reply.saveInKeychain = reply.saveInKeychain && offered
         promptSecure = ""
-        sheet = nil
+        saveSecret = false
+        prompts.finishLogin(reply)
     }
 
     func finishHost(_ decision: HostKeyDecision) {
-        pendingHost?.resume(returning: decision)
-        pendingHost = nil
-        sheet = nil
+        prompts.finishHostKey(decision)
     }
 
     func finishCollision(_ choice: NameCollisionChoice, applyToAll: Bool) {
-        pendingCollision?.resume(returning: (choice, applyToAll))
-        pendingCollision = nil
-        sheet = nil
+        prompts.finishCollision(choice, toAll: applyToAll)
     }
 }
 
