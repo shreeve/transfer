@@ -74,7 +74,7 @@ actor LiveSync {
             state.dirty = false
         }
         /// Named after the working copy, which keeps its name when the remote file is renamed.
-        var serverCopy: URL { folder.appendingPathComponent("\(local.lastPathComponent) (server)") }
+        var serverCopy: URL { folder.appendingPathComponent(LiveDecision.siblingName(of: local.lastPathComponent, suffix: " (server)")) }
     }
 
     private struct Command {
@@ -692,7 +692,7 @@ actor LiveSync {
     private func placeServerBytes(_ item: RemoteItem, _ print: Fingerprint, for id: LiveFileID, ifStill expected: LiveStamp?,
                                   via server: any LiveServer, interactive: Bool) async throws -> Bool {
         guard let entry = entries[id] else { return false }
-        let fresh = entry.folder.appendingPathComponent(".\(entry.local.lastPathComponent).transfer-refresh")
+        let fresh = entry.folder.appendingPathComponent(LiveDecision.siblingName(of: entry.local.lastPathComponent, prefix: ".", suffix: ".transfer-refresh"))
         defer { try? FileManager.default.removeItem(at: fresh) }
         try await server.liveFetch(item, to: fresh, interactive: interactive)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fresh.path)

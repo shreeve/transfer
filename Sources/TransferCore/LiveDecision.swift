@@ -170,6 +170,20 @@ public enum LiveDecision {
         }
     }
 
+    /// The name of a file kept beside a working copy named `name` (its "(server)" copy, a refresh
+    /// download): `prefix`, the name, `suffix`. The name is cut, on a Unicode scalar boundary, so
+    /// the whole fits the Mac's 255-byte limit, and further when the cut would give back `name`
+    /// itself, which writing the sibling would then overwrite.
+    public static func siblingName(of name: String, prefix: String = "", suffix: String) -> String {
+        var kept = name.unicodeScalars[...]
+        while true {
+            let candidate = prefix + String(String.UnicodeScalarView(kept)) + suffix
+            if candidate.utf8.count <= 255, candidate != name { return candidate }
+            guard !kept.isEmpty else { return candidate }
+            kept.removeLast()
+        }
+    }
+
     /// A Live file whose remote path was just removed: forgotten when its copy held nothing the
     /// server lacked, or the user chose to discard it; else kept, as removed from the server.
     public static func afterRemoval(_ state: LiveState, _ change: LiveLocalChange?, force: Bool) -> LiveAction {

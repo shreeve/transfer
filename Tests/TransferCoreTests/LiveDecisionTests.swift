@@ -246,6 +246,26 @@ private func present(size: UInt64 = 10, at date: Date = t0, digest: String? = ni
     #expect(!file(conflict: true).isSynced)
 }
 
+// Files beside a working copy
+
+@Test func aSiblingNameFitsTheMacsLimitAndNeverIsTheCopysOwnName() {
+    #expect(LiveDecision.siblingName(of: "note.txt", suffix: " (server)") == "note.txt (server)")
+    #expect(LiveDecision.siblingName(of: "note.txt", prefix: ".", suffix: ".transfer-refresh") == ".note.txt.transfer-refresh")
+    // 250 bytes of two-byte scalars: the cut keeps whole scalars and the result fits.
+    let long = String(repeating: "é", count: 125)
+    let copy = LiveDecision.siblingName(of: long, suffix: " (server)")
+    #expect(copy.utf8.count <= 255)
+    #expect(copy.hasSuffix(" (server)"))
+    #expect(long.hasPrefix(String(copy.dropLast(" (server)".count))))
+    let fresh = LiveDecision.siblingName(of: long, prefix: ".", suffix: ".transfer-refresh")
+    #expect(fresh.utf8.count <= 255)
+    #expect(fresh.hasPrefix(".") && fresh.hasSuffix(".transfer-refresh"))
+    // A 255-byte name that already ends in " (server)" would be cut back to itself.
+    let clash = String(repeating: "a", count: 246) + " (server)"
+    #expect(LiveDecision.siblingName(of: clash, suffix: " (server)") != clash)
+    #expect(LiveDecision.siblingName(of: clash, suffix: " (server)").utf8.count <= 255)
+}
+
 // Keep Remote with no file on the server
 
 @Test func keepRemoteForgetsOnlyWhatTheConflictShowed() {

@@ -15,6 +15,9 @@ public enum TransferError: Error, Equatable, Sendable, LocalizedError {
     case typeMismatch(String)
     case connectionLost(String)
     case timeout(String)
+    /// The server's file changed while it was read, so what arrived is not one version of it.
+    /// Retried, as a dropped connection is: the next attempt reads the file as it is then.
+    case changedOnServer(String)
     case liveUnsynced(Int)
 
     public var errorDescription: String? {
@@ -29,6 +32,7 @@ public enum TransferError: Error, Equatable, Sendable, LocalizedError {
         case .typeMismatch(let text): "A file and a folder share the name \(text)"
         case .connectionLost(let text): "Connection lost: \(text)"
         case .timeout(let text): "Timed out: \(text)"
+        case .changedOnServer(let name): "“\(name)” changed on the server while it downloaded"
         case .liveUnsynced(let count): "\(count) Live file\(count == 1 ? " has" : "s have") unsynced edits"
         }
     }
