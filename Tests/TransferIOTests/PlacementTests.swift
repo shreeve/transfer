@@ -84,7 +84,7 @@ struct PlacementTests {
         try Data("keep".utf8).write(to: victim.appendingPathComponent("kept.txt"))
 
         let d = try LocalPlacement.child(downloads, name: "d")
-        try LocalPlacement.makeLink(d, target: victim.path)
+        try LocalPlacement.makeLink(d, target: victim.path, replacing: false)
         #expect(Placement.settle(.folder, onto: try LocalPlacement.occupant(d)) == .collide)
         #expect(throws: TransferError.self) { try LocalPlacement.makeFolder(d, replacing: false) }
 
@@ -101,7 +101,7 @@ struct PlacementTests {
         try FileManager.default.createDirectory(at: projects.appendingPathComponent("app/src"), withIntermediateDirectories: true)
         try Data("main".utf8).write(to: projects.appendingPathComponent("app/src/main.swift"))
 
-        #expect(throws: TransferError.self) { try LocalPlacement.makeLink(projects, target: "/elsewhere") }
+        #expect(throws: TransferError.self) { try LocalPlacement.makeLink(projects, target: "/elsewhere", replacing: true) }
         #expect(throws: TransferError.self) { try LocalPlacement.makeFolder(projects, replacing: true) }
         try LocalPlacement.makeFolder(projects, replacing: false)
         #expect(try Data(contentsOf: projects.appendingPathComponent("app/src/main.swift")) == Data("main".utf8))
@@ -114,10 +114,27 @@ struct PlacementTests {
         defer { try? FileManager.default.removeItem(at: base) }
         let spot = base.appendingPathComponent("spot")
         try Data("old".utf8).write(to: spot)
-        try LocalPlacement.makeLink(spot, target: "one")
+        try LocalPlacement.makeLink(spot, target: "one", replacing: true)
         #expect(try LocalPlacement.occupant(spot) == .link("one"))
-        try LocalPlacement.makeLink(spot, target: "two")
+        try LocalPlacement.makeLink(spot, target: "two", replacing: true)
         #expect(try LocalPlacement.occupant(spot) == .link("two"))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: base.path) == ["spot"])
+    }
+
+    /// A link placed where nothing was is made at its name at once, and fails when something took
+    /// the name since it was looked up: it was renamed over whatever was there (R-T7). A folder in
+    /// place of a link or special file removes only that: a file that took its place since stays.
+    @Test func whatTookANameSinceItWasLookedUpStays() throws {
+        let base = try scratch("since")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let spot = base.appendingPathComponent("spot")
+        try Data("arrived".utf8).write(to: spot)
+        #expect(throws: TransferError.self) { try LocalPlacement.makeLink(spot, target: "x", replacing: false) }
+        #expect(throws: TransferError.self) { try LocalPlacement.makeFolder(spot, replacing: true) }
+        #expect(try Data(contentsOf: spot) == Data("arrived".utf8))
+        try FileManager.default.removeItem(at: spot)
+        try LocalPlacement.makeLink(spot, target: "x", replacing: false)
+        #expect(try LocalPlacement.occupant(spot) == .link("x"))
         #expect(try FileManager.default.contentsOfDirectory(atPath: base.path) == ["spot"])
     }
 

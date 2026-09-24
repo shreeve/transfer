@@ -117,20 +117,35 @@ enum LocalPlacement {
     }
 
     /// Makes the folder `url`, or accepts a real folder already there. Never follows a link: one
-    /// in the way is removed only when `replacing` says the user chose Replace.
+    /// in the way, or a special file, is removed only when `replacing` says the user chose Replace
+    /// for it, and only if it still holds the name; anything else that took it since stays.
     static func makeFolder(_ url: URL, replacing: Bool) throws {
-        if replacing, unlink(url.path) != 0 {
-            let failure = posixError(url)
-            if failure.code != ENOENT { throw failure.error }
+        if replacing {
+            switch try occupant(url) {
+            case nil:
+                break
+            case .link?, .other?:
+                if unlink(url.path) != 0 {
+                    let failure = posixError(url)
+                    if failure.code != ENOENT { throw failure.error }
+                }
+            default:
+                throw TransferError.failed("“\(url.lastPathComponent)” changed while it was being replaced; nothing was removed")
+            }
         }
         if mkdir(url.path, 0o777) == 0 { return }
         let failure = posixError(url)
         guard failure.code == EEXIST, try occupant(url) == .folder else { throw failure.error }
     }
 
-    /// Makes a link at `url` pointing at `target`, in place of any file or link there. The link is
-    /// made beside it and renamed over it, which never removes a folder.
-    static func makeLink(_ url: URL, target: String) throws {
+    /// Makes a link at `url` pointing at `target`. Where nothing was (`replacing` false) it is made
+    /// at the name itself, which fails if something took the name since. In place of a file or
+    /// link it is made beside it and renamed over it, which never removes a folder.
+    static func makeLink(_ url: URL, target: String, replacing: Bool) throws {
+        guard replacing else {
+            guard symlink(target, url.path) == 0 else { throw posixError(url).error }
+            return
+        }
         let temp = url.deletingLastPathComponent().appendingPathComponent(CopyRules.tempName(for: url.lastPathComponent, transferID: UUID().uuidString))
         guard symlink(target, temp.path) == 0 else { throw posixError(url).error }
         guard rename(temp.path, url.path) == 0 else {

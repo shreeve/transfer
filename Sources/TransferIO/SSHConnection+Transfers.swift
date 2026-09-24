@@ -274,7 +274,9 @@ extension SSHConnection {
             }
         case .symlink:
             let target = try await link.readlink(item.path)
-            if let spot = try await settleLocally(.link(target), named: name, in: folder, taken: taken) { try LocalPlacement.makeLink(spot.url, target: target) }
+            if let spot = try await settleLocally(.link(target), named: name, in: folder, taken: taken) {
+                try LocalPlacement.makeLink(spot.url, target: target, replacing: spot.found != nil)
+            }
             tally.finished()
         case .file:
             guard let placed = try await settleLocally(.file(Fingerprint(item: item)), named: name, in: folder, taken: taken) else {
@@ -474,13 +476,19 @@ extension SSHConnection {
     }
 
     /// The server folder a folder merges into or is made as, and whether it was made; nil to skip
-    /// it. A link or special file in the way goes only when the user chose Replace, and a folder
-    /// never does.
+    /// it. A link or special file in the way goes only when the user chose Replace, and only if it
+    /// still holds the name: a listing may be stale, and something else may have taken the name
+    /// while the question was up. A folder never goes.
     private func remoteFolder(_ path: RemotePath, found: RemoteItem?, tally: CopyTally) async throws -> (path: RemotePath, made: Bool)? {
         guard let spot = try await settleRemotely(.folder, at: path, found: found, tally: tally) else { return nil }
         if spot.found == .folder { return (spot.path, false) }
         let link = try await metadataLink()
-        if spot.found != nil { try await link.removeFile(spot.path) }
+        if let asked = spot.found {
+            guard try await placedItem(try await link.lookup(spot.path), link: link) == asked else {
+                throw TransferError.failed("“\(spot.path.name)” changed on the server while it was being replaced; nothing was removed")
+            }
+            try await link.removeFile(spot.path)
+        }
         try await link.mkdir(spot.path)
         tally.record(spot.path)
         return (spot.path, true)
