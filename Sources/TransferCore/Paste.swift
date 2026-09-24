@@ -281,6 +281,8 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
         case live(Int)
         /// Something in the original changed after its copy was verified: what changed stayed.
         case changed
+        /// The item could not be copied, for this reason.
+        case failed(String)
 
         public init?(_ verdict: MoveCheck.Verdict) {
             switch verdict {
@@ -329,6 +331,8 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
                 "Kept \(list) \(place): \(TransferError.liveUnsynced(count).localizedDescription)."
             case .changed:
                 "\(list) changed during the move, and what changed was kept \(place)."
+            case .failed(let reason):
+                "Could not \(moving ? "move" : "copy") \(list): \(reason)\(reason.hasSuffix(".") ? "" : ".")"
             }
         }.joined(separator: " ")
     }

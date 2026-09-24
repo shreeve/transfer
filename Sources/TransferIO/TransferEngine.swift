@@ -45,35 +45,34 @@ struct TransferEngine {
     /// makes "name copy" beside it, as Finder does; anywhere else it keeps its name, byte for byte.
     private func onServer(_ paths: [RemotePath]) async throws {
         let folder = request.folder
-        let failures = CopyTally { _ in }
+        var undone = Undone()
         var names: Set<String>?
         for (index, path) in paths.enumerated() where !isDone(index) {
-            if request.moving {
-                do {
+            do {
+                if request.moving {
                     if path.parent != folder { try await destination.rename(path, to: folder.appending(name: path.nameBytes)) }
-                } catch {
-                    try failures.failed(path.name, error)
-                    continue
-                }
-            } else {
-                let target: RemotePath
-                if let chosen = memo.withLock({ $0.targets[index] }) {
-                    target = chosen
-                } else if path.parent == folder {
-                    var taken = if let names { names } else { try await destination.listedNames(folder) }
-                    let name = KeepBothName.duplicate(existing: taken, original: path.name)
-                    taken.insert(name)
-                    names = taken
-                    target = folder.appending(name)
                 } else {
-                    target = folder.appending(name: path.nameBytes)
+                    let target: RemotePath
+                    if let chosen = memo.withLock({ $0.targets[index] }) {
+                        target = chosen
+                    } else if path.parent == folder {
+                        var taken = if let names { names } else { try await destination.listedNames(folder) }
+                        let name = KeepBothName.duplicate(existing: taken, original: path.name)
+                        taken.insert(name)
+                        names = taken
+                        target = folder.appending(name)
+                    } else {
+                        target = folder.appending(name: path.nameBytes)
+                    }
+                    memo.withLock { $0.targets[index] = target }
+                    try await destination.copy(path, to: target, tally: tally(index, sum.next()))
                 }
-                memo.withLock { $0.targets[index] = target }
-                try await destination.copy(path, to: target, tally: tally(index, sum.next()))
+                finish(index)
+            } catch {
+                try undone.failed(path.name, error)
             }
-            finish(index)
         }
-        try failures.check()
+        try undone.check(moving: request.moving, place: "on the server")
     }
 
     /// Down from the other server into a scratch folder on this Mac, then up, one item at a time.
@@ -88,32 +87,35 @@ struct TransferEngine {
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("Transfer-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
         let ignoresCase = (try? FileManager.default.temporaryDirectory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames != true
-        var kept: [TransferKept.Item] = []
+        var undone = Undone()
         for (index, path) in paths.enumerated() where !isDone(index) {
-            // The Mac's disk may not hold two names the server keeps apart. Refused before
-            // anything is copied, since one of the two would stand in for the other.
-            var clash = NameClash(ignoringCase: ignoresCase)
-            for try await (key, _) in source.walkTree(path) { clash.add(key) }
-            if let (first, second) = clash.found {
-                kept.append(TransferKept.Item(path.name, .clash(first.description, second.description)))
-                continue
+            do {
+                // The Mac's disk may not hold two names the server keeps apart. Refused before
+                // anything is copied, since one of the two would stand in for the other.
+                var clash = NameClash(ignoringCase: ignoresCase)
+                for try await (key, _) in source.walkTree(path) { clash.add(key) }
+                if let (first, second) = clash.found {
+                    undone.keep(path.name, .clash(first.description, second.description))
+                    continue
+                }
+                let local = scratch.appendingPathComponent(String(index))
+                defer { try? FileManager.default.removeItem(at: local) }
+                let target = request.folder.appending(name: path.nameBytes)
+                var mark: UInt64 = 0
+                undone.keep(path.name, try await place(index, at: target) {
+                    try await source.download(path, to: local, progress: sum.next())
+                    try await destination.upload(local, to: target, tally: tally(index, sum.next()))
+                } original: {
+                    mark = await source.live.saveMark()
+                    return try await source.tree(path)
+                } remove: { verified in
+                    try await source.removeMoved(path, verified: verified, savedSince: mark)
+                })
+            } catch {
+                try undone.failed(path.name, error)
             }
-            let local = scratch.appendingPathComponent(String(index))
-            defer { try? FileManager.default.removeItem(at: local) }
-            let target = request.folder.appending(name: path.nameBytes)
-            var mark: UInt64 = 0
-            let reason = try await place(index, at: target) {
-                try await source.download(path, to: local, progress: sum.next())
-                try await destination.upload(local, to: target, tally: tally(index, sum.next()))
-            } original: {
-                mark = await source.live.saveMark()
-                return try await source.tree(path)
-            } remove: { verified in
-                try await source.removeMoved(path, verified: verified, savedSince: mark)
-            }
-            if let reason { kept.append(TransferKept.Item(path.name, reason)) }
         }
-        if !kept.isEmpty { throw TransferKept(kept, moving: request.moving, place: "on the other server") }
+        try undone.check(moving: request.moving, place: "on the other server")
     }
 
     /// Uploads; a move then puts each original in the Trash.
@@ -122,21 +124,24 @@ struct TransferEngine {
         try await proveApart(from: "the folder on this Mac the items are in") { name in
             try parents.contains { try LocalPlacement.occupant($0.appendingPathComponent(name)) != nil }
         }
-        var kept: [TransferKept.Item] = []
+        var undone = Undone()
         for (index, url) in urls.enumerated() where !isDone(index) {
-            let target = request.folder.appending(name: Array(url.lastPathComponent.utf8))
-            let reason = try await place(index, at: target) {
-                try await destination.upload(url, to: target, tally: tally(index, sum.next()))
-            } original: {
-                try LocalTree.entries(url)
-            } remove: { _ in
-                // The Trash keeps anything added since the walk too, where the user can find it.
-                try trash(url)
-                return true
+            do {
+                let target = request.folder.appending(name: Array(url.lastPathComponent.utf8))
+                undone.keep(url.lastPathComponent, try await place(index, at: target) {
+                    try await destination.upload(url, to: target, tally: tally(index, sum.next()))
+                } original: {
+                    try LocalTree.entries(url)
+                } remove: { _ in
+                    // The Trash keeps anything added since the walk too, where the user can find it.
+                    try trash(url)
+                    return true
+                })
+            } catch {
+                try undone.failed(url.lastPathComponent, error)
             }
-            if let reason { kept.append(TransferKept.Item(url.lastPathComponent, reason)) }
         }
-        if !kept.isEmpty { throw TransferKept(kept, moving: true, place: "on this Mac") }
+        try undone.check(moving: request.moving, place: "on this Mac")
     }
 
     // MARK: The move's checks
@@ -237,6 +242,31 @@ struct TransferEngine {
             if written.contains(path) { ours.insert(key) }
         }
         return TransferKept.Reason(MoveCheck.verdict(source: source, before: there, after: after, written: ours))
+    }
+}
+
+/// What a paste left undone, item by item: originals kept and why, and items that failed. Every
+/// item has its turn; only a cancel, a dropped connection, or a timeout ends the paste at once, so
+/// it can stop or retry.
+private struct Undone {
+    private var items: [TransferKept.Item] = []
+    private var errors: [any Error] = []
+
+    mutating func keep(_ name: String, _ reason: TransferKept.Reason?) {
+        if let reason { items.append(TransferKept.Item(name, reason)) }
+    }
+
+    mutating func failed(_ name: String, _ error: any Error) throws {
+        if CopyTally.ends(error) { throw error }
+        items.append(TransferKept.Item(name, .failed(error.localizedDescription)))
+        errors.append(error)
+    }
+
+    /// Throws what was left undone: one failure alone as it came, else all of it together.
+    func check(moving: Bool, place: String) throws {
+        guard !items.isEmpty else { return }
+        if items.count == 1, let only = errors.first { throw only }
+        throw TransferKept(items, moving: moving, place: place)
     }
 }
 

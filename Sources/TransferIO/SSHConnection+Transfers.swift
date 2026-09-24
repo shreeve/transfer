@@ -799,9 +799,16 @@ final class CopyTally: Sendable {
 
     /// Records that `name` failed and lets the copy go on, or rethrows an error that ends it.
     func failed(_ name: String, _ error: any Error) throws {
-        if error is CancellationError || RetryPolicy.isRetryable(error) { throw error }
-        if let error = error as? TransferError, error == .cancelled || error == .notConnected { throw error }
+        if Self.ends(error) { throw error }
         state.withLock { $0.failures.append((name, error)) }
+    }
+
+    /// Whether `error` ends a whole copy or paste, not just one item: a cancel, a dropped
+    /// connection, or a timeout, on which it stops or is retried.
+    static func ends(_ error: any Error) -> Bool {
+        if error is CancellationError || RetryPolicy.isRetryable(error) { return true }
+        guard let error = error as? TransferError else { return false }
+        return error == .cancelled || error == .notConnected
     }
 
     /// Throws the one failure as it was, or one error that names them all.

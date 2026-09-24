@@ -190,6 +190,39 @@ struct MoveServerTests {
         }
     }
 
+    /// One item that failed ended the whole paste, and the items after it were never tried (R-T6).
+    /// Each has its turn now, on every route, and what failed is reported at the end: a single
+    /// failure as it came, several together.
+    @Test func aFailedItemDoesNotStopTheOthers() async throws {
+        try await withHarness("each", connected: true) { h in
+            let site = try h.folder("site", files: ["good.txt": "g", "also.txt": "a"])
+            let to = try h.folder("to")
+            let paste = TransferRequest(.server(h.session.connection.id, [site.appending("gone.txt"), site.appending("good.txt")]), into: to, on: h.session.connection.id, moving: false)
+            await #expect(throws: TransferError.self) { try await run(paste, on: h.session) }
+            #expect(try h.names("to") == ["good.txt"])
+
+            try await withAlias(h) { alias in
+                let move = TransferRequest(.server(alias.connection.id, [site.appending("gone.txt"), site.appending("missing.txt"), site.appending("also.txt")]), into: to, on: h.session.connection.id, moving: true)
+                do {
+                    try await run(move, on: h.session, from: alias)
+                    Issue.record("the two missing items were not reported")
+                } catch let kept as TransferKept {
+                    #expect(kept.items.map(\.name) == ["gone.txt", "missing.txt"])
+                }
+                #expect(try h.read("to/also.txt") == "a")
+                #expect(try h.names("site") == ["good.txt"])
+            }
+
+            let mac = h.staging.appendingPathComponent("mac.txt")
+            try Data("m".utf8).write(to: mac)
+            let upload = TransferRequest(.mac([h.staging.appendingPathComponent("gone.txt"), mac]), into: to, on: h.session.connection.id, moving: true)
+            let trashed = Locked<[URL]>([])
+            await #expect(throws: TransferError.self) { try await run(upload, on: h.session, trash: { url in trashed.withLock { $0.append(url) } }) }
+            #expect(try h.read("to/mac.txt") == "m")
+            #expect(trashed.value == [mac])
+        }
+    }
+
     /// A move deleted a Live working copy's folder, edits and all, since the server's copy it
     /// compared was complete (CLIP-03).
     @Test func anUnsyncedLiveFileKeepsTheFolderItIsIn() async throws {
