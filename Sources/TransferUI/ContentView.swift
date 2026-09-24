@@ -165,7 +165,6 @@ struct DetailColumn: View {
                         .padding(6)
                         .background(model.snapshot.selection.contains(item.path) ? Color.accentColor.opacity(0.2) : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
-                        .contextMenu { rowMenu(item) }
                 }
             }
             .padding()
@@ -177,77 +176,17 @@ struct DetailColumn: View {
         .onTapGesture {
             if ProcessInfo.processInfo.systemUptime - model.itemClickTime > 0.5 { model.snapshot.selection = [] }
         }
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in dropFiles(providers) }
+        // The empty area's menu is the folder's; a cell shows its own, from its AppKit view.
+        .contextMenu { FolderMenu(model: model) }
+        .dropDestination(for: URL.self) { urls, _ in
+            let files = urls.filter(\.isFileURL)
+            guard !files.isEmpty else { return false }
+            Task { await model.upload(urls: files) }
+            return true
+        }
         .focusable()
         .focusEffectDisabled()
-        .onKeyPress(.space) {
-            model.togglePreview()
-            return .handled
-        }
     }
-
-    /// Gathers the URLs of one drop before starting uploads, so one operation row appears per file in order.
-    private func dropFiles(_ providers: [NSItemProvider]) -> Bool {
-        let model = model
-        let collected = Locked((urls: [URL](), remaining: providers.count))
-        for provider in providers {
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                let done: [URL]? = collected.withLock { state in
-                    if let url { state.urls.append(url) }
-                    state.remaining -= 1
-                    return state.remaining == 0 ? state.urls : nil
-                }
-                if let done { Task { @MainActor in await model.upload(urls: done) } }
-            }
-        }
-        return !providers.isEmpty
-    }
-
-    @ViewBuilder private func rowMenu(_ item: RemoteItem) -> some View {
-        Button("Open") { Task { await model.open(item) } }
-        if item.kind == .file {
-            Button("Open Live") {
-                model.snapshot.selection = [item.path]
-                Task { await model.openLiveSelection() }
-            }
-        }
-        Button("Quick Look") {
-            model.snapshot.selection = [item.path]
-            model.showPreview()
-        }
-        Divider()
-        Button("Download Copy…") {
-            if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
-            Task { await model.downloadCopy() }
-        }
-        if item.kind == .file {
-            Button("Duplicate") {
-                model.snapshot.selection = [item.path]
-                Task { await model.duplicateSelection() }
-            }
-        }
-        Button("Rename") {
-            model.snapshot.selection = [item.path]
-            model.beginRename()
-        }
-        Button(model.starTitle(model.dragItems(including: item).map(\.path))) {
-            Task { await model.toggleStar(model.dragItems(including: item).map(\.path)) }
-        }
-        Button("Copy") {
-            if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
-            model.copySelection()
-        }
-        Button("Copy Remote URL") {
-            model.snapshot.selection = [item.path]
-            model.copyRemoteURL()
-        }
-        Divider()
-        Button("Delete…") {
-            if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
-            model.askToDelete()
-        }
-    }
-
 
     // MARK: Shelf
 
@@ -744,6 +683,27 @@ private struct ClipBar: View {
         case .failed(let text): parts.append("Finder cannot paste it: \(text)")
         }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// The folder's menu for the icon grid's empty area: the entries `ItemMenu` gives the empty
+/// area of the list and column views, drawn as SwiftUI buttons, so the three views share one.
+private struct FolderMenu: View {
+    let model: TransferModel
+
+    var body: some View {
+        let menu = NSMenu()
+        ItemMenu.fill(menu, item: nil, model: model)
+        return ForEach(Array(menu.items.enumerated()), id: \.offset) { _, entry in
+            if entry.isSeparatorItem {
+                Divider()
+            } else {
+                Button(entry.title) {
+                    if let action = entry.action { NSApp.sendAction(action, to: entry.target, from: entry) }
+                }
+                .disabled(!entry.isEnabled)
+            }
+        }
     }
 }
 
