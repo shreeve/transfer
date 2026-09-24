@@ -106,6 +106,12 @@ public struct RemotePath: Hashable, Sendable {
         return RemotePath(bytes: joined.isEmpty ? [0x2E] : joined)
     }
 
+    /// Whether `name` names one entry: not empty, `.`, or `..`, and with no `/` or NUL, which
+    /// would reach somewhere else.
+    public static func isSingleName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
+    }
+
     /// Where Go to Remote Folder goes for `text`: `/…` is absolute, `~` and `~/…` start at `home`
     /// (the folder the login started in), and anything else is relative to `current`. `.` and
     /// `..` are taken lexically, as `normalized` does. Nil when `text` is blank.

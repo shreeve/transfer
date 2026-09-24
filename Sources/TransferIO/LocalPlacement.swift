@@ -75,7 +75,7 @@ enum LocalPlacement {
     /// `name` as one entry of `folder`. Throws when the name could reach anything else: empty,
     /// `.`, `..`, or holding `/` or NUL.
     static func child(_ folder: URL, name: String) throws -> URL {
-        guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
+        guard RemotePath.isSingleName(name) else {
             let shown = name.replacingOccurrences(of: "\0", with: "\\0")
             throw TransferError.failed("The server sent a name that is not a single file name: “\(shown)”")
         }

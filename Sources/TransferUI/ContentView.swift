@@ -585,7 +585,7 @@ struct InspectorColumn: View {
                 if let owner = item.owner { Text(item.group.map { "\(owner):\($0)" } ?? owner) }
             }
             if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
-            if model.liveFile(for: item.path) != nil { line(model.statusText(for: item.path)) }
+            if let live = model.liveFile(for: item.path) { line(live.status.label) }
             if let operation = model.operation(for: item.path) {
                 line(operation.message ?? operation.state.rawValue.capitalized)
             }

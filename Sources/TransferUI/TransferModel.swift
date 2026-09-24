@@ -125,7 +125,10 @@ public final class TransferModel {
     private static let cachedListingLimit = 64
     private static let historyLimit = 100
     public var columnRoot: RemotePath?
-    public var operations: [TransferOperation] = []
+    /// The shelf hides once its last row goes.
+    public var operations: [TransferOperation] = [] {
+        didSet { if operations.isEmpty { showsShelf = false } }
+    }
     public var stars: [RemotePath] = []
     /// Whether each starred path is a folder, from the server, so a starred file is never listed.
     private var starIsFolder: [RemotePath: Bool] = [:]
@@ -354,7 +357,6 @@ public final class TransferModel {
         error is CancellationError || (error as? TransferError) == .cancelled
     }
 
-    /// Runs `body`, showing what it throws.
     private func reporting(_ body: () async throws -> Void) async {
         do { try await body() } catch { report(error) }
     }
@@ -457,10 +459,8 @@ public final class TransferModel {
         guard !gone.isEmpty else { return }
         operations.removeAll { gone.contains($0.id) }
         for id in gone { liveRowSessions[id] = nil }
-        if operations.isEmpty { showsShelf = false }
     }
 
-    /// True while `context` is still the window's server.
     private func isCurrent(_ context: ServerContext) -> Bool {
         context === self.context
     }
@@ -803,15 +803,6 @@ public final class TransferModel {
         }
     }
 
-    /// The inspector's line for a path: its Live state, or an active transfer.
-    public func statusText(for path: RemotePath) -> String {
-        if let live = liveByPath[path] { return live.status.label }
-        if operations.contains(where: { $0.state == .active && $0.path == path }) {
-            return "Transferring"
-        }
-        return ""
-    }
-
     /// The operation that moves `path`, if one is queued or running.
     public func operation(for path: RemotePath) -> TransferOperation? {
         operations.first { $0.path == path || $0.livePath == path }
@@ -1025,8 +1016,14 @@ public final class TransferModel {
 
     // MARK: Transfers
 
-    public func downloadSelection(to directory: URL) async {
-        guard let session else { return }
+    public func downloadCopy() async {
+        guard !selectedItems.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "Download"
+        guard panel.runModal() == .OK, let directory = panel.url, let session else { return }
         for item in selectedItems {
             let destination = directory.appendingPathComponent(item.name)
             let path = item.path
@@ -1036,19 +1033,8 @@ public final class TransferModel {
         }
     }
 
-    public func downloadCopy() async {
-        guard !selectedItems.isEmpty else { return }
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.prompt = "Download"
-        guard panel.runModal() == .OK, let directory = panel.url else { return }
-        await downloadSelection(to: directory)
-    }
-
-    public func upload(urls: [URL], into folder: RemotePath? = nil) async {
-        await transfer(.mac(urls), into: folder ?? snapshot.path, moving: false)
+    public func upload(urls: [URL]) async {
+        await transfer(.mac(urls), into: snapshot.path, moving: false)
     }
 
     public func uploadFromPanel() async {
@@ -1112,13 +1098,11 @@ public final class TransferModel {
                     self?.finish(id, state: .succeeded, message: nil)
                     return
                 } catch {
-                    if error is CancellationError || (error as? TransferError) == .cancelled {
-                        return
-                    }
+                    if Self.isCancellation(error) { return }
                     if RetryPolicy.isRetryable(error), let delay = RetryPolicy.delay(afterAttempt: attempt) {
                         attempt += 1
                         self?.update(id) { $0.state = .queued; $0.message = "Retrying in \(Int(delay)) s" }
-                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        try? await Task.sleep(for: .seconds(delay))
                         if Task.isCancelled { return }
                         self?.update(id) { $0.state = .active; $0.message = nil }
                         continue
@@ -1146,7 +1130,6 @@ public final class TransferModel {
         } else if let message {
             status = message
         }
-        if operations.isEmpty { showsShelf = false }
     }
 
     /// Prompts for one new user operation: its collision sheets come to this window, and its
@@ -1186,7 +1169,6 @@ public final class TransferModel {
         runners[operation.id] = nil
         liveRowSessions[operation.id] = nil
         operations.removeAll { $0.id == operation.id }
-        if operations.isEmpty { showsShelf = false }
     }
 
     // MARK: Edits
@@ -1272,7 +1254,7 @@ public final class TransferModel {
         guard let context, let source = renameTarget, let parent = source.parent else { return }
         renameTarget = nil
         guard name != source.name else { return }
-        guard Self.isValidName(name) else {
+        guard RemotePath.isSingleName(name) else {
             status = "“\(name)” cannot be a name: it must not be empty, “.” or “..”, or hold a “/”."
             return
         }
@@ -1297,12 +1279,6 @@ public final class TransferModel {
                 snapshot.selection = [destination]
             }
         }
-    }
-
-    /// One item's name as the server takes it: not empty, not `.` or `..`, and with no `/` or
-    /// NUL, which would put the item somewhere else or fail.
-    private static func isValidName(_ name: String) -> Bool {
-        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
     }
 
     /// Copies each selected file, link, or folder beside itself as "name copy", on the server,
@@ -1335,19 +1311,12 @@ public final class TransferModel {
         return listedItem(path).map { $0.kind == .directory } ?? true
     }
 
-    /// Asks the server about `path` once, following a link, and remembers the answer.
-    private func learnStarred(_ path: RemotePath, session: any RemoteSession) async {
-        guard starIsFolder[path] == nil, let isFolder = await Self.isFolder(path, session: session) else { return }
-        starIsFolder[path] = isFolder
-    }
-
     /// Whether `path` is a folder, through a link; nil when the server cannot say.
     private static func isFolder(_ path: RemotePath, session: any RemoteSession) async -> Bool? {
         guard let target = try? await session.resolve(path) else { return nil }
         return target.kind == .directory
     }
 
-    /// Starred files and folders sit in the sidebar for one-click return.
     public func setStarred(_ paths: [RemotePath], _ starred: Bool) async {
         for path in paths {
             if starred { await session?.star(path) } else { await session?.unstar(path); starIsFolder[path] = nil }
@@ -1501,8 +1470,10 @@ public final class TransferModel {
             guard let connection = connections.first(where: { $0.id == id }) else { return }
             if snapshot.connectionID != id { await connect(connection) }
         case .star(let path):
-            // A starred folder opens; a starred file is revealed in its folder.
-            if let session { await learnStarred(path, session: session) }
+            // A starred folder opens; a starred file is revealed in its folder. Its kind is asked once.
+            if let session, starIsFolder[path] == nil, let isFolder = await Self.isFolder(path, session: session) {
+                starIsFolder[path] = isFolder
+            }
             if starredIsFolder(path) { await navigate(path) } else { await reveal(path) }
         case .live(let path):
             await reveal(path)
@@ -1611,7 +1582,6 @@ public final class TransferModel {
                 operations.append(operation)
                 showsShelf = true
             }
-            if operations.isEmpty { showsShelf = false }
         }
     }
 }
@@ -1714,7 +1684,7 @@ public enum AppSheet: Identifiable {
 /// task is cancelled, or whose window closes gets the safe answer: no password, no trust, and no
 /// choice, which fails its operation rather than guess.
 @MainActor
-public final class SheetPrompts: PromptSink {
+public final class SheetPrompts {
     weak var model: TransferModel?
     private var queue: [Ask] = []
     /// The question on screen, the first in the queue once shown.
@@ -1739,29 +1709,34 @@ public final class SheetPrompts: PromptSink {
             case .collision(let continuation): continuation.resume(returning: nil)
             }
         }
+
+        /// False, resuming nothing, when `answer` is for another kind of question.
+        func resume(_ answer: Answer) -> Bool {
+            switch (self, answer) {
+            case (.login(let continuation), .login(let reply)): continuation.resume(returning: reply)
+            case (.hostKey(let continuation), .hostKey(let decision)): continuation.resume(returning: decision)
+            case (.collision(let continuation), .collision(let choice, let toAll)): continuation.resume(returning: (choice, toAll))
+            default: return false
+            }
+            return true
+        }
     }
 
-    public func answer(_ request: PromptRequest) async -> PromptReply {
-        await answer(request, server: nil)
+    /// What a sheet's buttons answer.
+    enum Answer {
+        case login(PromptReply)
+        case hostKey(HostKeyDecision)
+        case collision(NameCollisionChoice, toAll: Bool)
     }
 
-    func answer(_ request: PromptRequest, server: String?) async -> PromptReply {
+    func answer(_ request: PromptRequest, server: String? = nil) async -> PromptReply {
         guard model != nil else { return PromptReply(text: nil) }
         return await ask { id, continuation in Ask(id: id, sheet: .prompt(request, server: server, ask: id), waiting: .login(continuation)) }
     }
 
-    public func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        await decideHostKey(event, server: nil)
-    }
-
-    func decideHostKey(_ event: HostKeyEvent, server: String?) async -> HostKeyDecision {
+    func decideHostKey(_ event: HostKeyEvent, server: String? = nil) async -> HostKeyDecision {
         guard model != nil else { return .cancel }
         return await ask { id, continuation in Ask(id: id, sheet: .hostKey(event, server: server, ask: id), waiting: .hostKey(continuation)) }
-    }
-
-    /// One answer, with no operation to remember Apply to All for; nil once the window is gone.
-    public func resolveCollision(fileName: String) async -> NameCollisionChoice? {
-        await askCollision(fileName)?.choice
     }
 
     /// Shows the collision sheet, with Apply to All unchecked. The choice, and whether it covers
@@ -1814,36 +1789,12 @@ public final class SheetPrompts: PromptSink {
         }
     }
 
-    /// The first question's answer, from its sheet's buttons.
-    private func finish(_ answer: (Waiting) -> Bool) {
-        guard let shown, let index = queue.firstIndex(where: { $0.id == shown }), answer(queue[index].waiting) else { return }
+    /// The answer to the question on screen, from its sheet's buttons.
+    func finish(_ answer: Answer) {
+        guard let shown, let index = queue.firstIndex(where: { $0.id == shown }), queue[index].waiting.resume(answer) else { return }
         queue.remove(at: index)
         self.shown = nil
         model?.sheet = nil
-    }
-
-    func finishLogin(_ reply: PromptReply) {
-        finish { waiting in
-            guard case .login(let continuation) = waiting else { return false }
-            continuation.resume(returning: reply)
-            return true
-        }
-    }
-
-    func finishHostKey(_ decision: HostKeyDecision) {
-        finish { waiting in
-            guard case .hostKey(let continuation) = waiting else { return false }
-            continuation.resume(returning: decision)
-            return true
-        }
-    }
-
-    func finishCollision(_ choice: NameCollisionChoice, toAll: Bool) {
-        finish { waiting in
-            guard case .collision(let continuation) = waiting else { return false }
-            continuation.resume(returning: (choice, toAll))
-            return true
-        }
     }
 
     /// The window closed: every waiting question gets the safe answer.
@@ -1874,8 +1825,9 @@ private struct LoginPrompts: PromptSink {
         await window.decideHostKey(event, server: server)
     }
 
+    /// One answer, with no operation to remember Apply to All for; nil once the window is gone.
     func resolveCollision(fileName: String) async -> NameCollisionChoice? {
-        await window.resolveCollision(fileName: fileName)
+        await window.askCollision(fileName)?.choice
     }
 }
 
@@ -1930,15 +1882,15 @@ extension TransferModel {
         reply.saveInKeychain = reply.saveInKeychain && offered
         promptSecure = ""
         saveSecret = false
-        prompts.finishLogin(reply)
+        prompts.finish(.login(reply))
     }
 
     func finishHost(_ decision: HostKeyDecision) {
-        prompts.finishHostKey(decision)
+        prompts.finish(.hostKey(decision))
     }
 
     func finishCollision(_ choice: NameCollisionChoice, applyToAll: Bool) {
-        prompts.finishCollision(choice, toAll: applyToAll)
+        prompts.finish(.collision(choice, toAll: applyToAll))
     }
 }
 
