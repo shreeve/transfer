@@ -32,8 +32,13 @@ public actor SSHConnection: RemoteSession {
     private var reopenedAt: [ChannelRole: ContinuousClock.Instant] = [:]
     private var pool: [SFTPChannel] = []
     private var busy: Set<ObjectIdentifier> = []
-    private var waiters: [CheckedContinuation<SFTPChannel, Error>] = []
-    private var poolRefused = false
+    /// Data channels still opening. They count against the limit, or every caller that arrives
+    /// during the open would see room and open its own.
+    private var opening = 0
+    /// Callers waiting for a data channel, in order. Each gets a released channel, or nil to look
+    /// again when an open it was counting on was cancelled.
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<SFTPChannel?, Error>)] = []
+    private var refusedAt: ContinuousClock.Instant?
     let pipe = EventPipe()
     let lane = InteractiveLane()
     /// Live files are `LiveSync`'s; this connection is its `LiveServer` and forwards the Live API.
@@ -239,11 +244,12 @@ public actor SSHConnection: RemoteSession {
         reopenedAt.removeAll()
         pool.removeAll()
         busy.removeAll()
-        poolRefused = false
+        opening = 0
+        refusedAt = nil
         scratch.removeAll()
         startPath = nil
         generation += 1
-        for waiter in waiters { waiter.resume(throwing: reason) }
+        for waiter in waiters { waiter.continuation.resume(throwing: reason) }
         waiters.removeAll()
         if ownsLive { await live.closeAll() } else { await live.disconnected(connection.id, server: self) }
         await release(held)
@@ -419,35 +425,90 @@ public actor SSHConnection: RemoteSession {
         return try await body(link)
     }
 
+    /// A free data channel: an idle one, a new one while fewer than seven are open or opening,
+    /// else the next one released. Callers queue in order and leave the queue when cancelled.
     private func acquire() async throws -> SFTPChannel {
-        var open: [SFTPChannel] = []
-        for link in pool where await link.isOpen { open.append(link) }
-        pool = open
-        if let free = pool.first(where: { !busy.contains(ObjectIdentifier($0)) }) {
-            busy.insert(ObjectIdentifier(free))
-            return free
-        }
-        if pool.count < Self.dataChannels, !poolRefused, master?.isRunning == true {
-            do {
-                let link = try await openLink()
-                pool.append(link)
+        while true {
+            if let link = pool.first(where: { !busy.contains(ObjectIdentifier($0)) }) {
                 busy.insert(ObjectIdentifier(link))
-                return link
-            } catch {
-                poolRefused = true
-                if pool.isEmpty { throw error }
+                if await link.isOpen { return link }
+                drop(link)
+                continue
             }
+            if pool.count + opening < Self.dataChannels, master?.isRunning == true,
+               refusedAt.map({ ContinuousClock.now - $0 > .seconds(10) }) ?? true {
+                opening += 1
+                let generation = generation
+                do {
+                    let link = try await openLink()
+                    guard generation == self.generation else {
+                        await link.closeLink()
+                        throw TransferError.connectionLost("The SSH connection closed")
+                    }
+                    opening -= 1
+                    pool.append(link)
+                    busy.insert(ObjectIdentifier(link))
+                    return link
+                } catch {
+                    guard generation == self.generation else { throw error }
+                    opening -= 1
+                    let nothingLeft = pool.isEmpty && opening == 0
+                    if error is CancellationError || (error as? TransferError) == .cancelled {
+                        if nothingLeft, !waiters.isEmpty { waiters.removeFirst().continuation.resume(returning: nil) }
+                        throw error
+                    }
+                    // The server allows no more sessions for now (MaxSessions); share what is open.
+                    refusedAt = .now
+                    if nothingLeft {
+                        for waiter in waiters { waiter.continuation.resume(throwing: error) }
+                        waiters.removeAll()
+                        throw error
+                    }
+                }
+            }
+            guard !pool.isEmpty || opening > 0 else {
+                throw master?.isRunning == true ? TransferError.connectionLost("No SFTP channel could open") : TransferError.notConnected
+            }
+            guard let link = try await nextReleased() else { continue }
+            if await link.isOpen { return link }
+            drop(link)
         }
-        guard !pool.isEmpty else { throw TransferError.notConnected }
-        return try await withCheckedThrowingContinuation { waiters.append($0) }
     }
 
+    private func nextReleased() async throws -> SFTPChannel? {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: TransferError.cancelled)
+                } else {
+                    waiters.append((id, continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.leaveQueue(id) }
+        }
+    }
+
+    private func leaveQueue(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume(throwing: TransferError.cancelled)
+    }
+
+    /// Hands the channel to the first caller waiting, else marks it idle. A channel from an
+    /// earlier login is only forgotten.
     private func release(_ link: SFTPChannel) {
         let id = ObjectIdentifier(link)
-        busy.remove(id)
-        guard !waiters.isEmpty else { return }
-        busy.insert(id)
-        waiters.removeFirst().resume(returning: link)
+        guard pool.contains(where: { $0 === link }), !waiters.isEmpty else {
+            busy.remove(id)
+            return
+        }
+        waiters.removeFirst().continuation.resume(returning: link)
+    }
+
+    private func drop(_ link: SFTPChannel) {
+        busy.remove(ObjectIdentifier(link))
+        pool.removeAll { $0 === link }
     }
 
     /// A passenger on the master. It gives up when the server has not started SFTP within 15 s,

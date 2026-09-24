@@ -200,6 +200,75 @@ struct SessionServerTests {
         }
     }
 
+    /// However many callers want one at once, at most seven data channels open (sshd's MaxSessions
+    /// of 10 less the three reserved), and every caller gets one.
+    @Test func dataChannelsNeverExceedSeven() async throws {
+        try await withHarness("pool") { h in
+            try await connectKnown(h)
+            let seen = Locked((inUse: 0, peak: 0, links: Set<ObjectIdentifier>()))
+            let peakProcesses = Locked(0)
+            let refusedBefore = try sessionRefusals()
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<40 {
+                    group.addTask {
+                        try await h.session.withData { link in
+                            seen.withLock {
+                                $0.inUse += 1
+                                $0.peak = max($0.peak, $0.inUse)
+                                $0.links.insert(ObjectIdentifier(link))
+                            }
+                            try await Task.sleep(for: .milliseconds(40))
+                            _ = try await link.realpath(RemotePath(string: "."))
+                            seen.withLock { $0.inUse -= 1 }
+                        }
+                    }
+                }
+                group.addTask {
+                    let count = try await processes(h, " sftp").count
+                    peakProcesses.withLock { $0 = max($0, count) }
+                }
+                try await group.waitForAll()
+            }
+            #expect(seen.value.peak <= SSHConnection.dataChannels)
+            #expect(seen.value.links.count <= SSHConnection.dataChannels)
+            #expect(try await processes(h, " sftp").count <= 3 + SSHConnection.dataChannels)
+            #expect(peakProcesses.value <= 3 + SSHConnection.dataChannels)
+            // sshd would refuse an eighth; none was even tried.
+            #expect(try sessionRefusals() == refusedBefore)
+        }
+    }
+
+    /// A caller queued for a data channel leaves the queue as soon as it is cancelled.
+    @Test func aCancelledCallerLeavesTheChannelQueue() async throws {
+        try await withHarness("queue") { h in
+            try await connectKnown(h)
+            let held = Locked(0)
+            let open = Locked(false)
+            let holders = Task {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for _ in 0..<SSHConnection.dataChannels {
+                        group.addTask {
+                            try await h.session.withData { _ in
+                                held.withLock { $0 += 1 }
+                                while !open.value { try await Task.sleep(for: .milliseconds(20)) }
+                            }
+                        }
+                    }
+                    try await group.waitForAll()
+                }
+            }
+            #expect(await waitUntil { held.value == SSHConnection.dataChannels })
+            let queued = Task { try await h.session.withData { _ in } }
+            try await Task.sleep(for: .milliseconds(200))
+            queued.cancel()
+            await #expect(throws: TransferError.cancelled) { try await queued.value }
+            #expect(!open.value)
+            open.value = true
+            try await holders.value
+            try await h.session.withData { _ in }
+        }
+    }
+
     /// Dead reserved channels are reopened, as often as every 5 s; a live master with no channel
     /// is a lost connection, which transfers retry, and the master's death is reported.
     @Test func reservedChannelsReopenAndTheMastersDeathIsReported() async throws {
@@ -274,6 +343,14 @@ private func hostKey() throws -> String {
 
 private func hostPattern() throws -> String {
     "[127.0.0.1]:\(try #require(ProcessInfo.processInfo.environment["TRANSFER_TEST_PORT"]))"
+}
+
+/// How many channels the local sshd has refused for MaxSessions, from the log `local-sshd.sh`
+/// writes beside the keys.
+private func sessionRefusals() throws -> Int {
+    let log = try hostKeyFile().deletingLastPathComponent().appendingPathComponent("sshd.log")
+    let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+    return text.components(separatedBy: "no more sessions").count - 1
 }
 
 private func knownHosts(_ h: ServerHarness) -> URL {
