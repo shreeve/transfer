@@ -89,6 +89,86 @@ import TransferCore
         await server.stop()
     }
 
+    // MARK: Replace without posix-rename
+
+    private static let temp = RemotePath(string: "/srv/.a.transfer-1")
+    private static let placed = RemotePath(string: "/srv/a")
+
+    /// A server without posix-rename, where `placed` is `kind` (nil: absent) and a RENAME of the
+    /// temp onto it answers `onto`, nil for no answer.
+    private static func stepping(_ kind: SFTPAttrs?, onto: UInt32? = SFTPCode.ok) async throws -> ScriptedServer {
+        try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.lstat:
+                guard let kind else { return ScriptedServer.status(request.id, SFTPCode.noSuchFile) }
+                return ScriptedServer.attrs(request.id, kind)
+            case SFTPCode.rename:
+                if request.paths[0] == temp.display {
+                    return onto.map { ScriptedServer.status(request.id, $0) }
+                }
+                return ScriptedServer.ok(request.id)
+            case SFTPCode.remove: return ScriptedServer.ok(request.id)
+            default: return ScriptedServer.status(request.id, SFTPCode.failure)
+            }
+        }
+    }
+
+    /// The old file steps aside, the temp takes its name, and only then is the old file removed.
+    @Test func aReplaceWithoutPosixRenameMovesTheOldFileAsideFirst() async throws {
+        let server = try await Self.stepping(ScriptedServer.file)
+        try await server.channel.replace(Self.temp, onto: Self.placed)
+        let renames = server.sent(SFTPCode.rename).map(\.paths)
+        #expect(renames.count == 2)
+        let aside = renames[0][1]
+        #expect(renames[0][0] == "/srv/a" && aside.hasPrefix("/srv/.transfer-old-"))
+        #expect(renames[1] == ["/srv/.a.transfer-1", "/srv/a"])
+        #expect(server.sent(SFTPCode.remove).map(\.paths) == [[aside]])
+        await server.stop()
+    }
+
+    /// LIVE-08: when the temp cannot take the name, the old file comes back and nothing is
+    /// removed, so the server never ends with neither version.
+    @Test func aFailedReplaceWithoutPosixRenamePutsTheOldFileBack() async throws {
+        let server = try await Self.stepping(ScriptedServer.file, onto: SFTPCode.failure)
+        await #expect(throws: TransferError.failed("")) { try await server.channel.replace(Self.temp, onto: Self.placed) }
+        let renames = server.sent(SFTPCode.rename).map(\.paths)
+        #expect(renames.count == 3)
+        #expect(renames[2] == [renames[0][1], "/srv/a"])
+        #expect(server.sent(SFTPCode.remove).isEmpty)
+        await server.stop()
+    }
+
+    /// Cancelled after the old file stepped aside, the replace still puts it back.
+    @Test func aCancelledReplaceWithoutPosixRenameStillPutsTheOldFileBack() async throws {
+        let server = try await Self.stepping(ScriptedServer.file, onto: nil)
+        let replace = Task { try await server.channel.replace(Self.temp, onto: Self.placed) }
+        #expect(await eventually { server.sent(SFTPCode.rename).count == 2 })
+        replace.cancel()
+        try await Task.sleep(for: .milliseconds(50))
+        server.send(ScriptedServer.status(server.sent(SFTPCode.rename)[1].id, SFTPCode.failure))
+        await #expect(throws: (any Error).self) { try await replace.value }
+        let renames = server.sent(SFTPCode.rename).map(\.paths)
+        #expect(renames.count == 3)
+        #expect(renames.last == [renames[0][1], "/srv/a"])
+        await server.stop()
+    }
+
+    @Test func aReplaceOntoNothingIsOneRename() async throws {
+        let server = try await Self.stepping(nil)
+        try await server.channel.replace(Self.temp, onto: Self.placed)
+        #expect(server.sent(SFTPCode.rename).map(\.paths) == [["/srv/.a.transfer-1", "/srv/a"]])
+        await server.stop()
+    }
+
+    @Test func aReplaceNeverReplacesAFolder() async throws {
+        var folder = SFTPAttrs()
+        folder.permissions = 0o040755
+        let server = try await Self.stepping(folder)
+        await #expect(throws: TransferError.typeMismatch("a")) { try await server.channel.replace(Self.temp, onto: Self.placed) }
+        #expect(server.sent(SFTPCode.rename).isEmpty)
+        await server.stop()
+    }
+
     /// A lookup that fails for any reason but "no such file" is not evidence the name is free.
     @Test func aRenameWhoseLookupFailsRenamesNothing() async throws {
         let server = try await Self.renaming([]) { _ in SFTPCode.permission }

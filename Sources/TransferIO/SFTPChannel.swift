@@ -208,7 +208,9 @@ actor SFTPChannel {
 
     /// Puts `temp` in place of `placed`. With `posix-rename@openssh.com` the swap is atomic and a
     /// failure leaves `placed` untouched. Without it, SFTP v3 rename will not replace a file, so
-    /// `placed` is removed first.
+    /// `placed` steps aside under a hidden name first and comes back if `temp` cannot take its
+    /// place: a failure never leaves the server with neither the old file nor the new one. A
+    /// folder is never replaced, as posix-rename would refuse it.
     func replace(_ temp: RemotePath, onto placed: RemotePath) async throws {
         if extensions.contains("posix-rename@openssh.com") {
             var body = Data()
@@ -218,8 +220,30 @@ actor SFTPChannel {
             _ = try await call(SFTPCode.extended, body: body)
             return
         }
-        try? await removeFile(placed)
-        try await plainRename(temp, to: placed)
+        // Once the old file has stepped aside, cancelling must not stop it coming back: the steps
+        // run in a task of their own, which the caller's cancellation does not reach.
+        try await Task { try await self.replaceStepping(temp, onto: placed) }.value
+    }
+
+    private func replaceStepping(_ temp: RemotePath, onto placed: RemotePath) async throws {
+        let existing: RemoteItem
+        do {
+            existing = try await lstat(placed)
+        } catch TransferError.noSuchFile {
+            try await plainRename(temp, to: placed)
+            return
+        }
+        guard existing.kind != .directory, let folder = placed.parent else { throw TransferError.typeMismatch(placed.name) }
+        // Short, so a long name cannot push it past the server's name limit.
+        let aside = folder.appending(name: Array(".transfer-old-\(UUID().uuidString)".utf8))
+        try await plainRename(placed, to: aside)
+        do {
+            try await plainRename(temp, to: placed)
+        } catch {
+            try? await plainRename(aside, to: placed)
+            throw error
+        }
+        try? await removeFile(aside)
     }
 
     func plainRename(_ source: RemotePath, to destination: RemotePath) async throws {
