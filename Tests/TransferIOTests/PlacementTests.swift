@@ -149,5 +149,9 @@ struct PlacementTests {
         #expect(next.lastPathComponent == (caseSensitive ? "report 2.pdf" : "report 3.pdf"))
         #expect(Placement.fold("Straße.TXT") == Placement.fold("straße.txt"))
         #expect(Placement.fold("caf\u{E9}") == Placement.fold("cafe\u{301}"))
+        // As APFS folds them (R-C1).
+        #expect(Placement.fold("Straße") == Placement.fold("STRASSE"))
+        #expect(Placement.fold("ΑΣ") == Placement.fold("ας"))
+        #expect(Placement.fold("ﬁle") == Placement.fold("FILE"))
     }
 }

@@ -45,6 +45,14 @@ import Testing
     exact.add(TreeKey(bytes: Array("cafe\u{301}".utf8)))
     #expect(exact.found != nil)
 
+    // APFS folds case fully: these pairs are one name on a case-insensitive disk (R-C1).
+    for (first, second) in [("Straße", "STRASSE"), ("ΑΣ", "ας"), ("ﬁle", "FILE")] {
+        var folding = NameClash(ignoringCase: true)
+        folding.add(TreeKey(stringLiteral: first))
+        folding.add(TreeKey(stringLiteral: second))
+        #expect(folding.found != nil)
+    }
+
     var undecodable = NameClash(ignoringCase: false)
     undecodable.add(TreeKey(bytes: [0x61, 0xFF]))
     undecodable.add(TreeKey(bytes: [0x61, 0xFE]))

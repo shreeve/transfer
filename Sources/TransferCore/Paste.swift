@@ -199,10 +199,10 @@ public enum MoveCheck {
     }
 }
 
-/// Finds two names that one folder on this Mac cannot hold apart: `README` and `readme` on a
-/// case-insensitive disk, the two Unicode spellings of `café` (APFS ignores that too), or two
-/// invalid UTF-8 names that decode alike. Fed each key once; a key folding like an earlier one
-/// clashes.
+/// Finds two names that one folder on this Mac cannot hold apart: `README` and `readme`, or
+/// `Straße` and `STRASSE`, on a case-insensitive disk, which folds case fully as APFS does; the two
+/// Unicode spellings of `café` (APFS ignores that too); or two invalid UTF-8 names that decode
+/// alike. Fed each key once; a key folding like an earlier one clashes.
 public struct NameClash: Sendable {
     public let ignoringCase: Bool
     private var seen: [String: TreeKey] = [:]
@@ -216,7 +216,7 @@ public struct NameClash: Sendable {
     public mutating func add(_ key: TreeKey) {
         guard found == nil else { return }
         let text = key.description.precomposedStringWithCanonicalMapping
-        let folded = ignoringCase ? text.lowercased() : text
+        let folded = ignoringCase ? text.folding(options: .caseInsensitive, locale: nil) : text
         if let other = seen[folded] { found = (other, key) } else { seen[folded] = key }
     }
 }
