@@ -138,14 +138,14 @@ struct ServerTests {
             #expect(try Data(contentsOf: upURL.appendingPathComponent("a/big.bin")) == Data(contentsOf: tree.appendingPathComponent("a/big.bin")))
 
             let down = h.root.appendingPathComponent("tree-down", isDirectory: true)
-            try await h.session.copyDirectory(from: up, to: down) { _ in }
+            try await h.session.download(up, to: down) { _ in }
             #expect(try Data(contentsOf: down.appendingPathComponent("one.txt")) == Data("one".utf8))
             #expect(try Data(contentsOf: down.appendingPathComponent("a/big.bin")) == Data(contentsOf: tree.appendingPathComponent("a/big.bin")))
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: down.appendingPathComponent("link").path) == "one.txt")
             #expect(h.prompts.collisions == 0)
 
             // A second download skips every matching file and asks about nothing.
-            try await h.session.copyDirectory(from: up, to: down) { _ in }
+            try await h.session.download(up, to: down) { _ in }
             #expect(h.prompts.collisions == 0)
 
             try await h.session.remove(up)

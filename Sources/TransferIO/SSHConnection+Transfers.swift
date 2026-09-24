@@ -31,21 +31,31 @@ extension SSHConnection {
 
     // MARK: Single files
 
+    /// `destination` is a folder on this Mac chosen by the caller, which may be reached through
+    /// links, plus the name to give the item there. Everything below it comes from the server and
+    /// is placed through `LocalPlacement`.
     public func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let info = try await stat(path)
+        let folder = destination.deletingLastPathComponent()
+        let name = destination.lastPathComponent
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         switch info.kind {
         case .directory:
-            try await copyDirectory(from: path, to: destination, progress: progress)
+            let tally = ProgressTally(progress)
+            guard let local = try await localFolder(named: name, in: folder) else { return }
+            let link: SFTPChannel
+            if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                try await walkDownload(path, into: local, link: link, group: &group, tally: tally)
+                try await group.waitForAll()
+            }
         case .symlink:
-            let target = try await readlink(path)
-            try? FileManager.default.removeItem(at: destination)
-            try FileManager.default.createSymbolicLink(atPath: destination.path, withDestinationPath: target)
+            try await localLink(try await readlink(path), named: name, in: folder)
         case .other:
             return
         case .file:
-            if Self.localFileMatches(destination, item: info) { return }
-            guard let placed = try await collisionFile(destination, item: info) else { return }
-            try await fetch(path, info: info, to: placed, progress: progress)
+            guard let placed = try await settleLocally(.file(Fingerprint(item: info)), named: name, in: folder) else { return }
+            try await fetch(path, info: info, to: placed.url, progress: progress)
         }
     }
 
@@ -165,49 +175,76 @@ extension SSHConnection {
 
     // MARK: Directory copy
 
-    func copyDirectory(from remote: RemotePath, to local: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
-        let tally = ProgressTally(progress)
-        let link: SFTPChannel
-        if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            try await walkDownload(remote, to: local, link: link, group: &group, tally: tally)
-            try await group.waitForAll()
-        }
-    }
-
+    /// Copies the server folder `remote` into `local`, a real folder this download found or made.
     private func walkDownload(
         _ remote: RemotePath,
-        to local: URL,
+        into local: URL,
         link: SFTPChannel,
         group: inout ThrowingTaskGroup<Void, Error>,
         tally: ProgressTally
     ) async throws {
-        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        // Names this listing already used. A later one that folds the same (a duplicate, or two
+        // names this Mac's disk takes for one) collides even before the first has landed.
+        var used: Set<String> = []
         for try await item in await link.list(remote) {
             try Task.checkCancellation()
-            let child = local.appendingPathComponent(item.name)
+            let taken = !used.insert(Placement.fold(item.name)).inserted
             switch item.kind {
             case .directory:
-                try await walkDownload(item.path, to: child, link: link, group: &group, tally: tally)
+                guard let folder = try await localFolder(named: item.name, in: local, taken: taken) else { continue }
+                try await walkDownload(item.path, into: folder, link: link, group: &group, tally: tally)
             case .symlink:
-                let target = try await link.readlink(item.path)
-                try? FileManager.default.removeItem(at: child)
-                try FileManager.default.createSymbolicLink(atPath: child.path, withDestinationPath: target)
+                try await localLink(try await link.readlink(item.path), named: item.name, in: local, taken: taken)
                 tally.finished(bytes: 0)
             case .file:
-                if Self.localFileMatches(child, item: item) {
+                guard let placed = try await settleLocally(.file(Fingerprint(item: item)), named: item.name, in: local, taken: taken) else {
                     tally.finished(bytes: 0)
                     continue
                 }
-                guard let placed = try await collisionFile(child, item: item) else { continue }
                 group.addTask {
-                    try await self.fetch(item.path, info: item, to: placed) { _ in }
+                    try await self.fetch(item.path, info: item, to: placed.url) { _ in }
                     tally.finished(bytes: item.size ?? 0)
                 }
             case .other:
                 continue
             }
         }
+    }
+
+    /// Where `incoming` lands as `name` in `folder`, a real folder on this Mac, and what holds that
+    /// spot now; nil to skip it. What holds the name is read without following a link, and anything
+    /// but the same file or link is asked about. `taken` says an earlier entry of the same listing
+    /// claimed the name and may not have landed yet.
+    private func settleLocally(_ incoming: PlacedItem, named name: String, in folder: URL, taken: Bool = false) async throws -> (url: URL, found: PlacedItem?)? {
+        let url = try LocalPlacement.child(folder, name: name)
+        var found = try LocalPlacement.occupant(url)
+        if taken, found == nil { found = .other }
+        switch Placement.settle(incoming, onto: found) {
+        case .write, .merge:
+            return (url, found)
+        case .skip:
+            return nil
+        case .typeMismatch:
+            throw TransferError.typeMismatch(name)
+        case .collide:
+            switch try await collisionChoice(for: name) {
+            case .skip: return nil
+            case .replace: return (url, found)
+            case .keepBoth: return (try LocalPlacement.keepBoth(url), nil)
+            }
+        }
+    }
+
+    /// The real folder a server folder named `name` merges into or is made as; nil to skip it.
+    private func localFolder(named name: String, in folder: URL, taken: Bool = false) async throws -> URL? {
+        guard let spot = try await settleLocally(.folder, named: name, in: folder, taken: taken) else { return nil }
+        if spot.found != .folder { try LocalPlacement.makeFolder(spot.url, replacing: spot.found != nil) }
+        return spot.url
+    }
+
+    private func localLink(_ target: String, named name: String, in folder: URL, taken: Bool = false) async throws {
+        guard let spot = try await settleLocally(.link(target), named: name, in: folder, taken: taken) else { return }
+        try LocalPlacement.makeLink(spot.url, target: target)
     }
 
     func copyDirectory(fromLocal local: URL, to remote: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
@@ -545,29 +582,6 @@ extension SSHConnection {
             names.insert(item.name)
         }
         return names
-    }
-
-    private static func localFileMatches(_ url: URL, item: RemoteItem) -> Bool {
-        guard let local = stamp(url), let remoteSize = item.size, let remoteTime = item.mtime else { return false }
-        return local.size == remoteSize && local.mtime == remoteTime
-    }
-
-    private func collisionFile(_ url: URL, item: RemoteItem) async throws -> URL? {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return url }
-        if isDirectory.boolValue { throw TransferError.typeMismatch(url.lastPathComponent) }
-        let choice = try await collisionChoice(for: item.name)
-        switch choice {
-        case .skip:
-            return nil
-        case .replace:
-            return url
-        case .keepBoth:
-            let folder = url.deletingLastPathComponent()
-            let existing = Set((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
-            let next = KeepBothName.next(existing: existing, original: item.name)
-            return folder.appendingPathComponent(next)
-        }
     }
 }
 
