@@ -12,6 +12,7 @@ enum SFTPCode {
     static let read: UInt8 = 5
     static let write: UInt8 = 6
     static let lstat: UInt8 = 7
+    static let fstat: UInt8 = 8
     static let setstat: UInt8 = 9
     static let fsetstat: UInt8 = 10
     static let opendir: UInt8 = 11

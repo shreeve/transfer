@@ -112,6 +112,12 @@ actor SFTPChannel {
         return try item(path: path, message: message)
     }
 
+    /// The size and time of the file `handle` has open, which its path may no longer name.
+    private func fstat(_ handle: Data) async throws -> Fingerprint? {
+        let message = try await call(SFTPCode.fstat) { $0.appendBlob(handle) }
+        return Fingerprint(item: try item(path: RemotePath(string: "/"), message: message))
+    }
+
     /// Keeps several READDIR requests in flight. OpenSSH answers each with at most a hundred names,
     /// so a large folder no longer pays one round trip per page. A listing its reader abandons
     /// stops at once and still closes its handle on the server.
@@ -385,11 +391,14 @@ actor SFTPChannel {
     }
 
     /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight (32 requests of
-    /// 64 KB), until nothing is left to ask for. Several small files may share the channel, each
-    /// with its own call.
-    func receive(_ path: RemotePath, into parts: DownloadParts) async throws {
+    /// 64 KB), until nothing is left to ask for. Several channels may read into one `parts` at
+    /// once, each with a handle of its own; with `matching`, this one helps only if the file it
+    /// opened is still the one listed, so a file replaced meanwhile is never read in pieces from
+    /// two versions. Several small files may share the channel, each with its own call.
+    func receive(_ path: RemotePath, into parts: DownloadParts, matching print: Fingerprint? = nil) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxRead)
         defer { closeSoon([handle]) }
+        if let print, try await fstat(handle) != print { return }
         var inFlight: [(offset: UInt64, length: UInt32, id: UInt32)] = []
         defer { for read in inFlight { abandon(read.id) } }
         while true {
@@ -461,6 +470,12 @@ actor SFTPChannel {
     /// Opens `path` for writing, creating it or cutting it to nothing.
     func create(_ path: RemotePath) async throws -> Data {
         try await openFile(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
+    }
+
+    /// Writes what `parts` hands out into `path`, which another channel created: a second
+    /// channel's share of one large upload.
+    func send(_ parts: UploadParts, into path: RemotePath) async throws {
+        try await send(parts, to: try await openFile(path, flags: SFTPCode.fxWrite))
     }
 
     /// Writes what `parts` hands out to `handle`, keeping 2 MB in flight, then closes the handle,

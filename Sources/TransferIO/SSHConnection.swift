@@ -462,6 +462,14 @@ public actor SSHConnection: RemoteSession {
         return try await body(link)
     }
 
+    /// Runs `body` on a whole data channel only when one is idle or can open now, without waiting
+    /// and never ahead of a caller that waits: another channel for one large file. Nil when none is.
+    func withSpareData<T>(_ body: (SFTPChannel) async throws -> T) async throws -> T? {
+        guard let link = await spare() else { return nil }
+        defer { release(link, DataShare.whole.rawValue) }
+        return try await body(link)
+    }
+
     /// A data channel with room for `share`: an idle one, a new one while fewer than seven are
     /// open or opening, else the least loaded with room, else the next with room once others let
     /// go. Callers queue in order and leave the queue when cancelled.
@@ -484,6 +492,20 @@ public actor SSHConnection: RemoteSession {
             if await link.isOpen { return link }
             drop(link)
         }
+    }
+
+    /// A whole channel for `withSpareData`: idle, or newly opened while there is room.
+    private func spare() async -> SFTPChannel? {
+        guard waiters.isEmpty else { return nil }
+        let whole = DataShare.whole.rawValue
+        if let link = fitting(whole, sharing: false) {
+            load[ObjectIdentifier(link), default: 0] += whole
+            if await link.isOpen { return link }
+            drop(link)
+            return nil
+        }
+        guard canOpen else { return nil }
+        return try? await openData(whole)
     }
 
     /// Whether another data channel may open: fewer than seven are open or opening, and the server
