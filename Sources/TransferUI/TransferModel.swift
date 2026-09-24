@@ -1222,13 +1222,19 @@ public final class TransferModel {
     }
 
     /// Deletes the selection and says which items could not go. What failed stays selected.
+    /// The Delete sheet has warned about unsynced Live edits under the selection, so those Live
+    /// files are discarded first; the session refuses to remove a path that still holds one.
     public func deleteSelection() async {
         guard let context else { return }
         let paths = snapshot.selection.sorted { $0.display < $1.display }
+        let live = liveFiles
         var removed: [RemotePath] = []
         var failures: [(name: String, error: any Error)] = []
         for path in paths {
             do {
+                for file in live where file.path.isInside(path) {
+                    try await context.session.discardLiveFile(file.path, force: true)
+                }
                 try await context.session.remove(path)
                 removed.append(path)
             } catch {
