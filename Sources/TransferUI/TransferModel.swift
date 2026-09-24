@@ -151,9 +151,6 @@ public final class TransferModel {
         didSet { if filter != oldValue { refreshItems() } }
     }
     public var filterFocusTick = 0
-    /// When an icon cell last took a mouse down (system uptime), so the grid's background tap for
-    /// that click keeps the cell's selection. A time, not a flag: a drag never gets the tap.
-    @ObservationIgnored public var itemClickTime: TimeInterval = 0
     /// True while a text field in the window has focus, so Space and Return stay with the field.
     public var textEditing = false
     public var folderText = ""

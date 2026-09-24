@@ -112,19 +112,19 @@ struct SidebarColumn: View {
     }
 }
 
-/// The content column: browser, rename bar, shelf, and every sheet.
+/// The content column: browser, rename bar, shelf, and every sheet. The icon grid, clipboard bar,
+/// and shelf are views of their own, so a progress tick or a clip's count redraws only its bar
+/// and never re-diffs the grid.
 struct DetailColumn: View {
     @Bindable var model: TransferModel
-    /// The shelf's rows at their natural height, which its scroll view grows to before scrolling.
-    @State private var shelfHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
             if let status = model.status { MessageBar(text: status) { model.status = nil } }
             if model.renaming { RenameBar(model: model) }
             browser
-            if model.snapshot.connectionID != nil, let clip = Clipboard.shared.clip { ClipBar(clip: clip) }
-            if model.showsShelf { shelf }
+            if model.snapshot.connectionID != nil { ClipSlot() }
+            if model.showsShelf { Shelf(model: model) }
         }
         .sheet(item: $model.sheet) { sheet in sheetView(sheet) }
         .scrollEdgeEffectHidden(true, for: .top)
@@ -143,142 +143,11 @@ struct DetailColumn: View {
             }
         } else {
             switch model.snapshot.viewMode {
-            case .icon: iconView
+            case .icon: IconGrid(model: model)
             case .list: ListTable(model: model)
             case .columns: ColumnBrowser(model: model)
             }
         }
-    }
-
-    private var iconView: some View {
-        ScrollView {
-            // Fixed-width columns packed left, not stretched: as the pane narrows, items hold still
-            // and only the column count steps, as in Finder's icon view.
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 108, maximum: 108), spacing: 16)], alignment: .leading, spacing: 16) {
-                ForEach(model.displayedItems) { item in
-                    FilePromiseLabel(item: item, model: model)
-                        .frame(width: 96, height: 88)
-                        .padding(6)
-                        .background(model.snapshot.selection.contains(item.path) ? Color.accentColor.opacity(0.2) : Color.clear)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                }
-            }
-            .padding()
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-        }
-        .contentShape(Rectangle())
-        // The grid's tap also sees clicks on an item, after the item has selected itself on mouse
-        // down; only a click on the background clears the selection.
-        .onTapGesture {
-            if ProcessInfo.processInfo.systemUptime - model.itemClickTime > 0.5 { model.snapshot.selection = [] }
-        }
-        // The empty area's menu is the folder's; a cell shows its own, from its AppKit view.
-        .contextMenu { FolderMenu(model: model) }
-        .dropDestination(for: URL.self) { urls, _ in
-            let files = urls.filter(\.isFileURL)
-            guard !files.isEmpty else { return false }
-            guard let context = model.shownContext else { return false }
-            Task { await model.transfer(.mac(files), into: model.snapshot.path, moving: false, on: context) }
-            return true
-        }
-        .focusable()
-        .focusEffectDisabled()
-    }
-
-    // MARK: Shelf
-
-    /// The transfers, in a list that grows to about five rows and then scrolls, so a large
-    /// drop never pushes the browser out of the window.
-    private var shelf: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if model.operations.count > 1 {
-                Text(shelfSummary).font(.caption).foregroundStyle(.secondary)
-            }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(model.operations) { operation in shelfRow(operation) }
-                }
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { shelfHeight = $0 }
-            }
-            .frame(height: min(shelfHeight, 160))
-        }
-        .padding(8)
-        .background(.bar)
-    }
-
-    private func shelfRow(_ operation: TransferOperation) -> some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(operation.title).lineLimit(1).truncationMode(.middle)
-                if let detail = shelfDetail(operation) {
-                    Text(detail).font(.caption).foregroundStyle(operation.state == .failed && !model.isKept(operation) ? .red : .secondary).lineLimit(2)
-                }
-            }
-            Spacer()
-            if operation.state == .active || operation.state == .paused {
-                if let total = operation.progress.total, total > 0 {
-                    ProgressView(value: Double(operation.progress.completed), total: Double(total))
-                        .frame(width: 140)
-                        .accessibilityLabel(operation.title)
-                } else {
-                    Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            if let label = stateLabel(operation) {
-                Text(label).font(.caption).foregroundStyle(.secondary)
-            }
-            // A Live file's sync pauses and resumes. A transfer can only stop: it restarts from its
-            // first byte, since a stopped transfer's temp is removed.
-            let live = operation.livePath != nil
-            switch operation.state {
-            case .active:
-                Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
-            case .queued:
-                Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
-                if !live { Button("Remove") { model.remove(operation) } }
-            case .paused:
-                Button(live ? "Resume" : "Restart") { Task { await model.resume(operation) } }
-                if !live { Button("Remove") { model.remove(operation) } }
-            case .failed:
-                Button("Retry") { Task { await model.resume(operation) } }
-                Button("Remove") { model.remove(operation) }
-            case .succeeded:
-                EmptyView()
-            }
-        }
-        .controlSize(.small)
-    }
-
-    /// "12 transfers, 3 failed".
-    private var shelfSummary: String {
-        let failed = model.operations.filter { $0.state == .failed && !model.isKept($0) }.count
-        let count = ClipText.count(model.operations.count, "transfer")
-        return failed == 0 ? count : "\(count), \(failed) failed"
-    }
-
-    /// The row's message, and the server it runs on when that is not the window's.
-    private func shelfDetail(_ operation: TransferOperation) -> String? {
-        var parts: [String] = []
-        if let message = operation.message, operation.state != .active { parts.append(message) }
-        if let server = model.otherServerName(for: operation) { parts.append("on \(server)") }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    private func stateLabel(_ operation: TransferOperation) -> String? {
-        switch operation.state {
-        case .queued: "Waiting"
-        case .active: nil
-        case .paused: operation.livePath == nil ? "Stopped" : "Paused"
-        case .failed: model.isKept(operation) ? "Kept" : "Failed"
-        case .succeeded: "Done"
-        }
-    }
-
-    private func progressText(_ progress: TransferProgress) -> String {
-        var parts: [String] = []
-        if progress.completed > 0 { parts.append(Format.si(progress.completed)) }
-        if progress.itemsCompleted > 0 { parts.append(ClipText.count(progress.itemsCompleted, "item")) }
-        return parts.joined(separator: ", ")
     }
 
     // MARK: Sheets
@@ -421,6 +290,140 @@ struct DetailColumn: View {
         let text = model.folderText
         model.sheet = nil
         Task { await model.goToFolder(text) }
+    }
+}
+
+/// The icon view. Each cell is an AppKit view the size of its whole highlight, and under the grid,
+/// as tall as the pane at least, lies an AppKit view for the empty area; both take their own
+/// clicks, menus, and drops, so every drop goes through `dropAction` as in the other views.
+private struct IconGrid: View {
+    let model: TransferModel
+
+    var body: some View {
+        GeometryReader { pane in
+            ScrollView {
+                // Fixed-width columns packed left, not stretched: as the pane narrows, items hold
+                // still and only the column count steps, as in Finder's icon view.
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 108, maximum: 108), spacing: 16)], alignment: .leading, spacing: 16) {
+                    ForEach(model.displayedItems) { item in
+                        FilePromiseLabel(item: item, model: model)
+                            .frame(width: IconItemView.size.width, height: IconItemView.size.height)
+                            .background(model.snapshot.selection.contains(item.path) ? Color.accentColor.opacity(0.2) : Color.clear)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+                .padding()
+                .frame(maxWidth: .infinity, minHeight: pane.size.height, alignment: .topLeading)
+                .background(IconGridBackground(model: model))
+            }
+        }
+    }
+}
+
+/// The transfers, in a list that grows to about five rows and then scrolls, so a large drop never
+/// pushes the browser out of the window.
+private struct Shelf: View {
+    let model: TransferModel
+    /// The rows at their natural height, which the scroll view grows to before scrolling.
+    @State private var height: CGFloat = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if model.operations.count > 1 {
+                Text(summary).font(.caption).foregroundStyle(.secondary)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.operations) { operation in row(operation) }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
+            }
+            .frame(height: min(height, 160))
+        }
+        .padding(8)
+        .background(.bar)
+    }
+
+    private func row(_ operation: TransferOperation) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(operation.title).lineLimit(1).truncationMode(.middle)
+                if let detail = detail(operation) {
+                    Text(detail).font(.caption).foregroundStyle(operation.state == .failed && !model.isKept(operation) ? .red : .secondary).lineLimit(2)
+                }
+            }
+            Spacer()
+            if operation.state == .active || operation.state == .paused {
+                if let total = operation.progress.total, total > 0 {
+                    ProgressView(value: Double(operation.progress.completed), total: Double(total))
+                        .frame(width: 140)
+                        .accessibilityLabel(operation.title)
+                } else {
+                    Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let label = stateLabel(operation) {
+                Text(label).font(.caption).foregroundStyle(.secondary)
+            }
+            // A Live file's sync pauses and resumes. A transfer can only stop: it restarts from its
+            // first byte, since a stopped transfer's temp is removed.
+            let live = operation.livePath != nil
+            switch operation.state {
+            case .active:
+                Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
+            case .queued:
+                Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
+                if !live { Button("Remove") { model.remove(operation) } }
+            case .paused:
+                Button(live ? "Resume" : "Restart") { Task { await model.resume(operation) } }
+                if !live { Button("Remove") { model.remove(operation) } }
+            case .failed:
+                Button("Retry") { Task { await model.resume(operation) } }
+                Button("Remove") { model.remove(operation) }
+            case .succeeded:
+                EmptyView()
+            }
+        }
+        .controlSize(.small)
+    }
+
+    /// "12 transfers, 3 failed".
+    private var summary: String {
+        let failed = model.operations.filter { $0.state == .failed && !model.isKept($0) }.count
+        let count = ClipText.count(model.operations.count, "transfer")
+        return failed == 0 ? count : "\(count), \(failed) failed"
+    }
+
+    /// The row's message, and the server it runs on when that is not the window's.
+    private func detail(_ operation: TransferOperation) -> String? {
+        var parts: [String] = []
+        if let message = operation.message, operation.state != .active { parts.append(message) }
+        if let server = model.otherServerName(for: operation) { parts.append("on \(server)") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func stateLabel(_ operation: TransferOperation) -> String? {
+        switch operation.state {
+        case .queued: "Waiting"
+        case .active: nil
+        case .paused: operation.livePath == nil ? "Stopped" : "Paused"
+        case .failed: model.isKept(operation) ? "Kept" : "Failed"
+        case .succeeded: "Done"
+        }
+    }
+
+    private func progressText(_ progress: TransferProgress) -> String {
+        var parts: [String] = []
+        if progress.completed > 0 { parts.append(Format.si(progress.completed)) }
+        if progress.itemsCompleted > 0 { parts.append(ClipText.count(progress.itemsCompleted, "item")) }
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// The clipboard bar while there is a clip. Its own view, since staging updates the clip often.
+private struct ClipSlot: View {
+    var body: some View {
+        if let clip = Clipboard.shared.clip { ClipBar(clip: clip) }
     }
 }
 
@@ -658,26 +661,6 @@ private struct ClipBar: View {
         case .failed(let text): parts.append("Finder cannot paste it: \(text)")
         }
         return parts.joined(separator: " · ")
-    }
-}
-
-/// The folder's menu for the icon grid's empty area: the entries `ItemMenu` gives the empty
-/// area of the list and column views, drawn as SwiftUI buttons, so the three views share one.
-private struct FolderMenu: View {
-    let model: TransferModel
-
-    var body: some View {
-        let menu = ItemMenu.fill(item: nil, model: model)
-        return ForEach(Array(menu.items.enumerated()), id: \.offset) { _, entry in
-            if entry.isSeparatorItem {
-                Divider()
-            } else {
-                Button(entry.title) {
-                    if let action = entry.action { NSApp.sendAction(action, to: entry.target, from: entry) }
-                }
-                .disabled(!entry.isEnabled)
-            }
-        }
     }
 }
 
