@@ -360,13 +360,13 @@ struct DetailColumn: View {
             } actions: {
                 Button("Remove") { Task { await model.removeServer(connection) } }
             }
-        case .discardLive(let path):
+        case .discardLive(let path, let server):
             SheetForm(title: "Discard unsynced edits to “\(path.name)”?", detail: "The working copy has changes that were not uploaded.", width: 420, onCancel: { model.sheet = nil }) {
                 EmptyView()
             } actions: {
                 Button("Discard") {
                     model.sheet = nil
-                    Task { await model.discardLive(path, force: true) }
+                    Task { await model.discardLive(path, force: true, on: server) }
                 }
             }
         }
@@ -392,7 +392,7 @@ struct DetailColumn: View {
     }
 
     private func conflictSheet(_ path: RemotePath, comparable: Bool) -> some View {
-        let later = { model.sheet = nil; model.conflictConfirm = nil }
+        let later = { model.putOffConflict() }
         return SheetForm(title: "“\(path.name)” changed on the server", detail: "Neither version has been overwritten.", width: 520,
                          cancel: "Later", cancelKey: .cancelAction, onCancel: later) {
             if let confirm = model.conflictConfirm {

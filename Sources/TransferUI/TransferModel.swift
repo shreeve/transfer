@@ -141,6 +141,8 @@ public final class TransferModel {
     @ObservationIgnored private var comparableConflicts: [RemotePath: Bool] = [:]
     /// Conflicts that arrived while another sheet was up, shown in turn once it closes.
     @ObservationIgnored private var waitingConflicts: [RemotePath] = []
+    /// Conflicts the user answered Later, until they are resolved.
+    @ObservationIgnored private var putOffConflicts: Set<RemotePath> = []
     /// The Keep Local or Keep Remote press waiting for its confirming second press.
     public var conflictConfirm: LiveConflictChoice?
     public var filter = "" {
@@ -174,8 +176,11 @@ public final class TransferModel {
     public var draft = SavedConnection(name: "", host: "")
     public var draftIsEdit = false
     public var sheet: AppSheet? {
-        didSet { sheetChanged() }
+        didSet { sheetChanged(from: oldValue) }
     }
+    /// The window's own sheets that came while another was up, shown in turn.
+    @ObservationIgnored private var waitingSheets: [AppSheet] = []
+    @ObservationIgnored private var restoringSheet = false
     public var promptSecure = ""
     public var saveSecret = false
     public var renaming = false
@@ -459,8 +464,11 @@ public final class TransferModel {
         stars = []
         liveFiles = []
         waitingConflicts.removeAll()
+        putOffConflicts.removeAll()
         comparableConflicts.removeAll()
-        if case .conflict = sheet { sheet = nil }
+        // A sheet about the server left behind would act on the next one.
+        waitingSheets.removeAll(where: \.isServerBound)
+        if sheet?.isServerBound == true { sheet = nil }
         dropLiveRows(keeping: id)
     }
 
@@ -502,7 +510,10 @@ public final class TransferModel {
         sheet = .connection
     }
 
+    /// With a sheet up, the connection form would wait behind it and a draft already open would
+    /// be overwritten, so the command does nothing.
     public func newConnection() {
+        guard sheet == nil else { return NSSound.beep() }
         pendingLanding = nil
         draft = SavedConnection(name: "", host: "")
         draftIsEdit = false
@@ -510,6 +521,7 @@ public final class TransferModel {
     }
 
     public func editConnection(_ connection: SavedConnection) {
+        guard sheet == nil else { return NSSound.beep() }
         draft = connection
         draftIsEdit = true
         sheet = .connection
@@ -1359,14 +1371,17 @@ public final class TransferModel {
         }
     }
 
-    public func discardLive(_ path: RemotePath, force: Bool = false) async {
-        guard let session else { return }
+    /// Discards the Live file at `path` on the server shown, or only on `server` when named, as
+    /// by the sheet that warned about its edits.
+    public func discardLive(_ path: RemotePath, force: Bool = false, on server: ConnectionID? = nil) async {
+        guard let context, server == nil || server == context.connection.id else { return }
         do {
-            try await session.discardLiveFile(path, force: force)
+            try await context.session.discardLiveFile(path, force: force)
+            guard isCurrent(context) else { return }
             waitingConflicts.removeAll { $0 == path }
             await reloadSidebars()
         } catch TransferError.liveUnsynced {
-            sheet = .discardLive(path)
+            if isCurrent(context) { sheet = .discardLive(path, context.connection.id) }
         } catch {
             report(error)
         }
@@ -1439,6 +1454,7 @@ public final class TransferModel {
         conflictConfirm = nil
         if choice != .compare {
             waitingConflicts.removeAll { $0 == path }
+            putOffConflicts.remove(path)
             sheet = nil
         }
         do {
@@ -1459,10 +1475,33 @@ public final class TransferModel {
         sheet = .conflict(path, comparable: comparableConflicts[path] ?? false)
     }
 
-    /// A sheet came or went: a waiting question goes first, then a waiting conflict.
-    private func sheetChanged() {
+    /// A sheet came or went. One sheet never replaces another: a question's would get the safe
+    /// answer, and a form would lose what was typed, so the newcomer waits. When the window is
+    /// free, a waiting question goes first, then a waiting sheet, then a waiting conflict.
+    private func sheetChanged(from old: AppSheet?) {
+        guard !restoringSheet else { return }
+        if let old, let new = sheet, old.id != new.id {
+            restoringSheet = true
+            defer { restoringSheet = false }
+            waitingSheets.append(new)
+            sheet = old
+            return
+        }
         prompts.sheetChanged()
-        if sheet == nil, !waitingConflicts.isEmpty { showConflict(waitingConflicts.removeFirst()) }
+        guard sheet == nil else { return }
+        if !waitingSheets.isEmpty {
+            sheet = waitingSheets.removeFirst()
+        } else if !waitingConflicts.isEmpty {
+            showConflict(waitingConflicts.removeFirst())
+        }
+    }
+
+    /// Later on the conflict sheet. The conflict stays in the sidebar, and the same conflict
+    /// announced again does not bring the sheet back; a click on its row does.
+    public func putOffConflict() {
+        if case .conflict(let path, _) = sheet { putOffConflicts.insert(path) }
+        conflictConfirm = nil
+        sheet = nil
     }
 
     // MARK: Sidebar
@@ -1516,6 +1555,7 @@ public final class TransferModel {
         guard isCurrent(context) else { return }
         if stars != starred { stars = starred }
         if liveFiles != live { liveFiles = live }
+        putOffConflicts.formIntersection(conflicts)
         let unknown = starred.filter { starIsFolder[$0] == nil }
         guard !unknown.isEmpty else { return }
         let learned = await withTaskGroup(of: (RemotePath, Bool)?.self) { group in
@@ -1568,7 +1608,7 @@ public final class TransferModel {
             status = text
         case .conflict(let path, let comparable):
             comparableConflicts[path] = comparable
-            showConflict(path)
+            if !putOffConflicts.contains(path) { showConflict(path) }
         case .liveChanged:
             scheduleSidebarReload()
         case .directoryChanged(let path):
@@ -1641,7 +1681,8 @@ public enum AppSheet: Identifiable {
     case conflict(RemotePath, comparable: Bool)
     case goToFolder
     case removeServer(SavedConnection)
-    case discardLive(RemotePath)
+    /// Discarding a Live file's unsynced edits, on the server it names.
+    case discardLive(RemotePath, ConnectionID)
 
     public var id: String {
         switch self {
@@ -1654,6 +1695,15 @@ public enum AppSheet: Identifiable {
         case .goToFolder: "goto"
         case .removeServer: "remove"
         case .discardLive: "discard"
+        }
+    }
+
+    /// Whether the sheet acts on the server the window shows, so it goes when the window leaves
+    /// that server. A question belongs to its login or operation, which go on without the window.
+    var isServerBound: Bool {
+        switch self {
+        case .delete, .conflict, .goToFolder, .discardLive: true
+        case .connection, .prompt, .hostKey, .collision, .removeServer: false
         }
     }
 
