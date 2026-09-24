@@ -973,7 +973,7 @@ public final class TransferModel {
         do {
             let target = try await Self.resolveLink(item, session: session)
             guard target.kind == .file, (target.size ?? 0) <= inspectorPreviewLimit else { return nil }
-            let url = try await session.prepareViewFile(target.path)
+            let url = try await session.prepareInspectorPreview(target.path)
             let isText = await session.openKind(fileName: target.name) == .live
             let isPicture = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true
             let read = await Task.detached(priority: .userInitiated) { () -> InspectorPreview? in
@@ -998,7 +998,7 @@ public final class TransferModel {
         inspectorTasks.append(Task { [weak self] in
             for neighbor in neighbors {
                 guard !Task.isCancelled, self?.inspectorGeneration == generation else { return }
-                _ = try? await session.prepareViewFile(neighbor.path)
+                _ = try? await session.prepareInspectorPreview(neighbor.path)
             }
         })
     }

@@ -182,8 +182,12 @@ public protocol RemoteSession: Sendable {
     func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func openKind(fileName: String) async -> OpenKind
     func prepareLiveFile(_ path: RemotePath) async throws -> URL
+    /// A cached copy of a file the user opened to view; no preview cancels its fetch.
     func prepareViewFile(_ path: RemotePath) async throws -> URL
+    /// Quick Look's copy: a text file as highlighted HTML.
     func preparePreview(_ path: RemotePath) async throws -> URL
+    /// The inspector's copy, also used to prefetch; a newer preview cancels its fetch.
+    func prepareInspectorPreview(_ path: RemotePath) async throws -> URL
     func clearPreviewCache() async
     func discardLiveFile(_ path: RemotePath, force: Bool) async throws
     func setLivePaused(_ path: RemotePath, paused: Bool) async

@@ -119,6 +119,33 @@ import TransferCore
         try await newer.value
     }
 
+    /// A double-click to view a file rode the lane as a preview, so a neighbour's prefetch or the
+    /// next preview cancelled it and the double-click did nothing. A preview never cancels a view,
+    /// waiting or running, and still waits for it.
+    @Test func aPreviewNeverCancelsAView() async throws {
+        let lane = InteractiveLane()
+        let gate = Gate()
+        let order = Locked<[String]>([])
+        let running = Task {
+            try await lane.submit(.view) {
+                await gate.wait()
+                order.withLock { $0.append(Task.isCancelled ? "view cancelled" : "view") }
+            }
+        }
+        #expect(await eventually { await lane.isRunning })
+        let waiting = Task { try await lane.submit(.view) { order.withLock { $0.append("second view") } } }
+        #expect(await eventually { await lane.waiting == 1 })
+        let prefetch = Task { try await lane.submit(.preview) { order.withLock { $0.append("prefetch") } } }
+        #expect(await eventually { await lane.waiting == 2 })
+        let preview = Task { try await lane.submit(.preview) { order.withLock { $0.append("preview") } } }
+        await #expect(throws: TransferError.cancelled) { try await prefetch.value }
+        await gate.open()
+        try await running.value
+        try await waiting.value
+        try await preview.value
+        #expect(order.value == ["view", "second view", "preview"])
+    }
+
     /// SES-34: a caller that gives up takes its waiting job off the lane; it never runs.
     @Test func aCancelledCallersWaitingJobNeverRuns() async throws {
         let lane = InteractiveLane()

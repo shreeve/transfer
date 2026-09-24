@@ -539,12 +539,21 @@ extension SSHConnection {
     // MARK: View and preview
 
     public func prepareViewFile(_ path: RemotePath) async throws -> URL {
+        try await cachedCopy(path, lane: .view)
+    }
+
+    public func prepareInspectorPreview(_ path: RemotePath) async throws -> URL {
+        try await cachedCopy(path, lane: .preview)
+    }
+
+    /// The whole file in the preview cache, fetched on the lane as `kind`.
+    private func cachedCopy(_ path: RemotePath, lane kind: InteractiveLane.Kind) async throws -> URL {
         let item = try await stat(path)
         let ext = (item.name as NSString).pathExtension
         let file = try previewURL(path, ext: ext.isEmpty ? "bin" : ext)
         // The copy carries the remote size and mtime; the same pair means the same bytes.
         if let print = Fingerprint(item: item), (try? LocalPlacement.occupant(file)) == .file(print) { return file }
-        try await lane.submit(.preview) {
+        try await lane.submit(kind) {
             try await self.fetch(path, info: item, to: file, quarantine: true) { _ in }
         }
         trimPreviewCache()
@@ -566,14 +575,14 @@ extension SSHConnection {
             defer { try? FileManager.default.removeItem(at: part) }
             let data = try Data(contentsOf: part)
             guard let text = String(data: data, encoding: .utf8) else {
-                return try await prepareViewFile(path)
+                return try await cachedCopy(path, lane: .preview)
             }
             let html = SyntaxPreview.html(text: text, fileName: item.name)
             try html.write(to: file, atomically: true, encoding: .utf8)
             trimPreviewCache()
             return file
         }
-        return try await prepareViewFile(path)
+        return try await cachedCopy(path, lane: .preview)
     }
 
     public func clearPreviewCache() async {
