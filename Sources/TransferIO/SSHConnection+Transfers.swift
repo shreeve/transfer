@@ -71,8 +71,8 @@ extension SSHConnection {
             }
             store.forgetTemp(temp.path)
         } catch {
-            try? FileManager.default.removeItem(at: temp)
-            store.forgetTemp(temp.path)
+            // A temp that cannot be removed now stays recorded, and the next launch removes it.
+            if unlink(temp.path) == 0 || errno == ENOENT { store.forgetTemp(temp.path) }
             throw error
         }
     }
@@ -95,11 +95,7 @@ extension SSHConnection {
         measure: Bool = false,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws -> Fingerprint? {
-        let base = String(decoding: placed.nameBytes, as: UTF8.self)
-        let parent = placed.parent ?? RemotePath(string: "/")
-        let temp = parent.appending(name: Array(CopyRules.tempName(for: base, transferID: UUID().uuidString).utf8))
-        store.rememberTemp(temp.display, connection: connection.id)
-        do {
+        try await withRemoteTemp(for: placed) { temp in
             if interactive {
                 try await withInteractive { link in try await link.upload(source, to: temp, progress: progress) }
             } else {
@@ -129,12 +125,7 @@ extension SSHConnection {
                 if let kept = found?.mode { try? await link.setstat(temp, mode: kept & 0o7777, mtime: nil) }
             }
             try await link.replace(temp, onto: placed)
-            store.forgetTemp(temp.display)
             return written
-        } catch {
-            try? await metadataLink().removeFile(temp)
-            store.forgetTemp(temp.display)
-            throw error
         }
     }
 
@@ -436,10 +427,24 @@ extension SSHConnection {
             store.forgetTemp(temp.display)
             return result
         } catch {
-            try? await metadataLink().removeFile(temp)
-            store.forgetTemp(temp.display)
+            await discardRemoteTemp(temp)
             throw error
         }
+    }
+
+    /// Removes a temp left by a failed or cancelled write and forgets it once it is gone. The
+    /// removal runs in a task of its own, so the cancel that stopped the write does not stop it
+    /// too. When the server cannot be reached, the record stays and the next login removes it.
+    func discardRemoteTemp(_ temp: RemotePath) async {
+        await Task {
+            do {
+                try await metadataLink().removeFile(temp)
+            } catch TransferError.noSuchFile {
+            } catch {
+                return
+            }
+            store.forgetTemp(temp.display)
+        }.value
     }
 
     public nonisolated func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(String, TreeEntry), Error> {

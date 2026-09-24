@@ -224,6 +224,51 @@ struct TransferServerTests {
             #expect(reports.value.last == TransferProgress(completed: 3_000_000, itemsCompleted: 1))
         }
     }
+
+    /// A cancelled or cut-off upload forgot its hidden temp even when removing it failed, so the
+    /// partial file stayed on the server for good (SES-07).
+    @Test func anInterruptedUploadLeavesNoTempBehind() async throws {
+        try await withHarness("temps", connected: true) { h in
+            let big = h.staging.appendingPathComponent("big.bin")
+            FileManager.default.createFile(atPath: big.path, contents: nil)
+            try FileHandle(forWritingTo: big).truncate(atOffset: 2 << 30)
+            let destination = h.remotePath.appending(name: Array("big.bin".utf8))
+            let records = try Store(root: h.root)
+            func temps() throws -> [String] {
+                try FileManager.default.contentsOfDirectory(atPath: h.remote.path).filter { $0.contains(".transfer-") }
+            }
+
+            // Cancelled: the temp is removed even though the task that wrote it was cancelled.
+            let started = Locked(false)
+            let upload = Task {
+                try await OperationPrompts.$current.withValue(h.prompts) {
+                    try await h.session.upload(big, to: destination) { if $0.completed > 0 { started.value = true } }
+                }
+            }
+            #expect(await waitUntil { started.value })
+            upload.cancel()
+            _ = await upload.result
+            #expect(try temps().isEmpty)
+            #expect(records.remoteTemps(connection: h.session.connection.id).isEmpty)
+
+            // Cut off: the temp cannot be removed, so it stays recorded, and the next login removes it.
+            started.value = false
+            let cut = Task {
+                try await OperationPrompts.$current.withValue(h.prompts) {
+                    try await h.session.upload(big, to: destination) { if $0.completed > 0 { started.value = true } }
+                }
+            }
+            #expect(await waitUntil { started.value })
+            await h.session.disconnect()
+            _ = await cut.result
+            let left = try temps()
+            #expect(left.count == 1)
+            #expect(records.remoteTemps(connection: h.session.connection.id).count == 1)
+            _ = try await h.session.connect(prompts: h.prompts)
+            #expect(try temps().isEmpty)
+            #expect(records.remoteTemps(connection: h.session.connection.id).isEmpty)
+        }
+    }
 }
 
 /// A listening unix socket at `url`, as a dev tool leaves in a project folder.
