@@ -361,6 +361,23 @@ struct LiveSyncTests {
         }
     }
 
+    /// A file whose name is near the Mac's 255-byte limit still gets its "(server)" copy in a
+    /// conflict, and Keep Remote still downloads beside it; both names used to be too long.
+    @Test func aLongNameStillGetsItsServerCopyAndRefresh() async throws {
+        try await withLive("longname") { h in
+            let path = RemotePath(string: "/srv/" + String(repeating: "n", count: 246) + ".txt")
+            let (local, id) = try await openLive(h, path, "first")
+            await h.fake.changeBehind(path, "theirs")
+            try await edit(h, local, id, "mine")
+            #expect(await waitUntil { await h.file()?.conflict == true })
+            let copies = try FileManager.default.contentsOfDirectory(atPath: local.deletingLastPathComponent().path).filter { $0.hasSuffix(" (server)") }
+            #expect(copies.count == 1)
+            try await h.live.resolve(path, on: h.connection, choice: .keepRemote)
+            #expect(read(local) == "theirs")
+            #expect(await h.file()?.conflict == false)
+        }
+    }
+
     @Test func keepBothSavesASiblingAndPicksAFreeName() async throws {
         try await withLive("keepboth") { h in
             let (local, id) = try await conflicted(h, server: "theirs", local: "mine")
