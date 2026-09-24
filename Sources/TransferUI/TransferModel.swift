@@ -100,6 +100,8 @@ public final class TransferModel {
     @ObservationIgnored private var connectGeneration = 0
     /// The sheets of the login a connect is waiting on, until it lands or fails.
     @ObservationIgnored private var loginPrompt: OperationPrompt?
+    /// That login itself, so a window that goes back to the server it shows can stop it.
+    @ObservationIgnored private var loginTask: Task<RemotePath, Error>?
     /// Seeded from the last window's list, so a new window or tab has servers in its first frame.
     public var connections: [SavedConnection] = TransferModel.lastConnections
     private static var lastConnections: [SavedConnection] = []
@@ -267,6 +269,7 @@ public final class TransferModel {
         connectGeneration &+= 1
         loginPrompt?.retire()
         loginPrompt = nil
+        loginTask?.cancel()
         context?.close()
         sidebarReload?.cancel()
         previewTask?.cancel()
@@ -405,6 +408,7 @@ public final class TransferModel {
             login = current
         } else {
             loginPrompt?.retire()
+            loginTask?.cancel()
             login = prompts.login(connection)
             loginPrompt = login
         }
@@ -414,6 +418,7 @@ public final class TransferModel {
             if generation == connectGeneration {
                 connectingTo = nil
                 loginPrompt = nil
+                loginTask = nil
                 // A failed or cancelled login leaves the sidebar on the server still shown.
                 syncSidebarSelection()
             }
@@ -425,7 +430,10 @@ public final class TransferModel {
             pending = fresh
             // Listening before the login catches the notices the login itself raises.
             listen(fresh)
-            let start = try await session.connect(prompts: login)
+            // Its own task, so `abandonConnect` can end the wait even when the caller's task goes on.
+            let attempt = Task { try await session.connect(prompts: login) }
+            loginTask = attempt
+            let start = try await withTaskCancellationHandler { try await attempt.value } onCancel: { attempt.cancel() }
             var path = start
             var selection: Set<RemotePath> = []
             var missing: RemotePath?
@@ -446,6 +454,18 @@ public final class TransferModel {
             guard generation == connectGeneration, !login.declined else { return }
             report(error)
         }
+    }
+
+    /// The user chose the server the window shows while it logs in to another: that login stops
+    /// here. It asks nothing more, can no longer land, and ends in the session unless another
+    /// window waits for it too.
+    private func abandonConnect() {
+        connectGeneration &+= 1
+        connectingTo = nil
+        loginPrompt?.retire()
+        loginPrompt = nil
+        loginTask?.cancel()
+        loginTask = nil
     }
 
     /// Makes `fresh` the window's server in one step: its session, listener, location, and
@@ -1583,7 +1603,11 @@ public final class TransferModel {
         switch item {
         case .server(let id):
             guard let connection = connections.first(where: { $0.id == id }) else { return }
-            if snapshot.connectionID != id { await connect(connection) }
+            if snapshot.connectionID != id {
+                await connect(connection)
+            } else if let pending = connectingTo, pending.id != id {
+                abandonConnect()
+            }
         case .star(let path):
             // A starred folder opens; a starred file is revealed in its folder. Its kind is asked once.
             guard let context else { break }
