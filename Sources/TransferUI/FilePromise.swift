@@ -4,7 +4,7 @@ import TransferCore
 import UniformTypeIdentifiers
 
 /// The pasteboard type for a drag that starts inside Transfer. Its payload is `RemoteDragPayload` as JSON.
-let remoteDragType = NSPasteboard.PasteboardType("com.example.transfer.remote-items")
+let remoteDragType = NSPasteboard.PasteboardType("com.github.shreeve.transfer.remote-items")
 
 struct RemoteDragPayload: Codable {
     var connection: UUID

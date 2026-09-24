@@ -103,7 +103,7 @@ final class Store: @unchecked Sendable {
         }
     }
 
-    // MARK: Recents and pins
+    // MARK: Recents and stars
 
     func recents(connection: ConnectionID) -> [String] {
         queue.sync {
@@ -122,11 +122,12 @@ final class Store: @unchecked Sendable {
         }
     }
 
-    func pins(connection: ConnectionID) -> [String] {
+    /// Starred paths live in the `pins` table, named before the sidebar called them Starred.
+    func stars(connection: ConnectionID) -> [String] {
         queue.sync { strings("SELECT path FROM pins WHERE connection_id = ? ORDER BY path", connection.rawValue.uuidString) }
     }
 
-    func pin(connection: ConnectionID, path: String, on: Bool) {
+    func star(connection: ConnectionID, path: String, on: Bool) {
         queue.sync {
             if on {
                 bind("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, path)

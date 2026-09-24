@@ -111,7 +111,7 @@ public protocol SessionProvider: Sendable {
     func removeConnection(_ id: ConnectionID) async throws
     func session(for id: ConnectionID) async throws -> any RemoteSession
     /// The saved server an `sftp://` link means, or nil when none does.
-    func connection(matching link: SftpLink) async -> SavedConnection?
+    func connection(matching link: SFTPURL) async -> SavedConnection?
     var unsyncedLiveCount: Int { get async }
     func unsyncedLiveCount(for id: ConnectionID) async -> Int
     func disconnectAll() async
@@ -150,9 +150,9 @@ public protocol RemoteSession: Sendable {
     func events() -> AsyncStream<SessionEvent>
     func recents() async -> [RemotePath]
     func remember(_ path: RemotePath) async
-    func pins() async -> [RemotePath]
-    func pin(_ path: RemotePath) async
-    func unpin(_ path: RemotePath) async
+    func stars() async -> [RemotePath]
+    func star(_ path: RemotePath) async
+    func unstar(_ path: RemotePath) async
     func duplicate(_ path: RemotePath) async throws
     /// Copies a file, link, or folder tree to `destination` on this same server. Files are copied
     /// on the server when it offers `copy-data`, else through the Mac. Folders merge into an

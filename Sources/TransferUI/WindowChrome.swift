@@ -627,12 +627,12 @@ public enum NewTab {
 /// tab of the front window. At launch it waits for the first window to appear.
 @MainActor
 public enum LinkInbox {
-    private static var pending: [SftpLink] = []
+    private static var pending: [SFTPURL] = []
     /// Opens a new browser window. Set by each browser window as it appears, since only a view
     /// can reach SwiftUI's window opener.
     public static var openWindow: (() -> Void)?
 
-    public static func deliver(_ link: SftpLink) {
+    public static func deliver(_ link: SFTPURL) {
         NSApp.activate()
         let browsers = ChromeController.browsers
         let idle = browsers.first { $0 === ChromeController.keyWindowController && $0.model?.isIdle == true }

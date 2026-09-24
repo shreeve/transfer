@@ -14,13 +14,13 @@ public actor SSHConnection: RemoteSession {
     private var askDirectories: [URL] = []
     private var onceKnownHosts: [URL] = []
     private var startPath: RemotePath?
-    private var browse: SFTPLink?
-    private var interactive: SFTPLink?
-    private var walker: SFTPLink?
+    private var browse: SFTPChannel?
+    private var interactive: SFTPChannel?
+    private var walker: SFTPChannel?
     private var reopened: Set<ChannelRole> = []
-    private var pool: [SFTPLink] = []
+    private var pool: [SFTPChannel] = []
     private var busy: Set<ObjectIdentifier> = []
-    private var waiters: [CheckedContinuation<SFTPLink, Error>] = []
+    private var waiters: [CheckedContinuation<SFTPChannel, Error>] = []
     private var poolRefused = false
     private var performance = false
     private var prompted = false
@@ -240,16 +240,16 @@ public actor SSHConnection: RemoteSession {
         store.remember(connection: connection.id, path: path.display)
     }
 
-    public func pins() async -> [RemotePath] {
-        store.pins(connection: connection.id).map(RemotePath.init(string:))
+    public func stars() async -> [RemotePath] {
+        store.stars(connection: connection.id).map(RemotePath.init(string:))
     }
 
-    public func pin(_ path: RemotePath) async {
-        store.pin(connection: connection.id, path: path.display, on: true)
+    public func star(_ path: RemotePath) async {
+        store.star(connection: connection.id, path: path.display, on: true)
     }
 
-    public func unpin(_ path: RemotePath) async {
-        store.pin(connection: connection.id, path: path.display, on: false)
+    public func unstar(_ path: RemotePath) async {
+        store.star(connection: connection.id, path: path.display, on: false)
     }
 
     public func terminalCommand(directory: RemotePath) async -> String? {
@@ -264,21 +264,21 @@ public actor SSHConnection: RemoteSession {
 
     // MARK: Channels
 
-    private func requireBrowse() throws -> SFTPLink {
+    private func requireBrowse() throws -> SFTPChannel {
         guard let browse else { throw TransferError.notConnected }
         return browse
     }
 
     /// The browse passenger, or interactive between its jobs.
-    func metadataLink() async throws -> SFTPLink {
+    func metadataLink() async throws -> SFTPChannel {
         if let link = await liveLink(.browse) { return link }
         if let link = await liveLink(.interactive) { return link }
         throw TransferError.notConnected
     }
 
     /// A reserved passenger, reopened once after it dies. Nil when down.
-    func liveLink(_ role: ChannelRole) async -> SFTPLink? {
-        let current: SFTPLink?
+    func liveLink(_ role: ChannelRole) async -> SFTPChannel? {
+        let current: SFTPChannel?
         switch role {
         case .browse: current = browse
         case .interactive: current = interactive
@@ -298,19 +298,19 @@ public actor SSHConnection: RemoteSession {
         return link
     }
 
-    func withInteractive<T>(_ body: (SFTPLink) async throws -> T) async throws -> T {
+    func withInteractive<T>(_ body: (SFTPChannel) async throws -> T) async throws -> T {
         if let link = await liveLink(.interactive) { return try await body(link) }
         return try await withData(body)
     }
 
-    func withData<T>(_ body: (SFTPLink) async throws -> T) async throws -> T {
+    func withData<T>(_ body: (SFTPChannel) async throws -> T) async throws -> T {
         let link = try await acquire()
         defer { release(link) }
         return try await body(link)
     }
 
-    private func acquire() async throws -> SFTPLink {
-        var open: [SFTPLink] = []
+    private func acquire() async throws -> SFTPChannel {
+        var open: [SFTPChannel] = []
         for link in pool where await link.isOpen { open.append(link) }
         pool = open
         if let free = pool.first(where: { !busy.contains(ObjectIdentifier($0)) }) {
@@ -332,7 +332,7 @@ public actor SSHConnection: RemoteSession {
         return try await withCheckedThrowingContinuation { waiters.append($0) }
     }
 
-    private func release(_ link: SFTPLink) {
+    private func release(_ link: SFTPChannel) {
         let id = ObjectIdentifier(link)
         busy.remove(id)
         guard !waiters.isEmpty else { return }
@@ -340,7 +340,7 @@ public actor SSHConnection: RemoteSession {
         waiters.removeFirst().resume(returning: link)
     }
 
-    private func openLink(_ role: ChannelRole) async throws -> SFTPLink {
+    private func openLink(_ role: ChannelRole) async throws -> SFTPChannel {
         guard master?.isRunning == true else { throw TransferError.notConnected }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
@@ -357,7 +357,7 @@ public actor SSHConnection: RemoteSession {
         _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         try process.run()
         let chunks = ChunkPipe()
-        let link = SFTPLink(
+        let link = SFTPChannel(
             role: role,
             process: process,
             input: input.fileHandleForWriting,
@@ -642,6 +642,15 @@ public actor SSHConnection: RemoteSession {
         if flag.fired { throw TransferError.timeout((launch as NSString).lastPathComponent) }
         return result
     }
+}
+
+/// The SFTP channels on one master: three reserved passengers opened at login, and data channels
+/// opened on demand.
+enum ChannelRole {
+    case browse
+    case interactive
+    case walker
+    case data
 }
 
 private struct CommandResult {

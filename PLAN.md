@@ -344,7 +344,7 @@ A Core function returns a decision, such as "this file is editable" or "skip thi
 - `TransferProgress`, `OperationState`: queued, active, paused, succeeded, failed, canceled.
 - `HostKeyEvent`: unchanged, first seen, changed, plus the key type and SHA256 fingerprint. The sheet is not in Core.
 - `ProbeResult`: the boolean and the version line. Parsing stdout is pure. Running the process is not.
-- `SftpURL`: one password-free `sftp://` string for a path.
+- `SFTPURL`: one password-free `sftp://` string for a path.
 - `BrowserSnapshot`: connection, path, selection (raw paths), view mode, sort, hidden-files flag. A value, not an `@Observable` object.
 - `LiveDecision` with `LiveState`, `LiveStamp`, `LiveLocal`, `LiveServerFact`, and `LiveAction`: the Live sync rules as one pure function.
 - `TreeEntry`, `ClipTally`, `ClipText`, `PasteRules`, `TreeCheck`: what a copied tree holds, the clipboard bar's words, where a paste lands, and whether a copy is complete before a move removes its source.

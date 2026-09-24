@@ -23,7 +23,7 @@ public enum Preferences {
 
 public enum SidebarItem: Hashable {
     case server(ConnectionID)
-    case pin(RemotePath)
+    case star(RemotePath)
     case live(RemotePath)
     case conflict(RemotePath)
 }
@@ -43,9 +43,9 @@ public final class TransferModel {
     public var columns: [RemotePath: [RemoteItem]] = [:]
     public var columnRoot: RemotePath?
     public var operations: [TransferOperation] = []
-    public var pins: [RemotePath] = []
+    public var stars: [RemotePath] = []
     /// Whether each starred path is a folder, from the server, so a starred file is never listed.
-    @ObservationIgnored private var pinIsFolder: [RemotePath: Bool] = [:]
+    @ObservationIgnored private var starIsFolder: [RemotePath: Bool] = [:]
     public var liveFiles: [LiveFile] = [] {
         didSet { liveByPath = Dictionary(liveFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first }) }
     }
@@ -201,7 +201,7 @@ public final class TransferModel {
             backStack.removeAll()
             forwardStack.removeAll()
             columns.removeAll()
-            pinIsFolder.removeAll()
+            starIsFolder.removeAll()
             loadPreferences(for: connection.id)
             status = connection.displayName
             snapshot.path = path
@@ -230,7 +230,7 @@ public final class TransferModel {
     /// Opens an `sftp://` link here: the saved server it names, at its folder or with its file
     /// selected. A server not in the library opens the New Connection sheet, filled in from the
     /// link; nothing is saved until Connect.
-    public func open(link: SftpLink) async {
+    public func open(link: SFTPURL) async {
         if let connection = await provider.connection(matching: link) {
             await connect(connection, landing: link.path)
             return
@@ -246,7 +246,7 @@ public final class TransferModel {
         snapshot.connectionID = nil
         items = []
         columns.removeAll()
-        pinIsFolder.removeAll()
+        starIsFolder.removeAll()
         liveFiles = []
         status = "Not connected"
     }
@@ -961,28 +961,28 @@ public final class TransferModel {
     }
 
     public func isStarred(_ path: RemotePath) -> Bool {
-        pins.contains(path)
+        stars.contains(path)
     }
 
     /// Starred entries whose kind is unknown are treated as folders; a starred file is one the
     /// user has seen listed, so its kind is in a cached listing.
     public func starredIsFolder(_ path: RemotePath) -> Bool {
-        if let known = pinIsFolder[path] { return known }
+        if let known = starIsFolder[path] { return known }
         guard let parent = path.parent, let item = columns[parent]?.first(where: { $0.path == path }) else { return true }
         return item.kind == .directory
     }
 
     /// Asks the server about `path` once, following a link, and remembers the answer.
     private func learnStarred(_ path: RemotePath, session: any RemoteSession) async {
-        guard pinIsFolder[path] == nil else { return }
+        guard starIsFolder[path] == nil else { return }
         guard let item = try? await session.stat(path), let target = try? await Self.resolveLink(item, session: session) else { return }
-        pinIsFolder[path] = target.kind == .directory
+        starIsFolder[path] = target.kind == .directory
     }
 
     /// Starred files and folders sit in the sidebar for one-click return.
     public func setStarred(_ paths: [RemotePath], _ starred: Bool) async {
         for path in paths {
-            if starred { await session?.pin(path) } else { await session?.unpin(path); pinIsFolder[path] = nil }
+            if starred { await session?.star(path) } else { await session?.unstar(path); starIsFolder[path] = nil }
         }
         await reloadSidebars()
     }
@@ -1071,7 +1071,7 @@ public final class TransferModel {
     public func copyRemoteURL() {
         guard let connection = currentConnection else { return }
         let paths = snapshot.selection.isEmpty ? [snapshot.path] : Array(snapshot.selection)
-        let text = paths.map { SftpURL.string(connection: connection, path: $0) }.joined(separator: "\n")
+        let text = paths.map { SFTPURL.string(connection: connection, path: $0) }.joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
@@ -1114,7 +1114,7 @@ public final class TransferModel {
         case .server(let id):
             guard let connection = connections.first(where: { $0.id == id }) else { return }
             if snapshot.connectionID != id { await connect(connection) }
-        case .pin(let path):
+        case .star(let path):
             // A starred folder opens; a starred file is revealed in its folder.
             if let session { await learnStarred(path, session: session) }
             if starredIsFolder(path) { await navigate(path) } else { await reveal(path) }
@@ -1139,10 +1139,10 @@ public final class TransferModel {
 
     private func reloadSidebars() async {
         guard let session else { return }
-        let starred = await session.pins()
+        let starred = await session.stars()
         // Learn each star's kind before publishing, so the sidebar draws the right icon at once.
         for path in starred { await learnStarred(path, session: session) }
-        pins = starred
+        stars = starred
         liveFiles = await session.liveFiles()
         conflicts = liveFiles.filter(\.conflict).map(\.path)
     }

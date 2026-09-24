@@ -10,14 +10,14 @@ extension SSHConnection {
 
     public func remove(_ path: RemotePath) async throws {
         try await live.remove(path, on: connection.id) {
-            let link: SFTPLink
+            let link: SFTPChannel
             if let walker = await self.liveLink(.walker) { link = walker } else { link = try await self.metadataLink() }
             try await self.removeTree(path, link: link)
         }
         if let parent = path.parent { pipe.emit(.directoryChanged(parent)) }
     }
 
-    private func removeTree(_ path: RemotePath, link: SFTPLink) async throws {
+    private func removeTree(_ path: RemotePath, link: SFTPChannel) async throws {
         let item = try await link.lstat(path)
         if item.kind == .directory {
             for try await child in await link.list(path) {
@@ -154,7 +154,7 @@ extension SSHConnection {
 
     /// The item at `path`, or nil when there is none. Any other failure, such as a dropped
     /// connection, is thrown: it is not evidence that the file was removed.
-    func existing(_ path: RemotePath, on link: SFTPLink? = nil) async throws -> RemoteItem? {
+    func existing(_ path: RemotePath, on link: SFTPChannel? = nil) async throws -> RemoteItem? {
         do {
             if let link { return try await link.lstat(path) }
             return try await stat(path)
@@ -167,7 +167,7 @@ extension SSHConnection {
 
     public func copyDirectory(from remote: RemotePath, to local: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let tally = ProgressTally(progress)
-        let link: SFTPLink
+        let link: SFTPChannel
         if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
         try await withThrowingTaskGroup(of: Void.self) { group in
             try await walkDownload(remote, to: local, link: link, group: &group, tally: tally)
@@ -178,7 +178,7 @@ extension SSHConnection {
     private func walkDownload(
         _ remote: RemotePath,
         to local: URL,
-        link: SFTPLink,
+        link: SFTPChannel,
         group: inout ThrowingTaskGroup<Void, Error>,
         tally: ProgressTally
     ) async throws {
@@ -266,7 +266,7 @@ extension SSHConnection {
         let tally = ProgressTally(progress)
         switch item.kind {
         case .directory:
-            let link: SFTPLink
+            let link: SFTPChannel
             if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
             try await withThrowingTaskGroup(of: Void.self) { group in
                 try await walkCopy(source, to: destination, link: link, group: &group, tally: tally)
@@ -287,7 +287,7 @@ extension SSHConnection {
     private func walkCopy(
         _ source: RemotePath,
         to destination: RemotePath,
-        link: SFTPLink,
+        link: SFTPChannel,
         group: inout ThrowingTaskGroup<Void, Error>,
         tally: ProgressTally
     ) async throws {
@@ -321,7 +321,7 @@ extension SSHConnection {
     }
 
     /// A link is copied as a link. One already at the destination is left alone.
-    private func copyLink(_ source: RemotePath, to destination: RemotePath, link: SFTPLink) async throws {
+    private func copyLink(_ source: RemotePath, to destination: RemotePath, link: SFTPChannel) async throws {
         if (try? await stat(destination)) != nil { return }
         let target = try await link.readlink(source)
         try await metadataLink().symlink(target: target, link: destination)
@@ -358,7 +358,7 @@ extension SSHConnection {
     }
 
     public func walkTree(_ root: RemotePath, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {
-        let link: SFTPLink
+        let link: SFTPChannel
         if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
         let item = try await link.lstat(root)
         visit("", TreeEntry(item))
@@ -366,7 +366,7 @@ extension SSHConnection {
         try await walk(root, prefix: "", link: link, visit: visit)
     }
 
-    private func walk(_ folder: RemotePath, prefix: String, link: SFTPLink, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {
+    private func walk(_ folder: RemotePath, prefix: String, link: SFTPChannel, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {
         for try await child in await link.list(folder) {
             try Task.checkCancellation()
             guard child.kind != .other else { continue }

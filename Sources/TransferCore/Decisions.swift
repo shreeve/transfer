@@ -132,26 +132,6 @@ public struct ProbeResult: Equatable, Sendable {
     }
 }
 
-public enum SftpURL {
-    public static func string(connection: SavedConnection, path: RemotePath) -> String {
-        var host = connection.host
-        if !connection.port.isEmpty { host += ":\(connection.port)" }
-        let user = connection.user.trimmingCharacters(in: .whitespaces)
-        let authority = user.isEmpty ? host : "\(percent(user))@\(host)"
-        let encoded = path.display.split(separator: "/", omittingEmptySubsequences: false).map {
-            percent(String($0))
-        }.joined(separator: "/")
-        let suffix = encoded.hasPrefix("/") ? encoded : "/" + encoded
-        return "sftp://\(authority)\(suffix)"
-    }
-
-    private static func percent(_ value: String) -> String {
-        var allowed = CharacterSet.urlPathAllowed
-        allowed.remove(charactersIn: "/@:?#[]")
-        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-    }
-}
-
 public enum OperationState: String, Hashable, Sendable, Codable {
     case queued
     case active

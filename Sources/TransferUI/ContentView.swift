@@ -55,12 +55,12 @@ struct SidebarColumn: View {
                 Button("Add Server…") { model.newConnection() }
                     .buttonStyle(.link)
             }
-            if !model.pins.isEmpty {
+            if !model.stars.isEmpty {
                 Section("Starred") {
-                    ForEach(model.pins, id: \.self) { path in
+                    ForEach(model.stars, id: \.self) { path in
                         Label(folderName(path), systemImage: model.starredIsFolder(path) ? "star" : "star.fill")
                             .help(path.display)
-                            .tag(SidebarItem.pin(path))
+                            .tag(SidebarItem.star(path))
                             // A double-click opens the item the way the browser would: Live or view for a
                             // file, after revealing it, and its listing for a folder.
                             .onTapGesture(count: 2) { Task { await model.openStarred(path) } }

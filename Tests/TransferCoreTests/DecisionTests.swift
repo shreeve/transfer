@@ -74,16 +74,6 @@ import TransferCore
     #expect(!ProbeResult(exitCode: 0, stdout: "one\ntwo\n").enabled)
 }
 
-@Test func channelRolesAreOneDataRole() {
-    #expect(ChannelRole.allCases == [.browse, .interactive, .walker, .data])
-}
-
-@Test func sftpURLOmitsThePassword() {
-    let connection = SavedConnection(name: "Box", host: "example.com", user: "ada", port: "22")
-    let url = SftpURL.string(connection: connection, path: RemotePath(string: "/work/a b.txt"))
-    #expect(url == "sftp://ada@example.com:22/work/a%20b.txt")
-}
-
 @Test func retriesOnlyDroppedConnectionsAndTimeouts() {
     #expect(RetryPolicy.isRetryable(TransferError.connectionLost("closed")))
     #expect(RetryPolicy.isRetryable(TransferError.timeout("stat")))

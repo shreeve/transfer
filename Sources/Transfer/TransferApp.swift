@@ -242,7 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `sftp://` links, such as a Command-click on one a terminal shows.
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
-            if let link = SftpLink(url: url) { LinkInbox.deliver(link) }
+            if let link = SFTPURL(url: url) { LinkInbox.deliver(link) }
         }
     }
 

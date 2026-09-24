@@ -15,7 +15,7 @@ final class ChunkPipe: @unchecked Sendable {
     func finish() { continuation.finish() }
 }
 
-actor SFTPLink {
+actor SFTPChannel {
     let role: ChannelRole
     private let process: Process
     private let input: FileHandle
