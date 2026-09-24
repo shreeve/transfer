@@ -202,6 +202,7 @@ public final class TransferModel {
     @ObservationIgnored private var liveRowSessions: [String: any RemoteSession] = [:]
     @ObservationIgnored private var sidebarReload: Task<Void, Never>?
     @ObservationIgnored private var sidebarReloadAgain = false
+    @ObservationIgnored private var observers: [any NSObjectProtocol] = []
 
     /// One queued transfer. It keeps the server it was queued for: a retry, a Resume, or a
     /// Retry after a failure runs there even when the window has moved to another server.
@@ -226,8 +227,6 @@ public final class TransferModel {
             snapshot.viewMode = mode
         }
     }
-
-    @ObservationIgnored private var observers: [any NSObjectProtocol] = []
 
     /// Loads the library and follows changes to preferences and to the library. The window
     /// calls it once it is on screen.
@@ -1378,9 +1377,14 @@ public final class TransferModel {
 
     /// Asks the server about `path` once, following a link, and remembers the answer.
     private func learnStarred(_ path: RemotePath, session: any RemoteSession) async {
-        guard starIsFolder[path] == nil else { return }
-        guard let item = try? await session.stat(path), let target = try? await Self.resolveLink(item, session: session) else { return }
-        starIsFolder[path] = target.kind == .directory
+        guard starIsFolder[path] == nil, let isFolder = await Self.isFolder(path, session: session) else { return }
+        starIsFolder[path] = isFolder
+    }
+
+    /// Whether `path` is a folder, through a link; nil when the server cannot say.
+    private static func isFolder(_ path: RemotePath, session: any RemoteSession) async -> Bool? {
+        guard let item = try? await session.stat(path), let target = try? await resolveLink(item, session: session) else { return nil }
+        return target.kind == .directory
     }
 
     /// Starred files and folders sit in the sidebar for one-click return.
@@ -1450,7 +1454,7 @@ public final class TransferModel {
     }
 
     public func discardSelectedLive() async {
-        for item in selectedItems where liveFiles.contains(where: { $0.path == item.path }) {
+        for item in selectedItems where liveByPath[item.path] != nil {
             await discardLive(item.path)
         }
     }
@@ -1581,10 +1585,7 @@ public final class TransferModel {
         guard !unknown.isEmpty else { return }
         let learned = await withTaskGroup(of: (RemotePath, Bool)?.self) { group in
             for path in unknown {
-                group.addTask {
-                    guard let item = try? await session.stat(path), let target = try? await Self.resolveLink(item, session: session) else { return nil }
-                    return (path, target.kind == .directory)
-                }
+                group.addTask { await Self.isFolder(path, session: session).map { (path, $0) } }
             }
             var found: [(RemotePath, Bool)] = []
             for await answer in group { if let answer { found.append(answer) } }
