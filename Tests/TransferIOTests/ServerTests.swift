@@ -3,86 +3,16 @@ import Testing
 import TransferCore
 @testable import TransferIO
 
-/// These run only against a local sshd. Start one with `Scripts/local-sshd.sh` and export the
-/// variables it prints: TRANSFER_TEST_PORT and TRANSFER_TEST_IDENTITY.
+/// The real SSH master, SFTP channels, copies, and Live sync against the local sshd
+/// (`ServerHarness`).
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct ServerTests {
-    private static var port: String? { ProcessInfo.processInfo.environment["TRANSFER_TEST_PORT"] }
-    private static var identity: String? { ProcessInfo.processInfo.environment["TRANSFER_TEST_IDENTITY"] }
-
-    private struct Harness {
-        let session: SSHConnection
-        let root: URL
-        let remote: URL
-        let prompts: TestPrompts
-
-        var remotePath: RemotePath { RemotePath(string: remote.path) }
-
-        func cleanUp() async {
-            await session.disconnect()
-            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
-        }
-    }
-
-    private final class TestPrompts: PromptSink, @unchecked Sendable {
-        var hostDecision: HostKeyDecision = .trustOnce
-        var collision: NameCollisionChoice = .replace
-        var collisions = 0
-
-        func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-        func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { hostDecision }
-        func resolveCollision(fileName: String) async -> NameCollisionChoice? {
-            collisions += 1
-            return collision
-        }
-    }
-
-    private func harness(_ name: String) throws -> Harness? {
-        guard let port = Self.port, let identity = Self.identity else { return nil }
-        // Short on purpose: the control socket lives under this root and socket paths are capped at 104 bytes.
-        let base = TestCaches.fresh(name)
-        let root = base.appendingPathComponent("library", isDirectory: true)
-        let remote = base.appendingPathComponent("remote", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: remote, withIntermediateDirectories: true)
-            let store = try Store(root: root)
-            let saved = SavedConnection(name: name, host: "127.0.0.1", user: NSUserName(), port: port, identityFile: identity, remotePath: remote.path)
-            let session = SSHConnection(connection: saved, store: store, editableExtensions: TransferConfig.builtIn.extensionSet)
-            return Harness(session: session, root: root, remote: remote, prompts: TestPrompts())
-        } catch {
-            try? FileManager.default.removeItem(at: base)
-            throw error
-        }
-    }
-
-    /// Runs `body` with a fresh harness and always awaits its cleanup, when it throws too. Its
-    /// prompts answer for every operation, as a window's do. Does nothing without a server.
-    private func withHarness(_ name: String, _ body: (Harness) async throws -> Void) async throws {
-        guard let h = try harness(name) else { return }
-        do {
-            try await OperationPrompts.$current.withValue(h.prompts) { try await body(h) }
-        } catch {
-            await h.cleanUp()
-            throw error
-        }
-        await h.cleanUp()
-    }
-
     private func randomData(_ count: Int) -> Data {
         var data = Data(count: count)
         data.withUnsafeMutableBytes { buffer in
             for index in 0..<count { buffer[index] = UInt8.random(in: 0...255) }
         }
         return data
-    }
-
-    private func waitUntil(_ seconds: Double = 8, _ condition: () async -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-        return await condition()
     }
 
     @Test func loginListsAndMovesBytes() async throws {
@@ -283,10 +213,6 @@ struct ServerTests {
             try Data("first".utf8).write(to: remoteFile)
             let path = h.remotePath.appending(name: Array("note.txt".utf8))
 
-            let events = EventLog()
-            let stream = h.session.events()
-            let logger = Task { for await event in stream { events.record(event) } }
-
             let local = try await h.session.prepareLiveFile(path)
             #expect(try Data(contentsOf: local) == Data("first".utf8))
             #expect(local.path.contains("/Live/"))
@@ -309,10 +235,10 @@ struct ServerTests {
             try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)], ofItemAtPath: remoteFile.path)
             try Data("third".utf8).write(to: local)
             // The event reaches the log through its own task, a moment after the flag is set.
-            let conflicted = await waitUntil { await h.session.liveFiles().first?.conflict == true && events.conflicts.contains(path) }
+            let conflicted = await waitUntil { await h.session.liveFiles().first?.conflict == true && h.events.conflicts(path) > 0 }
             #expect(conflicted)
             #expect(try Data(contentsOf: remoteFile) == Data("remote-edit".utf8))
-            #expect(events.conflicts.contains(path))
+            #expect(h.events.conflicts(path) > 0)
             #expect(FileManager.default.fileExists(atPath: local.deletingLastPathComponent().appendingPathComponent("note.txt (server)").path))
 
             try await h.session.resolveLive(path, choice: .keepLocal)
@@ -339,7 +265,6 @@ struct ServerTests {
             try await h.session.discardLiveFile(renamed, force: false)
             #expect(await h.session.liveFiles().isEmpty)
             #expect(!FileManager.default.fileExists(atPath: local.deletingLastPathComponent().path))
-            logger.cancel()
             await h.session.disconnect()
         }
     }
@@ -407,13 +332,12 @@ struct ServerTests {
             // Edited while Transfer was closed.
             try Data("v2-offline".utf8).write(to: local)
 
-            let store = try Store(root: h.root)
-            let again = SSHConnection(connection: h.session.connection, store: store, editableExtensions: TransferConfig.builtIn.extensionSet)
-            _ = try await again.connect(prompts: h.prompts)
-            #expect(await again.liveFiles().map(\.path) == [path])
-            let uploaded = await waitUntil { (try? Data(contentsOf: remoteFile)) == Data("v2-offline".utf8) }
-            #expect(uploaded)
-            await again.disconnect()
+            try await h.withSecondSession { again in
+                _ = try await again.connect(prompts: h.prompts)
+                #expect(await again.liveFiles().map(\.path) == [path])
+                let uploaded = await waitUntil { (try? Data(contentsOf: remoteFile)) == Data("v2-offline".utf8) }
+                #expect(uploaded)
+            }
         }
     }
 
@@ -425,23 +349,6 @@ struct ServerTests {
             }
             #expect(await h.session.isConnected == false)
         }
-    }
-}
-
-private final class EventLog: @unchecked Sendable {
-    private let lock = NSLock()
-    private var events: [SessionEvent] = []
-
-    func record(_ event: SessionEvent) {
-        lock.lock()
-        events.append(event)
-        lock.unlock()
-    }
-
-    var conflicts: [RemotePath] {
-        lock.lock()
-        defer { lock.unlock() }
-        return events.compactMap { if case .conflict(let path, _) = $0 { path } else { nil } }
     }
 }
 

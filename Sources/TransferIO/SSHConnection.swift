@@ -27,15 +27,19 @@ public actor SSHConnection: RemoteSession {
     /// Live files are `LiveSync`'s; this connection is its `LiveServer` and forwards the Live API.
     let live: LiveSync
     private let ownsLive: Bool
+    /// A config file every ssh this connection runs reads with `-F` in place of `~/.ssh/config`.
+    /// Nil in the app. Tests set it so they never read the developer's config or known hosts.
+    private let sshConfigFile: String?
 
     /// The hub passes its one `LiveSync`. Without one, as in tests, the connection makes its own
     /// and closes it on disconnect.
-    init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync? = nil) {
+    init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync? = nil, sshConfigFile: String? = nil) {
         self.connection = connection
         self.store = store
         self.editableExtensions = editableExtensions
         self.live = live ?? LiveSync(store: store)
         ownsLive = live == nil
+        self.sshConfigFile = sshConfigFile
     }
 
     public nonisolated func events() -> AsyncStream<SessionEvent> { pipe.stream() }
@@ -241,7 +245,8 @@ public actor SSHConnection: RemoteSession {
     public func terminalCommand(directory: RemotePath) async -> String? {
         guard isConnected else { return nil }
         let remote = "cd \(Self.quote(directory.display)) && exec \"$SHELL\" -l"
-        return "/usr/bin/ssh -S \(Self.quote(socketPath)) -o Compression=no -t -- \(Self.quote(connection.destination)) \(Self.quote(remote))"
+        let config = sshConfigFile.map { " -F \(Self.quote($0))" } ?? ""
+        return "/usr/bin/ssh -S \(Self.quote(socketPath))\(config) -o Compression=no -t -- \(Self.quote(connection.destination)) \(Self.quote(remote))"
     }
 
     private static func quote(_ value: String) -> String {
@@ -329,7 +334,7 @@ public actor SSHConnection: RemoteSession {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         // With -s the subsystem name is the command argument, so it must follow the destination.
-        process.arguments = ["-S", socketPath, "-o", "Compression=no", "-o", "ControlMaster=no", "-s", "--", connection.destination, "sftp"]
+        process.arguments = configArguments + ["-S", socketPath, "-o", "Compression=no", "-o", "ControlMaster=no", "-s", "--", connection.destination, "sftp"]
         let input = Pipe()
         let output = Pipe()
         process.standardInput = input
@@ -389,7 +394,11 @@ public actor SSHConnection: RemoteSession {
         arguments += hostKeyArguments
         arguments += destinationArguments
         arguments += ["--", connection.destination]
-        return arguments
+        return configArguments + arguments
+    }
+
+    private var configArguments: [String] {
+        sshConfigFile.map { ["-F", $0] } ?? []
     }
 
     /// Learns the offered key with a no-auth ssh run, compares it with the known-hosts files `ssh -G`
@@ -578,7 +587,7 @@ public actor SSHConnection: RemoteSession {
     // MARK: Processes
 
     private func run(arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
-        try await run(launch: "/usr/bin/ssh", arguments: arguments, timeout: timeout)
+        try await run(launch: "/usr/bin/ssh", arguments: configArguments + arguments, timeout: timeout)
     }
 
     private func run(launch: String, arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
