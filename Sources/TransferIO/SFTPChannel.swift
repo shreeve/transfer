@@ -346,22 +346,33 @@ actor SFTPChannel {
         }
     }
 
-    /// Downloads `path` into `destination` over this channel alone.
-    func download(_ path: RemotePath, to destination: URL, size: UInt64?, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    /// Downloads `path` into `destination` over this channel alone; `matching` as for `receive`.
+    func download(_ path: RemotePath, to destination: URL, size: UInt64?, matching print: Fingerprint? = nil,
+                  progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let parts = try DownloadParts(destination, size: size, progress: progress)
-        try await receive(path, into: parts)
+        try await receive(path, into: parts, matching: print)
         try parts.finish()
     }
 
     /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight, until nothing is
-    /// left to ask for. With `matching`, a second channel helps only if the file it opened is still
-    /// the one listed, so a file replaced meanwhile is never read in pieces from two versions.
-    func receive(_ path: RemotePath, into parts: DownloadParts, matching print: Fingerprint? = nil) async throws {
+    /// left to ask for. With `matching`, the file opened must still be the one listed: the plan
+    /// stops at the listed size, so a file that grew would arrive cut short and look complete.
+    /// The channel that owns the download throws when it is not, checking with its first READs
+    /// and before writing a byte; one `helping` leaves it alone, so a file replaced meanwhile is
+    /// never read in pieces from two versions.
+    func receive(_ path: RemotePath, into parts: DownloadParts, matching print: Fingerprint? = nil, helping: Bool = false) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxRead)
         defer { closeSoon([handle]) }
-        if let print, try await fstat(handle) != print { return }
+        var check: UInt32?
+        if let print {
+            if helping {
+                if try await fstat(handle) != print { return }
+            } else {
+                check = try send(SFTPCode.fstat) { $0.appendBlob(handle) }
+            }
+        }
         var inFlight: [(offset: UInt64, length: UInt32, id: UInt32)] = []
-        defer { for read in inFlight { abandon(read.id) } }
+        defer { for id in inFlight.map(\.id) + (check.map { [$0] } ?? []) { abandon(id) } }
         while true {
             try Task.checkCancellation()
             while inFlight.count < 32, let request = parts.nextRequest() {
@@ -371,6 +382,12 @@ actor SFTPChannel {
                     $0.appendU32(request.length)
                 }
                 inFlight.append((request.offset, request.length, id))
+            }
+            if let id = check {
+                check = nil
+                guard Fingerprint(item: try item(path: path, message: await reply(id))) == print else {
+                    throw TransferError.failed("“\(path.name)” changed on the server while it downloaded")
+                }
             }
             guard !inFlight.isEmpty else { break }
             let read = inFlight.removeFirst()

@@ -182,18 +182,21 @@ extension SSHConnection {
     static let stripeWidth = 4
 
     /// Reads the server's file into `file` over one data channel, which a small file shares with
-    /// others, and a large one also over the channels free now.
+    /// others, and a large one also over the channels free now. Every channel checks that the file
+    /// it opened is still the one `info` lists, whose size says where to stop.
     private func receive(_ path: RemotePath, info: RemoteItem, into file: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
-        // A second channel opens the file again, and helps only when that is still the same file.
-        guard let size = info.size, size >= Self.stripeSize, let print = Fingerprint(item: info) else {
+        let print = Fingerprint(item: info)
+        guard let size = info.size, size >= Self.stripeSize, let print else {
             // The channel creates the file, off this actor, once the job holds the channel.
             return try await withData(DataShare(size: info.size)) { link in
-                try await link.download(path, to: file, size: info.size, progress: progress)
+                try await link.download(path, to: file, size: info.size, matching: print, progress: progress)
             }
         }
         try await withData(.whole) { link in
             let parts = try DownloadParts(file, size: size, progress: progress)
-            try await striped({ try await link.receive(path, into: parts) }) { try await $0.receive(path, into: parts, matching: print) }
+            try await striped({ try await link.receive(path, into: parts, matching: print) }) {
+                try await $0.receive(path, into: parts, matching: print, helping: true)
+            }
             try parts.finish()
         }
     }
