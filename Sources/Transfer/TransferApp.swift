@@ -67,7 +67,7 @@ struct TransferApp: App {
                     .keyboardShortcut(.return, modifiers: [])
                     .disabled(primary == nil || !plainKeys)
                 Button("Forget Synced Live Files") { Task { await model?.forgetSyncedLive() } }
-                    .disabled(model?.liveFiles.contains { !$0.dirty && !$0.uploading && !$0.conflict } != true)
+                    .disabled(model?.liveFiles.contains(where: \.isSynced) != true)
                 Button("Discard Live File") { Task { await model?.discardSelectedLive() } }
                     .disabled(model.map { m in m.liveFiles.contains { m.snapshot.selection.contains($0.path) } } != true)
             }

@@ -131,13 +131,14 @@ extension TransferModel {
     /// Down from the source server into a scratch folder, then up to this one, one item at a
     /// time. A move removes each original only once `MoveCheck` says this move wrote its copy.
     private func pasteAcross(_ paths: [RemotePath], from source: any RemoteSession, into folder: RemotePath, session: any RemoteSession, moving: Bool, clip: Clipboard.Clip) {
-        let prompts = prompts
+        // The source server may need its own login; its sheets name it, not this window's server.
+        let login = prompts.login(source.connection)
         let tally = clip.tally
         let clipID = clip.id
         let state = Locked(PasteState())
         let parents = Set(paths.compactMap(\.parent))
         enqueue(title: Self.title(moving ? "Move" : "Paste", paths.map(\.name)), path: folder) { progress in
-            if !(await source.isConnected) { _ = try await source.connect(prompts: prompts) }
+            if !(await source.isConnected) { _ = try await source.connect(prompts: login) }
             if moving, !state.value.checked {
                 let same = try await Self.sameFolder(folder, on: session) { name in
                     for parent in parents {
