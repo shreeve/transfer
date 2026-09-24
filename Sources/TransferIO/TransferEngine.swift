@@ -101,13 +101,15 @@ struct TransferEngine {
             let local = scratch.appendingPathComponent(String(index))
             defer { try? FileManager.default.removeItem(at: local) }
             let target = request.folder.appending(name: path.nameBytes)
+            var mark: UInt64 = 0
             let reason = try await place(index, at: target) {
                 try await source.download(path, to: local, progress: sum.next())
                 try await destination.upload(local, to: target, tally: tally(index, sum.next()))
             } original: {
-                try await source.tree(path)
-            } remove: {
-                try await source.remove(path)
+                mark = await source.live.saveMark()
+                return try await source.tree(path)
+            } remove: { verified in
+                try await source.removeMoved(path, verified: verified, savedSince: mark)
             }
             if let reason { kept.append(TransferKept.Item(path.name, reason)) }
         }
@@ -127,8 +129,10 @@ struct TransferEngine {
                 try await destination.upload(url, to: target, tally: tally(index, sum.next()))
             } original: {
                 try LocalTree.entries(url)
-            } remove: {
+            } remove: { _ in
+                // The Trash keeps anything added since the walk too, where the user can find it.
                 try trash(url)
+                return true
             }
             if let reason { kept.append(TransferKept.Item(url.lastPathComponent, reason)) }
         }
@@ -137,22 +141,24 @@ struct TransferEngine {
 
     // MARK: The move's checks
 
-    /// Copies source `index` to `target`. A move then walks the `original` and removes it only
-    /// when `MoveCheck` passes; a Live file under it with unsynced edits keeps it too. Returns
-    /// why the original was kept, or nil once the item is done.
+    /// Copies source `index` to `target`. A move then walks the `original` and, only when
+    /// `MoveCheck` passes, has `remove` take what the walk found, which says whether all of it went;
+    /// a Live file under it with unsynced edits keeps it too. Returns why the original was kept,
+    /// or nil once the item is done.
     private func place(
         _ index: Int,
         at target: RemotePath,
         copy: () async throws -> Void,
         original: () async throws -> [TreeKey: TreeEntry],
-        remove: () async throws -> Void
+        remove: ([TreeKey: TreeEntry]) async throws -> Bool
     ) async throws -> TransferKept.Reason? {
         try await snapshot(index, target)
         try await copy()
         if request.moving {
-            if let reason = try await keptReason(index, target: target, source: try await original()) { return reason }
+            let tree = try await original()
+            if let reason = try await keptReason(index, target: target, source: tree) { return reason }
             do {
-                try await remove()
+                if try await !remove(tree) { return .changed }
             } catch TransferError.liveUnsynced(let count) {
                 return .live(count)
             }

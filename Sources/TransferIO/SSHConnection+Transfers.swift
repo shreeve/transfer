@@ -11,10 +11,32 @@ extension SSHConnection {
     public func remove(_ path: RemotePath) async throws {
         try await live.remove(path, on: connection.id) {
             let link = try await self.walkerLink()
-            try await self.removeTree(path, folder: try await link.lstat(path).kind == .directory, link: link)
+            _ = try await self.removeTree(path, as: TreeEntry(try await link.lstat(path)), link: link)
         }
         if let parent = path.parent { pipe.emit(.directoryChanged(parent)) }
     }
+
+    /// Removes a moved original: only what the move verified of it, `verified` by key as it was
+    /// then. A file changed or added since stays, with the folders holding it, and so does all of
+    /// it when a Live file under it was saved since `mark` (`LiveSync.saveMark`, read before the
+    /// walk): the copy lacks those bytes. Returns whether all of it went.
+    func removeMoved(_ path: RemotePath, verified: [TreeKey: TreeEntry], savedSince mark: UInt64) async throws -> Bool {
+        defer { if let parent = path.parent { pipe.emit(.directoryChanged(parent)) } }
+        do {
+            try await live.remove(path, on: connection.id) {
+                // Thrown when anything stays, so its Live files are not forgotten as removed. Those
+                // whose server file did go are settled by their next pass.
+                if await self.live.saved(under: path, on: self.connection.id, since: mark) { throw ChangedDuringMove() }
+                let link = try await self.walkerLink()
+                guard try await self.removeTree(path, as: TreeEntry(try await link.lstat(path)), verified: verified, link: link) else { throw ChangedDuringMove() }
+            }
+        } catch is ChangedDuringMove {
+            return false
+        }
+        return true
+    }
+
+    private struct ChangedDuringMove: Error {}
 
     /// The walker passenger, else the browse one.
     private func walkerLink() async throws -> SFTPChannel {
@@ -22,17 +44,27 @@ extension SSHConnection {
         return try await metadataLink()
     }
 
-    /// A folder is listed in full, closing its handle, before what it holds is removed: one handle
-    /// open at a time however deep the tree, and nothing is unlinked while the server reads it.
-    private func removeTree(_ path: RemotePath, folder: Bool, link: SFTPChannel) async throws {
-        guard folder else { return try await link.removeFile(path) }
+    /// Removes `path`, which is `entry` now, and what it holds; with `verified`, only entries that
+    /// are still as it holds them under `key`, and a folder only once it is empty. Returns whether
+    /// all of it went. A folder is listed in full, closing its handle, before what it holds is
+    /// removed: one handle open at a time however deep the tree, and nothing is unlinked while the
+    /// server reads it.
+    private func removeTree(_ path: RemotePath, as entry: TreeEntry, key: TreeKey = "", verified: [TreeKey: TreeEntry]? = nil, link: SFTPChannel) async throws -> Bool {
+        if let verified, verified[key] != entry { return false }
+        guard entry == .directory else {
+            try await link.removeFile(path)
+            return true
+        }
         var children: [RemoteItem] = []
         for try await child in await link.list(path) { children.append(child) }
+        var whole = true
         for child in children {
             try Task.checkCancellation()
-            try await removeTree(child.path, folder: child.kind == .directory, link: link)
+            let gone = try await removeTree(child.path, as: TreeEntry(child), key: key.appending(child.path.nameBytes), verified: verified, link: link)
+            whole = whole && gone
         }
-        try await link.removeDirectory(path)
+        if whole { try await link.removeDirectory(path) }
+        return whole
     }
 
     // MARK: Single files

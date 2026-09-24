@@ -214,6 +214,52 @@ struct MoveServerTests {
         }
     }
 
+    /// Removing a moved original listed each folder again and removed all it held, so a file added
+    /// or changed after the copy was verified went too, and its only copy with it (R-T2). Only the
+    /// verified entries go now; what changed stays, with the folders holding it.
+    @Test func aMovedOriginalLosesOnlyWhatWasVerified() async throws {
+        try await withHarness("verified", connected: true) { h in
+            let dir = try h.folder("dir", files: ["a.txt": "a", "sub/b.txt": "b", "sub/c.txt": "c", "gone/d.txt": "d"])
+            let verified = try await h.session.tree(dir)
+            try h.write("dir/sub/new.txt", "added")
+            try h.write("dir/sub/c.txt", "changed")
+            #expect(try await h.session.removeMoved(dir, verified: verified, savedSince: await h.live.saveMark()) == false)
+            #expect(try h.names("dir") == ["sub"])
+            #expect(try h.names("dir/sub") == ["c.txt", "new.txt"])
+
+            let unchanged = try h.folder("unchanged", files: ["x/y.txt": "y"])
+            #expect(try await h.session.removeMoved(unchanged, verified: try await h.session.tree(unchanged), savedSince: 0))
+            #expect(try !h.names("").contains("unchanged"))
+        }
+    }
+
+    /// A Live save that landed after the move walked its original and before the removal left
+    /// the removal a clean Live file: the original, holding the newer bytes, was removed and the
+    /// working copy with it (R-L2). The save here keeps the size and whole-second time the walk
+    /// saw, so only the Live save count tells.
+    @Test func aLiveSaveAfterTheWalkKeepsTheOriginal() async throws {
+        try await withHarness("lsave", connected: true) { h in
+            let dir = try h.folder("dir", files: ["note.txt": "first"])
+            try h.setTime("dir/note.txt", 1_700_000_000)
+            let local = try await h.session.prepareLiveFile(dir.appending("note.txt"))
+            let mark = await h.live.saveMark()
+            let verified = try await h.session.tree(dir)
+
+            let saved = h.staging.appendingPathComponent("note.txt")
+            try Data("FIRST".utf8).write(to: saved)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000.5)], ofItemAtPath: saved.path)
+            #expect(rename(saved.path, local.path) == 0)
+            #expect(await waitUntil { (try? h.read("dir/note.txt")) == "FIRST" })
+            #expect(await waitUntil { await h.session.liveFiles().first?.dirty == false })
+            #expect(try await h.session.tree(dir) == verified)
+
+            #expect(try await h.session.removeMoved(dir, verified: verified, savedSince: mark) == false)
+            #expect(try h.read("dir/note.txt") == "FIRST")
+            #expect(try Data(contentsOf: local) == Data("FIRST".utf8))
+            #expect(await h.session.liveFiles().count == 1)
+        }
+    }
+
     /// Files from this Mac go to the Trash only once their copy is verified; a folder holding a
     /// FIFO, which no copy can hold, stays. Moving a Mac folder onto itself on the server, which
     /// the local sshd serves from this very disk, removes nothing.

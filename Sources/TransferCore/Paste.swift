@@ -279,6 +279,8 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
         case incomplete
         /// Live files under the original with edits not yet on the server.
         case live(Int)
+        /// Something in the original changed after its copy was verified: what changed stayed.
+        case changed
 
         public init?(_ verdict: MoveCheck.Verdict) {
             switch verdict {
@@ -325,6 +327,8 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
                 "Kept \(list) \(place): the copy is not complete."
             case .live(let count):
                 "Kept \(list) \(place): \(TransferError.liveUnsynced(count).localizedDescription)."
+            case .changed:
+                "\(list) changed during the move, and what changed was kept \(place)."
             }
         }.joined(separator: " ")
     }

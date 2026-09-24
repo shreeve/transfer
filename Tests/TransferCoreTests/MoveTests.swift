@@ -54,6 +54,8 @@ import Testing
 @Test func keptItemsAreNamedOnceForEachReason() {
     let kept = TransferKept([.init("a", .incomplete), .init("b", .incomplete), .init("c", .live(2))], moving: true, place: "on this Mac")
     #expect(kept.localizedDescription == "Kept “a” and “b” on this Mac: the copy is not complete. Kept “c” on this Mac: 2 Live files have unsynced edits.")
+    #expect(TransferKept([.init("d", .changed)], moving: true, place: "on the other server").localizedDescription
+        == "“d” changed during the move, and what changed was kept on the other server.")
     #expect(TransferKept.Reason(.remove) == nil)
     #expect(TransferKept.Reason(.alreadyThere(["x"])) == .alreadyThere)
 }
