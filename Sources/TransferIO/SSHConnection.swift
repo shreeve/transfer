@@ -22,7 +22,6 @@ public actor SSHConnection: RemoteSession {
     private var busy: Set<ObjectIdentifier> = []
     private var waiters: [CheckedContinuation<SFTPChannel, Error>] = []
     private var poolRefused = false
-    private var performance = false
     private var prompted = false
     let pipe = EventPipe()
     let lane = InteractiveLane()
@@ -46,7 +45,6 @@ public actor SSHConnection: RemoteSession {
         editableExtensions = extensions
     }
 
-    public var performanceModeEnabled: Bool { performance }
     public var isConnected: Bool { startPath != nil && master?.isRunning == true }
     public var unsyncedLiveCount: Int { get async { await live.unsyncedCount(on: connection.id) } }
 
@@ -105,7 +103,6 @@ public actor SSHConnection: RemoteSession {
         process.terminationHandler = { [weak self] _ in
             Task { await self?.masterEnded() }
         }
-        performance = await probe() && PerformanceDirectoryCopy.available()
         let resolved: RemotePath
         do {
             browse = try await openLink(.browse)
@@ -152,7 +149,6 @@ public actor SSHConnection: RemoteSession {
         onceKnownHosts.removeAll()
         for folder in askDirectories { try? FileManager.default.removeItem(at: folder) }
         askDirectories.removeAll()
-        performance = false
         startPath = nil
     }
 
@@ -381,16 +377,7 @@ public actor SSHConnection: RemoteSession {
         }
     }
 
-    // MARK: Probe and host keys
-
-    private func probe() async -> Bool {
-        let result = try? await run(
-            arguments: ["-S", socketPath, "-o", "Compression=no", "--", connection.destination, "performance-version", "--probe"],
-            timeout: 10
-        )
-        guard let result else { return false }
-        return ProbeResult(exitCode: result.code, stdout: result.stdout).enabled
-    }
+    // MARK: Host keys
 
     /// Paths go through flags (`-i`, `-S`) or quoted `-o` values: ssh splits a bare `-o` value on
     /// spaces, and the library lives under "Application Support".

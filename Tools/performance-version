@@ -1,3 +1,0 @@
-#!/bin/sh
-printf 'performance-version 0\n'
-exit 2

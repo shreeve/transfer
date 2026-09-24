@@ -9,7 +9,6 @@ public enum TransferError: Error, Equatable, Sendable, LocalizedError {
     case noSuchFile(String)
     case failed(String)
     case typeMismatch(String)
-    case performanceUnavailable
     case connectionLost(String)
     case timeout(String)
     case liveUnsynced(Int)
@@ -24,7 +23,6 @@ public enum TransferError: Error, Equatable, Sendable, LocalizedError {
         case .noSuchFile(let text): "No such file: \(text)"
         case .failed(let text): text
         case .typeMismatch(let text): "A file and a folder share the name \(text)"
-        case .performanceUnavailable: "The fast copy engine is not available"
         case .connectionLost(let text): "Connection lost: \(text)"
         case .timeout(let text): "Timed out: \(text)"
         case .liveUnsynced(let count): "\(count) Live file\(count == 1 ? " has" : "s have") unsynced edits"
@@ -128,7 +126,6 @@ public protocol RemoteSession: Sendable {
     /// Logs in, or returns the start path at once when already logged in.
     func connect(prompts: any PromptSink) async throws -> RemotePath
     func disconnect() async
-    var performanceModeEnabled: Bool { get async }
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error>
     func stat(_ path: RemotePath) async throws -> RemoteItem
     func readlink(_ path: RemotePath) async throws -> String
@@ -175,8 +172,4 @@ public enum SessionEvent: Sendable {
     case liveChanged
     case directoryChanged(RemotePath)
     case disconnected(String)
-}
-
-public extension RemoteSession {
-    func performanceFlag() async -> Bool { await performanceModeEnabled }
 }

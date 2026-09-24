@@ -14,7 +14,7 @@ Views talk to a `RemoteSession`. `SSHConnection` is the implementation. Do not p
 ## Do not reopen these
 
 - The transport is `/usr/bin/ssh`. No libssh, no custom SSH stack, no HTTP/3, no tunnel, no compression. Passengers are `ssh -S sock -s -- <host> sftp`.
-- Do not embed rsync. The fast copy, when it exists, replaces `Tools/performance-version` and leaves the browser alone. `PerformanceDirectoryCopy.available()` returns false on purpose.
+- Do not embed rsync. A fast copy, when it exists, must not change the browser.
 - The window frame is AppKit (`WindowChrome.swift`): `NSSplitViewController`, `NSToolbar`, content pane spanning the window, sidebar and inspector as safe-area insets, columns pinned to `safeAreaLayoutGuide`, collapse behavior `.useConstraints`, title-bar separator forced to `.none`. Do not move that frame back to SwiftUI.
 - Hide `NSScrollPocket` views over the content. Leave the sidebar’s pocket. Draw the toolbar line with `hoverLine`, and read the pointer on each refresh.
 - Host each SwiftUI column once. Do not assign `rootView` on every update.

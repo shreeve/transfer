@@ -90,7 +90,6 @@ struct ServerTests {
             let start = try await h.session.connect(prompts: h.prompts)
             #expect(start.display == h.remote.resolvingSymlinksInPath().path)
             #expect(await h.session.isConnected)
-            #expect(await h.session.performanceModeEnabled == false)
 
             let many = h.remote.appendingPathComponent("many")
             try FileManager.default.createDirectory(at: many, withIntermediateDirectories: true)

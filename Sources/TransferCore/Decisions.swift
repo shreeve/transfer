@@ -115,23 +115,6 @@ public enum CopyRules {
     }
 }
 
-public struct ProbeResult: Equatable, Sendable {
-    public var enabled: Bool
-    public var versionLine: String?
-
-    public init(exitCode: Int32, stdout: String) {
-        let trimmed = stdout.hasSuffix("\n") ? String(stdout.dropLast()) : stdout
-        let oneLine = !trimmed.isEmpty && !trimmed.contains("\n")
-        if exitCode == 0 && oneLine {
-            enabled = true
-            versionLine = trimmed
-        } else {
-            enabled = false
-            versionLine = nil
-        }
-    }
-}
-
 public enum OperationState: String, Hashable, Sendable, Codable {
     case queued
     case active

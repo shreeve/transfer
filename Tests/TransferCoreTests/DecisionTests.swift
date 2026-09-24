@@ -68,12 +68,6 @@ import TransferCore
     #expect(decision == .skip)
 }
 
-@Test func probeRequiresASingleVersionLine() {
-    #expect(ProbeResult(exitCode: 0, stdout: "performance-version 1\n").enabled)
-    #expect(!ProbeResult(exitCode: 2, stdout: "performance-version 0\n").enabled)
-    #expect(!ProbeResult(exitCode: 0, stdout: "one\ntwo\n").enabled)
-}
-
 @Test func retriesOnlyDroppedConnectionsAndTimeouts() {
     #expect(RetryPolicy.isRetryable(TransferError.connectionLost("closed")))
     #expect(RetryPolicy.isRetryable(TransferError.timeout("stat")))
