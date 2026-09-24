@@ -1,6 +1,9 @@
 import Foundation
 import TransferCore
 
+/// The SFTP version 3 codec: message codes, attributes, packet framing, and a reader that checks
+/// every length against the bytes it has. The server's bytes are untrusted; `SFTPChannel` speaks
+/// the protocol with these pieces.
 enum SFTPCode {
     static let initialize: UInt8 = 1
     static let version: UInt8 = 2
@@ -100,13 +103,15 @@ struct SFTPMessage {
 }
 
 enum SFTPWire {
-    static func packet(type: UInt8, body: Data) -> Data {
-        var payload = Data([type])
-        payload.append(body)
-        var framed = Data()
-        framed.appendU32(UInt32(payload.count))
-        framed.append(payload)
-        return framed
+    /// One packet: its length, `type`, and the fields `build` appends, built in one buffer so a
+    /// 64 KB WRITE's bytes are copied once. `capacity` is a hint for the whole packet.
+    static func packet(type: UInt8, capacity: Int = 64, _ build: (inout Data) -> Void) -> Data {
+        var packet = Data(capacity: capacity)
+        packet.append(contentsOf: [0, 0, 0, 0, type])
+        build(&packet)
+        let length = UInt32(packet.count - 4).bigEndian
+        withUnsafeBytes(of: length) { packet.replaceSubrange(0..<4, with: $0) }
+        return packet
     }
 
     /// The longest packet accepted, as in OpenSSH's own client (SFTP_MAX_MSG_LENGTH). The largest
@@ -237,6 +242,11 @@ extension Data {
     mutating func appendBlob(_ data: Data) {
         appendU32(UInt32(data.count))
         append(data)
+    }
+
+    mutating func appendPath(_ path: RemotePath) {
+        appendU32(UInt32(path.bytes.count))
+        append(contentsOf: path.bytes)
     }
 
     mutating func appendString(_ string: String) {

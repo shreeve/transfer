@@ -28,7 +28,7 @@ import TransferCore
     // MARK: Frames
 
     @Test func popPacketWaitsForAWholePacket() throws {
-        let packet = SFTPWire.packet(type: SFTPCode.status, body: Data([0, 0, 0, 7]))
+        let packet = SFTPWire.packet(type: SFTPCode.status) { $0.appendU32(7) }
         var buffer = packet.prefix(6)
         #expect(try SFTPWire.popPacket(from: &buffer) == nil)
         buffer.append(packet.dropFirst(6))

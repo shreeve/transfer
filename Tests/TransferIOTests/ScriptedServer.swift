@@ -108,7 +108,7 @@ final class ScriptedServer: @unchecked Sendable {
     // MARK: Replies
 
     static func version(_ extensions: [String]) -> Data {
-        frame(SFTPCode.version) { packet in
+        SFTPWire.packet(type: SFTPCode.version) { packet in
             packet.appendU32(3)
             for name in extensions {
                 packet.appendString(name)
@@ -118,7 +118,7 @@ final class ScriptedServer: @unchecked Sendable {
     }
 
     static func status(_ id: UInt32, _ code: UInt32, _ text: String = "") -> Data {
-        frame(SFTPCode.status) { packet in
+        SFTPWire.packet(type: SFTPCode.status) { packet in
             packet.appendU32(id)
             packet.appendU32(code)
             packet.appendString(text)
@@ -129,21 +129,21 @@ final class ScriptedServer: @unchecked Sendable {
     static func ok(_ id: UInt32) -> Data { status(id, SFTPCode.ok) }
 
     static func handle(_ id: UInt32, _ handle: String = "h") -> Data {
-        frame(SFTPCode.handle) { packet in
+        SFTPWire.packet(type: SFTPCode.handle) { packet in
             packet.appendU32(id)
             packet.appendString(handle)
         }
     }
 
     static func attrs(_ id: UInt32, _ attrs: SFTPAttrs = file) -> Data {
-        frame(SFTPCode.attrs) { packet in
+        SFTPWire.packet(type: SFTPCode.attrs) { packet in
             packet.appendU32(id)
             packet.append(attrs.encoded())
         }
     }
 
     static func names(_ id: UInt32, _ names: [[UInt8]], attrs: SFTPAttrs = file) -> Data {
-        frame(SFTPCode.name) { packet in
+        SFTPWire.packet(type: SFTPCode.name) { packet in
             packet.appendU32(id)
             packet.appendU32(UInt32(names.count))
             for name in names {
@@ -159,7 +159,7 @@ final class ScriptedServer: @unchecked Sendable {
     }
 
     static func data(_ id: UInt32, _ bytes: Data) -> Data {
-        frame(SFTPCode.data) { packet in
+        SFTPWire.packet(type: SFTPCode.data) { packet in
             packet.appendU32(id)
             packet.appendBlob(bytes)
         }
@@ -171,13 +171,6 @@ final class ScriptedServer: @unchecked Sendable {
         attrs.permissions = 0o100644
         return attrs
     }
-}
-
-/// One packet of `type` with the fields `build` appends.
-private func frame(_ type: UInt8, _ build: (inout Data) -> Void) -> Data {
-    var body = Data()
-    build(&body)
-    return SFTPWire.packet(type: type, body: body)
 }
 
 /// Polls `condition` until it holds or five seconds pass.
