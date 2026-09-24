@@ -99,6 +99,7 @@ import Testing
 @Test func retriesOnlyDroppedConnectionsAndTimeouts() {
     #expect(RetryPolicy.isRetryable(TransferError.connectionLost("closed")))
     #expect(RetryPolicy.isRetryable(TransferError.timeout("stat")))
+    #expect(RetryPolicy.isRetryable(TransferError.changedOnServer("grows.bin")))
     #expect(!RetryPolicy.isRetryable(TransferError.authenticationFailed("no")))
     #expect(!RetryPolicy.isRetryable(TransferError.permissionDenied("no")))
     #expect(!RetryPolicy.isRetryable(TransferError.hostKeyRejected))

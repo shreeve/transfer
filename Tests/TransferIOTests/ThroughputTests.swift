@@ -154,7 +154,7 @@ import TransferCore
             try await download()
             #expect(try Data(contentsOf: file) == content)
         } else {
-            await #expect(throws: TransferError.failed("“file” changed on the server while it downloaded")) { try await download() }
+            await #expect(throws: TransferError.changedOnServer("file")) { try await download() }
             #expect(try Data(contentsOf: file).isEmpty)
         }
         #expect(server.sent(SFTPCode.fstat).count == 1)
@@ -384,7 +384,7 @@ struct ThroughputServerTests {
             try handle.write(contentsOf: Data(count: 1000))
             try handle.close()
             let down = h.staging.appendingPathComponent("grows.bin")
-            await #expect(throws: TransferError.failed("“grows.bin” changed on the server while it downloaded")) {
+            await #expect(throws: TransferError.changedOnServer("grows.bin")) {
                 try await h.session.fetch(path, info: listed, to: down) { _ in }
             }
             #expect(try FileManager.default.contentsOfDirectory(atPath: h.staging.path).isEmpty)

@@ -99,15 +99,7 @@ public enum CopyRules {
     /// inside a character, so the temp fits the 255 bytes a file name may take even when
     /// `basename` nearly does.
     public static func tempName(for basename: String, transferID: String) -> String {
-        let suffix = ".transfer-\(transferID)"
-        var room = 255 - 1 - suffix.utf8.count
-        var kept = String.UnicodeScalarView()
-        for scalar in basename.unicodeScalars {
-            room -= scalar.utf8.count
-            guard room >= 0 else { break }
-            kept.append(scalar)
-        }
-        return ".\(String(kept))\(suffix)"
+        LiveDecision.siblingName(of: basename, prefix: ".", suffix: ".transfer-\(transferID)")
     }
 }
 
@@ -438,7 +430,7 @@ public enum RetryPolicy {
 
     public static func isRetryable(_ error: Error) -> Bool {
         switch error as? TransferError {
-        case .connectionLost?, .timeout?: true
+        case .connectionLost?, .timeout?, .changedOnServer?: true
         default: false
         }
     }

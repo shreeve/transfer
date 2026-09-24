@@ -395,7 +395,7 @@ actor SFTPChannel {
             if let id = check {
                 check = nil
                 guard Fingerprint(item: try item(path: path, message: await reply(id))) == print else {
-                    throw TransferError.failed("“\(path.name)” changed on the server while it downloaded")
+                    throw TransferError.changedOnServer(path.name)
                 }
             }
             guard !inFlight.isEmpty else { break }
