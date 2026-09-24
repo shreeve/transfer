@@ -85,4 +85,18 @@ struct HubTests {
         #expect(replaced !== first)
         #expect(replaced.connection.host == "other.invalid")
     }
+
+    /// A config.json that no longer decodes is copied aside before the defaults take over, since
+    /// the next Settings save rewrites it.
+    @Test func anUnreadableConfigIsKeptAside() throws {
+        let root = TestCaches.fresh("config")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let file = root.appendingPathComponent("config.json")
+        try Data("{ not json".utf8).write(to: file)
+        let config = ConfigLoader.load(root: root)
+        #expect(!config.editableExtensions.isEmpty)
+        #expect(try Data(contentsOf: root.appendingPathComponent("config.json.bak")) == Data("{ not json".utf8))
+        #expect(try Data(contentsOf: file) == Data("{ not json".utf8))
+    }
 }
