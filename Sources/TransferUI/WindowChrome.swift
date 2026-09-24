@@ -221,9 +221,22 @@ enum ChromeItem {
 @MainActor
 final class ChromeController: NSSplitViewController {
     weak var coordinator: (any NSToolbarDelegate)?
+    weak var model: TransferModel?
+    /// Every browser window's controller, while its window is open.
+    private static let live = NSHashTable<ChromeController>.weakObjects()
     private var toolbarInstalled = false
     private var pendingTitle = ""
     private var pendingSubtitle = ""
+    /// Finder shows a faint line under the toolbar, over the content column only, while the
+    /// pointer is in the toolbar. This is that line.
+    private let hoverLine = HoverLine()
+    private var hoverTracking: NSTrackingArea?
+    var hoverLineEnabled = true {
+        didSet { refreshHoverLine(animated: false) }
+    }
+    /// Notification observers on this controller's window, removed when the window closes.
+    private var windowObservers: [any NSObjectProtocol] = []
+    private var separatorObservation: NSKeyValueObservation?
 
     func install(sidebar: NSHostingController<AnyView>, detail: NSHostingController<AnyView>, inspector: NSHostingController<AnyView>) {
         // The split view decides the columns' sizes; the hosted SwiftUI content reports none.
@@ -274,17 +287,10 @@ final class ChromeController: NSSplitViewController {
         addSplitViewItem(sidebarItem)
         addSplitViewItem(detailItem)
         addSplitViewItem(inspectorItem)
+        // One name for every window, as Finder shares its sidebar's width: a new window opens
+        // with the sidebar and inspector as the last one left them, and the model follows the
+        // restored state through splitViewDidResizeSubviews.
         splitView.autosaveName = "Transfer.Split"
-    }
-
-    /// Finder shows a faint line under the toolbar, over the content column only, while the
-    /// pointer is in the toolbar. This is that line.
-    private let hoverLine = HoverLine()
-    private var hoverTracking: NSTrackingArea?
-    /// Notification observers on this controller's window, removed when the window closes.
-    private var windowObservers: [any NSObjectProtocol] = []
-    var hoverLineEnabled = true {
-        didSet { refreshHoverLine(animated: false) }
     }
 
     override func viewDidLoad() {
@@ -357,12 +363,6 @@ final class ChromeController: NSSplitViewController {
         refreshHoverLine(animated: true)
     }
 
-    /// SwiftUI re-applies its own titlebar separator style to the window after it appears and
-    /// again around inspector and sidebar changes. Automatic draws a line under the toolbar that
-    /// then stays until something sets the style again, so the window is watched and every
-    /// layout re-asserts none. The hover line is the only line under the toolbar.
-    private var separatorObservation: NSKeyValueObservation?
-
 
     /// AppKit hangs a scroll pocket, the macOS 26 scroll-edge effect, under the toolbar over each
     /// section of the window. Over the content section it draws a hard edge for the placeholder
@@ -388,6 +388,10 @@ final class ChromeController: NSSplitViewController {
     /// Looked up once. A future AppKit without the class hides nothing, which only costs a line.
     private static let scrollPocketClass: AnyClass? = NSClassFromString("NSScrollPocket")
 
+    /// SwiftUI re-applies its own titlebar separator style to the window after it appears and
+    /// again around inspector and sidebar changes. Automatic draws a line under the toolbar that
+    /// then stays until something sets the style again, so the window is watched and every
+    /// layout re-asserts none. The hover line is the only line under the toolbar.
     private func keepSeparatorOff() {
         guard let window = view.window, window.titlebarSeparatorStyle != .none else { return }
         // The title bar keeps the line it drew under the automatic style until it draws again;
@@ -413,13 +417,13 @@ final class ChromeController: NSSplitViewController {
         separatorObservation = window.observe(\.titlebarSeparatorStyle, options: [.new]) { [weak self] _, _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
-        // The window posts this after every pass of event handling, so a style SwiftUI sets after
-        // the last layout of an inspector animation is still caught before the next frame draws.
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
             windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
                 MainActor.assumeIsolated { self?.refreshHoverLine(animated: true) }
             })
         }
+        // The window posts this after every pass of event handling, so a style SwiftUI sets after
+        // the last layout of an inspector animation is still caught before the next frame draws.
         windowObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         })
@@ -490,7 +494,7 @@ final class ChromeController: NSSplitViewController {
         refreshHoverLine(animated: true)
     }
 
-    /// `TRANSFER_ANIMATION_SCALE=8` in the environment stretches the sidebar and inspector
+    /// `TRANSFER_ANIMATION_SCALE=6` in the environment stretches the sidebar and inspector
     /// animations for watching them; unset, AppKit's own timing applies.
     private static let animationScale = Double(ProcessInfo.processInfo.environment["TRANSFER_ANIMATION_SCALE"] ?? "") ?? 1
 
@@ -504,15 +508,6 @@ final class ChromeController: NSSplitViewController {
 
     // MARK: Edit menu
 
-    /// Edit > Copy and Paste reach the window here through the responder chain whenever no text
-    /// field has focus; a focused field answers them first and keeps its own text editing. When
-    /// nothing in the content holds the focus (a folder just opened in icon view, or a toolbar
-    /// button has it), the chain skips this controller, and the app delegate, last in the chain,
-    /// forwards them here through `KeyWindowEdit`.
-    weak var model: TransferModel?
-
-    private static let live = NSHashTable<ChromeController>.weakObjects()
-
     static var keyWindowController: ChromeController? {
         guard let key = NSApp.keyWindow else { return nil }
         return live.allObjects.first { $0.view.window === key }
@@ -525,6 +520,11 @@ final class ChromeController: NSSplitViewController {
         return ordered + all.filter { controller in !ordered.contains { $0 === controller } }
     }
 
+    /// Edit > Copy and Paste reach the window here through the responder chain whenever no text
+    /// field has focus; a focused field answers them first and keeps its own text editing. When
+    /// nothing in the content holds the focus (a folder just opened in icon view, or a toolbar
+    /// button has it), the chain skips this controller, and the app delegate, last in the chain,
+    /// forwards them here through `KeyWindowEdit`.
     @objc func copy(_ sender: Any?) {
         model?.copySelection()
     }
