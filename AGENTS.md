@@ -8,7 +8,7 @@ Transfer is a native Mac SFTP browser that feels like a small utility Apple ship
 
 - `TransferCore`: values and decisions. No SwiftUI, AppKit, `Process`, or `FileManager`.
 - `TransferIO`: `/usr/bin/ssh`, SFTP, SQLite, Keychain, Live files, the transfer engine. No SwiftUI or AppKit.
-- `TransferUI`: views and AppKit adapters. No `TransferIO`. It writes and removes no file except the clipboard's staging folders; everything else goes through `RemoteSession` or `SessionProvider`.
+- `TransferUI`: views and AppKit adapters. No `TransferIO`. It writes and removes no file except the clipboard's staging folder; everything else goes through `RemoteSession` or `SessionProvider`.
 - `Transfer`: `@main`, the only target that imports both UI and IO.
 
 A rule with a decision in it belongs in Core, with a test.
@@ -19,7 +19,7 @@ A rule with a decision in it belongs in Core, with a test.
 - Every `ssh` command line puts `--` before the destination: a user or host from an `sftp://` link comes from another app, and one starting with `-` would be an option such as `-oProxyCommand`. Processes start with an argument vector, never through a shell; the one command typed into a shell, Open in Terminal's, quotes every field and is refused when any holds a control character.
 - A server is untrusted. Every name it sends that reaches the Mac's disk goes through `LocalPlacement` (`child`, `occupant`, `makeFolder`, `makeLink`): one path component, read with `lstat`, never followed through a local link, never removed without the user's answer.
 - A name collision is asked through the operation's own prompt, `OperationPrompts.current`, never the login's sheet. With nobody to ask, the operation fails; it never guesses Skip or Replace. A rename the user asks for never replaces anything.
-- Moves and pastes run only through `SessionProvider.transfer` (`TransferEngine` in TransferIO, tested in `MoveServerTests`); TransferUI only queues a `TransferRequest`. A move removes an original only when `MoveCheck` finds this move wrote a complete copy of it.
+- Moves and pastes run only through `SessionProvider.transfer` (`TransferEngine` in TransferIO, tested in `MoveServerTests`); TransferUI only queues a `TransferRequest`. A move removes an original only when `MoveCheck` finds that item's own copy complete, and on a server removes only what that check verified (a Finder original goes to the Trash whole).
 - Live files belong to `LiveSync`. Only its per-server worker changes a Live file's sync state; anything else (a conflict choice, discard, a rename or delete under a Live path) is a command on that worker. What a pass does is `LiveDecision` in TransferCore: change the rules there, with a test. Never write the working copy behind an open editor, and never rename it. A Live open rides the interactive lane as `.open`, which a preview never drops.
 - Every AppKit callback that takes a row or column (`NSBrowser`, `NSTableView`, a menu's `clickedRow`, a drop's −1) checks it against the listing that view was loaded with before using it. An Objective-C exception must never escape an `updateNSView` or a layout pass: AppKit catches it, and the Observation crash that follows lands somewhere else.
 - Keys the content pane handles go through one local key monitor each: Command-Down and Space in `ContentKeys`, Escape in `Clipboard`. Copy and Paste reach the window through the responder chain, with the app delegate as the fallback (`KeyWindowEdit`). Do not add per-view key handlers.
@@ -50,4 +50,4 @@ eval "$(Scripts/local-sshd.sh 2222)" && TRANSFER_REQUIRE_SERVER=1 swift test; ki
 open --env TRANSFER_LIBRARY=/tmp/transfer-dev "$(Scripts/package-app.sh)"
 ```
 
-Without `TRANSFER_LIBRARY` it uses the real library in `~/Library/Application Support/Transfer`: it removes the installed app's login scratch and starts Live sync on the user's own records. `TRANSFER_ANIMATION_SCALE=6` stretches the sidebar and inspector animations for watching them.
+Without `TRANSFER_LIBRARY` it opens the real library in `~/Library/Application Support/Transfer`: while the installed app is open it is refused (one copy per library), and otherwise it sweeps the library's login scratch and temps and starts Live sync on the user's own records. `TRANSFER_ANIMATION_SCALE=6` stretches the sidebar and inspector animations for watching them.
