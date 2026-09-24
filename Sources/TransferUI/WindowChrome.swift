@@ -439,7 +439,7 @@ final class ChromeController: NSSplitViewController {
                 MainActor.assumeIsolated { if let window { WindowFrames.remember(window) } }
             })
         }
-        OpenShortcut.install()
+        ContentKeys.install()
         if let model { LinkInbox.take(into: model) }
         window.titlebarSeparatorStyle = .none
         // The opaque title bar over the content column draws its own bottom edge regardless of
@@ -672,12 +672,13 @@ public enum LinkInbox {
     }
 }
 
-/// Command-Down opens the selection, as in Finder: a second shortcut for File > Open, with no menu
-/// item of its own. `NSBrowser`'s columns take Command-Down as a plain Down arrow before the
-/// browser sees the key, so it is watched here, as Escape is in `Clipboard`, and left alone for
-/// text fields, sheets, and any window that is not a browser.
+/// Keys that act on the content pane: Command-Down opens the selection, as in Finder (a second
+/// shortcut for File > Open, with no menu item of its own), and Space toggles Quick Look.
+/// `NSBrowser`'s columns take Command-Down as a plain Down arrow before the browser sees the key,
+/// and the table, the browser, and the icon grid would each have to catch Space for themselves, so
+/// both are watched here with one monitor, as Escape is in `Clipboard`.
 @MainActor
-enum OpenShortcut {
+enum ContentKeys {
     private static var monitor: Any?
 
     static func install() {
@@ -687,15 +688,24 @@ enum OpenShortcut {
         }
     }
 
-    /// Only for the content pane, or a window with nothing focused: in the sidebar or inspector,
-    /// Command-Down keeps its usual meaning. Held down, it opens once.
+    /// Only for the content pane in any view, or a window with nothing focused: text fields,
+    /// sheets, the sidebar, the inspector, and windows that are not browsers keep the keys.
+    /// Held down, a key acts once.
     private static func takes(_ event: NSEvent) -> Bool {
-        guard event.keyCode == 125, !event.isARepeat, event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        let open = event.keyCode == 125 && modifiers == .command
+        let look = event.keyCode == 49 && modifiers.isEmpty
+        guard open || look,
               let window = event.window, window.isKeyWindow, window.attachedSheet == nil, !(window.firstResponder is NSText),
               let controller = ChromeController.keyWindowController, let model = controller.model, model.plainKeysAvailable else { return false }
         if let focused = window.firstResponder as? NSView, focused !== window.contentView,
            !focused.isDescendant(of: controller.splitViewItems[1].viewController.view) { return false }
-        Task { await model.openSelection() }
+        guard !event.isARepeat else { return true }
+        if open {
+            Task { await model.openSelection() }
+        } else {
+            model.togglePreview()
+        }
         return true
     }
 }

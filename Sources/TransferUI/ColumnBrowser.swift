@@ -11,7 +11,6 @@ struct ColumnBrowser: NSViewRepresentable {
 
     func makeNSView(context: Context) -> ColumnStack {
         let browser = TiledBrowser()
-        browser.model = model
         browser.setCellClass(CenteredBrowserCell.self)
         browser.delegate = context.coordinator
         browser.target = context.coordinator
@@ -474,7 +473,7 @@ final class ColumnStack: NSView {
 /// Sideways scrolling over the column view: Shift with a mouse wheel, or a swipe on a trackpad or
 /// Magic Mouse whose sideways motion outweighs its vertical. Each column is its own vertical
 /// scroll view and the browser never scrolls sideways, so nothing else would take these. One
-/// monitor for the app, as `OpenShortcut` is; vertical scrolling goes on to the columns.
+/// monitor for the app, as `ContentKeys` is; vertical scrolling goes on to the columns.
 @MainActor
 enum ColumnPan {
     private static var monitor: Any?
@@ -509,21 +508,12 @@ enum ColumnPan {
     }
 }
 
-/// The column browser: fixed-width columns. Space opens Quick Look, as in Finder.
+/// The column browser: fixed-width columns. Space reaches Quick Look through `ContentKeys`.
 final class TiledBrowser: NSBrowser {
     /// Columns start at this width and never reflow to fit the pane. `ColumnStack` moves the whole
     /// set instead. Re-tiling to fit made every column visibly resize during the inspector toggle,
     /// which read as an overlay rather than a slide.
     static let columnWidth: CGFloat = 260
-    weak var model: TransferModel?
-
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
-            model?.togglePreview()
-            return
-        }
-        super.keyDown(with: event)
-    }
 }
 
 

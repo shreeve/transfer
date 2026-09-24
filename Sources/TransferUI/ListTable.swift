@@ -324,15 +324,6 @@ final class RowMenuTableView: NSTableView {
         let point = convert(event.locationInWindow, from: nil)
         return coordinator?.menu(forRow: row(at: point))
     }
-
-    /// Space opens Quick Look, as in Finder; the table would otherwise swallow it.
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
-            coordinator?.model.togglePreview()
-            return
-        }
-        super.keyDown(with: event)
-    }
 }
 
 /// The right-click menu of the list and column views: for the clicked item, which the view has
