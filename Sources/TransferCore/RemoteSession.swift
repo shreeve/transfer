@@ -1,3 +1,8 @@
+// The seam between the views and the transport. TransferUI sees servers only through
+// SessionProvider and RemoteSession, which TransferIO implements with TransferHub and
+// SSHConnection; prompts go back through PromptSink (OperationPrompts for an operation's own).
+// Also the errors, operations, and events that cross it, and the library-root override.
+
 import Foundation
 
 public enum TransferError: Error, Equatable, Sendable, LocalizedError {

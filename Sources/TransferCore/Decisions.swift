@@ -1,3 +1,7 @@
+// The app's small pure rules: which files open Live, made-up names, copy dispositions, listing
+// order, the column trail, units, retries, preview-cache eviction, and known-hosts matching.
+// Each is a value or a function of values, tested in Tests/TransferCoreTests.
+
 import Foundation
 import UniformTypeIdentifiers
 
@@ -49,27 +53,36 @@ public enum LiveConflictChoice: String, Sendable {
     case keepBoth
 }
 
+/// Every name the app makes up so as not to take an existing one.
 public enum KeepBothName {
-    public static func next(existing: Set<String>, original: String) -> String {
-        let split = splitExtension(original)
-        var n = 2
-        while true {
-            let candidate = "\(split.base) \(n)\(split.ext)"
-            if !existing.contains(candidate) { return candidate }
-            n += 1
-        }
+    /// The first of `candidate(first)`, `candidate(first + 1)`, … that `existing` lacks.
+    public static func firstFree(existing: Set<String>, from first: Int = 1, _ candidate: (Int) -> String) -> String {
+        var n = first
+        while existing.contains(candidate(n)) { n += 1 }
+        return candidate(n)
     }
 
+    /// Keep Both: "report 2.pdf", "report 3.pdf", …
+    public static func next(existing: Set<String>, original: String) -> String {
+        let split = splitExtension(original)
+        return firstFree(existing: existing, from: 2) { "\(split.base) \($0)\(split.ext)" }
+    }
+
+    /// Duplicate: "notes copy.txt", "notes copy 2.txt", …
     public static func duplicate(existing: Set<String>, original: String) -> String {
         let split = splitExtension(original)
-        let first = "\(split.base) copy\(split.ext)"
-        if !existing.contains(first) { return first }
-        var n = 2
-        while true {
-            let candidate = "\(split.base) copy \(n)\(split.ext)"
-            if !existing.contains(candidate) { return candidate }
-            n += 1
-        }
+        return firstFree(existing: existing) { $0 == 1 ? "\(split.base) copy\(split.ext)" : "\(split.base) copy \($0)\(split.ext)" }
+    }
+
+    /// New Folder: "untitled folder", "untitled folder 2", …
+    public static func untitledFolder(existing: Set<String>) -> String {
+        firstFree(existing: existing) { $0 == 1 ? "untitled folder" : "untitled folder \($0)" }
+    }
+
+    /// Keep Both for a Live conflict, the Mac's copy beside the server's: "notes.txt (from this
+    /// Mac)", "notes.txt (from this Mac 2)", …
+    public static func fromThisMac(existing: Set<String>, original: String) -> String {
+        firstFree(existing: existing) { $0 == 1 ? "\(original) (from this Mac)" : "\(original) (from this Mac \($0))" }
     }
 
     private static func splitExtension(_ name: String) -> (base: String, ext: String) {
@@ -245,49 +258,146 @@ public enum ColumnTrail {
     }
 }
 
+/// The order of a folder's items. Each item's sort key (its kind, the column's value, its
+/// case-folded name, its name's bytes) is computed once, not in every comparison: a listing is
+/// sorted again on each publish while a big folder streams in.
 public enum ListingSort {
     /// With `foldersFirst`, directories come first in every column and direction. Within each
-    /// group the chosen column applies, with raw-byte name order breaking ties.
+    /// group the chosen column applies; ties go to name order, ascending in every direction.
+    /// Names compare case-folded first when `caseInsensitive`, then by their raw bytes. A size
+    /// or time the server did not send counts as 0.
     public static func apply(_ items: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
-        items.sorted { lhs, rhs in
-            if sort.foldersFirst, (lhs.kind == .directory) != (rhs.kind == .directory) {
-                return lhs.kind == .directory
+        let order = Order(sort)
+        return order.sorted(items) { index, _ in items[index] }
+    }
+
+    /// `page`, newly listed, merged into `sorted`, a listing already in `apply`'s order for the
+    /// same `sort`. The result is what `apply(sorted + page, sort:)` gives, for the cost of
+    /// sorting the page and copying the listing: a streaming folder's publishes stop costing a
+    /// full sort each.
+    public static func merge(_ page: [RemoteItem], into sorted: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
+        guard !sorted.isEmpty else { return apply(page, sort: sort) }
+        let order = Order(sort)
+        var merged: [RemoteItem] = []
+        merged.reserveCapacity(sorted.count + page.count)
+        var start = sorted.startIndex
+        for (index, key) in order.sorted(page, { ($0, $1) }) {
+            // The first listed item that sorts after the new one. Galloping from the last
+            // insertion point computes the keys of only a few listed items per new one.
+            let after = { (listed: Int) in order.precedes(key, order.key(sorted[listed])) }
+            var low = start
+            var high = start
+            var step = 1
+            while high < sorted.endIndex, !after(high) {
+                low = high + 1
+                high = low + step
+                step *= 2
             }
-            let order: ComparisonResult
+            high = min(high, sorted.endIndex)
+            while low < high {
+                let middle = (low + high) / 2
+                if after(middle) { high = middle } else { low = middle + 1 }
+            }
+            merged += sorted[start..<low]
+            merged.append(page[index])
+            start = low
+        }
+        merged += sorted[start...]
+        return merged
+    }
+
+    private struct Key {
+        var folder: Bool
+        var value: UInt64
+        /// The lowercased name's UTF-8, when names fold. Byte order is the order of
+        /// `compare(_:options: .literal)`, which the sort used before.
+        var folded: ArraySlice<UInt8>
+        var name: ArraySlice<UInt8>
+    }
+
+    private struct Order {
+        enum Column { case name, size, mtime, kind }
+        let column: Column
+        let ascending: Bool
+        let foldersFirst: Bool
+        let caseInsensitive: Bool
+
+        init(_ sort: SortConfiguration) {
             switch sort.column {
-            case "size":
-                order = (lhs.size ?? 0) < (rhs.size ?? 0) ? .orderedAscending : (lhs.size == rhs.size ? .orderedSame : .orderedDescending)
-            case "mtime":
-                order = (lhs.mtime ?? 0) < (rhs.mtime ?? 0) ? .orderedAscending : (lhs.mtime == rhs.mtime ? .orderedSame : .orderedDescending)
-            case "kind":
-                order = lhs.kind.rawValue.compare(rhs.kind.rawValue, options: .literal)
-            default:
-                order = compareNames(lhs, rhs, caseInsensitive: sort.caseInsensitive)
+            case "size": column = .size
+            case "mtime": column = .mtime
+            case "kind": column = .kind
+            default: column = .name
             }
-            if order == .orderedSame {
-                return compareNames(lhs, rhs, caseInsensitive: sort.caseInsensitive) == .orderedAscending
+            ascending = sort.ascending
+            foldersFirst = sort.foldersFirst
+            caseInsensitive = sort.caseInsensitive
+        }
+
+        /// `items` in order, as `each(index, key)`. The keys stay put while their indices are
+        /// sorted, and Swift's sort is stable, so items that tie on every key keep their order.
+        func sorted<T>(_ items: [RemoteItem], _ each: (Int, Key) -> T) -> [T] {
+            let keys = items.map(key)
+            return keys.withUnsafeBufferPointer { keys in
+                keys.indices.sorted { precedes(keys[$0], keys[$1]) }.map { each($0, keys[$0]) }
             }
-            return sort.ascending ? order == .orderedAscending : order == .orderedDescending
         }
-    }
 
-    private static func compareNames(_ lhs: RemoteItem, _ rhs: RemoteItem, caseInsensitive: Bool) -> ComparisonResult {
-        if caseInsensitive {
-            let folded = lhs.name.lowercased().compare(rhs.name.lowercased(), options: .literal)
-            if folded != .orderedSame { return folded }
+        func key(_ item: RemoteItem) -> Key {
+            let name = item.path.nameSlice
+            let value: UInt64 = switch column {
+            case .size: item.size ?? 0
+            case .mtime: UInt64(item.mtime ?? 0)
+            case .kind: Self.kindRank(item.kind)
+            case .name: 0
+            }
+            return Key(folder: item.kind == .directory, value: value, folded: caseInsensitive ? Self.fold(name) : [], name: name)
         }
-        return compareBytes(lhs.path.nameBytes, rhs.path.nameBytes)
-    }
 
-    private static func compareBytes(_ left: [UInt8], _ right: [UInt8]) -> ComparisonResult {
-        let count = min(left.count, right.count)
-        for index in 0..<count {
-            if left[index] < right[index] { return .orderedAscending }
-            if left[index] > right[index] { return .orderedDescending }
+        /// What `String.lowercased()` makes of the name, as UTF-8. ASCII, the usual case, folds
+        /// byte by byte, and a name with no capitals is its own fold.
+        private static func fold(_ name: ArraySlice<UInt8>) -> ArraySlice<UInt8> {
+            var capitals = false
+            for byte in name {
+                if byte >= 0x80 { return Array(String(decoding: name, as: UTF8.self).lowercased().utf8)[...] }
+                if byte &- 0x41 < 26 { capitals = true }
+            }
+            return capitals ? ArraySlice(name.map { $0 &- 0x41 < 26 ? $0 | 0x20 : $0 }) : name
         }
-        if left.count < right.count { return .orderedAscending }
-        if left.count > right.count { return .orderedDescending }
-        return .orderedSame
+
+        /// The kinds in the order of their raw values, as the kind column sorted them before.
+        private static func kindRank(_ kind: ItemKind) -> UInt64 {
+            switch kind {
+            case .directory: 0
+            case .file: 1
+            case .other: 2
+            case .symlink: 3
+            }
+        }
+
+        func precedes(_ lhs: Key, _ rhs: Key) -> Bool {
+            if foldersFirst, lhs.folder != rhs.folder { return lhs.folder }
+            if column != .name, lhs.value != rhs.value { return (lhs.value < rhs.value) == ascending }
+            let names = compareNames(lhs, rhs)
+            return column == .name && !ascending ? names > 0 : names < 0
+        }
+
+        private func compareNames(_ lhs: Key, _ rhs: Key) -> Int {
+            if caseInsensitive {
+                let folded = Self.compare(lhs.folded, rhs.folded)
+                if folded != 0 { return folded }
+            }
+            return Self.compare(lhs.name, rhs.name)
+        }
+
+        private static func compare(_ left: ArraySlice<UInt8>, _ right: ArraySlice<UInt8>) -> Int {
+            let count = min(left.count, right.count)
+            let order = left.withUnsafeBufferPointer { l in
+                right.withUnsafeBufferPointer { r in count == 0 ? 0 : memcmp(l.baseAddress!, r.baseAddress!, count) }
+            }
+            if order != 0 { return order < 0 ? -1 : 1 }
+            return left.count == right.count ? 0 : (left.count < right.count ? -1 : 1)
+        }
     }
 }
 

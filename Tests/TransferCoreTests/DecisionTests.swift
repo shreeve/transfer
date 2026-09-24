@@ -59,6 +59,18 @@ import TransferCore
 @Test func duplicateUsesCopySuffix() {
     let name = KeepBothName.duplicate(existing: ["notes.txt"], original: "notes.txt")
     #expect(name == "notes copy.txt")
+    #expect(KeepBothName.duplicate(existing: ["notes copy.txt", "notes copy 2.txt"], original: "notes.txt") == "notes copy 3.txt")
+    #expect(KeepBothName.duplicate(existing: [], original: ".env") == ".env copy")
+    #expect(KeepBothName.next(existing: [], original: "Makefile") == "Makefile 2")
+}
+
+/// New Folder and a Live conflict's Keep Both named files with their own loops, outside Core.
+@Test func everyMadeUpNameIsTheFirstFreeOne() {
+    #expect(KeepBothName.untitledFolder(existing: []) == "untitled folder")
+    #expect(KeepBothName.untitledFolder(existing: ["untitled folder", "untitled folder 2"]) == "untitled folder 3")
+    #expect(KeepBothName.fromThisMac(existing: ["note.txt"], original: "note.txt") == "note.txt (from this Mac)")
+    #expect(KeepBothName.fromThisMac(existing: ["note.txt (from this Mac)"], original: "note.txt") == "note.txt (from this Mac 2)")
+    #expect(KeepBothName.firstFree(existing: ["a0", "a1"], from: 0) { "a\($0)" } == "a2")
 }
 
 @Test func matchingSizeAndTimeSkipsTheCopy() {
@@ -223,6 +235,15 @@ import TransferCore
     #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv")) == nil)
 }
 
+/// A `..` in the destination once hid that it was inside the folder being pasted (SFC-13).
+@Test func pasteRefusalSeesThroughDotSegments() {
+    let site = RemotePath(string: "/srv/site")
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/x/../site/sub")) != nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/./site")) != nil)
+    #expect(PasteRules.refusal(sources: [RemotePath(string: "/srv/a/../site")], into: RemotePath(string: "/srv/site/b")) != nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/site/../site2")) == nil)
+}
+
 @Test func pasteIntoTheSameFolderMakesACopy() {
     let file = RemotePath(string: "/srv/notes.txt")
     #expect(PasteRules.destinationName(for: file, into: RemotePath(string: "/srv"), existing: ["notes.txt"]) == "notes copy.txt")
@@ -237,6 +258,23 @@ import TransferCore
     partial["sub/b"] = nil
     partial["extra"] = .file(size: 1)
     #expect(TreeCheck.missing(source: source, destination: partial) == ["a.txt", "sub/b"])
+}
+
+/// A FIFO, socket, or device walked as a plain empty file once let a move pass the check with
+/// an empty file at its name, and remove the original.
+@Test func treeCheckNeverCountsASpecialFileAsCopied() {
+    #expect(TreeEntry(RemoteItem(path: RemotePath(string: "/srv/fifo"), kind: .other, size: 0, mtime: 1)) == .other)
+    let source: [String: TreeEntry] = ["": .directory, "a.txt": .file(size: 4), "fifo": .other]
+    #expect(TreeCheck.missing(source: source, destination: source) == ["fifo"])
+    #expect(TreeCheck.missing(source: source, destination: ["": .directory, "a.txt": .file(size: 4), "fifo": .file(size: 0)]) == ["fifo"])
+    #expect(TreeCheck.missing(source: ["": .other], destination: ["": .other]) == [""])
+    var tally = ClipTally()
+    tally.add(root: .other)
+    tally.add(root: .directory)
+    tally.add(inside: .other)
+    #expect(tally.files == 1)
+    #expect(tally.allFiles == 2)
+    #expect(tally.bytes == 0)
 }
 
 /// A move whose collision was skipped once compared the source with the file already there, and

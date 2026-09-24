@@ -48,6 +48,35 @@ struct SFTPURLTests {
         #expect(link.user == "shreeve")
     }
 
+    /// Copy Remote URL once wrote `sftp://u@::1:22/x`, which no URL parser reads (SFC-7).
+    @Test func anIPv6HostIsBracketedAndRoundTrips() throws {
+        let saved = SavedConnection(name: "Six", host: "::1", user: "ada", port: "2222")
+        let text = SFTPURL.string(connection: saved, path: RemotePath(string: "/srv/a b"))
+        #expect(text == "sftp://ada@[::1]:2222/srv/a%20b")
+        let url = try #require(URL(string: text))
+        let link = try #require(SFTPURL(url: url))
+        #expect(link.host == "::1")
+        #expect(link.port == "2222")
+        #expect(link.user == "ada")
+        #expect(link.path == RemotePath(string: "/srv/a b"))
+        let bare = try #require(URL(string: SFTPURL.string(connection: SavedConnection(name: "Six", host: "fe80::1"), path: RemotePath(string: "/"))))
+        #expect(SFTPURL(url: bare)?.host == "fe80::1")
+        let zoned = try #require(URL(string: SFTPURL.string(connection: SavedConnection(name: "Six", host: "fe80::1%en0"), path: RemotePath(string: "/"))))
+        #expect(SFTPURL(url: zoned)?.host == "fe80::1%en0")
+        let bracketed = SavedConnection(name: "Six", host: "[::1]")
+        #expect(SFTPURL.string(connection: bracketed, path: RemotePath(string: "/x")) == "sftp://[::1]/x")
+    }
+
+    /// A NUL in a path reached the wire and ended the channel (SFC-9).
+    @Test func aPathWithAControlCharacterIsNoLink() {
+        #expect(SFTPURL(url: URL(string: "sftp://live/tmp/a%00b")!) == nil)
+        #expect(SFTPURL(url: URL(string: "sftp://live/tmp/a%0Ab")!) == nil)
+        #expect(SFTPURL(url: URL(string: "sftp://live/tmp/a%7Fb")!) == nil)
+        #expect(SFTPURL(url: URL(string: "sftp://live/tmp/a%C2%85b")!) == nil)
+        // Format characters are not controls: emoji sequences join with U+200D.
+        #expect(SFTPURL(url: URL(string: "sftp://live/tmp/%F0%9F%91%A9%E2%80%8D%F0%9F%92%BB.txt")!)?.path == RemotePath(string: "/tmp/👩‍💻.txt"))
+    }
+
     private let live = SavedConnection(name: "Live", host: "live")
     private let edi = SavedConnection(name: "EDI", host: "trust")
 

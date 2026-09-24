@@ -1,3 +1,7 @@
+// The identities everything else is keyed by: connections, Live files, remote paths (bytes, not
+// strings, since a server's names need not be UTF-8), listed items, SFTP times and fingerprints,
+// and saved servers.
+
 import Foundation
 
 public struct ConnectionID: Hashable, Sendable, RawRepresentable {
@@ -18,15 +22,20 @@ public struct LiveFileID: Hashable, Sendable, RawRepresentable {
     public init() { self.rawValue = UUID() }
 }
 
+/// A path on a server, as bytes: a server's names need not be UTF-8, and the bytes are what go
+/// back on the wire. Trailing slashes are dropped when the path is made, so `/srv/site/` and
+/// `/srv/site` are one path, its name is `site`, and appending to it never makes a `//`.
 public struct RemotePath: Hashable, Sendable {
     public var bytes: [UInt8]
 
     public init(bytes: [UInt8]) {
+        var bytes = bytes
+        while bytes.count > 1, bytes.last == 0x2F { bytes.removeLast() }
         self.bytes = bytes
     }
 
     public init(string: String) {
-        self.bytes = Array(string.utf8)
+        self.init(bytes: Array(string.utf8))
     }
 
     public var display: String {
@@ -35,35 +44,59 @@ public struct RemotePath: Hashable, Sendable {
 
     public var isRoot: Bool { bytes == [0x2F] }
 
+    /// `name` as the last component. Leading slashes in `name` are ignored.
     public func appending(name: [UInt8]) -> RemotePath {
-        if bytes == [0x2F] {
-            return RemotePath(bytes: [0x2F] + name)
-        }
-        return RemotePath(bytes: bytes + [0x2F] + name)
+        let name = name.drop { $0 == 0x2F }
+        return RemotePath(bytes: isRoot ? bytes + name : bytes + [0x2F] + name)
     }
 
+    public func appending(_ name: String) -> RemotePath {
+        appending(name: Array(name.utf8))
+    }
+
+    /// Nil for the root and for a relative path of one component.
     public var parent: RemotePath? {
-        guard bytes.count > 1 else { return nil }
-        let slash = bytes.lastIndex(of: 0x2F) ?? 0
-        if slash == 0 { return RemotePath(bytes: [0x2F]) }
-        return RemotePath(bytes: Array(bytes[..<slash]))
+        guard !isRoot, let slash = bytes.lastIndex(of: 0x2F) else { return nil }
+        return RemotePath(bytes: slash == 0 ? [0x2F] : Array(bytes[..<slash]))
     }
 
     /// The last path component, decoded for display.
-    public var name: String { String(decoding: nameBytes, as: UTF8.self) }
+    public var name: String { String(decoding: nameSlice, as: UTF8.self) }
 
-    /// True when this path is `ancestor` or lies under it.
+    public var nameBytes: [UInt8] { Array(nameSlice) }
+
+    /// `nameBytes` without a copy.
+    var nameSlice: ArraySlice<UInt8> {
+        if isRoot { return [] }
+        guard let slash = bytes.lastIndex(of: 0x2F) else { return bytes[...] }
+        return bytes[(slash + 1)...]
+    }
+
+    /// True when this path is `ancestor` or lies under it. A lexical test: `..` is a name here,
+    /// so compare `normalized` paths when either side may hold one.
     public func isInside(_ ancestor: RemotePath) -> Bool {
         if bytes == ancestor.bytes { return true }
         let head = ancestor.isRoot ? ancestor.bytes : ancestor.bytes + [0x2F]
-        return bytes.count > head.count && Array(bytes[..<head.count]) == head
+        return bytes.count > head.count && bytes.starts(with: head)
     }
 
-    public var nameBytes: [UInt8] {
-        guard let slash = bytes.lastIndex(of: 0x2F), slash + 1 < bytes.count else {
-            return bytes == [0x2F] ? [] : bytes
+    /// The path with empty and `.` components dropped and each `..` taking away the one before
+    /// it, as far as the root. Lexical only: a symlinked folder's `..` is where the server says,
+    /// which only the server knows.
+    public var normalized: RemotePath {
+        let absolute = bytes.first == 0x2F
+        var kept: [ArraySlice<UInt8>] = []
+        for part in bytes.split(separator: 0x2F) {
+            switch part {
+            case [0x2E]: continue
+            case [0x2E, 0x2E] where kept.last.map({ $0 != [0x2E, 0x2E] }) ?? absolute:
+                if !kept.isEmpty { kept.removeLast() }
+            default: kept.append(part)
+            }
         }
-        return Array(bytes[(slash + 1)...])
+        let joined = Array(kept.joined(separator: [0x2F]))
+        if absolute { return RemotePath(bytes: [0x2F] + joined) }
+        return RemotePath(bytes: joined.isEmpty ? [0x2E] : joined)
     }
 }
 
@@ -103,7 +136,7 @@ public struct RemoteItem: Hashable, Sendable, Identifiable {
         self.group = group
     }
 
-    public var name: String { String(decoding: path.nameBytes, as: UTF8.self) }
+    public var name: String { path.name }
     public var isHidden: Bool { name.hasPrefix(".") && name != "." && name != ".." }
     public var isDotEntry: Bool { name == "." || name == ".." }
 }
