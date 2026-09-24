@@ -92,8 +92,7 @@ enum LocalPlacement {
         }
         switch info.st_mode & S_IFMT {
         case S_IFREG:
-            let seconds = info.st_mtimespec.tv_sec
-            let mtime = seconds <= 0 ? 0 : UInt32(clamping: seconds)
+            let mtime = SFTPTime.seconds(Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec)))
             return .file(Fingerprint(size: UInt64(info.st_size), mtime: mtime))
         case S_IFDIR:
             return .folder

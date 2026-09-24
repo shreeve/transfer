@@ -105,6 +105,16 @@ actor SFTPChannel {
         try item(path: path, message: await call(SFTPCode.lstat) { $0.appendPath(path) })
     }
 
+    /// The item at `path`, or nil when there is none. Any other failure, such as a dropped
+    /// connection, is thrown: it is not evidence that the name is free.
+    func lookup(_ path: RemotePath) async throws -> RemoteItem? {
+        do {
+            return try await lstat(path)
+        } catch TransferError.noSuchFile {
+            return nil
+        }
+    }
+
     /// The size and time of the file `handle` has open, which its path may no longer name.
     private func fstat(_ handle: Data) async throws -> Fingerprint? {
         Fingerprint(item: try item(path: RemotePath(string: "/"), message: await call(SFTPCode.fstat) { $0.appendBlob(handle) }))
@@ -168,14 +178,7 @@ actor SFTPChannel {
     /// needs `posix-rename` on a case-insensitive disk, where the lookup finds the source itself;
     /// the folder's listing tells that apart from a second file on a case-sensitive disk.
     func rename(_ source: RemotePath, to destination: RemotePath) async throws {
-        let taken: Bool
-        do {
-            _ = try await lstat(destination)
-            taken = true
-        } catch TransferError.noSuchFile {
-            taken = false
-        }
-        if taken {
+        if try await lookup(destination) != nil {
             let caseOnly = source.parent == destination.parent && source != destination
                 && source.name.lowercased() == destination.name.lowercased()
             guard caseOnly, let folder = destination.parent, try await !hasEntry(named: destination.name, in: folder) else {
@@ -218,13 +221,7 @@ actor SFTPChannel {
     }
 
     private func replaceStepping(_ temp: RemotePath, onto placed: RemotePath) async throws {
-        let existing: RemoteItem
-        do {
-            existing = try await lstat(placed)
-        } catch TransferError.noSuchFile {
-            try await plainRename(temp, to: placed)
-            return
-        }
+        guard let existing = try await lookup(placed) else { return try await plainRename(temp, to: placed) }
         guard existing.kind != .directory, let folder = placed.parent else { throw TransferError.typeMismatch(placed.name) }
         // Short, so a long name cannot push it past the server's name limit.
         let aside = folder.appending(name: Array(".transfer-old-\(UUID().uuidString)".utf8))

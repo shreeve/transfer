@@ -199,15 +199,10 @@ extension SSHConnection {
         parts.finish()
     }
 
-    /// The item at `path`, or nil when there is none. Any other failure, such as a dropped
-    /// connection, is thrown: it is not evidence that the file was removed.
+    /// `SFTPChannel.lookup` on `link`, else on the metadata channel.
     func existing(_ path: RemotePath, on link: SFTPChannel? = nil) async throws -> RemoteItem? {
-        do {
-            if let link { return try await link.lstat(path) }
-            return try await stat(path)
-        } catch TransferError.noSuchFile {
-            return nil
-        }
+        if let link { return try await link.lookup(path) }
+        return try await metadataLink().lookup(path)
     }
 
     // MARK: Directory copy
