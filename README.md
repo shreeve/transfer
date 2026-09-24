@@ -2,11 +2,7 @@
 
 Transfer is a native Mac app for browsing an SFTP server. Open an editable file and later saves upload. Open a PDF or an image and it is only viewed. Press Space to preview. Drag a file to the Finder and you get a real copy. Command-C and Command-V copy files and folders to another folder, another server, or the Finder, and back; Option-Command-V moves them. A bar at the bottom shows what is copied, and Escape clears it.
 
-It targets macOS 27 on Apple silicon. The bundle id is `com.github.shreeve.transfer`.
-
-## Requirements
-
-A Mac with Apple silicon running macOS 27 or later.
+It needs a Mac with Apple silicon running macOS 27 or later. The bundle id is `com.github.shreeve.transfer`.
 
 ## Install
 
@@ -26,7 +22,7 @@ This adds the `shreeve/tap` tap the first time. The cask is `transfer-sftp` beca
 curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash
 ```
 
-It downloads the newest release from GitHub, checks the app's signature, and puts `Transfer.app` in `/Applications` (or `~/Applications` if `/Applications` is not writable). An existing copy is replaced only once the new one is ready, so a failed install leaves it in place. To install somewhere else, name the folder:
+It downloads the newest release from GitHub and installs it only if the app is signed with Transfer's Developer ID and Gatekeeper accepts it as notarized, so it stops, changing nothing, on a Mac where Gatekeeper's checks are turned off. It puts `Transfer.app` in `/Applications` (or `~/Applications` if `/Applications` is not writable). An existing copy is replaced only once the new one is ready, so a failed install leaves it in place. To install somewhere else, name the folder:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | TRANSFER_DEST=~/Apps bash
@@ -63,7 +59,7 @@ Homebrew will not install over a `Transfer.app` it did not put there. To move to
 
 ## Open a server folder from its terminal
 
-Transfer opens `sftp://` links. A link to a folder opens it in a new tab; a link to a file selects it in its folder. The server is found among your saved servers by name, by the host name `~/.ssh/config` gives it, or by address; a server not yet saved opens the New Connection sheet, filled in.
+Transfer opens `sftp://` links. A link to a folder opens it in a window that shows no server yet, or else in a new tab; a link to a file selects it in its folder. The server is found among your saved servers by name, by the host name `~/.ssh/config` gives it, or by address; a server not yet saved opens the New Connection sheet, filled in.
 
 `Tools/xfer` prints such a link from a shell on the server, for Command-click in Ghostty or any terminal that shows OSC 8 links. Install it on each server, with the name the Mac uses for that server:
 
@@ -71,19 +67,21 @@ Transfer opens `sftp://` links. A link to a folder opens it in a new tab; a link
 ssh live 'mkdir -p ~/bin ~/.config/transfer && cat > ~/bin/xfer && chmod 755 ~/bin/xfer && echo live > ~/.config/transfer/host' < Tools/xfer
 ```
 
-Then run `xfer` (this folder) or `xfer some/path` on the server and Command-click what it prints.
+`~/bin` must be on the server's `PATH`. Many shells, zsh among them, leave it off: add `export PATH="$HOME/bin:$PATH"` to `~/.zshrc` or `~/.profile` there. Then run `xfer` (this folder) or `xfer some/path` on the server and Command-click what it prints. Inside tmux older than 3.4, `xfer` says when `allow-passthrough` must be on for the link to get through.
 
 ## Where your data lives
 
 | What | Where |
 | --- | --- |
-| Saved servers, stars, Live file records | `~/Library/Application Support/Transfer/transfer.sqlite` |
+| Saved servers, stars, Live file records | `~/Library/Application Support/Transfer/transfer.sqlite`, and the `-wal` and `-shm` files beside it |
 | Working copies of Live files | `~/Library/Application Support/Transfer/Live/` |
 | Editable file extensions | `~/Library/Application Support/Transfer/config.json` (Settings → Extensions) |
 | Passwords you chose to save | Keychain, service "Transfer" |
 | Preview cache | `~/Library/Caches/Transfer/` |
 | Copy and paste staging | `~/Library/Caches/com.github.shreeve.transfer/` |
 | Preferences | `defaults read com.github.shreeve.transfer` |
+
+A library written by a newer Transfer is left alone: an older version says so and quits rather than guess. A library from 0.1.7 or earlier is upgraded in place on first launch, and 0.1.7 can still open it afterwards.
 
 To remove everything after uninstalling, delete `~/Library/Application Support/Transfer`, `~/Library/Caches/Transfer`, and `~/Library/Caches/com.github.shreeve.transfer`, run `defaults delete com.github.shreeve.transfer`, and remove the "Transfer" items in Keychain Access. Check first that no Live file has unsynced edits.
 
@@ -93,37 +91,25 @@ The Xcode 27 toolchain has to be selected (`xcode-select` pointing at Xcode.app)
 
 ```bash
 swift test
-Scripts/package-app.sh
-open .build/Transfer.app
+open --env TRANSFER_LIBRARY=/tmp/transfer-dev "$(Scripts/package-app.sh)"
 ```
 
-`swift test` does not need a server. To run the tests that log in to a local `sshd`:
+`Scripts/package-app.sh` builds `Transfer.app` (in `.build`, or in the folder `SCRATCH` names) and prints its path. `TRANSFER_LIBRARY` gives the build a library of its own, with its caches inside it, so it never touches your saved servers, Live files, or caches. Leave it out only on purpose: a build on the real library is a second copy of Transfer working on your Live files. Either way the build shares the installed app's preferences, and `sftp://` links open in whichever copy macOS registered last; open the installed copy once to send them back to it.
+
+`swift test` needs no server. The tests that log in run against an unprivileged local `sshd`, never Remote Login or a real server:
 
 ```bash
-eval "$(Scripts/local-sshd.sh)" && swift test; kill $TRANSFER_TEST_SSHD
+eval "$(Scripts/local-sshd.sh 2222)" && TRANSFER_REQUIRE_SERVER=1 swift test; kill $TRANSFER_TEST_SSHD
 ```
 
-That starts an unprivileged server on 127.0.0.1:2222 and does not turn on Remote Login.
-
-A build from `Scripts/package-app.sh` runs from `.build/Transfer.app` and leaves an installed copy alone, so you can keep a release in Applications for daily use and open builds beside it. Both use the same saved servers, Live files, and settings, and only one runs at a time: quit one before opening the other. `sftp://` links open in whichever copy macOS registered last; open the installed copy once to send them back to it.
+The port is optional (2222 by default). Without the server those suites report skipped; `TRANSFER_REQUIRE_SERVER=1` makes them fail instead.
 
 ## How a connection works
 
-Transfer uses the `ssh` already on the Mac. One login is shared by every window for that server. Listing, the file you are previewing, and copying run on separate SSH channels, so a download does not block the file list. Several files can copy at once.
+Transfer uses the `ssh` already on the Mac, so your `~/.ssh/config`, agent, and `ProxyJump` apply. One login is shared by every window for that server. Listing, the file you are previewing, and copying run on separate SSH channels, so a download does not block the file list, and many files copy at once.
 
-Which files open for editing is `editableExtensions` in `Support/config.json`. The first launch copies that file to `~/Library/Application Support/Transfer/config.json`, and Settings > Extensions edits the copy.
-
-## Releasing
-
-Maintainers publish a version with one command from a clean, pushed `main`:
-
-```bash
-Scripts/release.sh 0.1.1 --dry-run
-Scripts/release.sh 0.1.1
-```
-
-`docs/RELEASING.md` explains the one-time setup, what the script checks and publishes, how to verify a release, and how to test an update before shipping it.
+Which files open for editing is `editableExtensions` in `config.json`. The first launch copies `Support/config.json` to the library, and Settings → Extensions edits that copy.
 
 ## For people changing it
 
-`PLAN.md` is the product spec. `HANDOFF.md` is how the current code actually works, including the window layout and the mistakes that already cost a day. `AGENTS.md` is the short rule list for an automated session. `docs/RELEASING.md` is how releases and updates work.
+`docs/SPEC.md` is what the app does. `HANDOFF.md` is how the code works, including the window layout and the traps that already cost a day. `AGENTS.md` is the short rule list for an automated session. `docs/RELEASING.md` is how releases and updates work (`Scripts/release.sh X.Y.Z`), and `CHANGELOG.md` is what changed in each version.
