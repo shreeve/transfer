@@ -41,13 +41,13 @@ import TransferCore
 
 @Test func editableExtensionsOpenLive() {
     for name in ["notes.txt", "app.swift", "main.rs", "page.tsx", "config.json", "clip.rip"] {
-        #expect(EditableFile.openKind(fileName: name) == .live)
+        #expect(EditableFile.openKind(fileName: name, extensions: TransferConfig.builtIn.extensionSet) == .live)
     }
 }
 
 @Test func documentsOpenForViewing() {
     for name in ["photo.jpg", "scan.png", "book.pdf", "movie.mp4", "archive.zip"] {
-        #expect(EditableFile.openKind(fileName: name) == .view)
+        #expect(EditableFile.openKind(fileName: name, extensions: TransferConfig.builtIn.extensionSet) == .view)
     }
 }
 
@@ -64,7 +64,7 @@ import TransferCore
 @Test func matchingSizeAndTimeSkipsTheCopy() {
     let source = RemoteItem(path: RemotePath(string: "/a"), kind: .file, size: 4, mtime: 10)
     let destination = RemoteItem(path: RemotePath(string: "/b"), kind: .file, size: 4, mtime: 10)
-    let decision = CopyRules.fileDisposition(source: source, destination: destination, transferID: "1", liveSave: false)
+    let decision = CopyRules.fileDisposition(source: source, destination: destination)
     #expect(decision == .skip)
 }
 

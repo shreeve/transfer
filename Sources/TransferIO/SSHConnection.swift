@@ -46,7 +46,7 @@ public actor SSHConnection: RemoteSession {
     }
 
     public var isConnected: Bool { startPath != nil && master?.isRunning == true }
-    public var unsyncedLiveCount: Int { get async { await live.unsyncedCount(on: connection.id) } }
+    var unsyncedLiveCount: Int { get async { await live.unsyncedCount(on: connection.id) } }
 
     // MARK: Login
 
@@ -105,9 +105,9 @@ public actor SSHConnection: RemoteSession {
         }
         let resolved: RemotePath
         do {
-            browse = try await openLink(.browse)
-            interactive = try? await openLink(.interactive)
-            walker = try? await openLink(.walker)
+            browse = try await openLink()
+            interactive = try? await openLink()
+            walker = try? await openLink()
             let start = connection.remotePath.isEmpty ? RemotePath(string: ".") : RemotePath(string: connection.remotePath)
             resolved = try await requireBrowse().realpath(start)
         } catch {
@@ -228,14 +228,6 @@ public actor SSHConnection: RemoteSession {
 
     // MARK: Sidebar data
 
-    public func recents() async -> [RemotePath] {
-        store.recents(connection: connection.id).map(RemotePath.init(string:))
-    }
-
-    public func remember(_ path: RemotePath) async {
-        store.remember(connection: connection.id, path: path.display)
-    }
-
     public func stars() async -> [RemotePath] {
         store.stars(connection: connection.id).map(RemotePath.init(string:))
     }
@@ -279,17 +271,15 @@ public actor SSHConnection: RemoteSession {
         case .browse: current = browse
         case .interactive: current = interactive
         case .walker: current = walker
-        case .data: return nil
         }
         if let current, await current.isOpen { return current }
         guard master?.isRunning == true, !reopened.contains(role) else { return nil }
         reopened.insert(role)
-        guard let link = try? await openLink(role) else { return nil }
+        guard let link = try? await openLink() else { return nil }
         switch role {
         case .browse: browse = link
         case .interactive: interactive = link
         case .walker: walker = link
-        case .data: break
         }
         return link
     }
@@ -315,7 +305,7 @@ public actor SSHConnection: RemoteSession {
         }
         if pool.count < 7, !poolRefused {
             do {
-                let link = try await openLink(.data)
+                let link = try await openLink()
                 pool.append(link)
                 busy.insert(ObjectIdentifier(link))
                 return link
@@ -336,7 +326,7 @@ public actor SSHConnection: RemoteSession {
         waiters.removeFirst().resume(returning: link)
     }
 
-    private func openLink(_ role: ChannelRole) async throws -> SFTPChannel {
+    private func openLink() async throws -> SFTPChannel {
         guard master?.isRunning == true else { throw TransferError.notConnected }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
@@ -352,14 +342,7 @@ public actor SSHConnection: RemoteSession {
         // the whole app before the write returned.
         _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         try process.run()
-        let chunks = ChunkPipe()
-        let link = SFTPChannel(
-            role: role,
-            process: process,
-            input: input.fileHandleForWriting,
-            output: output.fileHandleForReading,
-            chunks: chunks
-        )
+        let link = SFTPChannel(process: process, input: input.fileHandleForWriting, output: output.fileHandleForReading)
         await link.start()
         do {
             try await link.handshake()
@@ -622,7 +605,7 @@ public actor SSHConnection: RemoteSession {
             process.terminationHandler = { process in
                 let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                 let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                continuation.resume(returning: CommandResult(code: process.terminationStatus, stdout: stdout, stderr: stderr))
+                continuation.resume(returning: CommandResult(stdout: stdout, stderr: stderr))
             }
         }
         watchdog.cancel()
@@ -631,17 +614,14 @@ public actor SSHConnection: RemoteSession {
     }
 }
 
-/// The SFTP channels on one master: three reserved passengers opened at login, and data channels
-/// opened on demand.
+/// The reserved passengers, opened at login. Data channels open on demand and have no role.
 enum ChannelRole {
     case browse
     case interactive
     case walker
-    case data
 }
 
 private struct CommandResult {
-    var code: Int32
     var stdout: String
     var stderr: String
 }

@@ -146,14 +146,12 @@ private final class ProgressSum: @unchecked Sendable {
     private let lock = NSLock()
     private let report: @Sendable (TransferProgress) -> Void
     private let total: UInt64?
-    private let itemsTotal: Int?
     private var base = TransferProgress(completed: 0)
     private var current = TransferProgress(completed: 0)
 
     init(_ report: @escaping @Sendable (TransferProgress) -> Void, tally: ClipTally, passes: UInt64) {
         self.report = report
         total = tally.complete && tally.bytes > 0 ? tally.bytes * passes : nil
-        itemsTotal = tally.complete ? tally.allFiles * Int(passes) : nil
     }
 
     /// The reporter for the next copy. What the previous one reported is kept.
@@ -169,8 +167,7 @@ private final class ProgressSum: @unchecked Sendable {
                 return TransferProgress(
                     completed: base.completed + progress.completed,
                     total: total,
-                    itemsCompleted: base.itemsCompleted + progress.itemsCompleted,
-                    itemsTotal: itemsTotal
+                    itemsCompleted: base.itemsCompleted + progress.itemsCompleted
                 )
             }
             report(combined)

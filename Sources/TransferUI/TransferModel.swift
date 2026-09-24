@@ -305,7 +305,6 @@ public final class TransferModel {
         let flushEarly = columns[path] == nil
         let task = Task { [weak self] in
             guard await self?.stream(path, from: session, flushEarly: flushEarly) == true else { return }
-            await session.remember(path)
             await self?.reloadSidebars()
         }
         listing = task
@@ -455,7 +454,6 @@ public final class TransferModel {
             loadColumn(folder.path)
             snapshot.path = folder.path
             items = visible(columns[folder.path] ?? [])
-            Task { await session?.remember(folder.path) }
         } else {
             snapshot.path = parent
             items = visible(columns[parent] ?? [])

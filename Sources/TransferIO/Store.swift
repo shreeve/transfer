@@ -103,24 +103,7 @@ final class Store: @unchecked Sendable {
         }
     }
 
-    // MARK: Recents and stars
-
-    func recents(connection: ConnectionID) -> [String] {
-        queue.sync {
-            strings("SELECT path FROM recents WHERE connection_id = ? ORDER BY used_at DESC LIMIT 10", connection.rawValue.uuidString)
-        }
-    }
-
-    func remember(connection: ConnectionID, path: String) {
-        queue.sync {
-            bind(
-                "INSERT OR REPLACE INTO recents (connection_id, path, used_at) VALUES (?,?,?)",
-                connection.rawValue.uuidString,
-                path,
-                String(Date().timeIntervalSince1970)
-            )
-        }
-    }
+    // MARK: Stars
 
     /// Starred paths live in the `pins` table, named before the sidebar called them Starred.
     func stars(connection: ConnectionID) -> [String] {

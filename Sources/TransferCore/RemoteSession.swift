@@ -111,7 +111,6 @@ public protocol SessionProvider: Sendable {
     /// The saved server an `sftp://` link means, or nil when none does.
     func connection(matching link: SFTPURL) async -> SavedConnection?
     var unsyncedLiveCount: Int { get async }
-    func unsyncedLiveCount(for id: ConnectionID) async -> Int
     func disconnectAll() async
     /// The extensions that open Live, from the user's config file.
     func editableExtensions() async -> [String]
@@ -134,8 +133,6 @@ public protocol RemoteSession: Sendable {
     func remove(_ path: RemotePath) async throws
     func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
-    func copyDirectory(from remote: RemotePath, to local: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
-    func copyDirectory(fromLocal local: URL, to remote: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func openKind(fileName: String) async -> OpenKind
     func prepareLiveFile(_ path: RemotePath) async throws -> URL
     func prepareViewFile(_ path: RemotePath) async throws -> URL
@@ -145,8 +142,6 @@ public protocol RemoteSession: Sendable {
     func setLivePaused(_ path: RemotePath, paused: Bool) async
     func liveFiles() async -> [LiveFile]
     func events() -> AsyncStream<SessionEvent>
-    func recents() async -> [RemotePath]
-    func remember(_ path: RemotePath) async
     func stars() async -> [RemotePath]
     func star(_ path: RemotePath) async
     func unstar(_ path: RemotePath) async
@@ -160,7 +155,6 @@ public protocol RemoteSession: Sendable {
     func walkTree(_ root: RemotePath, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws
     /// `.compare` opens the diff tool itself and returns nil.
     func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws
-    var unsyncedLiveCount: Int { get async }
     /// A shell command that joins the same SSH master and starts a login shell in `directory`.
     func terminalCommand(directory: RemotePath) async -> String?
 }

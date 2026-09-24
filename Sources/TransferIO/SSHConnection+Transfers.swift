@@ -165,7 +165,7 @@ extension SSHConnection {
 
     // MARK: Directory copy
 
-    public func copyDirectory(from remote: RemotePath, to local: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    func copyDirectory(from remote: RemotePath, to local: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let tally = ProgressTally(progress)
         let link: SFTPChannel
         if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
@@ -210,7 +210,7 @@ extension SSHConnection {
         }
     }
 
-    public func copyDirectory(fromLocal local: URL, to remote: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    func copyDirectory(fromLocal local: URL, to remote: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let tally = ProgressTally(progress)
         try await withThrowingTaskGroup(of: Void.self) { group in
             try await walkUpload(local, to: remote, group: &group, tally: tally)
@@ -496,7 +496,7 @@ extension SSHConnection {
     private func resolvedDestination(size: UInt64, mtime: UInt32, proposed: RemotePath) async throws -> RemotePath? {
         let sourceItem = RemoteItem(path: proposed, kind: .file, size: size, mtime: mtime)
         let existing = try? await stat(proposed)
-        switch CopyRules.fileDisposition(source: sourceItem, destination: existing, transferID: "place", liveSave: false) {
+        switch CopyRules.fileDisposition(source: sourceItem, destination: existing) {
         case .skip:
             return nil
         case .typeMismatch:

@@ -80,10 +80,6 @@ public actor TransferHub: SessionProvider {
 
     public var unsyncedLiveCount: Int { get async { await live.unsyncedCount() } }
 
-    public func unsyncedLiveCount(for id: ConnectionID) async -> Int {
-        await live.unsyncedCount(on: id)
-    }
-
     public func disconnectAll() async {
         for session in sessions.values { await session.disconnect() }
     }

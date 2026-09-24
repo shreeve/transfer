@@ -13,7 +13,7 @@ public struct LiveStamp: Hashable, Sendable {
 
     /// The whole-second view the server would record for these bytes.
     public var fingerprint: Fingerprint {
-        Fingerprint(kind: .file, size: size, mtime: SFTPTime.seconds(mtime))
+        Fingerprint(size: size, mtime: SFTPTime.seconds(mtime))
     }
 }
 
@@ -113,7 +113,7 @@ public enum LiveDecision {
         }
         // After a relaunch without an exact stamp: the whole-second view against the server's.
         guard let base = state.base else { return .changed }
-        return stamp.fingerprint == Fingerprint(kind: .file, size: base.size, mtime: base.mtime) ? .same : .changed
+        return stamp.fingerprint == base ? .same : .changed
     }
 
     public static func decide(_ state: LiveState, local: LiveLocal, server: LiveServerFact, intent: LiveIntent = .sync) -> LiveAction {

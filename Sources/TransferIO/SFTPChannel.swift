@@ -1,25 +1,11 @@
 import Foundation
 import TransferCore
 
-final class ChunkPipe: @unchecked Sendable {
-    let stream: AsyncStream<Data>
-    private let continuation: AsyncStream<Data>.Continuation
-
-    init() {
-        var continuation: AsyncStream<Data>.Continuation!
-        stream = AsyncStream { continuation = $0 }
-        self.continuation = continuation
-    }
-
-    func yield(_ data: Data) { continuation.yield(data) }
-    func finish() { continuation.finish() }
-}
-
 actor SFTPChannel {
-    let role: ChannelRole
     private let process: Process
     private let input: FileHandle
-    private let chunks: ChunkPipe
+    private let chunks: AsyncStream<Data>
+    private let chunkSink: AsyncStream<Data>.Continuation
     private var buffer = Data()
     private var nextID: UInt32 = 1
     private var waiters: [UInt32: CheckedContinuation<SFTPMessage, Error>] = [:]
@@ -29,20 +15,20 @@ actor SFTPChannel {
     private var reader: Task<Void, Never>?
     private(set) var isOpen = true
 
-    init(role: ChannelRole, process: Process, input: FileHandle, output: FileHandle, chunks: ChunkPipe) {
-        self.role = role
+    init(process: Process, input: FileHandle, output: FileHandle) {
         self.process = process
         self.input = input
+        let (chunks, sink) = AsyncStream<Data>.makeStream()
         self.chunks = chunks
-        reader = nil
+        chunkSink = sink
         output.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
                 // At end of file the handler would otherwise keep firing with nothing to read.
                 handle.readabilityHandler = nil
-                chunks.finish()
+                sink.finish()
             } else {
-                chunks.yield(data)
+                sink.yield(data)
             }
         }
     }
@@ -386,7 +372,7 @@ actor SFTPChannel {
         isOpen = false
         process.terminate()
         reader?.cancel()
-        chunks.finish()
+        chunkSink.finish()
         for waiter in waiters.values {
             waiter.resume(throwing: TransferError.cancelled)
         }
@@ -479,7 +465,7 @@ actor SFTPChannel {
     }
 
     private func readLoop() async {
-        for await chunk in chunks.stream {
+        for await chunk in chunks {
             buffer.append(chunk)
             while let packet = SFTPWire.popPacket(from: &buffer) {
                 if packet.type == SFTPCode.version {
@@ -495,7 +481,7 @@ actor SFTPChannel {
                 guard packet.rest.count >= 4 else { continue }
                 let id = packet.rest.prefix(4).loadU32()
                 let rest = packet.rest.dropFirst(4)
-                let message = SFTPMessage(type: packet.type, requestID: id, rest: Data(rest))
+                let message = SFTPMessage(type: packet.type, rest: Data(rest))
                 waiters.removeValue(forKey: id)?.resume(returning: message)
             }
         }
@@ -520,9 +506,10 @@ actor SFTPChannel {
         var values: [SFTPName] = []
         for _ in 0..<count {
             let filename = try reader.blob()
-            let longname = try reader.utf8()
+            // The `ls -l` style long name is not used.
+            _ = try reader.blob()
             let attrs = try reader.attrs()
-            values.append(SFTPName(filename: filename, longname: longname, attrs: attrs))
+            values.append(SFTPName(filename: filename, attrs: attrs))
         }
         return values
     }

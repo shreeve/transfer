@@ -1,6 +1,6 @@
 import Foundation
 
-public struct ConnectionID: Hashable, Sendable, Codable, RawRepresentable {
+public struct ConnectionID: Hashable, Sendable, RawRepresentable {
     public var rawValue: UUID
     public init(rawValue: UUID) { self.rawValue = rawValue }
     public init() { self.rawValue = UUID() }
@@ -12,13 +12,13 @@ public struct ConnectionID: Hashable, Sendable, Codable, RawRepresentable {
     }
 }
 
-public struct LiveFileID: Hashable, Sendable, Codable, RawRepresentable {
+public struct LiveFileID: Hashable, Sendable, RawRepresentable {
     public var rawValue: UUID
     public init(rawValue: UUID) { self.rawValue = rawValue }
     public init() { self.rawValue = UUID() }
 }
 
-public struct RemotePath: Hashable, Sendable, Codable {
+public struct RemotePath: Hashable, Sendable {
     public var bytes: [UInt8]
 
     public init(bytes: [UInt8]) {
@@ -67,14 +67,14 @@ public struct RemotePath: Hashable, Sendable, Codable {
     }
 }
 
-public enum ItemKind: String, Hashable, Sendable, Codable {
+public enum ItemKind: String, Hashable, Sendable {
     case file
     case directory
     case symlink
     case other
 }
 
-public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
+public struct RemoteItem: Hashable, Sendable, Identifiable {
     public var path: RemotePath
     public var kind: ItemKind
     public var size: UInt64?
@@ -82,7 +82,6 @@ public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
     public var mode: UInt32?
     public var owner: String?
     public var group: String?
-    public var linkTarget: String?
 
     public var id: RemotePath { path }
 
@@ -93,8 +92,7 @@ public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
         mtime: UInt32? = nil,
         mode: UInt32? = nil,
         owner: String? = nil,
-        group: String? = nil,
-        linkTarget: String? = nil
+        group: String? = nil
     ) {
         self.path = path
         self.kind = kind
@@ -103,7 +101,6 @@ public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
         self.mode = mode
         self.owner = owner
         self.group = group
-        self.linkTarget = linkTarget
     }
 
     public var name: String { String(decoding: path.nameBytes, as: UTF8.self) }
@@ -122,26 +119,24 @@ public enum SFTPTime {
     }
 }
 
-public struct Fingerprint: Hashable, Sendable, Codable {
-    public var kind: ItemKind
+/// A file as SFTP describes it: size and whole-second mtime.
+public struct Fingerprint: Hashable, Sendable {
     public var size: UInt64
     public var mtime: UInt32
 
-    public init(kind: ItemKind, size: UInt64, mtime: UInt32) {
-        self.kind = kind
+    public init(size: UInt64, mtime: UInt32) {
         self.size = size
         self.mtime = mtime
     }
 
     public init?(item: RemoteItem) {
         guard item.kind == .file, let size = item.size, let mtime = item.mtime else { return nil }
-        self.kind = item.kind
         self.size = size
         self.mtime = mtime
     }
 }
 
-public struct SavedConnection: Hashable, Sendable, Codable, Identifiable {
+public struct SavedConnection: Hashable, Sendable, Identifiable {
     public var id: ConnectionID
     public var name: String
     public var host: String

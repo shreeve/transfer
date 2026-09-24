@@ -4,8 +4,8 @@ import TransferCore
 
 private let t0 = Date(timeIntervalSince1970: 1_700_000_000.25)
 private let synced = LiveStamp(size: 10, mtime: t0)
-private let base = Fingerprint(kind: .file, size: 10, mtime: 1_700_000_000)
-private let other = Fingerprint(kind: .file, size: 12, mtime: 1_700_000_500)
+private let base = Fingerprint(size: 10, mtime: 1_700_000_000)
+private let other = Fingerprint(size: 12, mtime: 1_700_000_500)
 
 private func state(dirty: Bool = false, paused: Bool = false, conflict: Bool = false, exact: Bool = true) -> LiveState {
     LiveState(base: base, synced: exact ? synced : nil, syncedDigest: exact ? "d0" : nil, dirty: dirty, paused: paused, conflict: conflict)

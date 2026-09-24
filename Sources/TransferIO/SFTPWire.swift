@@ -31,7 +31,6 @@ enum SFTPCode {
     static let noSuchFile: UInt32 = 2
     static let permission: UInt32 = 3
     static let failure: UInt32 = 4
-    static let unsupported: UInt32 = 8
 
     static let attrSize: UInt32 = 0x1
     static let attrUID: UInt32 = 0x2
@@ -42,7 +41,6 @@ enum SFTPCode {
     static let fxWrite: UInt32 = 0x2
     static let fxCreat: UInt32 = 0x8
     static let fxTrunc: UInt32 = 0x10
-    static let fxExcl: UInt32 = 0x20
 }
 
 struct SFTPAttrs: Equatable {
@@ -93,13 +91,11 @@ struct SFTPAttrs: Equatable {
 
 struct SFTPName: Equatable {
     var filename: Data
-    var longname: String
     var attrs: SFTPAttrs
 }
 
 struct SFTPMessage {
     var type: UInt8
-    var requestID: UInt32?
     var rest: Data
 }
 
@@ -122,7 +118,7 @@ enum SFTPWire {
         buffer.removeSubrange(0..<total)
         let type = payload[payload.startIndex]
         let rest = payload.dropFirst()
-        return SFTPMessage(type: type, requestID: nil, rest: Data(rest))
+        return SFTPMessage(type: type, rest: Data(rest))
     }
 }
 
@@ -133,13 +129,6 @@ struct ByteReader {
     init(_ data: Data) {
         self.data = data
         self.index = 0
-    }
-
-    mutating func u8() throws -> UInt8 {
-        guard index < data.count else { throw TransferError.failed("Short SFTP packet") }
-        let value = data[data.startIndex + index]
-        index += 1
-        return value
     }
 
     mutating func u32() throws -> UInt32 {

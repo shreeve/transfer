@@ -1,7 +1,7 @@
 import Foundation
 import UniformTypeIdentifiers
 
-public enum OpenKind: String, Sendable, Codable {
+public enum OpenKind: String, Sendable {
     case live
     case view
 }
@@ -24,9 +24,7 @@ public struct TransferConfig: Codable, Equatable, Sendable {
 }
 
 public enum EditableFile {
-    public static let extensions = TransferConfig.builtIn.extensionSet
-
-    public static func openKind(fileName: String, extensions: Set<String> = EditableFile.extensions) -> OpenKind {
+    public static func openKind(fileName: String, extensions: Set<String>) -> OpenKind {
         let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
         if extensions.contains(ext) { return .live }
         if let type = UTType(filenameExtension: ext) {
@@ -38,13 +36,13 @@ public enum EditableFile {
     }
 }
 
-public enum NameCollisionChoice: String, Sendable, Codable {
+public enum NameCollisionChoice: String, Sendable {
     case skip
     case keepBoth
     case replace
 }
 
-public enum LiveConflictChoice: String, Sendable, Codable {
+public enum LiveConflictChoice: String, Sendable {
     case compare
     case keepLocal
     case keepRemote
@@ -86,22 +84,15 @@ public enum CopyDisposition: Equatable, Sendable {
     case skip
     case collide
     case typeMismatch
-    case write(tempName: String)
+    case write
 }
 
 public enum CopyRules {
-    public static func fileDisposition(
-        source: RemoteItem,
-        destination: RemoteItem?,
-        transferID: String,
-        liveSave: Bool
-    ) -> CopyDisposition {
-        let temp = tempName(for: source.name, transferID: transferID)
-        guard let destination else { return .write(tempName: temp) }
+    public static func fileDisposition(source: RemoteItem, destination: RemoteItem?) -> CopyDisposition {
+        guard let destination else { return .write }
         if source.kind != destination.kind { return .typeMismatch }
         if source.kind != .file { return .typeMismatch }
-        if !liveSave,
-           let left = Fingerprint(item: source),
+        if let left = Fingerprint(item: source),
            let right = Fingerprint(item: destination),
            left.size == right.size,
            left.mtime == right.mtime {
@@ -115,30 +106,27 @@ public enum CopyRules {
     }
 }
 
-public enum OperationState: String, Hashable, Sendable, Codable {
+public enum OperationState: String, Hashable, Sendable {
     case queued
     case active
     case paused
     case succeeded
     case failed
-    case canceled
 }
 
 public struct TransferProgress: Hashable, Sendable {
     public var completed: UInt64
     public var total: UInt64?
     public var itemsCompleted: Int
-    public var itemsTotal: Int?
 
-    public init(completed: UInt64, total: UInt64? = nil, itemsCompleted: Int = 0, itemsTotal: Int? = nil) {
+    public init(completed: UInt64, total: UInt64? = nil, itemsCompleted: Int = 0) {
         self.completed = completed
         self.total = total
         self.itemsCompleted = itemsCompleted
-        self.itemsTotal = itemsTotal
     }
 }
 
-public enum HostKeySituation: String, Sendable, Codable {
+public enum HostKeySituation: String, Sendable {
     case unchanged
     case firstSeen
     case changed
@@ -165,7 +153,7 @@ public enum HostKeyDecision: Sendable {
     case replace
 }
 
-public enum ViewMode: String, Hashable, Sendable, Codable, CaseIterable {
+public enum ViewMode: String, Hashable, Sendable, CaseIterable {
     case icon
     case list
     case columns

@@ -552,7 +552,7 @@ actor FakeServer: LiveServer {
     struct File {
         var data: Data
         var mtime: UInt32
-        var print: Fingerprint { Fingerprint(kind: .file, size: UInt64(data.count), mtime: mtime) }
+        var print: Fingerprint { Fingerprint(size: UInt64(data.count), mtime: mtime) }
     }
 
     private var files: [RemotePath: File] = [:]

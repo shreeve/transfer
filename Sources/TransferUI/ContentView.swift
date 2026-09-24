@@ -283,7 +283,7 @@ struct DetailColumn: View {
                     case .failed:
                         Button("Retry") { Task { await model.resume(operation) } }
                         Button("Remove") { model.remove(operation) }
-                    case .succeeded, .canceled:
+                    case .succeeded:
                         EmptyView()
                     }
                 }

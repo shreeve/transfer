@@ -755,7 +755,7 @@ actor LiveSync {
 
     private static func fingerprint(_ size: UInt64?, _ mtime: UInt32?) -> Fingerprint? {
         guard let size, let mtime else { return nil }
-        return Fingerprint(kind: .file, size: size, mtime: mtime)
+        return Fingerprint(size: size, mtime: mtime)
     }
 
     // MARK: Files

@@ -77,7 +77,7 @@ Then run `xfer` (this folder) or `xfer some/path` on the server and Command-clic
 
 | What | Where |
 | --- | --- |
-| Saved servers, recents, stars, Live file records | `~/Library/Application Support/Transfer/transfer.sqlite` |
+| Saved servers, stars, Live file records | `~/Library/Application Support/Transfer/transfer.sqlite` |
 | Working copies of Live files | `~/Library/Application Support/Transfer/Live/` |
 | Editable file extensions | `~/Library/Application Support/Transfer/config.json` (Settings → Extensions) |
 | Passwords you chose to save | Keychain, service "Transfer" |
