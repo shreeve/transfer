@@ -190,15 +190,18 @@ struct TransferEngine {
         guard request.moving, !memo.withLock({ $0.checked }) else { return }
         let name = ".transfer-move-check-\(UUID().uuidString)"
         let probe = request.folder.appending(name)
-        try await destination.mkdir(probe)
+        // Recorded like a temp, so a dropped connection leaves no folder behind for good.
+        destination.store.rememberTemp(probe, connection: destination.connection.id)
         let found: Bool
         do {
+            try await destination.mkdir(probe)
             found = try await seen(name)
         } catch {
-            try? await destination.remove(probe)
+            await destination.discardRemoteTemp(probe)
             throw error
         }
-        try? await destination.remove(probe)
+        await destination.discardRemoteTemp(probe)
+        destination.pipe.emit(.directoryChanged(request.folder))
         if found { throw TransferError.failed("Nothing was moved: this folder is \(place), so each item would be copied onto itself.") }
         memo.withLock { $0.checked = true }
     }

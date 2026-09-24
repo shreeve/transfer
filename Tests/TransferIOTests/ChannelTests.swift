@@ -307,6 +307,32 @@ import TransferCore
         await server.stop()
     }
 
+    /// The old file's step aside was not recorded, so a connection that dropped before it came
+    /// back or was removed left the user's file hidden under a temp name for good (R-T8). It is
+    /// recorded before it steps aside and forgotten once it is gone; a drop leaves the record.
+    @Test func aFileSetAsideIsRecordedUntilItIsGone() async throws {
+        func logging(_ events: Locked<[String]>) -> SFTPChannel.AsideLog {
+            SFTPChannel.AsideLog(
+                remember: { _, placed in events.withLock { $0.append("remember \(placed.display)") } },
+                forget: { _, placed in events.withLock { $0.append("forget \(placed.display)") } }
+            )
+        }
+        let done = Locked<[String]>([])
+        let server = try await Self.stepping(ScriptedServer.file)
+        try await server.channel.replace(Self.temp, onto: Self.placed, log: logging(done))
+        #expect(done.value == ["remember /srv/a", "forget /srv/a"])
+        await server.stop()
+
+        let dropped = Locked<[String]>([])
+        let hung = try await Self.stepping(ScriptedServer.file, onto: nil)
+        let replace = Task { try await hung.channel.replace(Self.temp, onto: Self.placed, log: logging(dropped)) }
+        #expect(await eventually { hung.sent(SFTPCode.rename).count == 2 })
+        hung.hangUp()
+        await #expect(throws: (any Error).self) { try await replace.value }
+        #expect(dropped.value == ["remember /srv/a"])
+        await hung.stop()
+    }
+
     @Test func aReplaceOntoNothingIsOneRename() async throws {
         let server = try await Self.stepping(nil)
         try await server.channel.replace(Self.temp, onto: Self.placed)

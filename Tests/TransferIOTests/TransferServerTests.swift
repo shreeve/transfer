@@ -400,6 +400,30 @@ struct TransferServerTests {
         }
     }
 
+    /// A file a replace set aside (on a server without posix-rename), or a move's probe folder,
+    /// left behind by a dropped connection stayed hidden for good (R-T8). The next login puts the
+    /// file back, finishes a replace that got as far as its new file, and removes the probe.
+    @Test func theNextLoginPutsBackWhatAReplaceSetAside() async throws {
+        try await withHarness("aside") { h in
+            let folder = h.remotePath
+            try Data("mine".utf8).write(to: h.remote.appendingPathComponent(".transfer-old-1"))
+            try Data("old".utf8).write(to: h.remote.appendingPathComponent(".transfer-old-2"))
+            try Data("new".utf8).write(to: h.remote.appendingPathComponent("done.txt"))
+            try FileManager.default.createDirectory(at: h.remote.appendingPathComponent(".transfer-move-check-3"), withIntermediateDirectories: true)
+            let store = try Store(root: h.root)
+            let id = h.session.connection.id
+            store.rememberTemp(SSHConnection.asideRecord(folder.appending(".transfer-old-1"), folder.appending("notes.txt")), connection: id)
+            store.rememberTemp(SSHConnection.asideRecord(folder.appending(".transfer-old-2"), folder.appending("done.txt")), connection: id)
+            store.rememberTemp(folder.appending(".transfer-move-check-3"), connection: id)
+
+            _ = try await h.session.connect(prompts: h.prompts)
+            #expect(try FileManager.default.contentsOfDirectory(atPath: h.remote.path).sorted() == ["done.txt", "notes.txt"])
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("notes.txt")) == Data("mine".utf8))
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("done.txt")) == Data("new".utf8))
+            #expect(store.remoteTemps(connection: id).isEmpty)
+        }
+    }
+
     /// A temp is named ".<name>.transfer-<UUID>", 47 bytes longer than the name, so a file whose
     /// name took more than 208 of the 255 bytes a name may have could not be copied either way
     /// (R-T5). The name in the temp is cut to fit, and a long name goes up and down whole.

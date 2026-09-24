@@ -28,6 +28,8 @@ struct MoveServerTests {
                 #expect(try h.read("elsewhere/a.txt") == "a")
                 #expect(try h.read("elsewhere/sub/b.txt") == "b")
                 #expect(try h.names("site").isEmpty)
+                // The probe folders were recorded, as temps are, and forgotten once removed.
+                #expect(try Store(root: h.root).remoteTemps(connection: h.session.connection.id).isEmpty)
             }
         }
     }

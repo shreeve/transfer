@@ -141,7 +141,7 @@ extension SSHConnection {
             // The temp is renamed on the channel that wrote it, once every write is acknowledged.
             try await withData(DataShare(size: local?.size)) { link in
                 try await self.send(source, size: local?.size, to: temp, on: link, stamp: stamp, progress: progress)
-                try await link.place(temp, onto: placed, replacing: replacing)
+                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
             }
         }
     }
@@ -171,7 +171,7 @@ extension SSHConnection {
             if !matches, now == nil || now != written { throw LiveRemoteChanged() }
             // A new file keeps the mode the server gave the temp when it was created.
             if let kept = found?.mode { try? await link.setstat(temp, SFTPAttrs(permissions: kept & 0o7777)) }
-            try await link.replace(temp, onto: placed)
+            try await link.replace(temp, onto: placed, log: asides)
             return written
         }
     }
@@ -504,7 +504,7 @@ extension SSHConnection {
         } else {
             try await withRemoteTemp(for: spot.path) { temp in
                 try await link.symlink(target: target, link: temp)
-                try await link.replace(temp, onto: spot.path)
+                try await link.replace(temp, onto: spot.path, log: asides)
             }
         }
         tally.record(spot.path)
@@ -519,7 +519,7 @@ extension SSHConnection {
             let onServer = try await withData(DataShare(size: item.size)) { link in
                 guard await link.extensions.contains("copy-data") else { return false }
                 try await link.copyData(item.path, to: temp, stamp: stamp)
-                try await link.place(temp, onto: placed, replacing: replacing)
+                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
                 return true
             }
             guard !onServer else { return }
@@ -528,7 +528,7 @@ extension SSHConnection {
             try await fetch(item.path, info: item, to: scratch) { _ in }
             try await withData(DataShare(size: item.size)) { link in
                 try await self.send(scratch, size: item.size, to: temp, on: link, stamp: stamp) { _ in }
-                try await link.place(temp, onto: placed, replacing: replacing)
+                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
             }
         }
     }
@@ -549,19 +549,55 @@ extension SSHConnection {
         }
     }
 
-    /// Removes a temp left by a failed or cancelled write and forgets it once it is gone. The
-    /// removal runs in a task of its own, so the cancel that stopped the write does not stop it
-    /// too. When the server cannot be reached, the record stays and the next login removes it.
+    /// Removes a temp left by a failed or cancelled write, or a move's empty probe folder, and
+    /// forgets it once it is gone; a file `replace` set aside goes back to its name, unless the
+    /// replace got as far as putting the new file there. The work runs in a task of its own, so
+    /// the cancel that stopped the write does not stop it too. When the server cannot be reached,
+    /// the record stays and the next login does it.
     func discardRemoteTemp(_ temp: RemotePath) async {
         await Task {
             do {
-                try await metadataLink().removeFile(temp)
+                let link = try await metadataLink()
+                if let (aside, placed) = Self.aside(in: temp) {
+                    if try await link.lookup(aside) != nil {
+                        if try await link.lookup(placed) == nil { try await link.rename(aside, to: placed) } else { try await link.removeFile(aside) }
+                    }
+                } else {
+                    do {
+                        try await link.removeFile(temp)
+                    } catch TransferError.noSuchFile {
+                    } catch {
+                        guard try await link.lookup(temp)?.kind == .directory else { throw error }
+                        try await link.removeDirectory(temp)
+                    }
+                }
             } catch TransferError.noSuchFile {
             } catch {
                 return
             }
             store.forgetTemp(temp)
         }.value
+    }
+
+    /// Records the files `replace` sets aside with the temps.
+    var asides: SFTPChannel.AsideLog {
+        let (store, id) = (store, connection.id)
+        return SFTPChannel.AsideLog(
+            remember: { store.rememberTemp(Self.asideRecord($0, $1), connection: id) },
+            forget: { store.forgetTemp(Self.asideRecord($0, $1)) }
+        )
+    }
+
+    /// The temp record of a file set aside: its path and its name's, joined by a NUL, which no
+    /// path holds.
+    static func asideRecord(_ aside: RemotePath, _ placed: RemotePath) -> RemotePath {
+        RemotePath(bytes: aside.bytes + [0] + placed.bytes)
+    }
+
+    /// The aside and its name, from an `asideRecord`; nil for any other record.
+    static func aside(in record: RemotePath) -> (aside: RemotePath, placed: RemotePath)? {
+        guard let split = record.bytes.firstIndex(of: 0) else { return nil }
+        return (RemotePath(bytes: Array(record.bytes[..<split])), RemotePath(bytes: Array(record.bytes[(split + 1)...])))
     }
 
     public nonisolated func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, TreeEntry), Error> {
