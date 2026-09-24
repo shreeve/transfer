@@ -136,7 +136,8 @@ public actor SSHConnection: RemoteSession {
             await release(held)
             throw error is CancellationError ? TransferError.cancelled : error
         }
-        await removeRecordedRemoteTemps()
+        // The temps an earlier run could not remove; each is forgotten only once it is gone.
+        for temp in store.remoteTemps(connection: connection.id) { await discardRemoteTemp(temp) }
         await live.connected(connection.id, server: self)
         guard let startPath else { throw TransferError.notConnected }
         return startPath
@@ -563,13 +564,6 @@ public actor SSHConnection: RemoteSession {
         return link
     }
 
-    /// Removes the temps an earlier run could not; each is forgotten only once it is gone.
-    private func removeRecordedRemoteTemps() async {
-        for temp in store.remoteTemps(connection: connection.id) {
-            await discardRemoteTemp(temp)
-        }
-    }
-
     // MARK: Arguments
 
     /// For every ssh that joins or runs on the server: `~/.ssh/config` may name a remote command, a
@@ -598,7 +592,7 @@ public actor SSHConnection: RemoteSession {
     }
 
     private func masterArguments(_ hostKeyArguments: [String]) -> [String] {
-        var arguments = [
+        let arguments = [
             "-N",
             "-o", "ControlMaster=yes",
             // A ControlPersist or ForkAfterAuthentication in ~/.ssh/config would fork the master
@@ -612,11 +606,7 @@ public actor SSHConnection: RemoteSession {
             "-S", socketPath,
             "-o", "StrictHostKeyChecking=yes",
         ]
-        arguments += Self.plainSession
-        arguments += hostKeyArguments
-        arguments += destinationArguments
-        arguments += ["--", connection.destination]
-        return configArguments + arguments
+        return configArguments + arguments + Self.plainSession + hostKeyArguments + destinationArguments + ["--", connection.destination]
     }
 
     private var configArguments: [String] {
@@ -756,40 +746,36 @@ public actor SSHConnection: RemoteSession {
         }
     }
 
+    /// The folder with the helper ssh runs for each prompt. The helper gives up with the login
+    /// (`loginTimeout`) or as soon as its folder is removed, so none outlives a login that ended.
     private func prepareAskpass() throws -> URL {
         let directory = store.root.appendingPathComponent("ask-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
-            try writeAskpass(in: directory)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            let script = directory.appendingPathComponent("askpass.sh")
+            let ticks = Self.loginTimeout.components.seconds * 10
+            let source = """
+            #!/bin/sh
+            dir="$TRANSFER_ASK_DIR"
+            umask 077
+            printf '%s' "$1" > "$dir/prompt" || exit 1
+            i=0
+            while [ ! -f "$dir/reply" ]; do
+              i=$((i+1))
+              if [ "$i" -gt \(ticks) ] || [ ! -d "$dir" ]; then exit 1; fi
+              sleep 0.1
+            done
+            cat "$dir/reply"
+            rm -f "$dir/prompt" "$dir/reply"
+            """
+            try source.write(to: script, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
         } catch {
             try? FileManager.default.removeItem(at: directory)
             throw error
         }
         return directory
-    }
-
-    /// The helper ssh runs for each prompt. It gives up with the login (`loginTimeout`) or as soon
-    /// as its folder is removed, so none outlives a login that ended.
-    private func writeAskpass(in directory: URL) throws {
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-        let script = directory.appendingPathComponent("askpass.sh")
-        let ticks = Self.loginTimeout.components.seconds * 10
-        let source = """
-        #!/bin/sh
-        dir="$TRANSFER_ASK_DIR"
-        umask 077
-        printf '%s' "$1" > "$dir/prompt" || exit 1
-        i=0
-        while [ ! -f "$dir/reply" ]; do
-          i=$((i+1))
-          if [ "$i" -gt \(ticks) ] || [ ! -d "$dir" ]; then exit 1; fi
-          sleep 0.1
-        done
-        cat "$dir/reply"
-        rm -f "$dir/prompt" "$dir/reply"
-        """
-        try source.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
     }
 
     private func askEnvironment(_ directory: URL) -> [String: String] {

@@ -8,10 +8,8 @@ enum KeychainStore {
     static func load(account: String) -> String? {
         var item: CFTypeRef?
         let search = query(account).merging([kSecReturnData as String: true]) { $1 }
-        guard SecItemCopyMatching(search as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let text = String(data: data, encoding: .utf8) else { return nil }
-        return text
+        guard SecItemCopyMatching(search as CFDictionary, &item) == errSecSuccess, let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     static func save(account: String, secret: String) {
