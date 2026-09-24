@@ -39,17 +39,14 @@ public actor TransferHub: SessionProvider {
     }
 
     public func removeConnection(_ id: ConnectionID) async throws {
-        let unsynced = await live.unsyncedCount(on: id)
-        if unsynced > 0 { throw TransferError.liveUnsynced(unsynced) }
-        // Live closes before anything else awaits, so no edit can land between the check and the
-        // folder's removal while the session disconnects.
-        await live.close(id)
+        // Live checks and closes in one call, and the folder goes before anything else awaits,
+        // so no edit can land between the check and the removal.
+        try await live.closeIfSynced(id)
+        try? FileManager.default.removeItem(at: store.root.appendingPathComponent("Live/\(id.rawValue.uuidString)", isDirectory: true))
         let session = sessions.removeValue(forKey: id)
         await session?.disconnect()
         store.remove(id)
         KeychainStore.delete(account: id.rawValue.uuidString)
-        let live = store.root.appendingPathComponent("Live/\(id.rawValue.uuidString)", isDirectory: true)
-        try? FileManager.default.removeItem(at: live)
     }
 
     public func session(for id: ConnectionID) async throws -> any RemoteSession {
