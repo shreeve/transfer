@@ -12,7 +12,6 @@ struct HubTests {
         let base = TestCaches.fresh("hub")
         defer { try? FileManager.default.removeItem(at: base) }
         let root = base.appendingPathComponent("library", isDirectory: true)
-        // Above the largest process id, so nobody owns it.
         let ask = root.appendingPathComponent("ask-999999-\(UUID().uuidString)", isDirectory: true)
         let probe = root.appendingPathComponent("hostkey-\(UUID().uuidString)", isDirectory: true)
         let key = root.appendingPathComponent("key-\(UUID().uuidString)")
