@@ -12,7 +12,9 @@ enum SFTPCode {
     static let read: UInt8 = 5
     static let write: UInt8 = 6
     static let lstat: UInt8 = 7
+    static let fstat: UInt8 = 8
     static let setstat: UInt8 = 9
+    static let fsetstat: UInt8 = 10
     static let opendir: UInt8 = 11
     static let readdir: UInt8 = 12
     static let remove: UInt8 = 13
@@ -62,6 +64,11 @@ struct SFTPAttrs: Equatable {
         case 0o100000: return .file
         default: return .other
         }
+    }
+
+    /// What a copy sets on the file it wrote: a mode, and a time for both access and change.
+    static func stamp(mode: UInt32?, mtime: UInt32?) -> SFTPAttrs {
+        SFTPAttrs(permissions: mode, atime: mtime, mtime: mtime)
     }
 
     func encoded() -> Data {
@@ -293,5 +300,12 @@ extension Data {
 
     mutating func appendString(_ string: String) {
         appendBlob(Data(string.utf8))
+    }
+
+    /// OPEN's fields: the path, the flags, and no attributes.
+    mutating func openFields(_ path: RemotePath, flags: UInt32) {
+        appendPath(path)
+        appendU32(flags)
+        append(SFTPAttrs().encoded())
     }
 }
