@@ -80,6 +80,13 @@ public struct RemotePath: Hashable, Sendable {
         return bytes.count > head.count && bytes.starts(with: head)
     }
 
+    /// The path with `prefix` swapped for `replacement` when this path is `prefix` or lies under
+    /// it, as where a moved folder's contents land; nil otherwise.
+    public func replacing(prefix: RemotePath, with replacement: RemotePath) -> RemotePath? {
+        guard isInside(prefix) else { return nil }
+        return self == prefix ? replacement : replacement.appending(name: Array(bytes[(prefix.isRoot ? 1 : prefix.bytes.count + 1)...]))
+    }
+
     /// The path with empty and `.` components dropped and each `..` taking away the one before
     /// it, as far as the root. Lexical only: a symlinked folder's `..` is where the server says,
     /// which only the server knows.

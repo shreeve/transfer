@@ -74,6 +74,23 @@ struct RemotePathTests {
         #expect(normal("/srv/..hidden/.x") == "/srv/..hidden/.x")
     }
 
+    @Test func replacingAPrefixMovesThePathAndItsContents() {
+        func moved(_ path: String, _ prefix: String, _ replacement: String) -> String? {
+            RemotePath(string: path).replacing(prefix: RemotePath(string: prefix), with: RemotePath(string: replacement))?.display
+        }
+        #expect(moved("/srv/a", "/srv/a", "/dst/b") == "/dst/b")
+        #expect(moved("/srv/a/x/y.txt", "/srv/a", "/dst/b") == "/dst/b/x/y.txt")
+        #expect(moved("/srv/ab", "/srv/a", "/dst/b") == nil)
+        #expect(moved("/srv", "/srv/a", "/dst/b") == nil)
+        // The root on either side never makes a `//`.
+        #expect(moved("/srv/a/x", "/srv/a", "/") == "/x")
+        #expect(moved("/srv/a", "/srv/a", "/") == "/")
+        #expect(moved("/x/y", "/", "/dst") == "/dst/x/y")
+        #expect(moved("/", "/", "/dst") == "/dst")
+        let latin1 = RemotePath(bytes: Array("/srv/a/".utf8) + [0xE9])
+        #expect(latin1.replacing(prefix: RemotePath(string: "/srv/a"), with: RemotePath(string: "/dst"))?.bytes == Array("/dst/".utf8) + [0xE9])
+    }
+
     @Test func anItemsNameIsItsPathsName() {
         let item = RemoteItem(path: RemotePath(string: "/srv/.env/"), kind: .file)
         #expect(item.name == ".env")

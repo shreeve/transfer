@@ -940,13 +940,3 @@ final class EventPipe: @unchecked Sendable {
         for target in targets { target.yield(event) }
     }
 }
-
-extension RemotePath {
-    /// The path with `prefix` swapped for `replacement` when this path is `prefix` or lies under it.
-    func replacing(prefix: RemotePath, with replacement: RemotePath) -> RemotePath? {
-        if bytes == prefix.bytes { return replacement }
-        let head = prefix.isRoot ? prefix.bytes : prefix.bytes + [0x2F]
-        guard bytes.count > head.count, Array(bytes[..<head.count]) == head else { return nil }
-        return RemotePath(bytes: replacement.bytes + [0x2F] + Array(bytes[head.count...]))
-    }
-}
