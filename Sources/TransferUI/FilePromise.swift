@@ -16,6 +16,19 @@ struct RemoteDragPayload: Codable {
         guard let data = pasteboard.data(forType: remoteDragType) else { return nil }
         return try? JSONDecoder().decode(RemoteDragPayload.self, from: data)
     }
+
+    /// The payload naming `items` on `session`'s server, for a drag or the clipboard.
+    static func data(for items: [RemoteItem], session: any RemoteSession) -> Data {
+        let payload = RemoteDragPayload(connection: session.connection.id.rawValue, paths: items.map(\.path.bytes))
+        return (try? JSONEncoder().encode(payload)) ?? Data()
+    }
+}
+
+extension NSPasteboard {
+    /// The file URLs on the pasteboard, from Finder or another app.
+    var fileURLs: [URL] {
+        (readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    }
 }
 
 /// One promise per dragged root. Finder receives a real file or folder. Transfer receives the remote paths.
@@ -83,18 +96,13 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
     }
 
     static func providers(for items: [RemoteItem], session: any RemoteSession, prompts: any PromptSink) -> [RemoteItemPromise] {
-        let data = payload(for: items, session: session)
+        let data = RemoteDragPayload.data(for: items, session: session)
         return items.map { RemoteItemPromise(item: $0, session: session, payload: data, prompts: prompts) }
     }
 
     /// One provider for `item`, whose payload names every item in `roots`, for row-based drags.
     static func provider(for item: RemoteItem, among roots: [RemoteItem], session: any RemoteSession, prompts: any PromptSink) -> RemoteItemPromise {
-        RemoteItemPromise(item: item, session: session, payload: payload(for: roots, session: session), prompts: prompts)
-    }
-
-    private static func payload(for items: [RemoteItem], session: any RemoteSession) -> Data {
-        let payload = RemoteDragPayload(connection: session.connection.id.rawValue, paths: items.map(\.path.bytes))
-        return (try? JSONEncoder().encode(payload)) ?? Data()
+        RemoteItemPromise(item: item, session: session, payload: RemoteDragPayload.data(for: roots, session: session), prompts: prompts)
     }
 }
 
@@ -120,7 +128,7 @@ func dropAction(from pasteboard: NSPasteboard, onto folder: RemotePath, connecti
         }
         return paths.isEmpty ? nil : .moveRemote(paths, into: folder)
     }
-    let urls = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    let urls = pasteboard.fileURLs
     return urls.isEmpty ? nil : .uploadFiles(urls, into: folder)
 }
 
