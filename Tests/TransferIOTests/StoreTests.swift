@@ -102,12 +102,12 @@ struct StoreTests {
             ]
         }
 
-        var expectedLocalTemps: [String] {
-            self == .first ? ["/tmp/.a.transfer-1"] : ["/tmp/.a.transfer-1", "/tmp/.c.transfer-3"]
+        var expectedLocalTemps: [URL] {
+            (self == .first ? ["/tmp/.a.transfer-1"] : ["/tmp/.a.transfer-1", "/tmp/.c.transfer-3"]).map(URL.init(fileURLWithPath:))
         }
 
-        var expectedRemoteTemps: [String] {
-            self == .first ? [] : ["/srv/.b.transfer-2"]
+        var expectedRemoteTemps: [RemotePath] {
+            self == .first ? [] : [RemotePath(string: "/srv/.b.transfer-2")]
         }
     }
 
@@ -129,16 +129,18 @@ struct StoreTests {
                             port: "2222", identityFile: "/Users/ann/.ssh/id_ed25519", remotePath: "/srv/www"),
             SavedConnection(id: ConnectionID(rawValue: Self.beta), name: "Beta", host: "beta.example"),
         ])
-        #expect(store.stars(connection: ConnectionID(rawValue: Self.alpha)) == ["/home/zoë", "/srv/www"])
-        #expect(store.stars(connection: ConnectionID(rawValue: Self.beta)) == ["/"])
+        #expect(stars(store, Self.alpha) == ["/home/zoë", "/srv/www"])
+        #expect(stars(store, Self.beta) == ["/"])
         #expect(describe(store.liveFiles()) == describe(shape.expectedLive))
-        #expect(store.localTemps().sorted() == shape.expectedLocalTemps)
+        #expect(store.localTemps() == shape.expectedLocalTemps)
         #expect(store.remoteTemps(connection: ConnectionID(rawValue: Self.alpha)) == shape.expectedRemoteTemps)
 
         let raw = try Raw(root)
         #expect(raw.value("PRAGMA user_version") == "\(Store.schemaVersion)")
         #expect(raw.value("SELECT count(*) FROM sqlite_master WHERE name = 'recents'") == "0")
-        #expect(raw.value("SELECT group_concat(DISTINCT typeof(path)) FROM live_files") == "blob")
+        for table in ["live_files", "pins", "temps"] {
+            #expect(raw.value("SELECT group_concat(DISTINCT typeof(path)) FROM \(table)") == "blob")
+        }
         #expect(raw.value("PRAGMA journal_mode") == "wal")
     }
 
@@ -163,6 +165,39 @@ struct StoreTests {
         #expect(added?.path == RemotePath(string: "/old/résumé.txt"))
         store.deleteLive(LiveFileID(rawValue: three))
         #expect(dump(store) == migrated)
+
+        // A star and a temp 0.1.7 writes as text are the same paths as the blobs, and go with them.
+        old.run("INSERT INTO pins VALUES ('\(Self.beta)', '/'), ('\(Self.beta)', '/old'); INSERT INTO temps VALUES ('/old/.t', '\(Self.alpha)')")
+        #expect(stars(store, Self.beta) == ["/", "/old"])
+        #expect(store.remoteTemps(connection: ConnectionID(rawValue: Self.alpha)).map(\.display) == ["/old/.t", "/srv/.b.transfer-2"])
+        store.star(connection: ConnectionID(rawValue: Self.beta), path: RemotePath(string: "/old"), on: false)
+        store.forgetTemp(RemotePath(string: "/old/.t"))
+        #expect(dump(store) == migrated)
+        try Raw(root).run("PRAGMA user_version = 2")
+        #expect(try dump(Store(root: root)) == migrated)
+    }
+
+    /// Stars and remote temps were stored as text decoded from the path, so a name that is not
+    /// UTF-8 came back as a different path: a star that opened nothing, a temp never removed.
+    @Test func aNonUTF8StarAndTempRoundTripExactly() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = RemotePath(bytes: Array("/srv/caf".utf8) + [0xE9, 0xFF, 0x80])
+        let lookalike = RemotePath(bytes: Array("/srv/caf".utf8) + [0xE9])
+        let alpha = ConnectionID(rawValue: Self.alpha)
+        let store = try Store(root: root)
+        for each in [path, lookalike] {
+            store.star(connection: alpha, path: each, on: true)
+            store.rememberTemp(each, connection: alpha)
+        }
+
+        let reopened = try Store(root: root)
+        #expect(Set(reopened.stars(connection: alpha)) == [path, lookalike])
+        #expect(Set(reopened.remoteTemps(connection: alpha)) == [path, lookalike])
+        reopened.star(connection: alpha, path: path, on: false)
+        reopened.forgetTemp(path)
+        #expect(reopened.stars(connection: alpha) == [lookalike])
+        #expect(reopened.remoteTemps(connection: alpha) == [lookalike])
     }
 
     /// A Live file's remote path is the server's bytes, UTF-8 or not (SFC-3, LIVE-07).
@@ -204,10 +239,10 @@ struct StoreTests {
         other.run("BEGIN IMMEDIATE; INSERT INTO pins VALUES ('\(Self.beta)', '/held')")
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { other.run("COMMIT") }
 
-        store.star(connection: ConnectionID(rawValue: Self.alpha), path: "/waited", on: true)
+        store.star(connection: ConnectionID(rawValue: Self.alpha), path: RemotePath(string: "/waited"), on: true)
 
-        #expect(store.stars(connection: ConnectionID(rawValue: Self.alpha)) == ["/waited"])
-        #expect(store.stars(connection: ConnectionID(rawValue: Self.beta)) == ["/held"])
+        #expect(stars(store, Self.alpha) == ["/waited"])
+        #expect(stars(store, Self.beta) == ["/held"])
     }
 
     /// Removing a server drops its rows from every table and nobody else's.
@@ -220,23 +255,27 @@ struct StoreTests {
         store.remove(ConnectionID(rawValue: Self.alpha))
 
         #expect(store.connections().map(\.name) == ["Beta"])
-        #expect(store.stars(connection: ConnectionID(rawValue: Self.alpha)).isEmpty)
-        #expect(store.stars(connection: ConnectionID(rawValue: Self.beta)) == ["/"])
+        #expect(stars(store, Self.alpha).isEmpty)
+        #expect(stars(store, Self.beta) == ["/"])
         #expect(store.liveFiles().map(\.id.rawValue) == [Self.two])
         #expect(store.remoteTemps(connection: ConnectionID(rawValue: Self.alpha)).isEmpty)
-        #expect(store.localTemps().sorted() == Shape.released.expectedLocalTemps)
+        #expect(store.localTemps() == Shape.released.expectedLocalTemps)
     }
 
     private func describe(_ rows: [LiveRow]) -> [String] {
         rows.map { String(describing: $0) }.sorted()
     }
 
+    private func stars(_ store: Store, _ connection: UUID) -> [String] {
+        store.stars(connection: ConnectionID(rawValue: connection)).map(\.display)
+    }
+
     private func dump(_ store: Store) -> [String] {
         store.connections().map { String(describing: $0) }
-            + [Self.alpha, Self.beta].flatMap { store.stars(connection: ConnectionID(rawValue: $0)) }
+            + [Self.alpha, Self.beta].flatMap { stars(store, $0) }
             + describe(store.liveFiles())
-            + store.localTemps().sorted()
-            + store.remoteTemps(connection: ConnectionID(rawValue: Self.alpha))
+            + store.localTemps().map(\.path)
+            + store.remoteTemps(connection: ConnectionID(rawValue: Self.alpha)).map(\.display)
     }
 }
 

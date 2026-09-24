@@ -68,7 +68,7 @@ final class Store: @unchecked Sendable {
     // MARK: Schema
 
     /// The newest schema this build knows; `migrate(from:)` has a step for each one before it.
-    static let schemaVersion = 2
+    static let schemaVersion = 3
 
     private func open() throws {
         // A development build and the installed app can have the same library open; a write
@@ -110,6 +110,13 @@ final class Store: @unchecked Sendable {
             try execute("""
             DROP TABLE IF EXISTS recents;
             UPDATE live_files SET path = CAST(path AS BLOB) WHERE typeof(path) = 'text';
+            """)
+        case 2:
+            // Stars and remote temps are server paths too. A text row and a blob of the same bytes
+            // are different keys, so a row one of them already holds is replaced, not doubled.
+            try execute("""
+            UPDATE OR REPLACE pins SET path = CAST(path AS BLOB) WHERE typeof(path) = 'text';
+            UPDATE OR REPLACE temps SET path = CAST(path AS BLOB) WHERE typeof(path) = 'text';
             """)
         default:
             preconditionFailure("No migration from library schema \(version)")
@@ -187,36 +194,49 @@ final class Store: @unchecked Sendable {
 
     // MARK: Stars
 
+    // Paths in `pins` and `temps` are blobs of their exact bytes. They are matched and read as
+    // blobs, so a text row an older Transfer writes to the same library is the same path.
+
     /// Starred paths live in the `pins` table, named before the sidebar called them Starred.
-    func stars(connection: ConnectionID) -> [String] {
-        strings("SELECT path FROM pins WHERE connection_id = ? ORDER BY path", connection.rawValue.uuidString)
+    func stars(connection: ConnectionID) -> [RemotePath] {
+        paths("SELECT DISTINCT CAST(path AS BLOB) FROM pins WHERE connection_id = ? ORDER BY 1", connection.rawValue.uuidString)
+            .map(RemotePath.init(bytes:))
     }
 
-    func star(connection: ConnectionID, path: String, on: Bool) {
+    func star(connection: ConnectionID, path: RemotePath, on: Bool) {
         if on {
-            write("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, path)
+            write("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, path.bytes)
         } else {
-            write("DELETE FROM pins WHERE connection_id = ? AND path = ?", connection.rawValue.uuidString, path)
+            write("DELETE FROM pins WHERE connection_id = ? AND CAST(path AS BLOB) = ?", connection.rawValue.uuidString, path.bytes)
         }
     }
 
     // MARK: Temps
 
-    /// `connection` is nil for a temp on the local disk.
-    func rememberTemp(_ path: String, connection: ConnectionID?) {
-        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", path, connection?.rawValue.uuidString ?? "")
+    func rememberTemp(_ path: RemotePath, connection: ConnectionID) {
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", path.bytes, connection.rawValue.uuidString)
     }
 
-    func forgetTemp(_ path: String) {
-        write("DELETE FROM temps WHERE path = ?", path)
+    func rememberTemp(local url: URL) {
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", Array(url.path.utf8), "")
     }
 
-    func localTemps() -> [String] {
-        strings("SELECT path FROM temps WHERE connection_id IS NULL OR connection_id = ''")
+    func forgetTemp(_ path: RemotePath) {
+        write("DELETE FROM temps WHERE CAST(path AS BLOB) = ?", path.bytes)
     }
 
-    func remoteTemps(connection: ConnectionID) -> [String] {
-        strings("SELECT path FROM temps WHERE connection_id = ?", connection.rawValue.uuidString)
+    func forgetTemp(local url: URL) {
+        write("DELETE FROM temps WHERE CAST(path AS BLOB) = ?", Array(url.path.utf8))
+    }
+
+    func localTemps() -> [URL] {
+        paths("SELECT DISTINCT CAST(path AS BLOB) FROM temps WHERE connection_id IS NULL OR connection_id = '' ORDER BY 1")
+            .map { URL(fileURLWithPath: String(decoding: $0, as: UTF8.self)) }
+    }
+
+    func remoteTemps(connection: ConnectionID) -> [RemotePath] {
+        paths("SELECT DISTINCT CAST(path AS BLOB) FROM temps WHERE connection_id = ? ORDER BY 1", connection.rawValue.uuidString)
+            .map(RemotePath.init(bytes:))
     }
 
     // MARK: Live files
@@ -288,10 +308,10 @@ final class Store: @unchecked Sendable {
         return values
     }
 
-    private func strings(_ sql: String, _ value: String? = nil) -> [String] {
+    private func paths(_ sql: String, _ value: String? = nil) -> [[UInt8]] {
         queue.sync {
-            var values: [String] = []
-            report("read the library") { try run(sql, value.map { [$0] } ?? []) { values.append($0.text(0)) } }
+            var values: [[UInt8]] = []
+            report("read the library") { try run(sql, value.map { [$0] } ?? []) { values.append($0.bytes(0)) } }
             return values
         }
     }

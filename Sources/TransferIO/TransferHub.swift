@@ -17,11 +17,9 @@ public actor TransferHub: SessionProvider {
         SSHConnection.removeLoginScratch(in: store.root)
         config = ConfigLoader.load(root: store.root)
         live = LiveSync(store: store)
-        for path in store.localTemps() {
-            if FileManager.default.fileExists(atPath: path) {
-                try? FileManager.default.removeItem(atPath: path)
-            }
-            store.forgetTemp(path)
+        for temp in store.localTemps() {
+            try? FileManager.default.removeItem(at: temp)
+            store.forgetTemp(local: temp)
         }
     }
 

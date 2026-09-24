@@ -362,15 +362,15 @@ public actor SSHConnection: RemoteSession {
     // MARK: Sidebar data
 
     public func stars() async -> [RemotePath] {
-        store.stars(connection: connection.id).map(RemotePath.init(string:))
+        store.stars(connection: connection.id)
     }
 
     public func star(_ path: RemotePath) async {
-        store.star(connection: connection.id, path: path.display, on: true)
+        store.star(connection: connection.id, path: path, on: true)
     }
 
     public func unstar(_ path: RemotePath) async {
-        store.star(connection: connection.id, path: path.display, on: false)
+        store.star(connection: connection.id, path: path, on: false)
     }
 
     /// Joins the master when it is up, else logs in on its own with the same port and identity;
@@ -555,8 +555,8 @@ public actor SSHConnection: RemoteSession {
 
     /// Removes the temps an earlier run could not; each is forgotten only once it is gone.
     private func removeRecordedRemoteTemps() async {
-        for path in store.remoteTemps(connection: connection.id) {
-            await discardRemoteTemp(RemotePath(string: path))
+        for temp in store.remoteTemps(connection: connection.id) {
+            await discardRemoteTemp(temp)
         }
     }
 

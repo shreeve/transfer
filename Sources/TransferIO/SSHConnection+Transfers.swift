@@ -78,7 +78,7 @@ extension SSHConnection {
         let folder = destination.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let temp = folder.appendingPathComponent(CopyRules.tempName(for: destination.lastPathComponent, transferID: UUID().uuidString))
-        store.rememberTemp(temp.path, connection: nil)
+        store.rememberTemp(local: temp)
         do {
             try await withData { link in
                 try await link.download(path, to: temp, size: info.size, progress: progress)
@@ -93,10 +93,10 @@ extension SSHConnection {
             guard placed == 0 else {
                 throw TransferError.failed("Could not place \(destination.lastPathComponent): \(String(cString: strerror(errno)))")
             }
-            store.forgetTemp(temp.path)
+            store.forgetTemp(local: temp)
         } catch {
             // A temp that cannot be removed now stays recorded, and the next launch removes it.
-            if unlink(temp.path) == 0 || errno == ENOENT { store.forgetTemp(temp.path) }
+            if unlink(temp.path) == 0 || errno == ENOENT { store.forgetTemp(local: temp) }
             throw error
         }
     }
@@ -478,10 +478,10 @@ extension SSHConnection {
     private func withRemoteTemp<T>(for placed: RemotePath, _ body: (RemotePath) async throws -> T) async throws -> T {
         let parent = placed.parent ?? RemotePath(string: "/")
         let temp = parent.appending(name: Array(CopyRules.tempName(for: placed.name, transferID: UUID().uuidString).utf8))
-        store.rememberTemp(temp.display, connection: connection.id)
+        store.rememberTemp(temp, connection: connection.id)
         do {
             let result = try await body(temp)
-            store.forgetTemp(temp.display)
+            store.forgetTemp(temp)
             return result
         } catch {
             await discardRemoteTemp(temp)
@@ -500,7 +500,7 @@ extension SSHConnection {
             } catch {
                 return
             }
-            store.forgetTemp(temp.display)
+            store.forgetTemp(temp)
         }.value
     }
 
