@@ -63,16 +63,23 @@ public actor TransferHub: SessionProvider {
         // An address in the link is compared with each server's resolved addresses; a name is not.
         let byAddress = SSHResolver.isAddress(link.host)
         let candidates = await withTaskGroup(of: SFTPURL.Match.Candidate?.self) { group in
-            for connection in saved {
+            // Four `ssh -G` at a time, however many servers are saved.
+            var pending = saved[...]
+            func next() {
+                guard let connection = pending.popFirst() else { return }
                 group.addTask {
-                    guard let output = await SSHResolver.config(for: connection) else { return nil }
-                    let hostName = SSHConfigValues.parse(output)["hostname"] ?? connection.host
-                    let addresses = byAddress ? SSHResolver.addresses(of: hostName) : []
-                    return SFTPURL.Match.Candidate(connection: connection, sshConfigOutput: output, addresses: addresses)
+                    guard let output = await SSHResolver.config(for: connection),
+                          var candidate = SFTPURL.Match.Candidate(connection: connection, sshConfigOutput: output) else { return nil }
+                    if byAddress { candidate.addresses = await SSHResolver.addresses(of: candidate.hostName) }
+                    return candidate
                 }
             }
+            for _ in 0..<4 { next() }
             var found: [SavedConnection.ID: SFTPURL.Match.Candidate] = [:]
-            for await candidate in group { if let candidate { found[candidate.connection.id] = candidate } }
+            for await candidate in group {
+                if let candidate { found[candidate.connection.id] = candidate }
+                next()
+            }
             // In library order, so the first saved server wins a tie.
             return saved.compactMap { found[$0.id] }
         }
