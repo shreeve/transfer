@@ -132,6 +132,8 @@ struct SidebarColumn: View {
 /// The content column: browser, rename bar, shelf, and every sheet.
 struct DetailColumn: View {
     @Bindable var model: TransferModel
+    /// The shelf's rows at their natural height, which its scroll view grows to before scrolling.
+    @State private var shelfHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -263,49 +265,94 @@ struct DetailColumn: View {
 
     // MARK: Shelf
 
+    /// The transfers, in a list that grows to about five rows and then scrolls, so a large
+    /// drop never pushes the browser out of the window.
     private var shelf: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(model.operations) { operation in
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(operation.title).lineLimit(1)
-                        if let message = operation.message, operation.state != .active {
-                            Text(message).font(.caption).foregroundStyle(operation.state == .failed ? .red : .secondary)
-                        }
-                    }
-                    Spacer()
-                    if operation.state == .active || operation.state == .paused {
-                        if let total = operation.progress.total, total > 0 {
-                            ProgressView(value: Double(operation.progress.completed), total: Double(total))
-                                .frame(width: 140)
-                        } else {
-                            Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    Text(operation.state.rawValue.capitalized).font(.caption).foregroundStyle(.secondary)
-                    switch operation.state {
-                    case .active, .queued:
-                        Button("Pause") { Task { await model.pause(operation) } }
-                    case .paused:
-                        Button("Resume") { Task { await model.resume(operation) } }
-                    case .failed:
-                        Button("Retry") { Task { await model.resume(operation) } }
-                        Button("Remove") { model.remove(operation) }
-                    case .succeeded:
-                        EmptyView()
-                    }
-                }
-                .controlSize(.small)
+        VStack(alignment: .leading, spacing: 4) {
+            if model.operations.count > 1 {
+                Text(shelfSummary).font(.caption).foregroundStyle(.secondary)
             }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.operations) { operation in shelfRow(operation) }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { shelfHeight = $0 }
+            }
+            .frame(height: min(shelfHeight, 160))
         }
         .padding(8)
         .background(.bar)
     }
 
+    private func shelfRow(_ operation: TransferOperation) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(operation.title).lineLimit(1).truncationMode(.middle)
+                if let detail = shelfDetail(operation) {
+                    Text(detail).font(.caption).foregroundStyle(operation.state == .failed ? .red : .secondary).lineLimit(2)
+                }
+            }
+            Spacer()
+            if operation.state == .active || operation.state == .paused {
+                if let total = operation.progress.total, total > 0 {
+                    ProgressView(value: Double(operation.progress.completed), total: Double(total))
+                        .frame(width: 140)
+                        .accessibilityLabel(operation.title)
+                } else {
+                    Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let label = stateLabel(operation.state) {
+                Text(label).font(.caption).foregroundStyle(.secondary)
+            }
+            switch operation.state {
+            case .active:
+                Button("Pause") { Task { await model.pause(operation) } }
+            case .queued:
+                Button("Pause") { Task { await model.pause(operation) } }
+                if operation.livePath == nil { Button("Remove") { model.remove(operation) } }
+            case .paused:
+                Button("Resume") { Task { await model.resume(operation) } }
+                if operation.livePath == nil { Button("Remove") { model.remove(operation) } }
+            case .failed:
+                Button("Retry") { Task { await model.resume(operation) } }
+                Button("Remove") { model.remove(operation) }
+            case .succeeded:
+                EmptyView()
+            }
+        }
+        .controlSize(.small)
+    }
+
+    /// "12 transfers, 3 failed".
+    private var shelfSummary: String {
+        let failed = model.operations.filter { $0.state == .failed }.count
+        let count = ClipText.count(model.operations.count, "transfer")
+        return failed == 0 ? count : "\(count), \(failed) failed"
+    }
+
+    /// The row's message, and the server it runs on when that is not the window's.
+    private func shelfDetail(_ operation: TransferOperation) -> String? {
+        var parts: [String] = []
+        if let message = operation.message, operation.state != .active { parts.append(message) }
+        if let server = model.otherServerName(for: operation) { parts.append("on \(server)") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func stateLabel(_ state: OperationState) -> String? {
+        switch state {
+        case .queued: "Waiting"
+        case .active: nil
+        case .paused: "Paused"
+        case .failed: "Failed"
+        case .succeeded: "Done"
+        }
+    }
+
     private func progressText(_ progress: TransferProgress) -> String {
         var parts: [String] = []
         if progress.completed > 0 { parts.append(Format.si(progress.completed)) }
-        if progress.itemsCompleted > 0 { parts.append("\(progress.itemsCompleted) items") }
+        if progress.itemsCompleted > 0 { parts.append(ClipText.count(progress.itemsCompleted, "item")) }
         return parts.joined(separator: ", ")
     }
 
@@ -514,7 +561,7 @@ struct InspectorColumn: View {
                 preview(item)
             } else {
                 Text(model.snapshot.path.name.isEmpty ? "/" : model.snapshot.path.name).font(.headline)
-                Text("\(model.items.count) items").font(.subheadline).foregroundStyle(.secondary)
+                Text(ClipText.count(model.items.count, "item")).font(.subheadline).foregroundStyle(.secondary)
                 line(model.snapshot.path.display).font(.subheadline).foregroundStyle(.secondary)
             }
         }

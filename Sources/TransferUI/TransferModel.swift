@@ -1089,8 +1089,23 @@ public final class TransferModel {
         let session = runner.session
         let login = prompts.login(runner.connection)
         let operationPrompts = runner.prompts
+        // IO reports every 64 KB, thousands of times a second. The latest report waits in a box
+        // and reaches the shelf at most every 100 ms, as one main-actor task.
+        let latest = Locked<TransferProgress?>(nil)
         let report: @Sendable (TransferProgress) -> Void = { [weak self] progress in
-            Task { @MainActor in self?.update(id) { $0.progress = progress } }
+            let idle = latest.withLock { box in
+                defer { box = progress }
+                return box == nil
+            }
+            guard idle else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(100))
+                guard let progress = latest.withLock({ box in
+                    defer { box = nil }
+                    return box
+                }) else { return }
+                self?.update(id) { $0.progress = progress }
+            }
         }
         let task = Task { [weak self] in
             var attempt = 0
