@@ -280,8 +280,11 @@ public final class Clipboard {
 
     // MARK: Folders
 
+    /// `~/Library/Caches/<bundle id>`, or `Caches` under the library root `TRANSFER_LIBRARY`
+    /// names, so a development build leaves the installed app's folders alone.
     nonisolated private static var cacheRoot: URL {
-        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        if let root = LibraryOverride.root { return root.appendingPathComponent("Caches", isDirectory: true) }
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Transfer", isDirectory: true)
     }
 

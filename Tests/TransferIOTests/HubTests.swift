@@ -27,4 +27,14 @@ struct HubTests {
         #expect(FileManager.default.fileExists(atPath: kept.path))
         #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("transfer.sqlite").path))
     }
+
+    /// A library at a custom root, as in tests and development builds, keeps its caches inside
+    /// that root, never in the user's `~/Library/Caches/Transfer`.
+    @Test func aCustomLibraryKeepsItsCachesInside() throws {
+        let base = TestCaches.fresh("cache")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        let store = try Store(root: root)
+        #expect(store.cacheRoot == root.appendingPathComponent("Caches", isDirectory: true))
+    }
 }

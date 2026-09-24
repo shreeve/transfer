@@ -10,9 +10,10 @@ public actor TransferHub: SessionProvider {
     /// files, and one watcher covers them all.
     private let live: LiveSync
 
-    /// `root` defaults to `~/Library/Application Support/Transfer`.
+    /// `root` defaults to `TRANSFER_LIBRARY` (`LibraryOverride`) when that is set, else to
+    /// `~/Library/Application Support/Transfer`.
     public init(root: URL? = nil) throws {
-        store = try Store(root: root)
+        store = try Store(root: root ?? LibraryOverride.root)
         SSHConnection.removeLoginScratch(in: store.root)
         config = ConfigLoader.load(root: store.root)
         live = LiveSync(store: store)

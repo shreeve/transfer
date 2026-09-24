@@ -114,6 +114,19 @@ public struct LiveFile: Hashable, Sendable, Identifiable {
     }
 }
 
+/// A library root in place of `~/Library/Application Support/Transfer`, from the
+/// `TRANSFER_LIBRARY` environment variable, for development builds and end-to-end tests. Under
+/// it the app keeps everything it would otherwise keep for the user: the SQLite library, the
+/// config, Live working copies, login scratch, and (in `Caches`) the preview cache and the
+/// clipboard's staging and scratch folders. A build started with it never touches the installed
+/// app's library, caches, or Live files. Nil when unset or empty.
+public enum LibraryOverride {
+    public static var root: URL? {
+        guard let path = ProcessInfo.processInfo.environment["TRANSFER_LIBRARY"], !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+}
+
 /// The library: saved servers and one session per saved server.
 public protocol SessionProvider: Sendable {
     func savedConnections() async throws -> [SavedConnection]

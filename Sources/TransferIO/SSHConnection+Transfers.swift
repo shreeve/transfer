@@ -434,16 +434,15 @@ extension SSHConnection {
     }
 
     public func clearPreviewCache() async {
-        try? FileManager.default.removeItem(at: Self.previewCacheDirectory)
+        try? FileManager.default.removeItem(at: previewCacheDirectory)
     }
 
-    private static var previewCacheDirectory: URL {
-        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Transfer/Preview", isDirectory: true)
+    private var previewCacheDirectory: URL {
+        store.cacheRoot.appendingPathComponent("Preview", isDirectory: true)
     }
 
     private func previewURL(_ path: RemotePath, ext: String) throws -> URL {
-        var cache = Self.previewCacheDirectory
+        var cache = previewCacheDirectory
         try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
@@ -454,7 +453,7 @@ extension SSHConnection {
 
     private func trimPreviewCache() {
         let keys: Set<URLResourceKey> = [.fileSizeKey, .contentAccessDateKey, .contentModificationDateKey]
-        guard let files = try? FileManager.default.contentsOfDirectory(at: Self.previewCacheDirectory, includingPropertiesForKeys: Array(keys)) else { return }
+        guard let files = try? FileManager.default.contentsOfDirectory(at: previewCacheDirectory, includingPropertiesForKeys: Array(keys)) else { return }
         let entries = files.compactMap { url -> CacheEntry? in
             guard let values = try? url.resourceValues(forKeys: keys) else { return nil }
             let used = values.contentAccessDate ?? values.contentModificationDate ?? .distantPast

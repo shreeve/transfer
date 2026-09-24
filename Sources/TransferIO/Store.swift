@@ -28,14 +28,22 @@ final class Store: @unchecked Sendable {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "transfer.store")
     let root: URL
+    /// Caches that can be rebuilt, such as previews: `~/Library/Caches/Transfer` for the default
+    /// library, else `Caches` under the custom root, so a test or a development build never
+    /// reads or evicts the user's.
+    let cacheRoot: URL
 
     /// `root` defaults to `~/Library/Application Support/Transfer`.
     init(root customRoot: URL? = nil) throws {
-        let base = customRoot ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let standard = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Transfer", isDirectory: true)
+        let base = customRoot ?? standard
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
         self.root = base
+        cacheRoot = base.standardizedFileURL == standard.standardizedFileURL
+            ? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Transfer", isDirectory: true)
+            : base.appendingPathComponent("Caches", isDirectory: true)
         let path = base.appendingPathComponent("transfer.sqlite").path
         if sqlite3_open(path, &db) != SQLITE_OK {
             throw TransferError.failed("Could not open the library")

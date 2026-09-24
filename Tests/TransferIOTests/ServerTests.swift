@@ -170,6 +170,7 @@ struct ServerTests {
 
             let first = try await h.session.prepareViewFile(remote)
             #expect(try String(contentsOf: first, encoding: .utf8) == "first")
+            #expect(first.path.hasPrefix(h.root.appendingPathComponent("Caches/Preview").path + "/"), "the cache is the test library's own")
             let identity = try first.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
 
             let again = try await h.session.prepareViewFile(remote)
