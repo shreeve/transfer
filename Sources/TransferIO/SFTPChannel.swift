@@ -316,18 +316,21 @@ actor SFTPChannel {
         _ = try await reply(finishing[finishing.count - 1])
     }
 
-    /// The handles OPEN requests already sent return, in order. When any fails, those that opened
-    /// are closed and the first failure is thrown.
+    /// The handles OPEN requests already sent return, in order. The replies are awaited even when
+    /// the caller is cancelled: an OPEN may create a temp, whose removal, sent on another channel
+    /// once the cancel lands, must not reach the server first and leave the temp behind. When any
+    /// fails, or the caller was cancelled, those that opened are closed and it throws.
     private func handles(opening ids: [UInt32]) async throws -> [Data] {
         var handles: [Data] = []
         var failure: (any Error)?
         for id in ids {
             do {
-                handles.append(try handle(in: await reply(id)))
+                handles.append(try await Task { try await self.handle(in: self.reply(id)) }.value)
             } catch {
                 failure = failure ?? error
             }
         }
+        if Task.isCancelled { failure = failure ?? TransferError.cancelled }
         if let failure {
             closeSoon(handles)
             throw failure
@@ -407,7 +410,8 @@ actor SFTPChannel {
 
     /// Opens `path` for writing, creating it or cutting it to nothing.
     func create(_ path: RemotePath) async throws -> Data {
-        try await openFile(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
+        try Task.checkCancellation()
+        return try await handles(opening: [send(SFTPCode.open) { $0.openFields(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc) }])[0]
     }
 
     /// Writes what `parts` hands out into `path`, which another channel created: a second

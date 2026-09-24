@@ -160,6 +160,41 @@ import TransferCore
         await server.stop()
     }
 
+    /// A write cancelled while the server has not answered the OPEN that creates its temp gives up
+    /// only once the answer is in, and closes the handle. The temp is removed on another channel,
+    /// and that removal used to reach the server first, so the temp stayed there, forgotten.
+    @Test(arguments: [false, true]) func aCancelledWriteWaitsForTheOpenThatCreatesItsTemp(copying: Bool) async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("open-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data(repeating: 3, count: 1000).write(to: file)
+        let temp = RemotePath(string: "/srv/.a.transfer-1")
+        let server = try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.open where request.paths.first != temp.display: ScriptedServer.handle(request.id, "source")
+            case SFTPCode.close: ScriptedServer.ok(request.id)
+            default: nil
+            }
+        }
+        let finished = Locked(false)
+        let write = Task {
+            defer { finished.value = true }
+            if copying {
+                try await server.channel.copyData(RemotePath(string: "/srv/a"), to: temp)
+            } else {
+                try await server.channel.upload(file, to: temp) { _ in }
+            }
+        }
+        #expect(await eventually { server.sent(SFTPCode.open).contains { $0.paths.first == temp.display } })
+        write.cancel()
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(!finished.value)
+        server.send(ScriptedServer.handle(server.sent(SFTPCode.open).last!.id, "temp"))
+        await #expect(throws: (any Error).self) { try await write.value }
+        #expect(server.sent(SFTPCode.write).isEmpty && server.sent(SFTPCode.extended).isEmpty)
+        #expect(await eventually { server.sent(SFTPCode.close).map(\.paths) == (copying ? [["source"], ["temp"]] : [["temp"]]) })
+        await server.stop()
+    }
+
     /// A server whose folder /srv lists `names`, where LSTAT finds what `lookup` says, and which
     /// has posix-rename.
     private static func renaming(_ names: [String], lookup: @escaping @Sendable (String) -> UInt32?) async throws -> ScriptedServer {
