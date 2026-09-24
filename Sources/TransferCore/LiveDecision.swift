@@ -159,6 +159,17 @@ public enum LiveDecision {
         }
     }
 
+    /// Keep Remote when the server holds no file: the record is forgotten only when the conflict
+    /// the user answered already showed that (removed, or replaced by something not a file). A
+    /// server file that vanished after the user chose it leaves nothing to take, so the working
+    /// copy stays and the conflict is asked again.
+    public static func keepRemoteForgets(_ conflict: LiveConflictKind?, server: LiveServerFact) -> Bool {
+        switch (conflict, server) {
+        case (.removed, .missing), (.notAFile, .notFile): true
+        default: false
+        }
+    }
+
     /// A Live file whose remote path was just removed: forgotten when its copy held nothing the
     /// server lacked, or the user chose to discard it; else kept, as removed from the server.
     public static func afterRemoval(_ state: LiveState, _ change: LiveLocalChange?, force: Bool) -> LiveAction {

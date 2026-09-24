@@ -55,10 +55,9 @@ public actor TransferHub: SessionProvider {
     }
 
     public func removeConnection(_ id: ConnectionID) async throws {
-        // Live checks and closes in one call, and the folder goes before anything else awaits,
-        // so no edit can land between the check and the removal.
+        // Live checks, closes, and deletes the server's Live folder in one turn, so no edit can
+        // land between the check and the removal.
         try await live.closeIfSynced(id)
-        try? FileManager.default.removeItem(at: store.root.appendingPathComponent("Live/\(id.rawValue.uuidString)", isDirectory: true))
         // Out of the library first, so no caller makes a new session while this one disconnects.
         store.remove(id)
         KeychainStore.delete(id)
