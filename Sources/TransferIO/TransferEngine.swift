@@ -57,7 +57,8 @@ struct TransferEngine {
                         target = chosen
                     } else if path.parent == folder {
                         var taken = if let names { names } else { try await destination.listedNames(folder) }
-                        let name = KeepBothName.duplicate(existing: taken, original: path.name)
+                        let isFolder = try await destination.stat(path).kind == .directory
+                        let name = KeepBothName.duplicate(existing: taken, original: path.name, isFolder: isFolder)
                         taken.insert(name)
                         names = taken
                         target = folder.appending(name)

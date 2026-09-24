@@ -225,6 +225,17 @@ struct MoveServerTests {
         }
     }
 
+    /// A folder pasted beside itself was named as a file is, at its last dot: "v1.2" became
+    /// "v1 copy.2" (R-C3).
+    @Test func aFolderPastedBesideItselfKeepsItsWholeName() async throws {
+        try await withHarness("vdup", connected: true) { h in
+            let site = try h.folder("site", files: ["v1.2/a.txt": "a", "notes.txt": "n"])
+            let id = h.session.connection.id
+            try await run(TransferRequest(.server(id, [site.appending("v1.2"), site.appending("notes.txt")]), into: site, on: id, moving: false), on: h.session)
+            #expect(try h.names("site") == ["notes copy.txt", "notes.txt", "v1.2", "v1.2 copy"])
+        }
+    }
+
     /// A move deleted a Live working copy's folder, edits and all, since the server's copy it
     /// compared was complete (CLIP-03).
     @Test func anUnsyncedLiveFileKeepsTheFolderItIsIn() async throws {

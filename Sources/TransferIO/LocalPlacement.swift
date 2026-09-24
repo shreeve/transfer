@@ -55,11 +55,11 @@ enum Placement: Equatable {
     }
 
     /// Keep Both's name for `name`: the next that no name in `names` folds to.
-    static func keepBoth(_ name: String, among names: Set<String>) -> String {
+    static func keepBoth(_ name: String, among names: Set<String>, isFolder: Bool = false) -> String {
         let folded = Set(names.map(fold))
         var taken = names
         while true {
-            let next = KeepBothName.next(existing: taken, original: name)
+            let next = KeepBothName.next(existing: taken, original: name, isFolder: isFolder)
             if !folded.contains(fold(next)) { return next }
             taken.insert(next)
         }
@@ -106,11 +106,11 @@ enum LocalPlacement {
 
     /// A free name beside `url` for Keep Both. The name is checked on disk too, since this Mac's
     /// disk may treat two names the listing tells apart as one.
-    static func keepBoth(_ url: URL) throws -> URL {
+    static func keepBoth(_ url: URL, isFolder: Bool) throws -> URL {
         let folder = url.deletingLastPathComponent()
         var taken = Set(try FileManager.default.contentsOfDirectory(atPath: folder.path))
         while true {
-            let name = Placement.keepBoth(url.lastPathComponent, among: taken)
+            let name = Placement.keepBoth(url.lastPathComponent, among: taken, isFolder: isFolder)
             let candidate = try child(folder, name: name)
             if try occupant(candidate) == nil { return candidate }
             taken.insert(name)

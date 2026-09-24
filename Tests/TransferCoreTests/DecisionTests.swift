@@ -77,6 +77,14 @@ import Testing
     }
 }
 
+/// A folder has no extension: "v1.2" duplicated was "v1 copy.2", and kept both "v1 2.2" (R-C3).
+@Test func aFolderNameIsNotSplitAtItsLastDot() {
+    #expect(KeepBothName.duplicate(existing: ["v1.2"], original: "v1.2", isFolder: true) == "v1.2 copy")
+    #expect(KeepBothName.duplicate(existing: ["v1.2", "v1.2 copy"], original: "v1.2", isFolder: true) == "v1.2 copy 2")
+    #expect(KeepBothName.next(existing: ["site.d"], original: "site.d", isFolder: true) == "site.d 2")
+    #expect(KeepBothName.next(existing: ["site.d"], original: "site.d") == "site 2.d")
+}
+
 /// New Folder and a Live conflict's Keep Both named files with their own loops, outside Core.
 @Test func everyMadeUpNameIsTheFirstFreeOne() {
     #expect(KeepBothName.untitledFolder(existing: []) == "untitled folder")

@@ -144,11 +144,15 @@ struct PlacementTests {
         defer { try? FileManager.default.removeItem(at: base) }
         try Data("a".utf8).write(to: base.appendingPathComponent("report.pdf"))
         try Data("b".utf8).write(to: base.appendingPathComponent("REPORT 2.pdf"))
-        let next = try LocalPlacement.keepBoth(base.appendingPathComponent("report.pdf"))
+        let next = try LocalPlacement.keepBoth(base.appendingPathComponent("report.pdf"), isFolder: false)
         let caseSensitive = try base.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames == true
         #expect(next.lastPathComponent == (caseSensitive ? "report 2.pdf" : "report 3.pdf"))
         #expect(Placement.fold("Straße.TXT") == Placement.fold("straße.txt"))
         #expect(Placement.fold("caf\u{E9}") == Placement.fold("cafe\u{301}"))
+        // A folder's name has no extension to keep (R-C3).
+        try FileManager.default.createDirectory(at: base.appendingPathComponent("v1.2"), withIntermediateDirectories: true)
+        #expect(try LocalPlacement.keepBoth(base.appendingPathComponent("v1.2"), isFolder: true).lastPathComponent == "v1.2 2")
+        #expect(Placement.keepBoth("v1.2", among: ["v1.2"], isFolder: true) == "v1.2 2")
         // As APFS folds them (R-C1).
         #expect(Placement.fold("Straße") == Placement.fold("STRASSE"))
         #expect(Placement.fold("ΑΣ") == Placement.fold("ας"))

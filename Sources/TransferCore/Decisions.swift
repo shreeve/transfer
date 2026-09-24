@@ -60,15 +60,15 @@ public enum KeepBothName {
         return candidate(n)
     }
 
-    /// Keep Both: "report 2.pdf", "report 3.pdf", …
-    public static func next(existing: Set<String>, original: String) -> String {
-        let split = splitExtension(original)
+    /// Keep Both: "report 2.pdf", "report 3.pdf", …; a folder's whole name is kept: "v1.2 2".
+    public static func next(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
+        let split = splitExtension(original, isFolder: isFolder)
         return firstFree(existing: existing, from: 2) { "\(split.base) \($0)\(split.ext)" }
     }
 
-    /// Duplicate: "notes copy.txt", "notes copy 2.txt", …
-    public static func duplicate(existing: Set<String>, original: String) -> String {
-        let split = splitExtension(original)
+    /// Duplicate: "notes copy.txt", "notes copy 2.txt", …; a folder's whole name is kept: "v1.2 copy".
+    public static func duplicate(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
+        let split = splitExtension(original, isFolder: isFolder)
         return firstFree(existing: existing) { $0 == 1 ? "\(split.base) copy\(split.ext)" : "\(split.base) copy \($0)\(split.ext)" }
     }
 
@@ -83,8 +83,9 @@ public enum KeepBothName {
         firstFree(existing: existing) { $0 == 1 ? "\(original) (from this Mac)" : "\(original) (from this Mac \($0))" }
     }
 
-    private static func splitExtension(_ name: String) -> (base: String, ext: String) {
-        guard let dot = name.lastIndex(of: "."), dot != name.startIndex else {
+    /// A folder has no extension, as in Finder: its name is all base.
+    private static func splitExtension(_ name: String, isFolder: Bool = false) -> (base: String, ext: String) {
+        guard !isFolder, let dot = name.lastIndex(of: "."), dot != name.startIndex else {
             return (name, "")
         }
         return (String(name[..<dot]), String(name[dot...]))

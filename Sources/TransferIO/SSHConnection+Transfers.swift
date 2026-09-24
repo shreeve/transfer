@@ -306,7 +306,7 @@ extension SSHConnection {
         switch try await settle(incoming, onto: found, named: name, shown: name) {
         case .skip: return nil
         case .replace: return (url, found)
-        case .keepBoth: return (try LocalPlacement.keepBoth(url), nil)
+        case .keepBoth: return (try LocalPlacement.keepBoth(url, isFolder: incoming == .folder), nil)
         }
     }
 
@@ -468,7 +468,7 @@ extension SSHConnection {
             return (proposed, there)
         case .keepBoth:
             let parent = proposed.parent ?? RemotePath(string: "/")
-            let name = Placement.keepBoth(proposed.name, among: try await listedNames(parent))
+            let name = Placement.keepBoth(proposed.name, among: try await listedNames(parent), isFolder: incoming == .folder)
             let landed = parent.appending(name: Array(name.utf8))
             tally.record(landed, for: proposed)
             return (landed, nil)
