@@ -192,7 +192,7 @@ public actor SSHConnection: RemoteSession {
             if ContinuousClock.now >= deadline { throw TransferError.timeout("login") }
             await errors.waitForEnd()
             guard let failure = HostKeyFailure(sshErrors: errors.text) else {
-                let line = errors.lastLine
+                let line = errors.text.lastLine
                 guard Self.droppedBeforeLogin(line) else { throw TransferError.authenticationFailed(line) }
                 drops += 1
                 if drops > 2 { throw TransferError.connectionLost(line) }
@@ -303,7 +303,7 @@ public actor SSHConnection: RemoteSession {
         let errors = masterErrors
         await tearDown(reason: .connectionLost("The SSH connection closed"))
         await errors?.waitForEnd()
-        let reason = errors?.lastLine ?? ""
+        let reason = errors?.text.lastLine ?? ""
         pipe.emit(.disconnected("The SSH connection to \(connection.displayName) closed" + (reason.isEmpty ? "" : ": \(reason)")))
     }
 
@@ -452,7 +452,7 @@ public actor SSHConnection: RemoteSession {
     /// Runs `body` on a data channel, holding `share` of it.
     func withData<T>(_ share: DataShare = .whole, _ body: (SFTPChannel) async throws -> T) async throws -> T {
         let link = try await acquire(share.rawValue)
-        defer { release(link, share.rawValue) }
+        defer { giveBack(link, share.rawValue) }
         return try await body(link)
     }
 
@@ -460,7 +460,7 @@ public actor SSHConnection: RemoteSession {
     /// and never ahead of a caller that waits: another channel for one large file. Nil when none is.
     func withSpareData<T>(_ body: (SFTPChannel) async throws -> T) async throws -> T? {
         guard let link = await spare() else { return nil }
-        defer { release(link, DataShare.whole.rawValue) }
+        defer { giveBack(link, DataShare.whole.rawValue) }
         return try await body(link)
     }
 
@@ -470,9 +470,7 @@ public actor SSHConnection: RemoteSession {
     private func acquire(_ share: Int) async throws -> SFTPChannel {
         while true {
             if waiters.isEmpty, let link = fitting(share, sharing: !canOpen) {
-                load[ObjectIdentifier(link), default: 0] += share
-                if await link.isOpen { return link }
-                drop(link)
+                if let link = await hold(link, share) { return link }
                 continue
             }
             if canOpen {
@@ -492,14 +490,17 @@ public actor SSHConnection: RemoteSession {
     private func spare() async -> SFTPChannel? {
         guard waiters.isEmpty else { return nil }
         let whole = DataShare.whole.rawValue
-        if let link = fitting(whole, sharing: false) {
-            load[ObjectIdentifier(link), default: 0] += whole
-            if await link.isOpen { return link }
-            drop(link)
-            return nil
-        }
+        if let link = fitting(whole, sharing: false) { return await hold(link, whole) }
         guard canOpen else { return nil }
         return try? await openData(whole)
+    }
+
+    /// `link` with `share` of it counted as held, or nil when it has closed and leaves the pool.
+    private func hold(_ link: SFTPChannel, _ share: Int) async -> SFTPChannel? {
+        load[ObjectIdentifier(link), default: 0] += share
+        if await link.isOpen { return link }
+        drop(link)
+        return nil
     }
 
     /// Whether another data channel may open: fewer than seven are open or opening, and the server
@@ -575,7 +576,7 @@ public actor SSHConnection: RemoteSession {
 
     /// Gives back `share` of the channel. A channel from an earlier login, or one dropped, is only
     /// forgotten.
-    private func release(_ link: SFTPChannel, _ share: Int) {
+    private func giveBack(_ link: SFTPChannel, _ share: Int) {
         let id = ObjectIdentifier(link)
         guard pool.contains(where: { $0 === link }) else { return }
         load[id] = max(load[id, default: 0] - share, 0)
@@ -624,7 +625,7 @@ public actor SSHConnection: RemoteSession {
             // banner already says what went wrong.
             guard case TransferError.connectionLost = error else { throw error }
             await errors.waitForEnd()
-            let line = errors.lastLine
+            let line = errors.text.lastLine
             throw line.isEmpty ? error : TransferError.connectionLost(line)
         }
         return link

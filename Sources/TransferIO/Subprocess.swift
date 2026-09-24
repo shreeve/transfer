@@ -94,8 +94,6 @@ final class OutputTail: Sendable {
             try? await Task.sleep(for: .milliseconds(20))
         }
     }
-
-    var lastLine: String { text.lastLine }
 }
 
 extension String {
