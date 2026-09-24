@@ -18,7 +18,12 @@ public struct GeneralSettings: View {
             }
             Section("Browsing") {
                 Toggle("Show hidden files", isOn: $showsHidden)
-                Picker("View", selection: $viewMode) {
+                // Chosen here, the view mode changes every open window; chosen in a window, it
+                // is only the default for the next one.
+                Picker("View", selection: Binding(get: { viewMode }, set: { mode in
+                    viewMode = mode
+                    NotificationCenter.default.post(name: Preferences.viewModeChosen, object: nil)
+                })) {
                     ForEach(ViewMode.allCases, id: \.rawValue) { Text($0.title).tag($0.rawValue) }
                 }
             }
@@ -32,7 +37,8 @@ public struct GeneralSettings: View {
 public struct ExtensionSettings: View {
     let provider: any SessionProvider
     @State private var text = ""
-    @State private var loaded = false
+    /// What the file held when the tab opened, or last saved; only a change from it is saved.
+    @State private var saved: String?
     @State private var message = ""
 
     public init(provider: any SessionProvider) {
@@ -47,7 +53,7 @@ public struct ExtensionSettings: View {
                     .frame(minHeight: 160)
                     .task(id: text) {
                         // Saved once typing pauses, so keystrokes never race each other to the file.
-                        guard loaded else { return }
+                        guard let saved, text != saved else { return }
                         try? await Task.sleep(for: .milliseconds(400))
                         if !Task.isCancelled { save() }
                     }
@@ -61,18 +67,21 @@ public struct ExtensionSettings: View {
         }
         .formStyle(.grouped)
         .task {
-            text = await provider.editableExtensions().joined(separator: "\n")
-            loaded = true
+            let loaded = await provider.editableExtensions().joined(separator: "\n")
+            saved = loaded
+            text = loaded
         }
     }
 
     private func save() {
-        let list = text
+        let written = text
+        let list = written
             .split(whereSeparator: { $0.isWhitespace || $0 == "," })
             .map(String.init)
         Task {
             do {
                 try await provider.setEditableExtensions(list)
+                saved = written
                 message = ""
             } catch {
                 message = error.localizedDescription

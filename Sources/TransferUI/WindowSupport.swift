@@ -3,6 +3,8 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
+/// What a browser window needs from AppKit beyond its views: the focused model for the menu
+/// commands, the quit question, and opening a downloaded file in its app.
 struct TransferModelKey: FocusedValueKey {
     typealias Value = TransferModel
 }
@@ -33,17 +35,20 @@ public enum QuitGuard {
 /// records the choice with Launch Services, so Transfer and Finder both remember it.
 @MainActor
 enum FileOpener {
-    static func open(_ url: URL) async {
+    /// Throws when no app opened the file, so the window can say so.
+    static func open(_ url: URL) async throws {
         let ext = url.pathExtension
         let type = ext.isEmpty ? nil : UTType(filenameExtension: ext)
         if let type, NSWorkspace.shared.urlForApplication(toOpen: type) == nil {
             guard let app = chooseApplication(for: ext) else { return }
             // The same thing Finder's "Always Open With" does: the default for this extension.
             try? await NSWorkspace.shared.setDefaultApplication(at: app, toOpen: type)
-            _ = try? await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+            _ = try await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
             return
         }
-        NSWorkspace.shared.open(url)
+        guard NSWorkspace.shared.open(url) else {
+            throw TransferError.failed("No app could open “\(url.lastPathComponent)”.")
+        }
     }
 
     private static func chooseApplication(for ext: String) -> URL? {

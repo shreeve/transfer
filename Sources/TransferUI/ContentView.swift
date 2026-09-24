@@ -5,6 +5,9 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
+/// A browser window's SwiftUI content: the sidebar, the content pane with its message,
+/// rename, clipboard, and transfer bars and every sheet, and the inspector. `WindowChrome`
+/// hosts each column once and each observes the model itself (HANDOFF.md, Window chrome).
 public struct ContentView: View {
     let model: TransferModel
 
@@ -15,7 +18,7 @@ public struct ContentView: View {
     public var body: some View {
         WindowChrome(
             model: model,
-            title: model.status,
+            title: model.title,
             subtitle: model.snapshot.connectionID == nil ? "" : model.snapshot.path.display,
             viewMode: model.snapshot.viewMode,
             sidebarCollapsed: model.sidebarCollapsed,
@@ -29,6 +32,7 @@ public struct ContentView: View {
         .focusedSceneValue(\.transferModel, model)
         .onChange(of: model.snapshot.selection) { model.selectionChanged() }
         .onChange(of: model.sidebarSelection) { _, item in Task { await model.sidebarSelected(item) } }
+        .task { model.start() }
         .frame(minWidth: 640, idealWidth: 960, minHeight: 400, idealHeight: 640)
     }
 }
@@ -77,9 +81,10 @@ struct SidebarColumn: View {
                         Label {
                             Text(live.path.name)
                         } icon: {
-                            Image(systemName: liveSymbol(live))
+                            Image(systemName: live.state.symbolName)
                         }
-                        .help(liveHelp(live))
+                        .help("\(live.path.display)\n\(live.state.help)")
+                        .accessibilityValue(live.state.label)
                         .tag(SidebarItem.live(live.path))
                         .contextMenu {
                             if live.paused {
@@ -87,8 +92,8 @@ struct SidebarColumn: View {
                             }
                             Button("Discard Live File") { Task { await model.discardLive(live.path) } }
                                 .disabled(live.uploading)
-                            Button("Forget All Synced Live Files") { Task { await model.forgetSyncedLive() } }
-                                .disabled(!model.liveFiles.contains { !$0.dirty && !$0.uploading && !$0.conflict })
+                            Button("Forget Synced Live Files") { Task { await model.forgetSyncedLive() } }
+                                .disabled(!model.liveFiles.contains(where: \.isSynced))
                         }
                     }
                 }
@@ -110,31 +115,17 @@ struct SidebarColumn: View {
     private func folderName(_ path: RemotePath) -> String {
         path.isRoot ? "/" : path.name
     }
-
-    private func liveSymbol(_ live: LiveFile) -> String {
-        if live.conflict { return "exclamationmark.triangle.fill" }
-        if live.uploading { return "arrow.up.circle.fill" }
-        if live.paused { return "pause.circle" }
-        return live.dirty ? "pencil.circle.fill" : "checkmark.circle"
-    }
-
-    private func liveHelp(_ live: LiveFile) -> String {
-        let state: String
-        if live.conflict { state = "Changed on the server; needs a decision" }
-        else if live.uploading { state = "Uploading" }
-        else if live.paused { state = "Paused" }
-        else if live.dirty { state = "Edited here, not yet uploaded" }
-        else { state = "Synced; saves in the editor upload" }
-        return "\(live.path.display)\n\(state)"
-    }
 }
 
 /// The content column: browser, rename bar, shelf, and every sheet.
 struct DetailColumn: View {
     @Bindable var model: TransferModel
+    /// The shelf's rows at their natural height, which its scroll view grows to before scrolling.
+    @State private var shelfHeight: CGFloat = 0
 
     var body: some View {
         VStack(spacing: 0) {
+            if let status = model.status { MessageBar(text: status) { model.status = nil } }
             if model.renaming { RenameBar(model: model) }
             browser
             if model.snapshot.connectionID != nil, let clip = Clipboard.shared.clip { ClipBar(clip: clip) }
@@ -176,7 +167,6 @@ struct DetailColumn: View {
                         .padding(6)
                         .background(model.snapshot.selection.contains(item.path) ? Color.accentColor.opacity(0.2) : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
-                        .contextMenu { rowMenu(item) }
                 }
             }
             .padding()
@@ -188,123 +178,108 @@ struct DetailColumn: View {
         .onTapGesture {
             if ProcessInfo.processInfo.systemUptime - model.itemClickTime > 0.5 { model.snapshot.selection = [] }
         }
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in dropFiles(providers) }
+        // The empty area's menu is the folder's; a cell shows its own, from its AppKit view.
+        .contextMenu { FolderMenu(model: model) }
+        .dropDestination(for: URL.self) { urls, _ in
+            let files = urls.filter(\.isFileURL)
+            guard !files.isEmpty else { return false }
+            Task { await model.upload(urls: files) }
+            return true
+        }
         .focusable()
         .focusEffectDisabled()
-        .onKeyPress(.space) {
-            model.togglePreview()
-            return .handled
-        }
     }
-
-    /// Gathers the URLs of one drop before starting uploads, so one operation row appears per file in order.
-    private func dropFiles(_ providers: [NSItemProvider]) -> Bool {
-        let model = model
-        let collected = Locked((urls: [URL](), remaining: providers.count))
-        for provider in providers {
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                let done: [URL]? = collected.withLock { state in
-                    if let url { state.urls.append(url) }
-                    state.remaining -= 1
-                    return state.remaining == 0 ? state.urls : nil
-                }
-                if let done { Task { @MainActor in await model.upload(urls: done) } }
-            }
-        }
-        return !providers.isEmpty
-    }
-
-    @ViewBuilder private func rowMenu(_ item: RemoteItem) -> some View {
-        Button("Open") { Task { await model.open(item) } }
-        if item.kind == .file {
-            Button("Open Live") {
-                model.snapshot.selection = [item.path]
-                Task { await model.openLiveSelection() }
-            }
-        }
-        Button("Quick Look") {
-            model.snapshot.selection = [item.path]
-            model.showPreview()
-        }
-        Divider()
-        Button("Download Copy…") {
-            if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
-            Task { await model.downloadCopy() }
-        }
-        if item.kind == .file {
-            Button("Duplicate") {
-                model.snapshot.selection = [item.path]
-                Task { await model.duplicateSelection() }
-            }
-        }
-        Button("Rename") {
-            model.snapshot.selection = [item.path]
-            model.beginRename()
-        }
-        Button(model.starTitle(model.dragItems(including: item).map(\.path))) {
-            Task { await model.toggleStar(model.dragItems(including: item).map(\.path)) }
-        }
-        Button("Copy") {
-            if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
-            model.copySelection()
-        }
-        Button("Copy Remote URL") {
-            model.snapshot.selection = [item.path]
-            model.copyRemoteURL()
-        }
-        Divider()
-        Button("Delete…") {
-            if !model.snapshot.selection.contains(item.path) { model.snapshot.selection = [item.path] }
-            model.askToDelete()
-        }
-    }
-
 
     // MARK: Shelf
 
+    /// The transfers, in a list that grows to about five rows and then scrolls, so a large
+    /// drop never pushes the browser out of the window.
     private var shelf: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(model.operations) { operation in
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(operation.title).lineLimit(1)
-                        if let message = operation.message, operation.state != .active {
-                            Text(message).font(.caption).foregroundStyle(operation.state == .failed ? .red : .secondary)
-                        }
-                    }
-                    Spacer()
-                    if operation.state == .active || operation.state == .paused {
-                        if let total = operation.progress.total, total > 0 {
-                            ProgressView(value: Double(operation.progress.completed), total: Double(total))
-                                .frame(width: 140)
-                        } else {
-                            Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    Text(operation.state.rawValue.capitalized).font(.caption).foregroundStyle(.secondary)
-                    switch operation.state {
-                    case .active, .queued:
-                        Button("Pause") { Task { await model.pause(operation) } }
-                    case .paused:
-                        Button("Resume") { Task { await model.resume(operation) } }
-                    case .failed:
-                        Button("Retry") { Task { await model.resume(operation) } }
-                        Button("Remove") { model.remove(operation) }
-                    case .succeeded:
-                        EmptyView()
-                    }
-                }
-                .controlSize(.small)
+        VStack(alignment: .leading, spacing: 4) {
+            if model.operations.count > 1 {
+                Text(shelfSummary).font(.caption).foregroundStyle(.secondary)
             }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.operations) { operation in shelfRow(operation) }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { shelfHeight = $0 }
+            }
+            .frame(height: min(shelfHeight, 160))
         }
         .padding(8)
         .background(.bar)
     }
 
+    private func shelfRow(_ operation: TransferOperation) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(operation.title).lineLimit(1).truncationMode(.middle)
+                if let detail = shelfDetail(operation) {
+                    Text(detail).font(.caption).foregroundStyle(operation.state == .failed ? .red : .secondary).lineLimit(2)
+                }
+            }
+            Spacer()
+            if operation.state == .active || operation.state == .paused {
+                if let total = operation.progress.total, total > 0 {
+                    ProgressView(value: Double(operation.progress.completed), total: Double(total))
+                        .frame(width: 140)
+                        .accessibilityLabel(operation.title)
+                } else {
+                    Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let label = stateLabel(operation.state) {
+                Text(label).font(.caption).foregroundStyle(.secondary)
+            }
+            switch operation.state {
+            case .active:
+                Button("Pause") { Task { await model.pause(operation) } }
+            case .queued:
+                Button("Pause") { Task { await model.pause(operation) } }
+                if operation.livePath == nil { Button("Remove") { model.remove(operation) } }
+            case .paused:
+                Button("Resume") { Task { await model.resume(operation) } }
+                if operation.livePath == nil { Button("Remove") { model.remove(operation) } }
+            case .failed:
+                Button("Retry") { Task { await model.resume(operation) } }
+                Button("Remove") { model.remove(operation) }
+            case .succeeded:
+                EmptyView()
+            }
+        }
+        .controlSize(.small)
+    }
+
+    /// "12 transfers, 3 failed".
+    private var shelfSummary: String {
+        let failed = model.operations.filter { $0.state == .failed }.count
+        let count = ClipText.count(model.operations.count, "transfer")
+        return failed == 0 ? count : "\(count), \(failed) failed"
+    }
+
+    /// The row's message, and the server it runs on when that is not the window's.
+    private func shelfDetail(_ operation: TransferOperation) -> String? {
+        var parts: [String] = []
+        if let message = operation.message, operation.state != .active { parts.append(message) }
+        if let server = model.otherServerName(for: operation) { parts.append("on \(server)") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func stateLabel(_ state: OperationState) -> String? {
+        switch state {
+        case .queued: "Waiting"
+        case .active: nil
+        case .paused: "Paused"
+        case .failed: "Failed"
+        case .succeeded: "Done"
+        }
+    }
+
     private func progressText(_ progress: TransferProgress) -> String {
         var parts: [String] = []
         if progress.completed > 0 { parts.append(Format.si(progress.completed)) }
-        if progress.itemsCompleted > 0 { parts.append("\(progress.itemsCompleted) items") }
+        if progress.itemsCompleted > 0 { parts.append(ClipText.count(progress.itemsCompleted, "item")) }
         return parts.joined(separator: ", ")
     }
 
@@ -314,151 +289,129 @@ struct DetailColumn: View {
         switch sheet {
         case .connection:
             ConnectionForm(model: model)
-        case .prompt(let request):
-            VStack(alignment: .leading, spacing: 12) {
-                Text(model.currentConnection?.displayName ?? model.draft.displayName).font(.headline)
+        case .prompt(let request, let server, _):
+            let reply = { PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret) }
+            let cancel = { model.finishPrompt(PromptReply(text: nil), offered: false) }
+            SheetForm(title: server ?? "Log In", width: 380, onCancel: cancel) {
                 Text(request.text)
                 SecureField("Password", text: $model.promptSecure)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.finishPrompt(PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret)) }
+                    .onSubmit { model.finishPrompt(reply(), offered: request.offerKeychain) }
                 if request.offerKeychain {
                     Toggle("Save in Keychain", isOn: $model.saveSecret)
                 }
-                HStack {
-                    Button("Cancel") { model.finishPrompt(PromptReply(text: nil)) }
-                        .keyboardShortcut(.cancelAction)
-                    Spacer()
-                    Button("Continue") {
-                        model.finishPrompt(PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret))
-                    }
+            } actions: {
+                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Continue") { model.finishPrompt(reply(), offered: request.offerKeychain) }
                     .keyboardShortcut(.defaultAction)
-                }
             }
-            .padding()
-            .frame(width: 380)
-            .onExitCommand { model.finishPrompt(PromptReply(text: nil)) }
-        case .hostKey(let event):
-            VStack(alignment: .leading, spacing: 12) {
-                Text(event.situation == .changed ? "The host key changed" : "First time connecting to this server")
-                    .font(.headline)
-                Text(event.situation == .changed
-                     ? "The server now presents a different key. Someone could be intercepting the connection."
-                     : "Check this fingerprint against one you got from the server's owner.")
-                    .foregroundStyle(.secondary)
+        case .hostKey(let event, let server, _):
+            SheetForm(
+                title: event.situation == .changed ? "The host key changed" : "First time connecting to this server",
+                detail: event.situation == .changed
+                    ? "The server now presents a different key. Someone could be intercepting the connection."
+                    : "Check this fingerprint against one you got from the server's owner.",
+                width: 460,
+                onCancel: { model.finishHost(.cancel) }
+            ) {
+                LabeledContent("Server", value: hostKeyServer(server, event))
                 LabeledContent("Key type", value: event.keyType)
                 LabeledContent("SHA256", value: event.fingerprint)
                     .font(.body.monospaced())
                     .textSelection(.enabled)
-                HStack {
-                    Button("Cancel") { model.finishHost(.cancel) }
-                        .keyboardShortcut(.defaultAction)
-                    Spacer()
-                    if event.situation == .firstSeen {
-                        Button("Trust Once") { model.finishHost(.trustOnce) }
-                        Button("Always Trust") { model.finishHost(.alwaysTrust) }
-                    } else {
-                        Button("Replace Trusted Key") { model.finishHost(.replace) }
-                    }
+            } actions: {
+                Button("Cancel") { model.finishHost(.cancel) }
+                    .keyboardShortcut(.defaultAction)
+                Spacer()
+                if event.situation == .firstSeen {
+                    Button("Trust Once") { model.finishHost(.trustOnce) }
+                    Button("Always Trust") { model.finishHost(.alwaysTrust) }
+                } else {
+                    Button("Replace Trusted Key") { model.finishHost(.replace) }
                 }
             }
-            .padding()
-            .frame(width: 460)
-            .onExitCommand { model.finishHost(.cancel) }
         case .delete:
-            let count = model.snapshot.selection.count
             let unsynced = model.unsyncedInSelection
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Delete \(count) item\(count == 1 ? "" : "s")?").font(.headline)
-                Text("The delete is permanent. There is no trash on the server.")
-                    .foregroundStyle(.secondary)
+            SheetForm(title: deleteTitle, detail: "The delete is permanent. There is no trash on the server.", onCancel: { model.sheet = nil }) {
                 if unsynced > 0 {
                     Text("\(unsynced) Live file\(unsynced == 1 ? " has" : "s have") unsynced edits that will be discarded.")
                         .foregroundStyle(.red)
                 }
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Delete") {
-                        model.sheet = nil
-                        Task { await model.deleteSelection() }
-                    }
+            } actions: {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Delete") {
+                    model.sheet = nil
+                    Task { await model.deleteSelection() }
                 }
             }
-            .padding()
-            .frame(width: 400)
-            .onExitCommand { model.sheet = nil }
-        case .collision(let name):
-            VStack(alignment: .leading, spacing: 12) {
-                Text("“\(name)” already exists").font(.headline)
-                Text("Keep Both saves the new file with a number before its extension.")
-                    .foregroundStyle(.secondary)
+        case .collision(let name, _):
+            let skip = { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
+            SheetForm(title: "“\(name)” already exists", detail: "Keep Both saves the new file with a number before its extension.", onCancel: skip) {
                 Toggle("Apply to all in this operation", isOn: $model.applyCollisionToAll)
-                HStack {
-                    Button("Skip") { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
-                        .keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Keep Both") { model.finishCollision(.keepBoth, applyToAll: model.applyCollisionToAll) }
-                    Button("Replace") { model.finishCollision(.replace, applyToAll: model.applyCollisionToAll) }
-                }
+            } actions: {
+                Button("Skip", action: skip).keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Keep Both") { model.finishCollision(.keepBoth, applyToAll: model.applyCollisionToAll) }
+                Button("Replace") { model.finishCollision(.replace, applyToAll: model.applyCollisionToAll) }
             }
-            .padding()
-            .frame(width: 400)
-            .onExitCommand { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
-        case .conflict:
-            conflictSheet
+        case .conflict(let path, let comparable):
+            conflictSheet(path, comparable: comparable)
         case .goToFolder:
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Go to Remote Folder").font(.headline)
+            SheetForm(title: "Go to Remote Folder", width: 420, onCancel: { model.sheet = nil }) {
                 TextField("Remote path", text: $model.folderText)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { goToFolder() }
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
-                    Spacer()
-                    Button("Go") { goToFolder() }.keyboardShortcut(.defaultAction)
-                }
+            } actions: {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Go") { goToFolder() }.keyboardShortcut(.defaultAction)
             }
-            .padding()
-            .frame(width: 420)
-            .onExitCommand { model.sheet = nil }
         case .removeServer(let connection):
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Remove “\(connection.displayName)”?").font(.headline)
-                Text("Only the saved connection is removed. Nothing on the server changes.")
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Remove") { Task { await model.removeServer(connection) } }
-                }
+            SheetForm(title: "Remove “\(connection.displayName)”?", detail: "Only the saved connection is removed. Nothing on the server changes.", onCancel: { model.sheet = nil }) {
+                EmptyView()
+            } actions: {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Remove") { Task { await model.removeServer(connection) } }
             }
-            .padding()
-            .frame(width: 400)
-            .onExitCommand { model.sheet = nil }
         case .discardLive(let path):
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Discard unsynced edits to “\(path.name)”?").font(.headline)
-                Text("The working copy has changes that were not uploaded.").foregroundStyle(.secondary)
-                HStack {
-                    Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
-                    Spacer()
-                    Button("Discard") {
-                        model.sheet = nil
-                        Task { await model.discardLive(path, force: true) }
-                    }
+            SheetForm(title: "Discard unsynced edits to “\(path.name)”?", detail: "The working copy has changes that were not uploaded.", width: 420, onCancel: { model.sheet = nil }) {
+                EmptyView()
+            } actions: {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+                Spacer()
+                Button("Discard") {
+                    model.sheet = nil
+                    Task { await model.discardLive(path, force: true) }
                 }
             }
-            .padding()
-            .frame(width: 420)
-            .onExitCommand { model.sheet = nil }
         }
     }
 
-    private var conflictSheet: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("“\(model.conflictPath?.name ?? "")” changed on the server")
-                .font(.headline)
-            Text("Neither version has been overwritten.").foregroundStyle(.secondary)
+    /// The server's name, and the host its key line names when that says more.
+    private func hostKeyServer(_ server: String?, _ event: HostKeyEvent) -> String {
+        let host = HostKeyLine(line: event.line)?.host
+        switch (server, host) {
+        case let (server?, host?) where host != server: return "\(server) (\(host))"
+        case let (server?, _): return server
+        case let (nil, host?): return host
+        case (nil, nil): return "Unknown"
+        }
+    }
+
+    /// "Delete “notes.txt”?" for one item, "Delete 3 items?" for more, so the sheet says what
+    /// goes, including a folder selected in column view.
+    private var deleteTitle: String {
+        let selection = model.snapshot.selection
+        if selection.count == 1, let path = selection.first { return "Delete “\(path.name)”?" }
+        return "Delete \(selection.count) items?"
+    }
+
+    private func conflictSheet(_ path: RemotePath, comparable: Bool) -> some View {
+        let later = { model.sheet = nil; model.conflictConfirm = nil }
+        return SheetForm(title: "“\(path.name)” changed on the server", detail: "Neither version has been overwritten.", width: 520, onCancel: later) {
             if let confirm = model.conflictConfirm {
                 Text(confirm == .keepLocal
                      ? "Keep Local overwrites the server copy with this Mac's edits. Press again to confirm."
@@ -467,7 +420,7 @@ struct DetailColumn: View {
             }
             HStack {
                 Button("Compare") { Task { await model.chooseConflict(.compare) } }
-                    .disabled(!model.conflictComparable)
+                    .disabled(!comparable)
                 Spacer()
                 Button(model.conflictConfirm == .keepLocal ? "Confirm Keep Local" : "Keep Local") {
                     Task { await model.chooseConflict(.keepLocal) }
@@ -477,15 +430,10 @@ struct DetailColumn: View {
                 }
                 Button("Keep Both") { Task { await model.chooseConflict(.keepBoth) } }
             }
-            HStack {
-                Button("Later") { model.sheet = nil; model.conflictConfirm = nil }
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
-            }
+        } actions: {
+            Button("Later", action: later).keyboardShortcut(.cancelAction)
+            Spacer()
         }
-        .padding()
-        .frame(width: 520)
-        .onExitCommand { model.sheet = nil; model.conflictConfirm = nil }
     }
 
     private func goToFolder() {
@@ -493,8 +441,29 @@ struct DetailColumn: View {
         model.sheet = nil
         Task { await model.goToFolder(text) }
     }
+}
 
+/// The frame the small sheets share: a headline, an optional line under it, the content, and a
+/// row of buttons, with Escape doing what the sheet's cancel does.
+private struct SheetForm<Content: View, Actions: View>: View {
+    let title: String
+    var detail: String?
+    var width: CGFloat = 400
+    let onCancel: () -> Void
+    @ViewBuilder let content: Content
+    @ViewBuilder let actions: Actions
 
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.headline)
+            if let detail { Text(detail).foregroundStyle(.secondary) }
+            content
+            HStack { actions }
+        }
+        .padding()
+        .frame(width: width)
+        .onExitCommand(perform: onCancel)
+    }
 }
 
 /// The inspector column.
@@ -519,7 +488,7 @@ struct InspectorColumn: View {
                 preview(item)
             } else {
                 Text(model.snapshot.path.name.isEmpty ? "/" : model.snapshot.path.name).font(.headline)
-                Text("\(model.items.count) items").font(.subheadline).foregroundStyle(.secondary)
+                Text(ClipText.count(model.items.count, "item")).font(.subheadline).foregroundStyle(.secondary)
                 line(model.snapshot.path.display).font(.subheadline).foregroundStyle(.secondary)
             }
         }
@@ -538,8 +507,8 @@ struct InspectorColumn: View {
                 content(preview, item).id(previewID).transition(.opacity)
             } else if shown.wait != .nothing {
                 VStack(spacing: 12) {
-                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 96, height: 96)
-                    if shown.wait == .spinner { ProgressView().controlSize(.small).transition(.opacity) }
+                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 96, height: 96).accessibilityLabel(item.kindLabel)
+                    if shown.wait == .spinner { ProgressView().controlSize(.small).accessibilityLabel("Loading preview").transition(.opacity) }
                 }
                 .padding(.top, 24)
                 .transition(.opacity)
@@ -577,7 +546,7 @@ struct InspectorColumn: View {
             QuickLookPreview(url: url)
         case .text(let text):
             VStack(alignment: .trailing, spacing: 4) {
-                SourcePreview(html: SyntaxPreview.html(text: text, fileName: item.name, compact: true, wraps: wrapsPreview))
+                SourcePreview(text: text, fileName: item.name, wraps: wrapsPreview)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
                 Toggle("Wrap lines", isOn: $wrapsPreview)
@@ -663,7 +632,6 @@ struct ConnectionForm: View {
     }
 }
 
-/// The rename field. Focus state has to live inside the hosted detail subtree, so this is its own view.
 /// What the clipboard holds, over the shelf in every window until it is cleared, replaced, or
 /// pasted with a move. Items copied in Transfer are made ready for Finder in the background.
 private struct ClipBar: View {
@@ -692,6 +660,7 @@ private struct ClipBar: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Clear the clipboard (Escape)")
+            .accessibilityLabel("Clear Clipboard")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -718,6 +687,59 @@ private struct ClipBar: View {
     }
 }
 
+/// The folder's menu for the icon grid's empty area: the entries `ItemMenu` gives the empty
+/// area of the list and column views, drawn as SwiftUI buttons, so the three views share one.
+private struct FolderMenu: View {
+    let model: TransferModel
+
+    var body: some View {
+        let menu = NSMenu()
+        ItemMenu.fill(menu, item: nil, model: model)
+        return ForEach(Array(menu.items.enumerated()), id: \.offset) { _, entry in
+            if entry.isSeparatorItem {
+                Divider()
+            } else {
+                Button(entry.title) {
+                    if let action = entry.action { NSApp.sendAction(action, to: entry.target, from: entry) }
+                }
+                .disabled(!entry.isEnabled)
+            }
+        }
+    }
+}
+
+/// The window's message, such as what failed, under the toolbar until it is dismissed or the
+/// next message replaces it.
+private struct MessageBar: View {
+    let text: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(text)
+                .lineLimit(3)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Spacer(minLength: 8)
+            Button(action: dismiss) {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+/// The rename field. Focus state has to live inside the hosted detail subtree, so this is its own view.
 private struct RenameBar: View {
     @Bindable var model: TransferModel
     @FocusState private var focused: Bool
@@ -755,30 +777,52 @@ struct QuickLookPreview: NSViewRepresentable {
     func updateNSView(_ view: QLPreviewView, context: Context) {
         if (view.previewItem as? NSURL) as URL? != url { view.previewItem = url as NSURL }
     }
+
+    /// A view that does not close with its window must be closed by hand, or each preview the
+    /// inspector drops keeps its Quick Look resources.
+    static func dismantleNSView(_ view: QLPreviewView, coordinator: ()) {
+        view.close()
+    }
 }
 
-/// Highlighted source in a web view, scrollable, with the pane's own background.
+/// Highlighted source in a web view, scrollable, with the pane's own background. The page is
+/// built only when the text, name, or wrapping changes, never on every redraw of the pane.
 struct SourcePreview: NSViewRepresentable {
-    let html: String
+    let text: String
+    let fileName: String
+    let wraps: Bool
 
     func makeNSView(context: Context) -> WKWebView {
-        let view = WKWebView()
+        let configuration = WKWebViewConfiguration()
+        // The text is escaped; with scripts off, nothing from the server runs even if some slipped through.
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        let view = WKWebView(frame: .zero, configuration: configuration)
         view.setValue(false, forKey: "drawsBackground")
-        view.loadHTMLString(html, baseURL: nil)
-        context.coordinator.html = html
+        load(into: view, context: context)
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
-        guard context.coordinator.html != html else { return }
-        context.coordinator.html = html
-        view.loadHTMLString(html, baseURL: nil)
+        load(into: view, context: context)
+    }
+
+    private func load(into view: WKWebView, context: Context) {
+        let page = Coordinator.Page(text: text, fileName: fileName, wraps: wraps)
+        guard context.coordinator.page != page else { return }
+        context.coordinator.page = page
+        view.loadHTMLString(SyntaxPreview.html(text: text, fileName: fileName, compact: true, wraps: wraps), baseURL: nil)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
-        var html = ""
+        struct Page: Equatable {
+            var text: String
+            var fileName: String
+            var wraps: Bool
+        }
+
+        var page: Page?
     }
 }
 
