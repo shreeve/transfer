@@ -5,11 +5,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash
 #
 # Installs the newest GitHub release, signed with a Developer ID and notarized, so it opens on first
-# launch; Sparkle updates it in place from then on.
+# launch; Sparkle updates it in place from then on. Nothing is installed unless the app is signed
+# by Transfer's Developer ID (team SD6N7Z8P9P) and Gatekeeper accepts it as notarized.
 #
 # The app lands in /Applications, or ~/Applications where that is not writable; TRANSFER_DEST
 # names another directory (... | TRANSFER_DEST=dir bash). An installed copy is replaced by
-# rename, so a failed install leaves it be. TRANSFER_ZIP_URL installs another archive, for tests.
+# rename, so a failed install leaves it be. TRANSFER_ZIP_URL installs another archive, for tests;
+# it must pass the same checks.
 #
 # Uninstall the same way — the app goes; your servers, Live files, and settings
 # (~/Library/Application Support/Transfer) stay:
@@ -59,6 +61,8 @@ main() {
     major=$(sw_vers -productVersion | cut -d. -f1)
     [ "$major" -ge 27 ] || fail "Transfer needs macOS 27 or later (this Mac runs $(sw_vers -productVersion))."
 
+    # A Developer ID Application certificate (the two Apple extensions that mark one) of team SD6N7Z8P9P.
+    requirement='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "SD6N7Z8P9P"'
     # The repo's latest release is Transfer's newest; its archive keeps one name.
     url="${TRANSFER_ZIP_URL:-https://github.com/shreeve/transfer/releases/latest/download/Transfer.zip}"
     # TRANSFER_DEST, when given, is honored or refused, never quietly
@@ -79,21 +83,26 @@ main() {
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp" "$staged"' EXIT
     info "Transfer (latest release, Apple Silicon)"
-    curl -fSL --retry 3 --retry-delay 1 --progress-bar "$url" -o "$tmp/Transfer.zip"
+    # A redirect may not leave HTTPS.
+    curl -fSL --proto-redir =https --retry 3 --retry-delay 1 --progress-bar "$url" -o "$tmp/Transfer.zip"
     # ditto, not unzip: it preserves the bundle exactly as it was archived.
-    ditto -x -k "$tmp/Transfer.zip" "$tmp"
+    ditto -x -k "$tmp/Transfer.zip" "$tmp/unpacked"
+    [ -d "$tmp/unpacked/Transfer.app" ] || fail "the download holds no Transfer.app; nothing was changed"
 
     # Stage beside the destination, so the swap below is two renames within
     # one directory. Everything that touches the bundle happens to the staged
     # copy: nothing is written into an app once it is in place.
     rm -rf "$staged"
-    mv "$tmp/Transfer.app" "$staged"
-    # curl sets no quarantine, and a notarized app would pass with one, but
-    # releases before 0.1.5 were ad-hoc signed and would not: untag it anyway.
-    xattr -dr com.apple.quarantine "$staged" 2>/dev/null || true
-    # A damaged download stops here, with the installed app still standing.
-    codesign --verify --deep --strict "$staged" 2>/dev/null \
-        || fail "the downloaded Transfer.app does not verify; nothing was changed"
+    mv "$tmp/unpacked/Transfer.app" "$staged"
+    # A damaged or substituted download stops here, with the installed app
+    # still standing. A valid signature is not enough, since anyone can sign
+    # a bundle: it must come from a Developer ID Application certificate of
+    # Transfer's team, and Gatekeeper must accept the app as notarized.
+    codesign --verify --deep --strict -R="$requirement" "$staged" 2>/dev/null \
+        || fail "the downloaded Transfer.app is not signed with Transfer's Developer ID; nothing was changed"
+    assessment=$(spctl --assess --type execute -vv "$staged" 2>&1) \
+        && grep -qx 'source=Notarized Developer ID' <<<"$assessment" \
+        || fail "Gatekeeper does not accept the downloaded Transfer.app as notarized; nothing was changed"
 
     # A swap that died between its two renames left the only copy set
     # aside; it goes back before anything else.
