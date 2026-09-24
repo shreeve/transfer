@@ -57,12 +57,15 @@ public struct RemotePath: Hashable, Sendable {
     }
 
     /// The last path component, decoded for display.
-    public var name: String { String(decoding: nameBytes, as: UTF8.self) }
+    public var name: String { String(decoding: nameSlice, as: UTF8.self) }
 
-    public var nameBytes: [UInt8] {
+    public var nameBytes: [UInt8] { Array(nameSlice) }
+
+    /// `nameBytes` without a copy.
+    var nameSlice: ArraySlice<UInt8> {
         if isRoot { return [] }
-        guard let slash = bytes.lastIndex(of: 0x2F) else { return bytes }
-        return Array(bytes[(slash + 1)...])
+        guard let slash = bytes.lastIndex(of: 0x2F) else { return bytes[...] }
+        return bytes[(slash + 1)...]
     }
 
     /// True when this path is `ancestor` or lies under it. A lexical test: `..` is a name here,
