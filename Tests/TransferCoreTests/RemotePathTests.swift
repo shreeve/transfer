@@ -78,6 +78,5 @@ struct RemotePathTests {
         let item = RemoteItem(path: RemotePath(string: "/srv/.env/"), kind: .file)
         #expect(item.name == ".env")
         #expect(item.isHidden)
-        #expect(!item.isDotEntry)
     }
 }

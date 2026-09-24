@@ -102,31 +102,6 @@ import TransferCore
     #expect(CacheEviction.victims(entries, limit: 200).isEmpty)
 }
 
-@Test func knownHostsFilesComeFromSSHConfig() {
-    let output = """
-    user ada
-    userknownhostsfile /Users/ada/.ssh/known_hosts /Users/ada/.ssh/known_hosts2
-    globalknownhostsfile /etc/ssh/ssh_known_hosts
-    """
-    #expect(KnownHosts.files(sshConfigOutput: output) == [
-        "/Users/ada/.ssh/known_hosts", "/Users/ada/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts",
-    ])
-}
-
-@Test func hostKeySituationComparesTypeAndKey() {
-    let stored = KnownHosts.entries(keygenOutput: """
-    # Host box found: line 3
-    box ssh-ed25519 AAAAold
-    # Host box found: line 9
-    @cert-authority box ssh-rsa AAAArsa
-    """)
-    #expect(stored.count == 2)
-    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "AAAAold"), stored: stored) == .unchanged)
-    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "AAAAnew"), stored: stored) == .changed)
-    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ecdsa-sha2-nistp256", key: "AAAAec"), stored: stored) == .firstSeen)
-    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "x"), stored: []) == .firstSeen)
-}
-
 @Test func socketNameIsShortAndStable() {
     let id = ConnectionID(rawValue: UUID(uuidString: "F10955FD-A0B1-44DA-B362-C9ED14BA0668")!)
     #expect(id.socketName == "f10955fda0b1")

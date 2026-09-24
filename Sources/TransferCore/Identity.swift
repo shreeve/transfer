@@ -138,7 +138,6 @@ public struct RemoteItem: Hashable, Sendable, Identifiable {
 
     public var name: String { path.name }
     public var isHidden: Bool { name.hasPrefix(".") && name != "." && name != ".." }
-    public var isDotEntry: Bool { name == "." || name == ".." }
 }
 
 /// SFTP v3 keeps times as unsigned 32-bit seconds since 1970.

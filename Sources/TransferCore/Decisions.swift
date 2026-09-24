@@ -140,7 +140,6 @@ public struct TransferProgress: Hashable, Sendable {
 }
 
 public enum HostKeySituation: String, Sendable {
-    case unchanged
     case firstSeen
     case changed
 }
@@ -543,37 +542,4 @@ public struct HostKeyLine: Hashable, Sendable {
     }
 
     public var text: String { "\(host) \(keyType) \(key)" }
-}
-
-public enum KnownHosts {
-    /// The known-hosts files `ssh -G` reports, user files first.
-    public static func files(sshConfigOutput: String) -> [String] {
-        var user: [String] = []
-        var global: [String] = []
-        for line in sshConfigOutput.split(separator: "\n") {
-            let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-            guard parts.count > 1 else { continue }
-            switch parts[0].lowercased() {
-            case "userknownhostsfile": user += parts.dropFirst()
-            case "globalknownhostsfile": global += parts.dropFirst()
-            default: continue
-            }
-        }
-        return user + global
-    }
-
-    /// The entries `ssh-keygen -F` printed.
-    public static func entries(keygenOutput: String) -> [HostKeyLine] {
-        keygenOutput.split(separator: "\n").compactMap { HostKeyLine(line: String($0)) }
-    }
-
-    public static func situation(offered: HostKeyLine, stored: [HostKeyLine]) -> HostKeySituation {
-        if stored.contains(where: { $0.keyType == offered.keyType && $0.key == offered.key }) {
-            return .unchanged
-        }
-        if stored.contains(where: { $0.keyType == offered.keyType }) {
-            return .changed
-        }
-        return .firstSeen
-    }
 }
