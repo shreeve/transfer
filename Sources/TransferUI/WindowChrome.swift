@@ -870,11 +870,21 @@ final class SearchToolbarView: NSView {
         // First: resigning the field ends its editing, which calls collapse again.
         isExpanded = false
         field.stringValue = ""
-        if window?.firstResponder === field.currentEditor() || window?.firstResponder === field {
-            window?.makeFirstResponder(nil)
-        }
+        dropFocus()
         show(expanded: false)
         onCollapse?()
+        // Return folds the field from inside AppKit's end of editing, which then selects the text,
+        // handing the field the keyboard again after this ran.
+        DispatchQueue.main.async { [weak self] in self?.dropFocus() }
+    }
+
+    /// A folded field never keeps the keyboard: typing into it filtered every listing in the
+    /// window to nothing, on any server, with no text on screen to say so.
+    private func dropFocus() {
+        guard !isExpanded, let window else { return }
+        let responder = window.firstResponder
+        guard responder === field || (responder as? NSText)?.delegate === field else { return }
+        window.makeFirstResponder(nil)
     }
 
     private func show(expanded: Bool) {
