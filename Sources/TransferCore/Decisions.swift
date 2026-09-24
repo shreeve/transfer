@@ -1,6 +1,6 @@
-// The app's small pure rules: which files open Live, made-up names, copy dispositions, listing
-// order, the column trail, units, retries, preview-cache eviction, and known-hosts matching.
-// Each is a value or a function of values, tested in Tests/TransferCoreTests.
+// The app's small pure rules: which files open Live, made-up names, listing order, the column
+// trail, units, retries, preview-cache eviction, known-hosts lines, and what Quit asks. Each is
+// a value or a function of values, tested in Tests/TransferCoreTests.
 
 import Foundation
 import UniformTypeIdentifiers
@@ -525,4 +525,27 @@ public struct HostKeyLine: Hashable, Sendable {
     }
 
     public var text: String { "\(host) \(keyType) \(key)" }
+}
+
+/// What Quit asks, or nil when quitting loses nothing. `unsynced` is nil when the Live count did
+/// not arrive in time: then it asks, since unsynced edits cannot be ruled out.
+public struct QuitQuestion: Equatable, Sendable {
+    public var message: String
+    public var detail: String
+
+    public init?(unsynced: Int?, running: Int) {
+        let stops = running > 0 ? "\(ClipText.count(running, "transfer")) not yet finished will stop; a move keeps each original until its copy is complete." : nil
+        switch unsynced {
+        case nil:
+            message = "Transfer could not check its Live files"
+            detail = ["Some may have edits that have not reached the server. Quitting now leaves any such edits on this Mac until the next launch.", stops].compactMap(\.self).joined(separator: " ")
+        case let count? where count > 0:
+            message = TransferError.liveUnsynced(count).localizedDescription
+            detail = ["Uploads run only while Transfer is open. Quitting now leaves those edits on this Mac until the next launch.", stops].compactMap(\.self).joined(separator: " ")
+        default:
+            guard let stops else { return nil }
+            message = running == 1 ? "A transfer has not finished" : "\(running) transfers have not finished"
+            detail = stops
+        }
+    }
 }

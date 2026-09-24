@@ -256,3 +256,15 @@ import TransferCore
     #expect(MoveCheck.verdict(source: tree, before: ["": .directory], after: tree) == .remove)
     #expect(MoveCheck.verdict(source: tree, before: tree, after: tree) == .alreadyThere(["a"]))
 }
+
+/// Quit asks whenever it could lose something, including when the Live count never arrived.
+@Test func quitAsksOnlyWhenSomethingCouldBeLost() {
+    #expect(QuitQuestion(unsynced: 0, running: 0) == nil)
+    let unknown = QuitQuestion(unsynced: nil, running: 0)
+    #expect(unknown?.message == "Transfer could not check its Live files")
+    let edits = QuitQuestion(unsynced: 2, running: 1)
+    #expect(edits?.message == "2 Live files have unsynced edits")
+    #expect(edits?.detail.hasSuffix("1 transfer not yet finished will stop; a move keeps each original until its copy is complete.") == true)
+    #expect(QuitQuestion(unsynced: 0, running: 3)?.message == "3 transfers have not finished")
+    #expect(QuitQuestion(unsynced: 0, running: 1)?.message == "A transfer has not finished")
+}
