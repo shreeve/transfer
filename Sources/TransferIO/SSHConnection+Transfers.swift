@@ -2,17 +2,16 @@ import CryptoKit
 import Foundation
 import TransferCore
 
-/// The transfer engine: removal, downloads, uploads, copies on the server, tree walks, the view
-/// and preview cache, and name collisions. Login, channels, and Live forwarding are in
-/// `SSHConnection.swift`. Every name from a server reaches this Mac's disk through
-/// `LocalPlacement`, and whatever already holds a destination's name is settled by `Placement`,
-/// the same way in every direction.
+/// Removal, downloads, uploads, copies on the server, tree walks, and the preview cache. Every
+/// name from a server reaches this Mac's disk through `LocalPlacement`, and whatever holds a
+/// destination's name is settled by `Placement`, the same way in every direction.
 extension SSHConnection {
     // MARK: Remove
 
     public func remove(_ path: RemotePath) async throws {
         try await live.remove(path, on: connection.id) {
-            try await self.removeTree(path, link: try await self.walkerLink())
+            let link = try await self.walkerLink()
+            try await self.removeTree(path, folder: try await link.lstat(path).kind == .directory, link: link)
         }
         if let parent = path.parent { pipe.emit(.directoryChanged(parent)) }
     }
@@ -23,23 +22,15 @@ extension SSHConnection {
         return try await metadataLink()
     }
 
-    private func removeTree(_ path: RemotePath, link: SFTPChannel) async throws {
-        guard try await link.lstat(path).kind == .directory else { return try await link.removeFile(path) }
-        try await removeFolder(path, link: link)
-    }
-
-    /// Lists the folder in full, closing its handle, before removing what it holds: one handle
+    /// A folder is listed in full, closing its handle, before what it holds is removed: one handle
     /// open at a time however deep the tree, and nothing is unlinked while the server reads it.
-    private func removeFolder(_ path: RemotePath, link: SFTPChannel) async throws {
+    private func removeTree(_ path: RemotePath, folder: Bool, link: SFTPChannel) async throws {
+        guard folder else { return try await link.removeFile(path) }
         var children: [RemoteItem] = []
         for try await child in await link.list(path) { children.append(child) }
         for child in children {
             try Task.checkCancellation()
-            if child.kind == .directory {
-                try await removeFolder(child.path, link: link)
-            } else {
-                try await link.removeFile(child.path)
-            }
+            try await removeTree(child.path, folder: child.kind == .directory, link: link)
         }
         try await link.removeDirectory(path)
     }
@@ -153,9 +144,8 @@ extension SSHConnection {
         }
     }
 
-    /// Files at least this large are split across up to `stripeWidth` data channels, those free
-    /// at the time: one channel moves at most its 2 MB window per round trip, 100 MB/s at 20 ms
-    /// (PERF-07).
+    /// Files at least this large are split across up to `stripeWidth` data channels: one channel
+    /// moves at most its 2 MB window per round trip, 100 MB/s at 20 ms (PERF-07).
     static let stripeSize: UInt64 = 8 << 20
     static let stripeWidth = 4
 
@@ -222,9 +212,8 @@ extension SSHConnection {
 
     // MARK: Directory copy
 
-    /// Places the server's `item` as `name` in `folder`, a real folder on this Mac: a folder is
-    /// merged or made and walked, a link is made, and a file's bytes go to the data channels.
-    /// `taken` says an earlier entry of the same listing claimed the name.
+    /// Places the server's `item` as `name` in `folder`, a real folder on this Mac. `taken` says an
+    /// earlier entry of the same listing claimed the name.
     private func placeDown(
         _ item: RemoteItem,
         named name: String,
@@ -261,7 +250,7 @@ extension SSHConnection {
             guard let placed = try await settleLocally(.file(Fingerprint(item: item)), named: name, in: folder, taken: taken) else {
                 return tally.finished()
             }
-            try await makeRoom(in: &group, tally: tally)
+            if tally.addingJob() { _ = try await group.next() }
             group.addTask {
                 do {
                     try await self.fetch(item.path, info: item, to: placed.url, replacing: placed.found != nil, quarantine: true, progress: tally.file())
@@ -275,10 +264,9 @@ extension SSHConnection {
         }
     }
 
-    /// Where `incoming` lands as `name` in `folder`, a real folder on this Mac, and what holds that
-    /// spot now; nil to skip it. What holds the name is read without following a link, and anything
-    /// but the same file or link is asked about. `taken` says an earlier entry of the same listing
-    /// claimed the name and may not have landed yet.
+    /// Where `incoming` lands as `name` in `folder`, and what holds that spot now; nil to skip it.
+    /// What holds the name is read without following a link. `taken` says an earlier entry of the
+    /// same listing claimed the name and may not have landed yet.
     private func settleLocally(_ incoming: PlacedItem, named name: String, in folder: URL, taken: Bool) async throws -> (url: URL, found: PlacedItem?)? {
         let url = try LocalPlacement.child(folder, name: name)
         var found = try LocalPlacement.occupant(url)
@@ -316,8 +304,6 @@ extension SSHConnection {
         case server(RemoteItem)
     }
 
-    /// Copies an upload or a copy on the server to `destination`. A folder copy goes on past an
-    /// item that fails and reports them all at the end.
     private func copyToServer(_ source: Source, at destination: RemotePath, tally: CopyTally) async throws {
         let link = try await walkerLink()
         guard let incoming = try await incoming(source, link: link) else {
@@ -333,8 +319,7 @@ extension SSHConnection {
         try tally.check()
     }
 
-    /// Places `source`, which is `incoming`, at `destination` on the server, where `found` is: a
-    /// folder is merged or made and walked, a link is made, and a file's bytes go to the data channels.
+    /// Places `source`, which is `incoming`, at `destination` on the server, where `found` is.
     private func placeUp(
         _ source: Source,
         _ incoming: PlacedItem,
@@ -354,8 +339,7 @@ extension SSHConnection {
             tally.finished()
         case .folder:
             guard let folder = try await remoteFolder(destination, found: found, tally: tally) else { return }
-            // A folder just made holds nothing to collide with; one already there is listed once,
-            // not looked up name by name, which cost a round trip per file (PERF-03).
+            // A folder already there is listed once, not looked up name by name (PERF-03).
             var held = Holdings()
             if !folder.made { for try await item in await link.list(folder.path) { held.add(item) } }
             switch source {
@@ -373,7 +357,7 @@ extension SSHConnection {
         case .file:
             guard let placed = try await settleRemotely(incoming, at: destination, found: found, tally: tally) else { return tally.finished() }
             let replacing = placed.found != nil
-            try await makeRoom(in: &group, tally: tally)
+            if tally.addingJob() { _ = try await group.next() }
             group.addTask {
                 do {
                     switch source {
@@ -415,8 +399,7 @@ extension SSHConnection {
         }
     }
 
-    /// What `source` is to the placement rules, read without following a link; nil when a file
-    /// on this Mac is gone.
+    /// `source` to the placement rules, read without following a link; nil for a Mac file gone.
     private func incoming(_ source: Source, link: SFTPChannel) async throws -> PlacedItem? {
         switch source {
         case .mac(let url): try LocalPlacement.occupant(url)
@@ -487,13 +470,6 @@ extension SSHConnection {
             }
         }
         tally.record(spot.path)
-    }
-
-    /// Waits, before a file's job is added, while `CopyTally.jobLimit` are running. A walk that
-    /// finds names faster than the channels move bytes would otherwise start a task for every
-    /// file of a large folder, all waiting on the seven data channels at once.
-    private func makeRoom(in group: inout ThrowingTaskGroup<Void, Error>, tally: CopyTally) async throws {
-        if tally.addingJob() { _ = try await group.next() }
     }
 
     /// Temp-and-rename on the server, keeping the source's mode and time so a later copy of the
@@ -773,8 +749,9 @@ final class CopyTally: Sendable {
         }
     }
 
-    /// Counts a file job in, and says whether one must first be taken back from the task group:
-    /// at the limit, one taken back and one added leaves the count there.
+    /// Counts a file job in, and says whether one must first be taken back from the task group,
+    /// since a walk finds names faster than the channels move bytes. At the limit, one taken back
+    /// and one added leaves the count there.
     func addingJob() -> Bool {
         jobs.withLock { count in
             if count == Self.jobLimit { return true }
