@@ -54,6 +54,20 @@ struct LiveSyncTests {
 
     private func pause(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000_000) }
 
+    /// Waits for the worker to have nothing queued, due, or running, so a check that something
+    /// did not happen tests something however slow the machine is.
+    private func settled(_ h: Harness) async -> Bool {
+        await waitUntil { await h.live.workCount(on: h.connection) == 0 }
+    }
+
+    /// The last state the shelf showed for `note`.
+    private func shelf(_ h: Harness) -> OperationState? {
+        h.fake.events.compactMap { event -> OperationState? in
+            if case .operation(let operation) = event, operation.livePath == note { return operation.state }
+            return nil
+        }.last
+    }
+
     private static var serverNow: UInt32 { UInt32(Date().timeIntervalSince1970) - 600 }
 
     /// Puts `text` on the server at `path` and opens it Live. Returns the working copy and its id.
@@ -96,7 +110,7 @@ struct LiveSyncTests {
             try await edit(h, local, id, "second edit")
             #expect(await waitUntil { await h.fake.contents(note) == "second edit" })
             #expect(await waitUntil { await h.file().map { !$0.dirty && !$0.uploading } == true })
-            await pause(500)
+            #expect(await settled(h))
             #expect(await h.fake.saves == 1)
             #expect(await h.file()?.conflict == false)
         }
@@ -176,8 +190,8 @@ struct LiveSyncTests {
             let before = await h.fake.lookups
             await h.fake.setFailing(true)
             try await edit(h, local, id, "offline edit")
-            #expect(await waitUntil { await h.fake.lookups > before })
-            await pause(200)
+            // A second lookup is the retry a second later: the first pass ended in a retry, not a conflict.
+            #expect(await waitUntil { await h.fake.lookups >= before + 2 })
             #expect(await h.file()?.conflict == false)
             #expect(await h.file()?.dirty == true)
             #expect(await h.fake.saves == 0)
@@ -198,8 +212,9 @@ struct LiveSyncTests {
             await h.live.disconnected(h.connection, server: h.fake)
             let lookups = await h.fake.lookups
             try await edit(h, local, id, "while away")
-            #expect(await waitUntil { await h.file()?.dirty == true })
-            await pause(400)
+            #expect(await h.file()?.dirty == true)
+            #expect(await waitUntil { shelf(h) == .queued })
+            #expect(await settled(h))
             #expect(await h.fake.saves == 0)
             #expect(await h.fake.lookups == lookups)
             #expect(await h.fake.contents(note) == "first")
@@ -215,8 +230,9 @@ struct LiveSyncTests {
             let (local, id) = try await openLive(h, note, "first")
             await h.live.setPaused(note, on: h.connection, paused: true)
             try await edit(h, local, id, "paused edit")
-            #expect(await waitUntil { await h.file()?.dirty == true })
-            await pause(400)
+            #expect(await settled(h))
+            #expect(await h.file()?.dirty == true)
+            #expect(h.store.liveFiles(connection: h.connection).first?.dirty == true)
             #expect(await h.fake.saves == 0)
             #expect(await h.file()?.paused == true)
             await h.live.setPaused(note, on: h.connection, paused: false)
@@ -276,7 +292,7 @@ struct LiveSyncTests {
             #expect(!FileManager.default.fileExists(atPath: serverCopy(local).path))
             // Stays clean: a later pass does not see the fetched copy as an edit.
             await h.live.localChanged(try #require(await h.file()?.id))
-            await pause(600)
+            #expect(await settled(h))
             #expect(await h.fake.saves == 0)
             #expect(await h.file()?.dirty == false)
         }
@@ -334,7 +350,8 @@ struct LiveSyncTests {
             let (local, id) = try await openLive(h, note, "first")
             await h.live.setPaused(note, on: h.connection, paused: true)
             try await edit(h, local, id, "unsynced")
-            #expect(await waitUntil { await h.file()?.dirty == true })
+            #expect(await settled(h))
+            #expect(await h.file()?.dirty == true)
             try FileManager.default.removeItem(at: local)
             await h.live.localChanged(id)
             #expect(await waitUntil(4) { h.fake.failures.contains { $0.contains("disappeared") } })
@@ -348,12 +365,14 @@ struct LiveSyncTests {
             let (local, id) = try await openLive(h, note, "first")
             try FileManager.default.removeItem(at: local)
             await h.live.localChanged(id)
-            await pause(550)
+            // Recreated once a pass has seen it missing, well inside the grace.
+            #expect(await waitUntil { await h.live.isMissing(id) })
             try await edit(h, local, id, "rewritten by the editor")
             #expect(await waitUntil { await h.fake.contents(note) == "rewritten by the editor" })
             #expect(await h.files().count == 1)
             #expect(await waitUntil { await h.file()?.dirty == false })
-            await pause(1200)
+            // No pass is left over from the grace to forget it.
+            #expect(await settled(h))
             #expect(await h.files().count == 1)
         }
     }
@@ -365,7 +384,8 @@ struct LiveSyncTests {
             let (local, id) = try await openLive(h, note, "first")
             await h.live.setPaused(note, on: h.connection, paused: true)
             try await edit(h, local, id, "unsynced")
-            #expect(await waitUntil { await h.file()?.dirty == true })
+            #expect(await settled(h))
+            #expect(await h.file()?.dirty == true)
             await #expect(throws: TransferError.liveUnsynced(1)) {
                 try await h.live.discard(note, on: h.connection, force: false)
             }
@@ -472,7 +492,7 @@ struct LiveSyncTests {
             #expect(read(local) == "newer on server")
             #expect(await h.file()?.dirty == false)
             #expect(await h.file()?.conflict == false)
-            await pause(500)
+            #expect(await settled(h))
             #expect(await h.fake.saves == 0)
         }
     }
@@ -543,6 +563,388 @@ struct LiveSyncTests {
             #expect(await h.fake.saves == 1)
         }
     }
+
+    // MARK: Retries (LIVE-01)
+
+    /// Every upload reads its snapshot, and the watcher reports that read as a change of the
+    /// working copy. That echo used to reset the attempts and schedule a pass 350 ms out, so a save
+    /// that kept timing out was retried about every 0.4 s, forever.
+    @Test func aFailingSaveBacksOffDespiteItsOwnEcho() async throws {
+        try await withLive("backoff") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.fake.setSaveError(TransferError.timeout("the test's server"))
+            // The watcher's echo, a little after each attempt.
+            await h.fake.setOnSave { _ in
+                Task {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    await h.live.localChanged(id)
+                }
+            }
+            try await edit(h, local, id, "cannot upload yet")
+            #expect(await waitUntil(8) { await h.fake.saveTimes.count >= 3 })
+            let times = await h.fake.saveTimes
+            try #require(times.count >= 3)
+            #expect(times[1].timeIntervalSince(times[0]) >= 0.9)
+            #expect(times[2].timeIntervalSince(times[1]) >= 1.9)
+            #expect(await h.file()?.dirty == true)
+        }
+    }
+
+    // MARK: Removal and discard (LIVE-02, LIVE-04, CLIP-03)
+
+    @Test func removingAFolderAboveUnsyncedEditsRefusesAndRemovesNothing() async throws {
+        try await withLive("remove-unsynced") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.live.setPaused(note, on: h.connection, paused: true)
+            try await edit(h, local, id, "unsynced edit")
+            #expect(await settled(h))
+            let folder = RemotePath(string: "/srv")
+            let ran = Locked(false)
+            await #expect(throws: TransferError.liveUnsynced(1)) {
+                try await h.live.remove(folder, on: h.connection) { ran.value = true }
+            }
+            #expect(!ran.value)
+            #expect(read(local) == "unsynced edit")
+            #expect(await h.files().count == 1)
+            // The user chose to discard those edits.
+            try await h.live.remove(folder, on: h.connection, force: true) {
+                ran.value = true
+                await h.fake.delete(RemotePath(string: "/srv/note.txt"))
+            }
+            #expect(ran.value)
+            #expect(await h.files().isEmpty)
+            #expect(h.store.liveFiles(connection: h.connection).isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: local.deletingLastPathComponent().path))
+        }
+    }
+
+    @Test func removingAFolderAboveAnEditNoPassHasSeenRefuses() async throws {
+        try await withLive("remove-unseen") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            try Data("saved, not yet seen".utf8).write(to: local)
+            await #expect(throws: TransferError.liveUnsynced(1)) {
+                try await h.live.remove(RemotePath(string: "/srv"), on: h.connection) {}
+            }
+            #expect(read(local) == "saved, not yet seen")
+            #expect(await h.files().count == 1)
+        }
+    }
+
+    @Test func removingAFolderAboveSyncedCopiesForgetsThem() async throws {
+        try await withLive("remove-synced") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            try await h.live.remove(RemotePath(string: "/srv"), on: h.connection) { await h.fake.delete(RemotePath(string: "/srv/note.txt")) }
+            #expect(await h.files().isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: local.deletingLastPathComponent().path))
+        }
+    }
+
+    /// An editor save that lands while the removal runs on the server is kept, as a file removed
+    /// from the server, and Keep Local puts it back.
+    @Test func anEditSavedDuringARemovalIsKeptAsRemovedFromTheServer() async throws {
+        try await withLive("remove-race") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            try await h.live.remove(RemotePath(string: "/srv"), on: h.connection) {
+                await h.fake.delete(RemotePath(string: "/srv/note.txt"))
+                try? Data("saved during the removal".utf8).write(to: local)
+            }
+            #expect(read(local) == "saved during the removal")
+            #expect(await raised(h))
+            #expect(await h.file()?.dirty == true)
+            #expect(h.store.liveFiles(connection: h.connection).first?.conflict == "removed")
+            try await h.live.resolve(note, on: h.connection, choice: .keepLocal)
+            #expect(await h.fake.contents(note) == "saved during the removal")
+            #expect(await h.file()?.conflict == false)
+        }
+    }
+
+    /// "Forget All Synced Live Files" discards every file the shelf shows clean, which an edit
+    /// saved a moment ago can still be: discard must see it.
+    @Test func discardRefusesAnEditNoPassHasSeen() async throws {
+        try await withLive("discard-unseen") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            try Data("typed and saved, no pass yet".utf8).write(to: local)
+            #expect(await h.file()?.dirty == true)
+            await #expect(throws: TransferError.liveUnsynced(1)) {
+                try await h.live.discard(note, on: h.connection, force: false)
+            }
+            #expect(read(local) == "typed and saved, no pass yet")
+            #expect(await h.files().count == 1)
+        }
+    }
+
+    @Test func removeServerRefusesUnsyncedEditsInOneStep() async throws {
+        try await withLive("close-unsynced") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            try Data("not yet uploaded".utf8).write(to: local)
+            await #expect(throws: TransferError.liveUnsynced(1)) { try await h.live.closeIfSynced(h.connection) }
+            #expect(await h.files().count == 1)
+            await h.live.localChanged(id)
+            #expect(await waitUntil { await h.fake.contents(note) == "not yet uploaded" })
+            #expect(await waitUntil { await h.file()?.dirty == false })
+            try await h.live.closeIfSynced(h.connection)
+            #expect(await h.files().isEmpty)
+        }
+    }
+
+    // MARK: Conflict choices under a save (LIVE-03, LIVE-21)
+
+    @Test func keepBothKeepsASaveMadeDuringItsUpload() async throws {
+        try await withLive("keepboth-race") { h in
+            let (local, _) = try await conflicted(h, server: "theirs", local: "mine")
+            await h.fake.setOnSave { path in
+                if path.name.hasSuffix("(from this Mac)") { try? Data("mine, saved again".utf8).write(to: local) }
+            }
+            await #expect(throws: (any Error).self) {
+                try await h.live.resolve(note, on: h.connection, choice: .keepBoth)
+            }
+            #expect(read(local) == "mine, saved again")
+            #expect(await h.fake.contents(RemotePath(string: "/srv/note.txt (from this Mac)")) == "mine")
+            #expect(await h.fake.contents(note) == "theirs")
+            #expect(await h.file()?.conflict == true)
+            #expect(await h.file()?.dirty == true)
+        }
+    }
+
+    @Test func keepRemoteKeepsASaveMadeDuringItsDownload() async throws {
+        try await withLive("keepremote-race") { h in
+            let (local, _) = try await conflicted(h, server: "theirs", local: "mine")
+            await h.fake.holdFetches()
+            let resolving = Task { try await h.live.resolve(note, on: h.connection, choice: .keepRemote) }
+            #expect(await waitUntil { await h.fake.heldFetches == 1 })
+            try Data("mine, saved again".utf8).write(to: local)
+            await h.fake.releaseFetches()
+            await #expect(throws: (any Error).self) { try await resolving.value }
+            #expect(read(local) == "mine, saved again")
+            #expect(await h.file()?.conflict == true)
+        }
+    }
+
+    @Test func keepBothWhenTheServerFileIsGoneUploadsTheSiblingAndForgets() async throws {
+        try await withLive("keepboth-gone") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.fake.delete(note)
+            try await edit(h, local, id, "mine")
+            #expect(await waitUntil { await raised(h) })
+            try await h.live.resolve(note, on: h.connection, choice: .keepBoth)
+            #expect(await h.fake.contents(RemotePath(string: "/srv/note.txt (from this Mac)")) == "mine")
+            #expect(await h.files().isEmpty)
+        }
+    }
+
+    @Test func keepLocalOverSomethingThatIsNotAFileRefuses() async throws {
+        try await withLive("keeplocal-folder") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.fake.putFolder(note)
+            try await edit(h, local, id, "mine")
+            #expect(await waitUntil { await raised(h) })
+            await #expect(throws: TransferError.typeMismatch(note.display)) {
+                try await h.live.resolve(note, on: h.connection, choice: .keepLocal)
+            }
+            #expect(await h.fake.saves == 0)
+            #expect(await h.file()?.conflict == true)
+        }
+    }
+
+    @Test func aFailedServerCopyFetchLeavesNoOutdatedCopy() async throws {
+        try await withLive("stale-copy") { h in
+            let (local, _) = try await conflicted(h, server: "theirs", local: "mine")
+            #expect(read(serverCopy(local)) == "theirs")
+            await h.fake.changeBehind(note, "theirs again")
+            await h.fake.setFailingFetches(true)
+            await #expect(throws: (any Error).self) {
+                try await h.live.resolve(note, on: h.connection, choice: .keepLocal)
+            }
+            #expect(!FileManager.default.fileExists(atPath: serverCopy(local).path))
+            #expect(await h.file()?.conflict == true)
+        }
+    }
+
+    // MARK: Uploading only settled bytes (LIVE-05)
+
+    /// An in-place writer that starts while the pass looks the server up: its first chunk has not
+    /// held still, so it is not uploaded; the finished file is, once.
+    @Test func aWriteDuringTheLookupWaitsToSettle() async throws {
+        try await withLive("mid-lookup") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            try Data("complete edit".utf8).write(to: local)
+            let first = Locked(true)
+            await h.fake.setOnLookup {
+                guard first.withLock({ defer { $0 = false }; return $0 }) else { return }
+                try? Data("PART".utf8).write(to: local)
+                Task {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    try? Data("PART and the rest".utf8).write(to: local)
+                    await h.live.localChanged(id)
+                }
+            }
+            await h.live.localChanged(id)
+            #expect(await waitUntil { await h.fake.contents(note) == "PART and the rest" })
+            #expect(await settled(h))
+            #expect(await h.fake.savedContents == ["PART and the rest"])
+        }
+    }
+
+    // MARK: Adopting only our own upload (LIVE-09)
+
+    /// Someone else's file with the edit's size and second used to be taken as our own save, and
+    /// the edit was marked synced without ever uploading.
+    @Test func aServerFileThatOnlyLooksLikeTheEditIsAConflict() async throws {
+        try await withLive("lookalike") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let second = floor(Date().timeIntervalSince1970)
+            try Data("mine!".utf8).write(to: local)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: second + 0.3)], ofItemAtPath: local.path)
+            await h.fake.put(note, "their", mtime: UInt32(second))
+            await h.live.localChanged(id)
+            #expect(await waitUntil { await raised(h) })
+            #expect(await h.fake.saves == 0)
+            #expect(await h.fake.contents(note) == "their")
+            #expect(read(local) == "mine!")
+        }
+    }
+
+    @Test func aSaveWhoseReplyWasLostIsAdoptedNotSentAgain() async throws {
+        try await withLive("lost-reply") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.fake.landNextSaveThenFail()
+            try await edit(h, local, id, "mine")
+            #expect(await waitUntil { await h.file().map { !$0.dirty && !$0.conflict } == true })
+            #expect(await settled(h))
+            #expect(await h.fake.saveTimes.count == 1)
+            #expect(await h.fake.contents(note) == "mine")
+            #expect(await h.file()?.conflict == false)
+        }
+    }
+
+    // MARK: Refreshing beside an editor (LIVE-06)
+
+    /// An NSDocument editor holding the copy is told before a refresh replaces it. One that saves
+    /// its unsaved text first keeps it: the refresh does not happen, and the save meets the
+    /// server's newer file as a conflict.
+    @Test func reopenTellsAnEditorFirstAndKeepsWhatItSaves() async throws {
+        try await withLive("reopen-editor") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            await h.fake.changeBehind(note, "newer on server")
+            let editor = SavingEditor(local, saves: "unsaved typing")
+            NSFileCoordinator.addFilePresenter(editor)
+            defer { NSFileCoordinator.removeFilePresenter(editor) }
+            _ = try await h.live.open(note, on: h.connection)
+            #expect(editor.relinquished.value)
+            #expect(read(local) == "unsaved typing")
+            #expect(await waitUntil { await raised(h) })
+            #expect(read(serverCopy(local)) == "newer on server")
+            #expect(await h.fake.saves == 0)
+        }
+    }
+
+    // MARK: Without the watcher (LIVE-20)
+
+    @Test func pollingUploadsEditsWhenTheFolderCannotBeWatched() async throws {
+        try await withLive("polling") { h in
+            await h.live.startPolling(every: .milliseconds(100))
+            let (local, _) = try await openLive(h, note, "first")
+            try Data("seen by the poll".utf8).write(to: local)
+            #expect(await waitUntil { await h.fake.contents(note) == "seen by the poll" })
+            #expect(await waitUntil { await h.file()?.dirty == false })
+        }
+    }
+
+    // MARK: Launch (LIVE-22, LIVE-23)
+
+    @Test func aCopyIdleForADayExpiresAtLaunchUnlessItHoldsEdits() async throws {
+        try await withLive("expiry") { h in
+            let other = RemotePath(string: "/srv/other.txt")
+            let (synced, _) = try await openLive(h, note, "first")
+            let (edited, _) = try await openLive(h, other, "first")
+            // Same size, so only the bytes tell: one is untouched, one holds an edit no pass saw.
+            try Data("fir5t".utf8).write(to: edited)
+            let old = Date().addingTimeInterval(-2 * LiveSync.expiry)
+            for url in [synced, edited, synced.deletingLastPathComponent(), edited.deletingLastPathComponent()] {
+                try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+            }
+            await h.live.closeAll()
+
+            let again = LiveSync(store: h.store, watches: false)
+            let files = await again.files(on: h.connection)
+            #expect(files.map(\.path) == [other])
+            #expect(files.first?.dirty == true)
+            #expect(!FileManager.default.fileExists(atPath: synced.deletingLastPathComponent().path))
+            #expect(read(edited) == "fir5t")
+            await again.closeAll()
+        }
+    }
+
+    @Test func aGoneCopyWithEditsIsReportedAndACleanOneLeavesNoFolder() async throws {
+        try await withLive("gone") { h in
+            let other = RemotePath(string: "/srv/other.txt")
+            let (dirty, dirtyID) = try await openLive(h, note, "first")
+            let (clean, _) = try await openLive(h, other, "first")
+            await h.live.setPaused(note, on: h.connection, paused: true)
+            try await edit(h, dirty, dirtyID, "edited")
+            #expect(await settled(h))
+            await h.live.closeAll()
+            try FileManager.default.removeItem(at: dirty)
+            try FileManager.default.removeItem(at: clean)
+
+            let again = LiveSync(store: h.store, watches: false)
+            let fake = FakeServer()
+            await again.connected(h.connection, server: fake)
+            #expect(await again.files(on: h.connection).isEmpty)
+            #expect(fake.events.contains { if case .notice(let text) = $0 { text.contains(note.display) } else { false } })
+            #expect(!fake.events.contains { if case .notice(let text) = $0 { text.contains(other.display) } else { false } })
+            #expect(!FileManager.default.fileExists(atPath: clean.deletingLastPathComponent().path))
+            await again.closeAll()
+        }
+    }
+
+    // MARK: The worker and the watcher
+
+    @Test func closingCancelsQueuedCommands() async throws {
+        try await withLive("close-queued") { h in
+            await h.fake.put(note, "first", mtime: Self.serverNow)
+            await h.fake.holdFetches()
+            let opening = Task { try await h.live.open(note, on: h.connection) }
+            #expect(await waitUntil { await h.fake.heldFetches == 1 })
+            let discarding = Task { try await h.live.discard(note, on: h.connection, force: false) }
+            // The open runs and the discard waits behind it.
+            #expect(await waitUntil { await h.live.workCount(on: h.connection) == 2 })
+            await h.live.close(h.connection)
+            await #expect(throws: TransferError.cancelled) { try await discarding.value }
+            await h.fake.releaseFetches()
+            _ = try? await opening.value
+        }
+    }
+
+    @Test func watcherPathsAreSplitUnderTheRealRoot() throws {
+        let base = TestCaches.fresh("watcher")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let watcher = try #require(LiveWatcher(root: base))
+        defer { watcher.stop() }
+        #expect(watcher.components(of: watcher.root + "/conn/file/note.txt") == ["conn", "file", "note.txt"])
+        #expect(watcher.components(of: watcher.root + "sibling/conn") == nil)
+        #expect(watcher.components(of: "/elsewhere/conn/file") == nil)
+    }
+}
+
+/// An NSDocument-like editor with unsaved text: asked to let a writer in, it saves first.
+private final class SavingEditor: NSObject, NSFilePresenter, @unchecked Sendable {
+    let presentedItemURL: URL?
+    let presentedItemOperationQueue = OperationQueue()
+    let text: String
+    let relinquished = Locked(false)
+
+    init(_ url: URL, saves text: String) {
+        presentedItemURL = url
+        self.text = text
+    }
+
+    func relinquishPresentedItem(toWriter writer: @escaping @Sendable ((@Sendable () -> Void)?) -> Void) {
+        relinquished.value = true
+        if let url = presentedItemURL { try? Data(text.utf8).write(to: url) }
+        writer(nil)
+    }
 }
 
 // MARK: - Fake server
@@ -552,13 +954,23 @@ actor FakeServer: LiveServer {
     struct File {
         var data: Data
         var mtime: UInt32
+        var kind = ItemKind.file
         var print: Fingerprint { Fingerprint(size: UInt64(data.count), mtime: mtime) }
     }
 
     private var files: [RemotePath: File] = [:]
+    /// Saves that landed, and the bytes each put there.
     private(set) var saves = 0
+    private(set) var savedContents: [String] = []
+    /// When each save was attempted, landed or not.
+    private(set) var saveTimes: [Date] = []
     private(set) var lookups = 0
     private var failing = false
+    private var failingFetches = false
+    private var saveError: Error?
+    private var landThenFail = false
+    private var onSave: (@Sendable (RemotePath) async -> Void)?
+    private var onLookup: (@Sendable () async -> Void)?
     private var holding = false
     private var held: [CheckedContinuation<Void, Never>] = []
     private let log = Locked<[SessionEvent]>([])
@@ -568,6 +980,25 @@ actor FakeServer: LiveServer {
     func put(_ path: RemotePath, _ text: String, mtime: UInt32) {
         files[path] = File(data: Data(text.utf8), mtime: mtime)
     }
+
+    /// Someone puts a folder where the file was.
+    func putFolder(_ path: RemotePath) {
+        files[path] = File(data: Data(), mtime: UInt32(Date().timeIntervalSince1970), kind: .directory)
+    }
+
+    /// Every save throws `error` before it lands.
+    func setSaveError(_ error: Error?) { saveError = error }
+
+    /// The next save lands, and then its reply is lost: it throws a timeout.
+    func landNextSaveThenFail() { landThenFail = true }
+
+    func setFailingFetches(_ failing: Bool) { failingFetches = failing }
+
+    /// Runs inside each save attempt, after it landed if it lands.
+    func setOnSave(_ hook: (@Sendable (RemotePath) async -> Void)?) { onSave = hook }
+
+    /// Runs inside each lookup, before it answers.
+    func setOnLookup(_ hook: (@Sendable () async -> Void)?) { onLookup = hook }
 
     /// Someone else writes the file: new bytes and a later mtime.
     func changeBehind(_ path: RemotePath, _ text: String) {
@@ -614,13 +1045,14 @@ actor FakeServer: LiveServer {
 
     func liveLookup(_ path: RemotePath) async throws -> RemoteItem? {
         lookups += 1
+        await onLookup?()
         if failing { throw TransferError.connectionLost("fake server unreachable") }
         guard let file = files[path] else { return nil }
-        return RemoteItem(path: path, kind: .file, size: UInt64(file.data.count), mtime: file.mtime)
+        return RemoteItem(path: path, kind: file.kind, size: UInt64(file.data.count), mtime: file.mtime)
     }
 
     func liveFetch(_ item: RemoteItem, to local: URL, interactive: Bool) async throws {
-        if failing { throw TransferError.connectionLost("fake server unreachable") }
+        if failing || failingFetches { throw TransferError.connectionLost("fake server unreachable") }
         guard let file = files[item.path] else { throw TransferError.noSuchFile(item.path.display) }
         if holding { await withCheckedContinuation { held.append($0) } }
         let temp = local.deletingLastPathComponent().appendingPathComponent(".fetch-\(UUID().uuidString)")
@@ -634,7 +1066,12 @@ actor FakeServer: LiveServer {
     }
 
     func liveSave(_ snapshot: URL, to path: RemotePath, expecting: ServerExpectation, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> Fingerprint {
+        saveTimes.append(Date())
         if failing { throw TransferError.connectionLost("fake server unreachable") }
+        if let saveError {
+            await onSave?(path)
+            throw saveError
+        }
         let data = try Data(contentsOf: snapshot)
         let date = try FileManager.default.attributesOfItem(atPath: snapshot.path)[.modificationDate] as? Date ?? Date()
         let written = File(data: data, mtime: UInt32(date.timeIntervalSince1970))
@@ -648,6 +1085,12 @@ actor FakeServer: LiveServer {
         if !matches, !ownBytes { throw LiveRemoteChanged() }
         files[path] = written
         saves += 1
+        savedContents.append(String(decoding: data, as: UTF8.self))
+        await onSave?(path)
+        if landThenFail {
+            landThenFail = false
+            throw TransferError.timeout("the reply was lost")
+        }
         progress(TransferProgress(completed: UInt64(data.count), total: UInt64(data.count)))
         return written.print
     }
