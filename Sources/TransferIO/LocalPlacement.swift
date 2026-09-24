@@ -27,7 +27,7 @@ enum Placement: Equatable {
     case typeMismatch
 
     /// In a move, the same file or link already there is asked about too: skipped, it would pass
-    /// for the move's copy, and the original would be removed for a lookalike (ledger D9).
+    /// for the move's copy, and the original would be removed for a lookalike.
     static func settle(_ incoming: PlacedItem, onto found: PlacedItem?, moving: Bool = false) -> Placement {
         guard let found else { return .write }
         switch (incoming, found) {
@@ -66,11 +66,11 @@ enum Placement: Equatable {
     }
 }
 
-/// The one place a name from a server becomes a path on this Mac (ledger D4). A server is
-/// untrusted: its names must never make Transfer write, remove, or follow anything outside the
-/// folder the user chose. So a name must be a single path component, and what already holds it
-/// is read with `lstat`, never through a link: a download goes down only into folders it found
-/// or made, never into a link, and nothing already there is removed without a collision prompt.
+/// The one place a name from a server becomes a path on this Mac. A server is untrusted: its
+/// names must never make Transfer write, remove, or follow anything outside the folder the user
+/// chose. So a name must be a single path component, and what already holds it is read with
+/// `lstat`, never through a link: a download goes down only into folders it found or made, never
+/// into a link, and nothing already there is removed without a collision prompt.
 enum LocalPlacement {
     /// `name` as one entry of `folder`. Throws when the name could reach anything else: empty,
     /// `.`, `..`, or holding `/` or NUL.

@@ -206,7 +206,6 @@ public protocol RemoteSession: Sendable {
     func stars() async -> [RemotePath]
     func star(_ path: RemotePath) async
     func unstar(_ path: RemotePath) async
-    func duplicate(_ path: RemotePath) async throws
     /// Copies a file, link, or folder tree to `destination` on this same server. Files are copied
     /// on the server when it offers `copy-data`, else through the Mac. Folders merge into an
     /// existing folder and file collisions are settled as uploads settle them.
@@ -214,7 +213,7 @@ public protocol RemoteSession: Sendable {
     /// Walks `root` on the walker channel and streams every entry, the root first under the
     /// empty key, the rest by their path relative to it.
     func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, TreeEntry), Error>
-    /// `.compare` opens the diff tool itself and returns nil.
+    /// `.compare` opens the diff tool itself.
     func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws
     /// A shell command that joins the same SSH master and starts a login shell in `directory`.
     func terminalCommand(directory: RemotePath) async -> String?
