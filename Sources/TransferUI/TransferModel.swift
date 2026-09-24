@@ -1771,17 +1771,29 @@ public final class SheetPrompts {
         for ask in waiting { ask.waiting.cancel() }
     }
 
-    /// This window's sheets for one server's login, which name that server.
+    /// This window's sheets for one server's login. They name that server, so a password or host
+    /// key is never typed for the wrong one.
     func login(_ connection: SavedConnection) -> any PromptSink {
-        LoginPrompts(window: self, server: connection.displayName)
+        OperationPrompt(window: self, server: connection.displayName)
     }
 }
 
-/// A login's questions, shown in the window that asked and naming the server they are for, so a
-/// password or host key is never typed for the wrong one.
-private struct LoginPrompts: PromptSink {
-    let window: SheetPrompts
-    let server: String
+/// One user operation's prompts (a download, upload, paste, drag, or clipboard staging), bound with
+/// `OperationPrompts.$current` around it, or one login's. Sheets go to the window that started it,
+/// and Apply to All holds for this operation alone. Collisions are asked one at a time, so an Apply
+/// to All also answers the ones still waiting.
+@MainActor
+final class OperationPrompt: PromptSink {
+    private let window: SheetPrompts
+    /// The server a login's sheets name.
+    private let server: String?
+    private var applyToAll: NameCollisionChoice?
+    private var asking: Task<(choice: NameCollisionChoice, toAll: Bool)?, Never>?
+
+    init(window: SheetPrompts, server: String? = nil) {
+        self.window = window
+        self.server = server
+    }
 
     func answer(_ request: PromptRequest) async -> PromptReply {
         await window.answer(request, server: server)
@@ -1789,34 +1801,6 @@ private struct LoginPrompts: PromptSink {
 
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
         await window.decideHostKey(event, server: server)
-    }
-
-    /// One answer, with no operation to remember Apply to All for; nil once the window is gone.
-    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
-        await window.askCollision(fileName)?.choice
-    }
-}
-
-/// One user operation's prompts (a download, upload, paste, drag, or clipboard staging), bound with
-/// `OperationPrompts.$current` around it. Sheets go to the window that started it, and Apply to All
-/// holds for this operation alone. Collisions are asked one at a time, so an Apply to All also
-/// answers the ones still waiting.
-@MainActor
-final class OperationPrompt: PromptSink {
-    private let window: SheetPrompts
-    private var applyToAll: NameCollisionChoice?
-    private var asking: Task<(choice: NameCollisionChoice, toAll: Bool)?, Never>?
-
-    init(window: SheetPrompts) {
-        self.window = window
-    }
-
-    func answer(_ request: PromptRequest) async -> PromptReply {
-        await window.answer(request)
-    }
-
-    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        await window.decideHostKey(event)
     }
 
     func resolveCollision(fileName: String) async -> NameCollisionChoice? {
