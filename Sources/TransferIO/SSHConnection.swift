@@ -1,27 +1,44 @@
+import CryptoKit
 import Foundation
 import TransferCore
 
+/// One saved server over the Mac's own /usr/bin/ssh: the ControlMaster login (askpass, host keys),
+/// the SFTP passengers riding it (browse, interactive, walker, and at most seven data channels),
+/// and the Live API it forwards to `LiveSync`. The transfer engine is in
+/// SSHConnection+Transfers.swift. HANDOFF.md explains the design and the traps it avoids.
 public actor SSHConnection: RemoteSession {
     public nonisolated let connection: SavedConnection
 
     let store: Store
     private(set) var editableExtensions: Set<String>
+    /// Every passenger joins the master here. It is one path per saved server, so a login waits
+    /// for the previous master to be gone (`releasing`) before it binds the path again.
+    private let socketPath: String
     private var master: Process?
-    private var socketPath = ""
-    /// Per-login folders under the library root, removed on disconnect. Lists, not single values:
-    /// two windows can start a login on one connection at once, and neither may orphan the other's.
-    private var askDirectories: [URL] = []
-    private var onceKnownHosts: [URL] = []
+    private var masterErrors: OutputTail?
+    /// Per-login files under the library root (the askpass folder, a Trust Once known-hosts file),
+    /// removed on disconnect.
+    private var scratch: [URL] = []
     private var startPath: RemotePath?
-    private var browse: SFTPChannel?
-    private var interactive: SFTPChannel?
-    private var walker: SFTPChannel?
-    private var reopened: Set<ChannelRole> = []
+    /// The one login in flight. Every `connect` meanwhile joins it rather than starting another.
+    private var login: Task<RemotePath, Error>?
+    private var loginWaiters = (waiting: 0, cancelled: 0)
+    /// The latest release of a master and its channels. The next login waits for it, so an old
+    /// master never exits, unlinking the socket, after a new one has bound it.
+    private var releasing: Task<Void, Never>?
+    /// Bumped by every login and teardown, so a channel that finishes opening afterwards is closed.
+    private var generation = 0
+    private var reserved: [ChannelRole: SFTPChannel] = [:]
+    private var reopenedAt: [ChannelRole: ContinuousClock.Instant] = [:]
     private var pool: [SFTPChannel] = []
     private var busy: Set<ObjectIdentifier> = []
-    private var waiters: [CheckedContinuation<SFTPChannel, Error>] = []
-    private var poolRefused = false
-    private var prompted = false
+    /// Data channels still opening. They count against the limit, or every caller that arrives
+    /// during the open would see room and open its own.
+    private var opening = 0
+    /// Callers waiting for a data channel, in order. Each gets a released channel, or nil to look
+    /// again when an open it was counting on was cancelled.
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<SFTPChannel?, Error>)] = []
+    private var refusedAt: ContinuousClock.Instant?
     let pipe = EventPipe()
     let lane = InteractiveLane()
     /// Live files are `LiveSync`'s; this connection is its `LiveServer` and forwards the Live API.
@@ -30,6 +47,12 @@ public actor SSHConnection: RemoteSession {
     /// A config file every ssh this connection runs reads with `-F` in place of `~/.ssh/config`.
     /// Nil in the app. Tests set it so they never read the developer's config or known hosts.
     private let sshConfigFile: String?
+
+    /// sshd's default MaxSessions is 10: three reserved passengers and seven data channels.
+    static let dataChannels = 7
+    /// How long a login may take, prompts included, before it gives up.
+    static let loginTimeout: Duration = .seconds(300)
+    static let handshakeTimeout: Duration = .seconds(15)
 
     /// The hub passes its one `LiveSync`. Without one, as in tests, the connection makes its own
     /// and closes it on disconnect.
@@ -40,6 +63,7 @@ public actor SSHConnection: RemoteSession {
         self.live = live ?? LiveSync(store: store)
         ownsLive = live == nil
         self.sshConfigFile = sshConfigFile
+        socketPath = store.root.appendingPathComponent("ssh/\(connection.id.socketName)").path
     }
 
     public nonisolated func events() -> AsyncStream<SessionEvent> { pipe.stream() }
@@ -53,111 +77,221 @@ public actor SSHConnection: RemoteSession {
 
     // MARK: Login
 
+    /// Joins the login in flight when there is one, so two windows or a retry never log in twice.
+    /// The login stops once every caller waiting for it is cancelled.
     public func connect(prompts: any PromptSink) async throws -> RemotePath {
         if let startPath, master?.isRunning == true { return startPath }
-        await disconnect()
-        prompted = false
-        let directory = store.root.appendingPathComponent("ssh", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-        socketPath = directory.appendingPathComponent(connection.id.socketName).path
+        let task: Task<RemotePath, Error>
+        if let login {
+            task = login
+        } else {
+            task = Task { try await self.logIn(prompts) }
+            login = task
+            loginWaiters = (0, 0)
+        }
+        loginWaiters.waiting += 1
+        defer { if login == task { login = nil } }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            Task { await self.loginWaiterCancelled(task) }
+        }
+    }
+
+    private func loginWaiterCancelled(_ task: Task<RemotePath, Error>) {
+        guard login == task else { return }
+        loginWaiters.cancelled += 1
+        if loginWaiters.cancelled >= loginWaiters.waiting { task.cancel() }
+    }
+
+    /// Stops a login in flight and closes the session.
+    public func disconnect() async {
+        while let login {
+            self.login = nil
+            login.cancel()
+            _ = await login.result
+        }
+        await tearDown(reason: .cancelled)
+    }
+
+    /// What one login has started, released together when it fails or the session ends.
+    private struct Held {
+        var master: Process?
+        var errors: OutputTail?
+        var reserved: [ChannelRole: SFTPChannel] = [:]
+        var pool: [SFTPChannel] = []
+        var scratch: [URL] = []
+    }
+
+    private func logIn(_ prompts: any PromptSink) async throws -> RemotePath {
+        // Whatever an earlier login left, such as a master that died; also waits out any release.
+        await tearDown(reason: .connectionLost("The SSH connection closed"))
+        var held = Held()
+        do {
+            let resolved = try await start(prompts, holding: &held)
+            try Task.checkCancellation()
+            master = held.master
+            masterErrors = held.errors
+            reserved = held.reserved
+            scratch = held.scratch
+            startPath = resolved
+            generation += 1
+        } catch {
+            await release(held)
+            throw error is CancellationError ? TransferError.cancelled : error
+        }
+        await removeRecordedRemoteTemps()
+        await live.connected(connection.id, server: self)
+        guard let startPath else { throw TransferError.notConnected }
+        return startPath
+    }
+
+    /// Starts the master and lets ssh check the host key against the user's own files. Only when
+    /// ssh refuses the key does the user decide, and then the master starts once more.
+    private func start(_ prompts: any PromptSink, holding held: inout Held) async throws -> RemotePath {
+        let folder = (socketPath as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder)
         if FileManager.default.fileExists(atPath: socketPath) {
-            _ = try? await run(arguments: ["-S", socketPath, "-O", "exit", "--", connection.destination], timeout: 3)
+            // A master left behind by a crash.
+            _ = try? await ssh(["-S", socketPath, "-O", "exit", "--", connection.destination], timeout: .seconds(3))
             try? FileManager.default.removeItem(atPath: socketPath)
         }
-        let hostKeyArguments = try await resolveHostKey(prompts)
-        let ask: URL
-        do {
-            ask = try prepareAskpass()
-        } catch {
-            await disconnect()
-            throw error
+        let ask = try prepareAskpass()
+        held.scratch.append(ask)
+        let deadline = ContinuousClock.now + Self.loginTimeout
+        let current = Locked<Process?>(nil)
+        let refused = Locked(false)
+        let poller = Task { await self.servePrompts(prompts, directory: ask, ssh: current, refused: refused) }
+        defer { poller.cancel() }
+        var hostKeyArguments: [String] = []
+        var askedAboutHostKey = false
+        var drops = 0
+        while true {
+            let (process, errors) = try startMaster(hostKeyArguments, ask: ask)
+            held.master = process
+            held.errors = errors
+            current.value = process
+            if try await waitForSocket(process, until: deadline) { break }
+            await Self.stop(process)
+            held.master = nil
+            if refused.value { throw TransferError.cancelled }
+            if ContinuousClock.now >= deadline { throw TransferError.timeout("login") }
+            await errors.waitForEnd()
+            guard let failure = HostKeyFailure(sshErrors: errors.text) else {
+                let line = errors.lastLine
+                guard Self.droppedBeforeLogin(line) else { throw TransferError.authenticationFailed(line) }
+                drops += 1
+                if drops > 2 { throw TransferError.connectionLost(line) }
+                try await Task.sleep(for: .milliseconds(500 * drops))
+                continue
+            }
+            if failure == .revoked || askedAboutHostKey { throw TransferError.hostKeyRejected }
+            askedAboutHostKey = true
+            hostKeyArguments = try await trustHostKey(failure, prompts: prompts, ask: ask, holding: &held)
         }
-        askDirectories.append(ask)
-        let poller = Task { await self.servePrompts(prompts, directory: ask) }
+        let browse = try await openLink()
+        held.reserved[.browse] = browse
+        held.reserved[.interactive] = try? await openLink()
+        held.reserved[.walker] = try? await openLink()
+        let start = connection.remotePath.isEmpty ? RemotePath(string: ".") : RemotePath(string: connection.remotePath)
+        return try await browse.realpath(start)
+    }
+
+    /// sshd dropped the connection before authentication, as its MaxStartups and PerSourcePenalties
+    /// do under load: worth another try, unlike a refused login.
+    static func droppedBeforeLogin(_ line: String) -> Bool {
+        line.hasPrefix("Connection reset") || line.hasPrefix("Connection closed") || line.hasPrefix("kex_exchange_identification")
+    }
+
+    private func startMaster(_ hostKeyArguments: [String], ask: URL) throws -> (Process, OutputTail) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         process.arguments = masterArguments(hostKeyArguments)
         process.environment = askEnvironment(ask)
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
+        // Drained for the master's whole life: ssh blocks once a pipe nobody reads is full.
+        let errors = OutputTail()
+        process.standardError = errors.pipe
         process.standardOutput = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] process in
+            Task { await self?.masterEnded(process) }
+        }
         do {
             try process.run()
         } catch {
-            poller.cancel()
-            await disconnect()
             throw TransferError.failed("Could not start ssh")
         }
-        master = process
-        let ready = await waitForSocket(process)
-        poller.cancel()
-        guard ready else {
-            let text = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let line = text.split(separator: "\n").last.map(String.init) ?? "Login failed"
-            await disconnect()
-            if text.contains("Host key verification failed") || text.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
-                throw TransferError.hostKeyRejected
-            }
-            throw TransferError.authenticationFailed(line.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        process.terminationHandler = { [weak self] _ in
-            Task { await self?.masterEnded() }
-        }
-        let resolved: RemotePath
-        do {
-            browse = try await openLink()
-            interactive = try? await openLink()
-            walker = try? await openLink()
-            let start = connection.remotePath.isEmpty ? RemotePath(string: ".") : RemotePath(string: connection.remotePath)
-            resolved = try await requireBrowse().realpath(start)
-        } catch {
-            await disconnect()
-            throw error
-        }
-        startPath = resolved
-        await removeRecordedRemoteTemps()
-        await live.connected(connection.id, server: self)
-        return resolved
+        return (process, errors)
     }
 
-    public func disconnect() async {
-        if ownsLive { await live.closeAll() } else { await live.disconnected(connection.id, server: self) }
-        for link in [browse, interactive, walker].compactMap({ $0 }) + pool {
-            await link.closeLink()
+    private func waitForSocket(_ process: Process, until deadline: ContinuousClock.Instant) async throws -> Bool {
+        while ContinuousClock.now < deadline {
+            if FileManager.default.fileExists(atPath: socketPath) { return true }
+            if !process.isRunning { return false }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        browse = nil
-        interactive = nil
-        walker = nil
-        reopened.removeAll()
+        return false
+    }
+
+    /// Closes everything the session holds. Waiting callers get `reason`: a disconnect nobody
+    /// asked for is a lost connection, which a transfer retries, not a cancel.
+    private func tearDown(reason: TransferError) async {
+        let held = Held(master: master, errors: masterErrors, reserved: reserved, pool: pool, scratch: scratch)
+        master = nil
+        masterErrors = nil
+        reserved.removeAll()
+        reopenedAt.removeAll()
         pool.removeAll()
         busy.removeAll()
-        poolRefused = false
-        for waiter in waiters { waiter.resume(throwing: TransferError.cancelled) }
-        waiters.removeAll()
-        if let master {
-            master.terminationHandler = nil
-            if master.isRunning {
-                if !socketPath.isEmpty {
-                    _ = try? await run(arguments: ["-S", socketPath, "-O", "exit", "--", connection.destination], timeout: 3)
-                }
-                master.terminate()
-            }
-        }
-        master = nil
-        if !socketPath.isEmpty { try? FileManager.default.removeItem(atPath: socketPath) }
-        for file in onceKnownHosts { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
-        onceKnownHosts.removeAll()
-        for folder in askDirectories { try? FileManager.default.removeItem(at: folder) }
-        askDirectories.removeAll()
+        opening = 0
+        refusedAt = nil
+        scratch.removeAll()
         startPath = nil
+        generation += 1
+        for waiter in waiters { waiter.continuation.resume(throwing: reason) }
+        waiters.removeAll()
+        if ownsLive { await live.closeAll() } else { await live.disconnected(connection.id, server: self) }
+        await release(held)
     }
 
-    private func masterEnded() async {
-        guard master != nil, startPath != nil else { return }
-        await disconnect()
-        pipe.emit(.disconnected("The SSH connection to \(connection.displayName) closed"))
+    /// Stops what `held` started, after any earlier release: when the last release returns, no
+    /// master of this connection runs and the socket path is free.
+    private func release(_ held: Held) async {
+        let previous = releasing
+        let task = Task {
+            await previous?.value
+            for link in Array(held.reserved.values) + held.pool { await link.closeLink() }
+            if let master = held.master {
+                master.terminationHandler = nil
+                if master.isRunning {
+                    _ = try? await ssh(["-S", socketPath, "-O", "exit", "--", connection.destination], timeout: .seconds(3))
+                    await Self.stop(master)
+                }
+                try? FileManager.default.removeItem(atPath: socketPath)
+            }
+            for folder in held.scratch { try? FileManager.default.removeItem(at: folder) }
+        }
+        releasing = task
+        await task.value
+    }
+
+    /// Terminates `process` and waits for it to exit, killing it after 3 s.
+    private static func stop(_ process: Process) async {
+        if process.isRunning { process.terminate() }
+        for _ in 0..<60 where process.isRunning {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+    }
+
+    private func masterEnded(_ process: Process) async {
+        guard master === process, startPath != nil else { return }
+        let errors = masterErrors
+        await tearDown(reason: .connectionLost("The SSH connection closed"))
+        await errors?.waitForEnd()
+        let reason = errors?.lastLine ?? ""
+        pipe.emit(.disconnected("The SSH connection to \(connection.displayName) closed" + (reason.isEmpty ? "" : ": \(reason)")))
     }
 
     // MARK: Metadata
@@ -242,11 +376,23 @@ public actor SSHConnection: RemoteSession {
         store.star(connection: connection.id, path: path.display, on: false)
     }
 
+    /// Joins the master when it is up, else logs in on its own with the same port and identity;
+    /// never becomes a master on this connection's socket. Nil when a field holds a control
+    /// character: the command is typed into an interactive shell, where a CR or LF in a folder
+    /// name the server chose would end the line and run the rest.
     public func terminalCommand(directory: RemotePath) async -> String? {
         guard isConnected else { return nil }
         let remote = "cd \(Self.quote(directory.display)) && exec \"$SHELL\" -l"
-        let config = sshConfigFile.map { " -F \(Self.quote($0))" } ?? ""
-        return "/usr/bin/ssh -S \(Self.quote(socketPath))\(config) -o Compression=no -t -- \(Self.quote(connection.destination)) \(Self.quote(remote))"
+        let arguments = ["-S", socketPath] + configArguments + ["-o", "Compression=no", "-o", "ControlMaster=no", "-o", "RemoteCommand=none", "-t"]
+            + destinationArguments + ["--", connection.destination, remote]
+        let flags: Set = ["-S", "-F", "-o", "-t", "-p", "-i", "--"]
+        let command = "/usr/bin/ssh " + arguments.map { flags.contains($0) ? $0 : Self.quote($0) }.joined(separator: " ")
+        guard !command.unicodeScalars.contains(where: Self.isControl) else { return nil }
+        return command
+    }
+
+    static func isControl(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value < 0x20 || (0x7F...0x9F).contains(scalar.value)
     }
 
     private static func quote(_ value: String) -> String {
@@ -255,35 +401,28 @@ public actor SSHConnection: RemoteSession {
 
     // MARK: Channels
 
-    private func requireBrowse() throws -> SFTPChannel {
-        guard let browse else { throw TransferError.notConnected }
-        return browse
-    }
-
     /// The browse passenger, or interactive between its jobs.
     func metadataLink() async throws -> SFTPChannel {
         if let link = await liveLink(.browse) { return link }
         if let link = await liveLink(.interactive) { return link }
-        throw TransferError.notConnected
+        // A live master with no channel is a lost connection, which callers retry.
+        throw master?.isRunning == true ? TransferError.connectionLost("The SFTP channels closed") : TransferError.notConnected
     }
 
-    /// A reserved passenger, reopened once after it dies. Nil when down.
+    /// A reserved passenger, reopened when it has died, at most once every 5 s. Nil when down.
     func liveLink(_ role: ChannelRole) async -> SFTPChannel? {
-        let current: SFTPChannel?
-        switch role {
-        case .browse: current = browse
-        case .interactive: current = interactive
-        case .walker: current = walker
-        }
-        if let current, await current.isOpen { return current }
-        guard master?.isRunning == true, !reopened.contains(role) else { return nil }
-        reopened.insert(role)
+        if let current = reserved[role], await current.isOpen { return current }
+        guard master?.isRunning == true else { return nil }
+        let now = ContinuousClock.now
+        if let last = reopenedAt[role], now - last < .seconds(5) { return nil }
+        reopenedAt[role] = now
+        let generation = generation
         guard let link = try? await openLink() else { return nil }
-        switch role {
-        case .browse: browse = link
-        case .interactive: interactive = link
-        case .walker: walker = link
+        guard generation == self.generation else {
+            await link.closeLink()
+            return nil
         }
+        reserved[role] = link
         return link
     }
 
@@ -298,48 +437,107 @@ public actor SSHConnection: RemoteSession {
         return try await body(link)
     }
 
+    /// A free data channel: an idle one, a new one while fewer than seven are open or opening,
+    /// else the next one released. Callers queue in order and leave the queue when cancelled.
     private func acquire() async throws -> SFTPChannel {
-        var open: [SFTPChannel] = []
-        for link in pool where await link.isOpen { open.append(link) }
-        pool = open
-        if let free = pool.first(where: { !busy.contains(ObjectIdentifier($0)) }) {
-            busy.insert(ObjectIdentifier(free))
-            return free
-        }
-        if pool.count < 7, !poolRefused {
-            do {
-                let link = try await openLink()
-                pool.append(link)
+        while true {
+            if let link = pool.first(where: { !busy.contains(ObjectIdentifier($0)) }) {
                 busy.insert(ObjectIdentifier(link))
-                return link
-            } catch {
-                poolRefused = true
-                if pool.isEmpty { throw error }
+                if await link.isOpen { return link }
+                drop(link)
+                continue
             }
+            if pool.count + opening < Self.dataChannels, master?.isRunning == true,
+               refusedAt.map({ ContinuousClock.now - $0 > .seconds(10) }) ?? true {
+                opening += 1
+                let generation = generation
+                do {
+                    let link = try await openLink()
+                    guard generation == self.generation else {
+                        await link.closeLink()
+                        throw TransferError.connectionLost("The SSH connection closed")
+                    }
+                    opening -= 1
+                    pool.append(link)
+                    busy.insert(ObjectIdentifier(link))
+                    return link
+                } catch {
+                    guard generation == self.generation else { throw error }
+                    opening -= 1
+                    let nothingLeft = pool.isEmpty && opening == 0
+                    if error is CancellationError || (error as? TransferError) == .cancelled {
+                        if nothingLeft, !waiters.isEmpty { waiters.removeFirst().continuation.resume(returning: nil) }
+                        throw error
+                    }
+                    // The server allows no more sessions for now (MaxSessions); share what is open.
+                    refusedAt = .now
+                    if nothingLeft {
+                        for waiter in waiters { waiter.continuation.resume(throwing: error) }
+                        waiters.removeAll()
+                        throw error
+                    }
+                }
+            }
+            guard !pool.isEmpty || opening > 0 else {
+                throw master?.isRunning == true ? TransferError.connectionLost("No SFTP channel could open") : TransferError.notConnected
+            }
+            guard let link = try await nextReleased() else { continue }
+            if await link.isOpen { return link }
+            drop(link)
         }
-        guard !pool.isEmpty else { throw TransferError.notConnected }
-        return try await withCheckedThrowingContinuation { waiters.append($0) }
     }
 
+    private func nextReleased() async throws -> SFTPChannel? {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: TransferError.cancelled)
+                } else {
+                    waiters.append((id, continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.leaveQueue(id) }
+        }
+    }
+
+    private func leaveQueue(_ id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume(throwing: TransferError.cancelled)
+    }
+
+    /// Hands the channel to the first caller waiting, else marks it idle. A channel from an
+    /// earlier login is only forgotten.
     private func release(_ link: SFTPChannel) {
         let id = ObjectIdentifier(link)
-        busy.remove(id)
-        guard !waiters.isEmpty else { return }
-        busy.insert(id)
-        waiters.removeFirst().resume(returning: link)
+        guard pool.contains(where: { $0 === link }), !waiters.isEmpty else {
+            busy.remove(id)
+            return
+        }
+        waiters.removeFirst().continuation.resume(returning: link)
     }
 
+    private func drop(_ link: SFTPChannel) {
+        busy.remove(ObjectIdentifier(link))
+        pool.removeAll { $0 === link }
+    }
+
+    /// A passenger on the master. It gives up when the server has not started SFTP within 15 s,
+    /// as when a shell startup file prints text ahead of it, or when the caller is cancelled.
     private func openLink() async throws -> SFTPChannel {
-        guard master?.isRunning == true else { throw TransferError.notConnected }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         // With -s the subsystem name is the command argument, so it must follow the destination.
-        process.arguments = configArguments + ["-S", socketPath, "-o", "Compression=no", "-o", "ControlMaster=no", "-s", "--", connection.destination, "sftp"]
+        // BatchMode: if the master is gone, ssh falls back to a login of its own, which must not prompt.
+        process.arguments = configArguments + ["-S", socketPath, "-o", "Compression=no", "-o", "ControlMaster=no", "-o", "BatchMode=yes"]
+            + Self.plainSession + ["-s", "--", connection.destination, "sftp"]
         let input = Pipe()
         let output = Pipe()
+        let errors = OutputTail(limit: 1024)
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errors.pipe
         // A channel whose ssh has exited makes the next write fail with EPIPE, which the link
         // reports as a lost connection and a transfer retries; the default SIGPIPE would end
         // the whole app before the write returned.
@@ -347,23 +545,57 @@ public actor SSHConnection: RemoteSession {
         try process.run()
         let link = SFTPChannel(process: process, input: input.fileHandleForWriting, output: output.fileHandleForReading)
         await link.start()
+        let timedOut = Locked(false)
+        let watchdog = Task {
+            try await Task.sleep(for: Self.handshakeTimeout)
+            timedOut.value = true
+            await link.closeLink()
+        }
+        defer { watchdog.cancel() }
         do {
-            try await link.handshake()
+            try await withTaskCancellationHandler {
+                try await link.handshake()
+            } onCancel: {
+                Task { await link.closeLink() }
+            }
         } catch {
             await link.closeLink()
-            throw error
+            if timedOut.value {
+                throw TransferError.failed("The server did not start SFTP within 15 s. A shell startup file that prints text can cause this.")
+            }
+            if Task.isCancelled { throw TransferError.cancelled }
+            await errors.waitForEnd()
+            let line = errors.lastLine
+            throw line.isEmpty ? error : TransferError.connectionLost(line)
         }
         return link
     }
 
+    /// Forgets a recorded temp only once it is gone from the server.
     private func removeRecordedRemoteTemps() async {
         for path in store.remoteTemps(connection: connection.id) {
-            try? await metadataLink().removeFile(RemotePath(string: path))
-            store.forgetTemp(path)
+            do {
+                try await metadataLink().removeFile(RemotePath(string: path))
+                store.forgetTemp(path)
+            } catch TransferError.noSuchFile {
+                store.forgetTemp(path)
+            } catch {
+                continue
+            }
         }
     }
 
-    // MARK: Host keys
+    // MARK: Arguments
+
+    /// For every ssh that joins or runs on the server: `~/.ssh/config` may name a remote command, a
+    /// TTY, forwards, or a local command for the host, meant for the user's own logins. Any of them
+    /// breaks an SFTP passenger or makes the master hold the user's forwarded ports.
+    private static let plainSession = [
+        "-o", "RemoteCommand=none",
+        "-o", "RequestTTY=no",
+        "-o", "ClearAllForwardings=yes",
+        "-o", "PermitLocalCommand=no",
+    ]
 
     /// Paths go through flags (`-i`, `-S`) or quoted `-o` values: ssh splits a bare `-o` value on
     /// spaces, and the library lives under "Application Support".
@@ -384,6 +616,10 @@ public actor SSHConnection: RemoteSession {
         var arguments = [
             "-N",
             "-o", "ControlMaster=yes",
+            // A ControlPersist or ForkAfterAuthentication in ~/.ssh/config would fork the master
+            // into the background, where this process can neither watch nor stop it.
+            "-o", "ControlPersist=no",
+            "-o", "ForkAfterAuthentication=no",
             "-o", "Compression=no",
             // A dead network is noticed in about 45 s instead of hanging every request on it.
             "-o", "ServerAliveInterval=15",
@@ -391,6 +627,7 @@ public actor SSHConnection: RemoteSession {
             "-S", socketPath,
             "-o", "StrictHostKeyChecking=yes",
         ]
+        arguments += Self.plainSession
         arguments += hostKeyArguments
         arguments += destinationArguments
         arguments += ["--", connection.destination]
@@ -401,97 +638,132 @@ public actor SSHConnection: RemoteSession {
         sshConfigFile.map { ["-F", $0] } ?? []
     }
 
-    /// Learns the offered key with a no-auth ssh run, compares it with the known-hosts files `ssh -G`
-    /// reports, and asks the user when it is new or changed. Returns extra ssh arguments for the master.
-    private func resolveHostKey(_ prompts: any PromptSink) async throws -> [String] {
-        let config = try await run(arguments: ["-G"] + destinationArguments + ["--", connection.destination], timeout: 5)
-        let files = KnownHosts.files(sshConfigOutput: config.stdout)
+    private func ssh(_ arguments: [String], environment: [String: String]? = nil, timeout: Duration) async throws -> Subprocess.Result {
+        try await Subprocess.run("/usr/bin/ssh", configArguments + arguments, environment: environment, timeout: timeout)
+    }
+
+    // MARK: Host keys
+
+    /// After ssh refused the host key: learns the key the server offers with a probe that reads no
+    /// known-hosts file, asks the user, and returns the arguments for the master's second try.
+    /// Always Trust and Replace write the first user file `ssh -G` names; Trust Once hands the
+    /// master the probe's file, removed on disconnect.
+    private func trustHostKey(_ failure: HostKeyFailure, prompts: any PromptSink, ask: URL, holding held: inout Held) async throws -> [String] {
+        let values = SSHConfigValues.parse(await SSHResolver.config(for: connection, configFile: sshConfigFile) ?? "")
         let probeDirectory = store.root.appendingPathComponent("hostkey-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: probeDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: probeDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        var keep = false
+        defer { if !keep { try? FileManager.default.removeItem(at: probeDirectory) } }
         let probeFile = probeDirectory.appendingPathComponent("known_hosts")
-        let probe: CommandResult
-        do {
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: probeDirectory.path)
-            probe = try await run(arguments: Self.quotedOption("UserKnownHostsFile", probeFile.path) + [
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-o", "HashKnownHosts=no",
-                "-o", "BatchMode=yes",
-                "-o", "PasswordAuthentication=no",
-                "-o", "PubkeyAuthentication=no",
-                "-o", "KbdInteractiveAuthentication=no",
-                "-o", "ControlMaster=no",
-                "-o", "ControlPath=none",
-                "-o", "Compression=no",
-                "-o", "ConnectTimeout=15",
-            ] + destinationArguments + ["--", connection.destination, "true"], timeout: 30)
-        } catch {
-            try? FileManager.default.removeItem(at: probeDirectory)
-            throw error
+        // No authentication, so it never logs in; the askpass environment lets a ProxyJump host ask.
+        let probeArguments = Self.quotedOption("UserKnownHostsFile", probeFile.path) + [
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "KnownHostsCommand=none",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "HashKnownHosts=no",
+            "-o", "PasswordAuthentication=no",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            "-o", "ConnectTimeout=15",
+        ] + Self.plainSession + destinationArguments + ["--", connection.destination, "true"]
+        var probe = try await ssh(probeArguments, environment: askEnvironment(ask), timeout: .seconds(30))
+        for drop in 1...2 where !FileManager.default.fileExists(atPath: probeFile.path) && Self.droppedBeforeLogin(probe.stderr.lastLine) {
+            try await Task.sleep(for: .milliseconds(500 * drop))
+            probe = try await ssh(probeArguments, environment: askEnvironment(ask), timeout: .seconds(30))
         }
         let text = (try? String(contentsOf: probeFile, encoding: .utf8)) ?? ""
-        let offered = text.split(separator: "\n").compactMap { HostKeyLine(line: String($0)) }.first
-        guard let offered else {
-            try? FileManager.default.removeItem(at: probeDirectory)
-            let reason = probe.stderr.split(separator: "\n").last.map(String.init) ?? "no reply"
-            throw TransferError.failed("Could not read the host key: \(reason)")
+        guard let offered = text.split(separator: "\n").compactMap({ HostKeyLine(line: String($0)) }).first else {
+            let reason = probe.stderr.lastLine
+            throw TransferError.failed("Could not read the host key: \(reason.isEmpty ? "no reply" : reason)")
         }
-        var stored: [HostKeyLine] = []
-        for file in files where FileManager.default.fileExists(atPath: file) {
-            let found = try? await run(launch: "/usr/bin/ssh-keygen", arguments: ["-F", offered.host, "-f", file], timeout: 5)
-            stored += KnownHosts.entries(keygenOutput: found?.stdout ?? "")
-        }
-        let situation = KnownHosts.situation(offered: offered, stored: stored)
-        if situation == .unchanged {
-            try? FileManager.default.removeItem(at: probeDirectory)
-            return []
-        }
-        let fingerprint = await fingerprint(offered.text)
-        let event = HostKeyEvent(situation: situation, keyType: offered.keyType, fingerprint: fingerprint, line: offered.text)
-        switch await prompts.decideHostKey(event) {
+        let event = HostKeyEvent(situation: failure == .changed ? .changed : .firstSeen, keyType: offered.keyType, fingerprint: Self.fingerprint(offered.key), line: offered.text)
+        switch try await Self.untilCancelled({ await prompts.decideHostKey(event) }) {
         case .cancel:
-            try? FileManager.default.removeItem(at: probeDirectory)
             throw TransferError.hostKeyRejected
         case .trustOnce:
-            onceKnownHosts.append(probeFile)
+            keep = true
+            held.scratch.append(probeDirectory)
             return Self.quotedOption("UserKnownHostsFile", probeFile.path)
         case .alwaysTrust, .replace:
-            try? FileManager.default.removeItem(at: probeDirectory)
-            guard let target = files.first else { throw TransferError.failed("ssh reports no known_hosts file") }
-            if situation == .changed {
-                for file in files where FileManager.default.fileExists(atPath: file) {
-                    _ = try? await run(launch: "/usr/bin/ssh-keygen", arguments: ["-R", offered.host, "-f", file], timeout: 5)
+            let userFiles = (values["userknownhostsfile"] ?? "").split(separator: " ").map(String.init)
+            guard let target = userFiles.first, target != "/dev/null", target != "none" else {
+                pipe.emit(.notice("Trusted for this login only: the SSH configuration names no known_hosts file to save the key in"))
+                keep = true
+                held.scratch.append(probeDirectory)
+                return Self.quotedOption("UserKnownHostsFile", probeFile.path)
+            }
+            if failure == .changed {
+                for file in userFiles where FileManager.default.fileExists(atPath: file) {
+                    for host in offered.host.split(separator: ",") {
+                        _ = try? await Subprocess.run("/usr/bin/ssh-keygen", ["-R", String(host), "-f", file], timeout: .seconds(5))
+                    }
                 }
             }
-            let folder = (target as NSString).deletingLastPathComponent
-            if !FileManager.default.fileExists(atPath: folder) {
-                try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            }
-            if !FileManager.default.fileExists(atPath: target) {
-                FileManager.default.createFile(atPath: target, contents: nil, attributes: [.posixPermissions: 0o600])
-            }
-            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: target))
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            let existing = (try? String(contentsOfFile: target, encoding: .utf8)) ?? ""
-            let prefix = existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n"
-            try handle.write(contentsOf: Data((prefix + offered.text + "\n").utf8))
+            try Self.append(Self.knownHostsLines(offered, hashed: values["hashknownhosts"] == "yes"), to: target)
             return []
         }
     }
 
-    private func fingerprint(_ line: String) async -> String {
-        let file = store.root.appendingPathComponent("key-\(UUID().uuidString)").path
-        try? line.write(toFile: file, atomically: true, encoding: .utf8)
-        let result = try? await run(launch: "/usr/bin/ssh-keygen", arguments: ["-lf", file], timeout: 3)
-        try? FileManager.default.removeItem(atPath: file)
-        let parts = result?.stdout.split(separator: " ") ?? []
-        return parts.count > 1 ? String(parts[1]) : line
+    /// The lines for known_hosts, one per host name hashed as ssh's `HashKnownHosts` does when
+    /// `hashed`: `|1|salt|HMAC-SHA1(salt, name)`.
+    static func knownHostsLines(_ offered: HostKeyLine, hashed: Bool) -> [String] {
+        guard hashed else { return [offered.text] }
+        return offered.host.split(separator: ",").map { name in
+            let salt = SymmetricKey(size: .init(bitCount: 160))
+            let mac = HMAC<Insecure.SHA1>.authenticationCode(for: Data(name.utf8), using: salt)
+            let saltText = salt.withUnsafeBytes { Data($0).base64EncodedString() }
+            return "|1|\(saltText)|\(Data(mac).base64EncodedString()) \(offered.keyType) \(offered.key)"
+        }
+    }
+
+    /// Appends in one `O_APPEND` write, so two logins trusting at once never overwrite each other.
+    private static func append(_ lines: [String], to path: String) throws {
+        let folder = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let fd = open(path, O_RDWR | O_APPEND | O_CREAT, 0o600)
+        guard fd >= 0 else { throw TransferError.failed("Could not open \(path)") }
+        defer { close(fd) }
+        var last: UInt8 = 0x0A
+        let size = lseek(fd, 0, SEEK_END)
+        if size > 0 { _ = pread(fd, &last, 1, size - 1) }
+        let bytes = Array(((last == 0x0A ? "" : "\n") + lines.joined(separator: "\n") + "\n").utf8)
+        guard write(fd, bytes, bytes.count) == bytes.count else { throw TransferError.failed("Could not write \(path)") }
+    }
+
+    /// `SHA256:` and the unpadded base64 digest of the key blob, as ssh prints it.
+    static func fingerprint(_ key: String) -> String {
+        guard let blob = Data(base64Encoded: key) else { return key }
+        return "SHA256:" + Data(SHA256.hash(data: blob)).base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "="))
+    }
+
+    /// `body`'s answer, or `.cancelled` as soon as the calling task is cancelled. A prompt sheet
+    /// cannot be withdrawn; its late answer is dropped.
+    private static func untilCancelled<T: Sendable>(_ body: @escaping @Sendable () async -> T) async throws -> T {
+        let slot = Locked<CheckedContinuation<T, Error>?>(nil)
+        let take: @Sendable () -> CheckedContinuation<T, Error>? = { slot.withLock { waiting in defer { waiting = nil }; return waiting } }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                slot.value = continuation
+                if Task.isCancelled {
+                    take()?.resume(throwing: TransferError.cancelled)
+                    return
+                }
+                Task {
+                    let answer = await body()
+                    take()?.resume(returning: answer)
+                }
+            }
+        } onCancel: {
+            take()?.resume(throwing: TransferError.cancelled)
+        }
     }
 
     // MARK: Askpass
 
-    /// Prefixes of the per-login files and folders under the library root: askpass folders, host-key
-    /// probes, and fingerprint scratch files.
+    /// Prefixes of the per-login files and folders under the library root: askpass folders and
+    /// host-key probes. `key-` is what 0.1.7 left for a fingerprint.
     static let loginScratchPrefixes = ["ask-", "hostkey-", "key-"]
 
     /// Removes per-login scratch left under `root` by a session that never disconnected: the app
@@ -516,18 +788,21 @@ public actor SSHConnection: RemoteSession {
         return directory
     }
 
+    /// The helper ssh runs for each prompt. It gives up with the login (`loginTimeout`) or as soon
+    /// as its folder is removed, so none outlives a login that ended.
     private func writeAskpass(in directory: URL) throws {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         let script = directory.appendingPathComponent("askpass.sh")
+        let ticks = Self.loginTimeout.components.seconds * 10
         let source = """
         #!/bin/sh
         dir="$TRANSFER_ASK_DIR"
         umask 077
-        printf '%s' "$1" > "$dir/prompt"
+        printf '%s' "$1" > "$dir/prompt" || exit 1
         i=0
         while [ ! -f "$dir/reply" ]; do
           i=$((i+1))
-          if [ "$i" -gt 6000 ]; then exit 1; fi
+          if [ "$i" -gt \(ticks) ] || [ ! -d "$dir" ]; then exit 1; fi
           sleep 0.1
         done
         cat "$dir/reply"
@@ -546,78 +821,72 @@ public actor SSHConnection: RemoteSession {
         return environment
     }
 
-    private func servePrompts(_ prompts: any PromptSink, directory: URL) async {
+    /// Answers ssh's prompts for one login. The Keychain secret answers only this server's own
+    /// password prompt (or a key's passphrase), never a ProxyJump host's, and only once: a second
+    /// prompt means it was wrong, so the user is asked and may save a new one. Cancel stops ssh.
+    private func servePrompts(_ prompts: any PromptSink, directory: URL, ssh: Locked<Process?>, refused: Locked<Bool>) async {
         let prompt = directory.appendingPathComponent("prompt")
         let reply = directory.appendingPathComponent("reply")
+        let account = connection.id.rawValue.uuidString
+        var storedTried = false
+        var target: (user: String, host: String)?
         while !Task.isCancelled {
-            if FileManager.default.fileExists(atPath: prompt.path),
-               let text = try? String(contentsOf: prompt, encoding: .utf8), !text.isEmpty {
-                let account = connection.id.rawValue.uuidString
-                let stored = KeychainStore.load(account: account)
+            if let text = try? String(contentsOf: prompt, encoding: .utf8), !text.isEmpty {
+                try? FileManager.default.removeItem(at: prompt)
+                if target == nil { target = await passwordTarget() }
+                let secret = target.map { Self.takesStoredSecret(text, user: $0.user, host: $0.host) } ?? false
                 let answer: PromptReply
-                if !prompted, let stored {
+                if secret, !storedTried, let stored = KeychainStore.load(account: account) {
+                    storedTried = true
                     answer = PromptReply(text: stored)
                 } else {
-                    answer = await prompts.answer(PromptRequest(text: text, offerKeychain: !prompted))
-                }
-                prompted = true
-                if answer.saveInKeychain, let text = answer.text {
-                    KeychainStore.save(account: account, secret: text)
+                    guard let asked = try? await Self.untilCancelled({ await prompts.answer(PromptRequest(text: text, offerKeychain: secret)) }) else { return }
+                    answer = asked
                 }
                 guard let text = answer.text else {
-                    master?.terminate()
+                    refused.value = true
+                    ssh.value?.terminate()
                     return
                 }
-                try? FileManager.default.removeItem(at: prompt)
+                if answer.saveInKeychain { KeychainStore.save(account: account, secret: text) }
                 try? text.write(to: reply, atomically: true, encoding: .utf8)
             }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            try? await Task.sleep(for: .milliseconds(50))
         }
     }
 
-    private func waitForSocket(_ process: Process) async -> Bool {
-        for _ in 0..<3000 {
-            if FileManager.default.fileExists(atPath: socketPath) { return true }
-            if !process.isRunning { return false }
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-        return FileManager.default.fileExists(atPath: socketPath)
+    /// The user and host ssh names in this server's password prompt: `user@host's password:`, or
+    /// `(user@host) Password:` for keyboard-interactive.
+    private func passwordTarget() async -> (user: String, host: String) {
+        let values = SSHConfigValues.parse(await SSHResolver.config(for: connection, configFile: sshConfigFile) ?? "")
+        let alias = values["hostkeyalias"].flatMap { $0 == "none" ? nil : $0 }
+        return (values["user"] ?? connection.user, alias ?? values["hostname"] ?? connection.host)
     }
 
-    // MARK: Processes
-
-    private func run(arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
-        try await run(launch: "/usr/bin/ssh", arguments: configArguments + arguments, timeout: timeout)
+    /// Whether a stored secret may answer `prompt`: this server's own password prompt, or a
+    /// passphrase for a key, which never leaves the Mac.
+    static func takesStoredSecret(_ prompt: String, user: String, host: String) -> Bool {
+        if prompt.hasPrefix("Enter passphrase for") { return true }
+        return prompt.contains("\(user)@\(host)") && prompt.lowercased().contains("password")
     }
+}
 
-    private func run(launch: String, arguments: [String], timeout: TimeInterval) async throws -> CommandResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: launch)
-        process.arguments = arguments
-        process.standardInput = FileHandle.nullDevice
-        let output = Pipe()
-        let error = Pipe()
-        process.standardOutput = output
-        process.standardError = error
-        let fired = Locked(false)
-        try process.run()
-        let watchdog = Task {
-            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            if !Task.isCancelled, process.isRunning {
-                fired.value = true
-                process.terminate()
-            }
+/// Why ssh refused a login over the host key, read from its error output.
+enum HostKeyFailure: Equatable {
+    case unknown
+    case changed
+    case revoked
+
+    init?(sshErrors text: String) {
+        if text.contains("REVOKED HOST KEY") || text.contains("was revoked") {
+            self = .revoked
+        } else if text.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") || text.contains("has changed and you have requested strict checking") {
+            self = .changed
+        } else if text.contains("Host key verification failed") {
+            self = .unknown
+        } else {
+            return nil
         }
-        let result: CommandResult = await withCheckedContinuation { continuation in
-            process.terminationHandler = { process in
-                let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                continuation.resume(returning: CommandResult(stdout: stdout, stderr: stderr))
-            }
-        }
-        watchdog.cancel()
-        if fired.value { throw TransferError.timeout((launch as NSString).lastPathComponent) }
-        return result
     }
 }
 
@@ -626,11 +895,6 @@ enum ChannelRole {
     case browse
     case interactive
     case walker
-}
-
-private struct CommandResult {
-    var stdout: String
-    var stderr: String
 }
 
 extension SSHConnection: LiveServer {

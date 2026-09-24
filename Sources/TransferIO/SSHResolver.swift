@@ -5,32 +5,14 @@ import TransferCore
 /// What ssh makes of a saved server without logging in: `ssh -G`, and its host name's addresses.
 enum SSHResolver {
     /// `ssh -G` for the server's destination and port, or nil when ssh fails or takes over 5 s.
-    static func config(for connection: SavedConnection) async -> String? {
-        var arguments = ["-G"]
+    /// `configFile` replaces `~/.ssh/config`, as a connection's `sshConfigFile` does.
+    static func config(for connection: SavedConnection, configFile: String? = nil) async -> String? {
+        var arguments = configFile.map { ["-F", $0] } ?? []
+        arguments.append("-G")
         if !connection.port.isEmpty { arguments += ["-p", connection.port] }
         arguments += ["--", connection.destination]
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = arguments
-        process.standardInput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        let output = Pipe()
-        process.standardOutput = output
-        let text: String? = await withCheckedContinuation { continuation in
-            process.terminationHandler = { process in
-                let data = output.fileHandleForReading.readDataToEndOfFile()
-                continuation.resume(returning: process.terminationStatus == 0 ? String(decoding: data, as: UTF8.self) : nil)
-            }
-            do {
-                try process.run()
-            } catch {
-                process.terminationHandler = nil
-                continuation.resume(returning: nil)
-                return
-            }
-            DispatchQueue.global().asyncAfter(deadline: .now() + 5) { if process.isRunning { process.terminate() } }
-        }
-        return text
+        guard let result = try? await Subprocess.run("/usr/bin/ssh", arguments, timeout: .seconds(5)), result.status == 0 else { return nil }
+        return result.stdout
     }
 
     /// True for an IPv4 or IPv6 literal.
@@ -40,8 +22,15 @@ enum SSHResolver {
         return inet_pton(AF_INET, host, &v4) == 1 || inet_pton(AF_INET6, host, &v6) == 1
     }
 
-    /// The numeric addresses `host` resolves to; itself when it is one.
-    static func addresses(of host: String) -> Set<String> {
+    /// The numeric addresses `host` resolves to; itself when it is one. `getaddrinfo` blocks for as
+    /// long as DNS takes, so it runs on a Dispatch thread, never on Swift's cooperative pool.
+    static func addresses(of host: String) async -> Set<String> {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { continuation.resume(returning: resolve(host)) }
+        }
+    }
+
+    private static func resolve(_ host: String) -> Set<String> {
         var hints = addrinfo()
         hints.ai_socktype = SOCK_STREAM
         var list: UnsafeMutablePointer<addrinfo>?

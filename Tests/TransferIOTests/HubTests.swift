@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import TransferCore
 @testable import TransferIO
 
 /// `TransferHub` with no server.
@@ -36,5 +37,66 @@ struct HubTests {
         let root = base.appendingPathComponent("library", isDirectory: true)
         let store = try Store(root: root)
         #expect(store.cacheRoot == root.appendingPathComponent("Caches", isDirectory: true))
+    }
+
+    /// Remove Server refuses while a Live copy holds unsynced edits, and leaves the copy alone.
+    @Test func removeServerRefusesWhileLiveEditsAreUnsynced() async throws {
+        let base = TestCaches.fresh("hubrm")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        let store = try Store(root: root)
+        let saved = SavedConnection(name: "box", host: "box.invalid", user: "u", port: "", identityFile: "", remotePath: "")
+        store.save(saved)
+        let folder = root.appendingPathComponent("Live/\(saved.id.rawValue.uuidString)/one", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let copy = folder.appendingPathComponent("notes.txt")
+        try Data("edited".utf8).write(to: copy)
+        store.saveLive(LiveRow(id: LiveFileID(), connection: saved.id, path: RemotePath(string: "/notes.txt"), baseSize: 1, baseMtime: 1, localPath: copy.path, dirty: true))
+
+        let hub = try TransferHub(root: root)
+        await #expect(throws: TransferError.liveUnsynced(1)) { try await hub.removeConnection(saved.id) }
+        #expect(FileManager.default.fileExists(atPath: copy.path))
+        #expect(try await hub.savedConnections().map(\.id) == [saved.id])
+    }
+
+    @Test func extensionsAreCleanedAndSaved() async throws {
+        let base = TestCaches.fresh("hubext")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        let hub = try TransferHub(root: root)
+        try await hub.setEditableExtensions([" .TXT", "md", "txt", "", ".Swift."])
+        #expect(await hub.editableExtensions() == ["txt", "md", "swift"])
+        #expect(ConfigLoader.load(root: root).editableExtensions == ["txt", "md", "swift"])
+    }
+
+    /// Every window gets the one session for a server until the saved server changes.
+    @Test func sessionsAreSharedUntilTheServerChanges() async throws {
+        let base = TestCaches.fresh("hubshare")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let hub = try TransferHub(root: base.appendingPathComponent("library", isDirectory: true))
+        var saved = SavedConnection(name: "box", host: "box.invalid", user: "u", port: "", identityFile: "", remotePath: "")
+        try await hub.save(saved)
+        let first = try #require(try await hub.session(for: saved.id) as? SSHConnection)
+        let again = try #require(try await hub.session(for: saved.id) as? SSHConnection)
+        #expect(first === again)
+        saved.host = "other.invalid"
+        try await hub.save(saved)
+        let replaced = try #require(try await hub.session(for: saved.id) as? SSHConnection)
+        #expect(replaced !== first)
+        #expect(replaced.connection.host == "other.invalid")
+    }
+
+    /// A config.json that no longer decodes is copied aside before the defaults take over, since
+    /// the next Settings save rewrites it.
+    @Test func anUnreadableConfigIsKeptAside() throws {
+        let root = TestCaches.fresh("config")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let file = root.appendingPathComponent("config.json")
+        try Data("{ not json".utf8).write(to: file)
+        let config = ConfigLoader.load(root: root)
+        #expect(!config.editableExtensions.isEmpty)
+        #expect(try Data(contentsOf: root.appendingPathComponent("config.json.bak")) == Data("{ not json".utf8))
+        #expect(try Data(contentsOf: file) == Data("{ not json".utf8))
     }
 }
