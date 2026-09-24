@@ -102,7 +102,12 @@ extension SSHConnection {
     }
 
     public func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
-        try await copyToServer(.mac(source), at: destination, progress: progress)
+        try await upload(source, to: destination, tally: CopyTally(progress))
+    }
+
+    /// An upload whose `tally` may belong to a move or a retried paste (`TransferEngine`).
+    func upload(_ source: URL, to destination: RemotePath, tally: CopyTally) async throws {
+        try await copyToServer(.mac(source), at: destination, tally: tally)
     }
 
     /// Temp-and-rename onto the server. No collision check, but without `replacing` the rename
@@ -258,8 +263,21 @@ extension SSHConnection {
     // MARK: Copies onto the server
 
     public func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+        try await copy(source, to: destination, tally: CopyTally(progress))
+    }
+
+    /// A copy on the server whose `tally` may belong to a retried paste (`TransferEngine`). A
+    /// folder is never copied into itself, as named or as the server resolves the two folders:
+    /// through a link into the source, the walk would read its own output until the disk filled.
+    func copy(_ source: RemotePath, to destination: RemotePath, tally: CopyTally) async throws {
         if let refusal = PasteRules.refusal(sources: [source], into: destination) { throw TransferError.failed(refusal) }
-        try await copyToServer(.server(try await stat(source)), at: destination, progress: progress)
+        if let from = source.parent, let into = destination.parent {
+            let link = try await metadataLink()
+            let real = try await link.realpath(from).appending(name: source.nameBytes)
+            let target = try await link.realpath(into).appending(name: destination.nameBytes)
+            if let refusal = PasteRules.refusal(sources: [real], into: target) { throw TransferError.failed(refusal) }
+        }
+        try await copyToServer(.server(try await stat(source)), at: destination, tally: tally)
     }
 
     /// Where a copy onto the server comes from: this Mac, or the same server.
@@ -270,14 +288,13 @@ extension SSHConnection {
 
     /// Copies an upload or a copy on the server to `destination`. A folder copy goes on past an
     /// item that fails and reports them all at the end.
-    private func copyToServer(_ source: Source, at destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    private func copyToServer(_ source: Source, at destination: RemotePath, tally: CopyTally) async throws {
         let link = try await walkerLink()
         guard let incoming = try await incoming(source, link: link) else {
             if case .mac(let url) = source { throw TransferError.noSuchFile(url.path) }
             return
         }
         let found = try await existing(destination)
-        let tally = CopyTally(progress)
         try await withThrowingTaskGroup(of: Void.self) { group in
             try await placeUp(source, incoming, at: destination, found: found, link: link, group: &group, tally: tally)
             try await group.waitForAll()
@@ -303,10 +320,10 @@ extension SSHConnection {
             // someone writes to it. Skipped, as a download skips the server's.
             return
         case .link(let target):
-            try await remoteLink(target, at: destination, found: found)
+            try await remoteLink(target, at: destination, found: found, tally: tally)
             tally.finished()
         case .folder:
-            guard let folder = try await remoteFolder(destination, found: found) else { return }
+            guard let folder = try await remoteFolder(destination, found: found, tally: tally) else { return }
             // A folder just made holds nothing to collide with; one already there is listed once,
             // not looked up name by name, which cost a round trip per file (PERF-03).
             let held = folder.made ? Holdings() : try await holdings(of: folder.path, link: link)
@@ -323,7 +340,7 @@ extension SSHConnection {
                 }
             }
         case .file:
-            guard let placed = try await settleRemotely(incoming, at: destination, found: found) else { return tally.finished() }
+            guard let placed = try await settleRemotely(incoming, at: destination, found: found, tally: tally) else { return tally.finished() }
             let replacing = placed.found != nil
             try await makeRoom(in: &group, tally: tally)
             group.addTask {
@@ -336,6 +353,7 @@ extension SSHConnection {
                         try await self.copyFile(item, to: placed.path, replacing: replacing)
                         tally.finished(bytes: item.size ?? 0)
                     }
+                    tally.record(placed.path)
                 } catch {
                     try tally.failed(destination.name, error)
                 }
@@ -390,10 +408,14 @@ extension SSHConnection {
     }
 
     /// The server's twin of `settleLocally`: where `incoming` lands at `proposed`, where `found`
-    /// is, and what holds that spot; nil to skip it.
-    private func settleRemotely(_ incoming: PlacedItem, at proposed: RemotePath, found: RemoteItem?) async throws -> (path: RemotePath, found: PlacedItem?)? {
+    /// is, and what holds that spot; nil to skip it. A retry goes where Keep Both sent the item
+    /// before, unasked; in a move, only a copy this move wrote passes for the same file.
+    private func settleRemotely(_ incoming: PlacedItem, at proposed: RemotePath, found: RemoteItem?, tally: CopyTally) async throws -> (path: RemotePath, found: PlacedItem?)? {
+        if let landed = tally.landed(proposed) {
+            return try await settleRemotely(incoming, at: landed, found: try await existing(landed), tally: tally)
+        }
         let there = try await placedItem(found)
-        switch Placement.settle(incoming, onto: there) {
+        switch Placement.settle(incoming, onto: there, moving: tally.moving && !tally.wrote(proposed)) {
         case .write, .merge:
             return (proposed, there)
         case .skip:
@@ -409,7 +431,9 @@ extension SSHConnection {
             case .keepBoth:
                 let parent = proposed.parent ?? RemotePath(string: "/")
                 let name = Placement.keepBoth(proposed.name, among: try await listedNames(parent))
-                return (parent.appending(name: Array(name.utf8)), nil)
+                let landed = parent.appending(name: Array(name.utf8))
+                tally.record(landed, for: proposed)
+                return (landed, nil)
             }
         }
     }
@@ -417,12 +441,13 @@ extension SSHConnection {
     /// The server folder a folder merges into or is made as, and whether it was made; nil to skip
     /// it. A link or special file in the way goes only when the user chose Replace, and a folder
     /// never does.
-    private func remoteFolder(_ path: RemotePath, found: RemoteItem?) async throws -> (path: RemotePath, made: Bool)? {
-        guard let spot = try await settleRemotely(.folder, at: path, found: found) else { return nil }
+    private func remoteFolder(_ path: RemotePath, found: RemoteItem?, tally: CopyTally) async throws -> (path: RemotePath, made: Bool)? {
+        guard let spot = try await settleRemotely(.folder, at: path, found: found, tally: tally) else { return nil }
         if spot.found == .folder { return (spot.path, false) }
         let link = try await metadataLink()
         if spot.found != nil { try await link.removeFile(spot.path) }
         try await link.mkdir(spot.path)
+        tally.record(spot.path)
         return (spot.path, true)
     }
 
@@ -435,14 +460,18 @@ extension SSHConnection {
 
     /// A link is copied as a link, settled like a file: the same link is kept, anything else is
     /// asked about, and Replace swaps it in with one rename.
-    private func remoteLink(_ target: String, at destination: RemotePath, found: RemoteItem?) async throws {
-        guard let spot = try await settleRemotely(.link(target), at: destination, found: found) else { return }
+    private func remoteLink(_ target: String, at destination: RemotePath, found: RemoteItem?, tally: CopyTally) async throws {
+        guard let spot = try await settleRemotely(.link(target), at: destination, found: found, tally: tally) else { return }
         let link = try await metadataLink()
-        guard spot.found != nil else { return try await link.symlink(target: target, link: spot.path) }
-        try await withRemoteTemp(for: spot.path) { temp in
-            try await link.symlink(target: target, link: temp)
-            try await link.replace(temp, onto: spot.path)
+        if spot.found == nil {
+            try await link.symlink(target: target, link: spot.path)
+        } else {
+            try await withRemoteTemp(for: spot.path) { temp in
+                try await link.symlink(target: target, link: temp)
+                try await link.replace(temp, onto: spot.path)
+            }
         }
+        tally.record(spot.path)
     }
 
     /// Waits, before a file's job is added, while `CopyTally.jobLimit` are running. A walk that
@@ -504,7 +533,7 @@ extension SSHConnection {
         }.value
     }
 
-    public nonisolated func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(String, TreeEntry), Error> {
+    public nonisolated func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, TreeEntry), Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -512,7 +541,7 @@ extension SSHConnection {
                     let item = try await link.lstat(root)
                     continuation.yield(("", TreeEntry(item)))
                     if item.kind == .directory {
-                        try await self.walk(root, prefix: "", link: link) { continuation.yield(($0, $1)) }
+                        try await self.walk(root, key: "", link: link) { continuation.yield(($0, $1)) }
                     }
                     continuation.finish()
                 } catch {
@@ -523,15 +552,15 @@ extension SSHConnection {
         }
     }
 
-    private func walk(_ folder: RemotePath, prefix: String, link: SFTPChannel, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {
+    private func walk(_ folder: RemotePath, key parent: TreeKey, link: SFTPChannel, visit: @escaping @Sendable (TreeKey, TreeEntry) -> Void) async throws {
         for try await child in await link.list(folder) {
             try Task.checkCancellation()
             // Special files are reported too: no copy writes them, so a move that compares the
             // trees keeps a folder holding one instead of removing it unseen.
-            let key = prefix + child.name
+            let key = parent.appending(child.path.nameBytes)
             visit(key, TreeEntry(child))
             if child.kind == .directory {
-                try await walk(child.path, prefix: key + "/", link: link, visit: visit)
+                try await walk(child.path, key: key, link: link, visit: visit)
             }
         }
     }
@@ -680,14 +709,39 @@ final class CopyTally: Sendable {
     private let report: @Sendable (TransferProgress) -> Void
     /// File jobs in the copy's task group not yet taken back from it.
     private let jobs = Locked(0)
+    /// A move's copy: the same file already at a destination is asked about, not skipped.
+    let moving: Bool
+    /// What a paste wrote and where Keep Both sent items, kept across its retries; nil for a copy
+    /// that is not part of one.
+    private let memo: Locked<TransferMemo>?
 
     /// About two jobs per data channel: while one renames its temp over the browse channel, the
     /// next already holds the data channel. With seven, a 2,000-file copy on the server at 20 ms
     /// ran at 40 files/s; with sixteen, at 57.
     static let jobLimit = 16
 
-    init(_ report: @escaping @Sendable (TransferProgress) -> Void) {
+    init(_ report: @escaping @Sendable (TransferProgress) -> Void, memo: Locked<TransferMemo>? = nil, moving: Bool = false) {
         self.report = report
+        self.memo = memo
+        self.moving = moving
+    }
+
+    /// `path` was written by this copy: a file, a link, or a folder it made.
+    func record(_ path: RemotePath) {
+        memo?.withLock { _ = $0.written.insert(path) }
+    }
+
+    func wrote(_ path: RemotePath) -> Bool {
+        memo?.withLock { $0.written.contains(path) } ?? false
+    }
+
+    /// Keep Both sent the item offered at `proposed` to `landed`.
+    func record(_ landed: RemotePath, for proposed: RemotePath) {
+        memo?.withLock { $0.landed[proposed] = landed }
+    }
+
+    func landed(_ proposed: RemotePath) -> RemotePath? {
+        memo?.withLock { $0.landed[proposed] }
     }
 
     /// A progress handler for one file's bytes, which adds what is new since its last report, so

@@ -26,14 +26,16 @@ enum Placement: Equatable {
     /// A folder would replace a file or the reverse. Nothing is removed to make room.
     case typeMismatch
 
-    static func settle(_ incoming: PlacedItem, onto found: PlacedItem?) -> Placement {
+    /// In a move, the same file or link already there is asked about too: skipped, it would pass
+    /// for the move's copy, and the original would be removed for a lookalike (ledger D9).
+    static func settle(_ incoming: PlacedItem, onto found: PlacedItem?, moving: Bool = false) -> Placement {
         guard let found else { return .write }
         switch (incoming, found) {
         case (.folder, .folder):
             return .merge
-        case (.file(let arriving?), .file(let there?)) where arriving == there:
+        case (.file(let arriving?), .file(let there?)) where arriving == there && !moving:
             return .skip
-        case (.link(let arriving), .link(let there)) where arriving == there:
+        case (.link(let arriving), .link(let there)) where arriving == there && !moving:
             return .skip
         // A link or a special file gives way only when the user says so, and removing one never
         // touches what a link points to. A folder never gives way.

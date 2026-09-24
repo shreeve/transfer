@@ -48,6 +48,17 @@ public actor TransferHub: SessionProvider {
     }
 
     public func session(for id: ConnectionID) async throws -> any RemoteSession {
+        try await sshSession(for: id)
+    }
+
+    public func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+        let destination = try await sshSession(for: request.connection)
+        var source: SSHConnection?
+        if case .server(let id, _) = request.sources, id != request.connection { source = try await sshSession(for: id) }
+        try await TransferEngine(request: request, destination: destination, progress: progress).run(from: source)
+    }
+
+    private func sshSession(for id: ConnectionID) async throws -> SSHConnection {
         guard let saved = store.connection(id) else { throw TransferError.noSuchFile("saved server") }
         guard let existing = sessions[id] else { return makeSession(saved) }
         if existing.connection == saved { return existing }

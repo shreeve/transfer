@@ -422,7 +422,7 @@ struct ServerTests {
 }
 
 /// A walked tree with files kept by size alone; the times are the server's.
-private func sizes(_ tree: [String: TreeEntry]) -> [String: TreeEntry] {
+private func sizes(_ tree: [TreeKey: TreeEntry]) -> [TreeKey: TreeEntry] {
     tree.mapValues { entry in
         if case .file(let size, _) = entry { .file(size: size) } else { entry }
     }
