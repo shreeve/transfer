@@ -96,6 +96,8 @@ public final class TransferModel {
     /// The server a connect is logging in to, until it lands or fails.
     public private(set) var connectingTo: SavedConnection?
     @ObservationIgnored private var connectGeneration = 0
+    /// The sheets of the login a connect is waiting on, until it lands or fails.
+    @ObservationIgnored private var loginPrompt: OperationPrompt?
     /// Seeded from the last window's list, so a new window or tab has servers in its first frame.
     public var connections: [SavedConnection] = TransferModel.lastConnections
     private static var lastConnections: [SavedConnection] = []
@@ -370,10 +372,27 @@ public final class TransferModel {
         connectGeneration &+= 1
         let generation = connectGeneration
         connectingTo = connection
+        // The last server's message is not about this one.
+        status = nil
+        // A login the window moved away from takes back its sheets and asks nothing more here;
+        // a second connect to the same server shares the first one's.
+        let login: OperationPrompt
+        if let current = loginPrompt, current.serverID == connection.id {
+            login = current
+        } else {
+            loginPrompt?.retire()
+            login = prompts.login(connection)
+            loginPrompt = login
+        }
         var pending: ServerContext?
         defer {
             if let pending, pending !== context { pending.close() }
-            if generation == connectGeneration { connectingTo = nil }
+            if generation == connectGeneration {
+                connectingTo = nil
+                loginPrompt = nil
+                // A failed or cancelled login leaves the sidebar on the server still shown.
+                syncSidebarSelection()
+            }
         }
         do {
             let session = try await provider.session(for: connection.id)
@@ -382,7 +401,7 @@ public final class TransferModel {
             pending = fresh
             // Listening before the login catches the notices the login itself raises.
             listen(fresh)
-            let start = try await session.connect(prompts: prompts.login(connection))
+            let start = try await session.connect(prompts: login)
             var path = start
             var selection: Set<RemotePath> = []
             var missing: RemotePath?
@@ -399,7 +418,8 @@ public final class TransferModel {
             scheduleSidebarReload()
             if let missing { status = "No such file or folder: \(missing.display)" }
         } catch {
-            guard generation == connectGeneration else { return }
+            // A login the user cancelled, at a password or a host key, fails quietly.
+            guard generation == connectGeneration, !login.declined else { return }
             report(error)
         }
     }
@@ -1658,10 +1678,15 @@ public final class SheetPrompts {
     private var shown: Int?
     private var lastAsk = 0
 
+    /// Set once the window closes: every question then gets the safe answer at once.
+    private var closed = false
+
     private struct Ask {
         let id: Int
         let sheet: AppSheet
         let waiting: Waiting
+        /// The prompt sink that asked, so a retired login's questions can be taken back.
+        var owner: ObjectIdentifier?
     }
 
     private enum Waiting {
@@ -1696,20 +1721,24 @@ public final class SheetPrompts {
         case collision(NameCollisionChoice, toAll: Bool)
     }
 
-    func answer(_ request: PromptRequest, server: String? = nil) async -> PromptReply {
-        guard model != nil else { return PromptReply(text: nil) }
-        return await ask { id, continuation in Ask(id: id, sheet: .prompt(request, server: server, ask: id), waiting: .login(continuation)) }
+    func answer(_ request: PromptRequest, server: String? = nil, owner: ObjectIdentifier? = nil) async -> PromptReply {
+        guard model != nil, !closed else { return PromptReply(text: nil) }
+        return await ask { id, continuation in
+            Ask(id: id, sheet: .prompt(request, server: server, ask: id), waiting: .login(continuation), owner: owner)
+        }
     }
 
-    func decideHostKey(_ event: HostKeyEvent, server: String? = nil) async -> HostKeyDecision {
-        guard model != nil else { return .cancel }
-        return await ask { id, continuation in Ask(id: id, sheet: .hostKey(event, server: server, ask: id), waiting: .hostKey(continuation)) }
+    func decideHostKey(_ event: HostKeyEvent, server: String? = nil, owner: ObjectIdentifier? = nil) async -> HostKeyDecision {
+        guard model != nil, !closed else { return .cancel }
+        return await ask { id, continuation in
+            Ask(id: id, sheet: .hostKey(event, server: server, ask: id), waiting: .hostKey(continuation), owner: owner)
+        }
     }
 
     /// Shows the collision sheet, with Apply to All unchecked. The choice, and whether it covers
     /// the rest of the operation; nil when nobody answered.
     func askCollision(_ fileName: String) async -> (choice: NameCollisionChoice, toAll: Bool)? {
-        guard model != nil else { return nil }
+        guard model != nil, !closed else { return nil }
         return await ask { id, continuation in Ask(id: id, sheet: .collision(fileName, ask: id), waiting: .collision(continuation)) }
     }
 
@@ -1756,6 +1785,11 @@ public final class SheetPrompts {
         }
     }
 
+    /// Takes back every question `owner` asked, with the safe answer.
+    func withdrawAll(from owner: ObjectIdentifier) {
+        for ask in queue where ask.owner == owner { withdraw(ask.id) }
+    }
+
     /// The answer to the question on screen, from its sheet's buttons.
     func finish(_ answer: Answer) {
         guard let shown, let index = queue.firstIndex(where: { $0.id == shown }), queue[index].waiting.resume(answer) else { return }
@@ -1764,8 +1798,9 @@ public final class SheetPrompts {
         model?.sheet = nil
     }
 
-    /// The window closed: every waiting question gets the safe answer.
+    /// The window closed: every waiting question gets the safe answer, and so does every later one.
     func cancelAll() {
+        closed = true
         let waiting = queue
         queue.removeAll()
         shown = nil
@@ -1774,8 +1809,8 @@ public final class SheetPrompts {
 
     /// This window's sheets for one server's login. They name that server, so a password or host
     /// key is never typed for the wrong one.
-    func login(_ connection: SavedConnection) -> any PromptSink {
-        OperationPrompt(window: self, server: connection.displayName)
+    func login(_ connection: SavedConnection) -> OperationPrompt {
+        OperationPrompt(window: self, server: connection.displayName, serverID: connection.id)
     }
 }
 
@@ -1788,20 +1823,38 @@ final class OperationPrompt: PromptSink {
     private let window: SheetPrompts
     /// The server a login's sheets name.
     private let server: String?
+    /// The server a login's sheets are for.
+    let serverID: ConnectionID?
     private var applyToAll: NameCollisionChoice?
     private var asking: Task<(choice: NameCollisionChoice, toAll: Bool)?, Never>?
+    /// A login the window moved away from: it asks nothing more, and gets the safe answers.
+    private var retired = false
+    /// Whether a login question got the safe answer (Cancel, or taken back), which makes the
+    /// login's failure the user's own choice rather than something to report.
+    private(set) var declined = false
 
-    init(window: SheetPrompts, server: String? = nil) {
+    init(window: SheetPrompts, server: String? = nil, serverID: ConnectionID? = nil) {
         self.window = window
         self.server = server
+        self.serverID = serverID
     }
 
     func answer(_ request: PromptRequest) async -> PromptReply {
-        await window.answer(request, server: server)
+        let reply = retired ? PromptReply(text: nil) : await window.answer(request, server: server, owner: ObjectIdentifier(self))
+        if reply.text == nil { declined = true }
+        return reply
     }
 
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        await window.decideHostKey(event, server: server)
+        let decision = retired ? .cancel : await window.decideHostKey(event, server: server, owner: ObjectIdentifier(self))
+        if decision == .cancel { declined = true }
+        return decision
+    }
+
+    /// Takes back this login's questions: the window has moved on to another server.
+    func retire() {
+        retired = true
+        window.withdrawAll(from: ObjectIdentifier(self))
     }
 
     func resolveCollision(fileName: String) async -> NameCollisionChoice? {
