@@ -31,17 +31,21 @@ public actor TransferHub: SessionProvider {
 
     public func save(_ connection: SavedConnection) async throws {
         store.save(connection)
-        if let existing = sessions[connection.id], !(await existing.isConnected) {
-            sessions[connection.id] = nil
-        }
+        // A session that is not logged in, perhaps mid-login with the old settings, is dropped and
+        // stopped, so no orphaned master finishes that login.
+        guard let existing = sessions[connection.id], !(await existing.isConnected), sessions[connection.id] === existing else { return }
+        sessions[connection.id] = nil
+        await existing.disconnect()
     }
 
     public func removeConnection(_ id: ConnectionID) async throws {
         let unsynced = await live.unsyncedCount(on: id)
         if unsynced > 0 { throw TransferError.liveUnsynced(unsynced) }
-        await sessions[id]?.disconnect()
-        sessions[id] = nil
+        // Live closes before anything else awaits, so no edit can land between the check and the
+        // folder's removal while the session disconnects.
         await live.close(id)
+        let session = sessions.removeValue(forKey: id)
+        await session?.disconnect()
         store.remove(id)
         KeychainStore.delete(account: id.rawValue.uuidString)
         let live = store.root.appendingPathComponent("Live/\(id.rawValue.uuidString)", isDirectory: true)
@@ -50,11 +54,20 @@ public actor TransferHub: SessionProvider {
 
     public func session(for id: ConnectionID) async throws -> any RemoteSession {
         guard let saved = store.connection(id) else { throw TransferError.noSuchFile("saved server") }
-        if let existing = sessions[id] {
-            if await existing.isConnected || existing.connection == saved { return existing }
-        }
+        guard let existing = sessions[id] else { return makeSession(saved) }
+        if existing.connection == saved { return existing }
+        let connected = await existing.isConnected
+        // Another caller may have replaced it meanwhile; theirs is the one to share.
+        if let current = sessions[id], current !== existing { return current }
+        if connected { return existing }
+        let session = makeSession(saved)
+        await existing.disconnect()
+        return session
+    }
+
+    private func makeSession(_ saved: SavedConnection) -> SSHConnection {
         let session = SSHConnection(connection: saved, store: store, editableExtensions: config.extensionSet, live: live)
-        sessions[id] = session
+        sessions[saved.id] = session
         return session
     }
 
@@ -89,7 +102,9 @@ public actor TransferHub: SessionProvider {
     public var unsyncedLiveCount: Int { get async { await live.unsyncedCount() } }
 
     public func disconnectAll() async {
-        for session in sessions.values { await session.disconnect() }
+        await withTaskGroup(of: Void.self) { group in
+            for session in sessions.values { group.addTask { await session.disconnect() } }
+        }
     }
 
     public func editableExtensions() async -> [String] {
