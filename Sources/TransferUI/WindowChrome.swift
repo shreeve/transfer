@@ -32,14 +32,12 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         return container
     }
 
-    /// The hosted columns observe the model on their own, so they are never re-hosted here;
-    /// only the chrome's own state is applied.
+    /// The hosted columns observe the model themselves and are never re-hosted here.
     func updateNSView(_ container: ChromeContainer, context: Context) {
         context.coordinator.model = model
         apply(to: container.controller, context: context)
     }
 
-    /// The chrome fills whatever the window offers.
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: ChromeContainer, context: Context) -> CGSize? {
         CGSize(width: proposal.width ?? 960, height: proposal.height ?? 640)
     }
@@ -122,9 +120,8 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 item.action = #selector(toggleShelf(_:))
                 return item
             case ChromeItem.search:
-                // Two fixed sizes, magnifier or field, changed only by the user. The system search
-                // item resizes itself whenever the toolbar's free space changes and shoves the
-                // other items in and out of the overflow menu as it does.
+                // Two fixed sizes, switched only by the user. The system search item resizes
+                // with free space, shoving other items in and out of the overflow menu.
                 let item = NSToolbarItem(itemIdentifier: identifier)
                 let view = SearchToolbarView()
                 view.field.placeholderString = "Search"
@@ -157,9 +154,8 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             if viewGroup?.selectedIndex != wanted { viewGroup?.selectedIndex = wanted }
         }
 
-        /// Command-F and the magnifier. The field holds the focus from here on, so Return and
-        /// Space stay with it even before the first character, which is when AppKit reports
-        /// that searching started.
+        /// Command-F and the magnifier. The field takes focus now, so Return and Space reach it
+        /// before the first character, when AppKit first reports that searching started.
         @objc func beginSearch(_ sender: Any?) {
             searchView?.expand(focus: true)
             model.textEditing = true
@@ -215,8 +211,7 @@ enum ChromeItem {
     static let search = NSToolbarItem.Identifier("transfer.search")
 }
 
-/// The split view controller. It also owns the window's toolbar, title, and frame placement,
-/// which it applies when it lands in a window.
+/// The split view controller. It also sets the window's toolbar, title, and frame when it lands.
 @MainActor
 final class ChromeController: NSSplitViewController {
     weak var coordinator: (any NSToolbarDelegate)?
@@ -226,8 +221,7 @@ final class ChromeController: NSSplitViewController {
     private var toolbarInstalled = false
     private var pendingTitle = ""
     private var pendingSubtitle = ""
-    /// Finder shows a faint line under the toolbar, over the content column only, while the
-    /// pointer is in the toolbar. This is that line.
+    /// Finder's faint line under the toolbar, over the content column only, shown on toolbar hover.
     private let hoverLine = HoverLine()
     private var hoverTracking: NSTrackingArea?
     var hoverLineEnabled = true {
@@ -246,15 +240,12 @@ final class ChromeController: NSSplitViewController {
         sidebarItem.maximumThickness = 320
         sidebarItem.canCollapse = true
         sidebarItem.allowsFullHeightLayout = true
-        // The sidebar holds its width while the inspector animates; only the content pane gives up
-        // space. Without this the split view shrinks both siblings and the sidebar appears to move.
+        // Holds its width while the inspector animates; else both siblings shrink and it moves.
         sidebarItem.holdingPriority = NSLayoutConstraint.Priority(260)
-        // Collapse and reveal by constraint animation alone. With the other behaviors a reveal
-        // grows the content pane's frame past the window, so the pane's safe area holds still and
-        // snaps to its final size on the last frame; with constraints it moves on every frame.
+        // Other behaviors grow the content pane past the window on reveal, so its safe area holds
+        // still and snaps to its final size on the last frame. Constraints move it every frame.
         sidebarItem.collapseBehavior = .useConstraints
-        // Finder draws no line under the title bar over the sidebar, and over the content only
-        // on hover, which the hover line handles. The built-in separators stay off.
+        // Separators off: Finder draws none over the sidebar, and `hoverLine` covers the content.
         sidebarItem.titlebarSeparatorStyle = .none
         // Finder's content column starts below the toolbar; only the sidebar runs behind the title
         // bar. Content under the toolbar would keep the system's scroll-pocket edge showing at rest.
@@ -278,15 +269,13 @@ final class ChromeController: NSSplitViewController {
         inspectorItem.isCollapsed = true
         inspectorItem.titlebarSeparatorStyle = .none
         inspectorItem.holdingPriority = NSLayoutConstraint.Priority(260)
-        // Same as the sidebar: only the constraint animation keeps the content pane's safe area
-        // moving in step with the inspector's edge while it opens.
+        // See the sidebar: only constraints keep the safe area moving with the inspector's edge.
         inspectorItem.collapseBehavior = .useConstraints
         addSplitViewItem(sidebarItem)
         addSplitViewItem(detailItem)
         addSplitViewItem(inspectorItem)
-        // One name for every window, as Finder shares its sidebar's width: a new window opens
-        // with the sidebar and inspector as the last one left them, and the model follows the
-        // restored state through splitViewDidResizeSubviews.
+        // One name for all windows, as in Finder: a new one opens with the sidebar and inspector
+        // as the last left them, and the model follows via `splitViewDidResizeSubviews`.
         splitView.autosaveName = "Transfer.Split"
     }
 
@@ -304,9 +293,8 @@ final class ChromeController: NSSplitViewController {
         let strip = NSRect(x: 0, y: view.bounds.height - top, width: view.bounds.width, height: top)
         if hoverTracking?.rect != strip {
             if let hoverTracking { view.removeTrackingArea(hoverTracking) }
-            // Enter and exit only prompt a fresh look at where the pointer is; they carry no state
-            // of their own, so a dropped event (another app taking focus, a tracking area rebuilt
-            // with the pointer already inside) cannot leave the line stuck.
+            // Enter and exit just prompt a pointer read: a dropped event (focus to another app,
+            // an area rebuilt with the pointer inside) cannot leave the line stuck.
             let area = NSTrackingArea(rect: strip, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil)
             view.addTrackingArea(area)
             hoverTracking = area
@@ -314,9 +302,8 @@ final class ChromeController: NSSplitViewController {
         }
     }
 
-    /// Just under the toolbar, from the content pane's visible edge to the window's right edge.
-    /// The content pane spans the window under the sidebar; the line starts where the pane shows.
-    /// Returns the toolbar's height.
+    /// Just under the toolbar, from where the content pane shows (it runs under the sidebar) to the
+    /// window's right edge. Returns the toolbar's height.
     @discardableResult private func placeHoverLine() -> CGFloat {
         let top = view.window?.contentView?.safeAreaInsets.top ?? 0
         let content = splitViewItems[1].viewController.view
@@ -331,9 +318,8 @@ final class ChromeController: NSSplitViewController {
         return rect.contains(view.convert(window.mouseLocationOutsideOfEventStream, from: nil))
     }
 
-    /// The line shows while the pointer is in the toolbar, and for as long as the inspector is
-    /// out, where it marks the top of the pane the inspector sits beside; it fades with the
-    /// inspector as that is dismissed. List view has its own header line and shows none.
+    /// Shown while the pointer is in the toolbar or the inspector is out, where it marks the pane's
+    /// top and fades as the inspector goes. List view has its own header line and shows none.
     private func refreshHoverLine(animated: Bool) {
         let inspectorOut = splitViewItems.count == 3 && !splitViewItems[2].isCollapsed
         let hovering = pointerInToolbar()
@@ -360,12 +346,10 @@ final class ChromeController: NSSplitViewController {
         refreshHoverLine(animated: true)
     }
 
-    /// AppKit hangs a scroll pocket, the macOS 26 scroll-edge effect, under the toolbar over each
-    /// section of the window. Over the content section it draws a hard edge for the placeholder
-    /// screen and for the inspector, and keeps that edge after the inspector collapses; it has no
-    /// public switch and no public class. The hover line is the only line under the toolbar, so
-    /// every pocket right of the sidebar is hidden as soon as it appears. The sidebar keeps its
-    /// own, which fades its list under the toolbar.
+    /// AppKit hangs a scroll pocket (the macOS 26 scroll-edge effect) under the toolbar over each
+    /// window section. Over the content it draws a hard edge for the placeholder and the inspector
+    /// and keeps it after the inspector collapses. No public switch or class exists, so each pocket
+    /// right of the sidebar is hidden on sight. The sidebar keeps its own, which fades its list.
     private func hideContentScrollPockets() {
         guard let frame = view.window?.contentView?.superview, splitViewItems.count == 3 else { return }
         let sidebar = splitViewItems[0].viewController.view
@@ -384,14 +368,12 @@ final class ChromeController: NSSplitViewController {
     /// Looked up once. A future AppKit without the class hides nothing, which only costs a line.
     private static let scrollPocketClass: AnyClass? = NSClassFromString("NSScrollPocket")
 
-    /// SwiftUI re-applies its own titlebar separator style to the window after it appears and
-    /// again around inspector and sidebar changes. Automatic draws a line under the toolbar that
-    /// then stays until something sets the style again, so the window is watched and every
-    /// layout re-asserts none. The hover line is the only line under the toolbar.
+    /// SwiftUI re-applies its titlebar separator style after the window appears and around
+    /// inspector and sidebar changes. Automatic draws a line under the toolbar that stays until the
+    /// style is set again, so the window is watched and every layout re-asserts `.none`.
     private func keepSeparatorOff() {
         guard let window = view.window, window.titlebarSeparatorStyle != .none else { return }
-        // The title bar keeps the line it drew under the automatic style until it draws again;
-        // nothing else makes it, so the whole frame is asked to.
+        // The title bar keeps its automatic-style line until redrawn, so the whole frame redraws.
         defer { redraw(window.contentView?.superview) }
         window.titlebarSeparatorStyle = .none
     }
@@ -402,10 +384,9 @@ final class ChromeController: NSSplitViewController {
         view.subviews.forEach(redraw)
     }
 
-    /// Dresses the window the moment the chrome lands in it. SwiftUI orders a new window in before
-    /// it inserts the content, but nothing has been drawn yet, so the toolbar, the title bar, and a
-    /// new tab's place in its group are all in the first frame. Waiting for `viewDidAppear` showed
-    /// the window bare and on its own for a few frames, then tabbed, then with its toolbar.
+    /// Dresses the window as the chrome lands: SwiftUI orders it in before inserting the content,
+    /// but before any drawing, so toolbar, title bar, and tab group are all in the first frame.
+    /// Waiting for `viewDidAppear` showed it bare and alone for frames, then tabbed, then dressed.
     func landed(in window: NSWindow) {
         guard !toolbarInstalled else { return }
         toolbarInstalled = true
@@ -430,18 +411,16 @@ final class ChromeController: NSSplitViewController {
         if !NewTab.join(window) {
             WindowFrames.place(window, among: Self.live.allObjects.compactMap { $0 === self ? nil : $0.view.window })
         }
-        // Watched only once placed: a new window becomes main at SwiftUI's default size first,
-        // which would otherwise replace the last-used frame it is about to take. A live resize
-        // is written once, when it ends, not on every frame of the drag.
+        // Watched only once placed: a new window first becomes main at SwiftUI's default size and
+        // would overwrite the saved frame. A live resize is saved once, when it ends.
         observe(NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didEndLiveResizeNotification, NSWindow.didBecomeMainNotification) { [weak window] in
             if let window, !window.inLiveResize { WindowFrames.remember(window) }
         }
         ContentKeys.install()
         if let model { LinkInbox.take(into: model) }
         window.titlebarSeparatorStyle = .none
-        // The opaque title bar over the content column draws its own bottom edge regardless of
-        // the separator style; a transparent title bar has no edge, and the sidebar is already
-        // full height, so nothing changes visually except the line going away.
+        // An opaque title bar draws a bottom edge in any separator style; a transparent one has
+        // none, and with the full-height sidebar nothing else changes visually.
         window.titlebarAppearsTransparent = true
         window.toolbarStyle = .unified
         // Full-height sidebar: the content extends under the title bar, as in Finder.
@@ -487,8 +466,7 @@ final class ChromeController: NSSplitViewController {
         refreshHoverLine(animated: true)
     }
 
-    /// `TRANSFER_ANIMATION_SCALE=6` in the environment stretches the sidebar and inspector
-    /// animations for watching them; unset, AppKit's own timing applies.
+    /// `TRANSFER_ANIMATION_SCALE=6` stretches the sidebar and inspector animations for watching.
     private static let animationScale = Double(ProcessInfo.processInfo.environment["TRANSFER_ANIMATION_SCALE"] ?? "") ?? 1
 
     private func animateCollapse(_ body: @escaping () -> Void) {
@@ -513,11 +491,9 @@ final class ChromeController: NSSplitViewController {
         return ordered + all.filter { controller in !ordered.contains { $0 === controller } }
     }
 
-    /// Edit > Copy and Paste reach the window here through the responder chain whenever no text
-    /// field has focus; a focused field answers them first and keeps its own text editing. When
-    /// nothing in the content holds the focus (a folder just opened in icon view, or a toolbar
-    /// button has it), the chain skips this controller, and the app delegate, last in the chain,
-    /// forwards them here through `KeyWindowEdit`.
+    /// Edit > Copy and Paste arrive via the responder chain unless a focused text field takes them.
+    /// With no focus in the content (a folder just opened in icon view, a toolbar button focused)
+    /// the chain skips this controller; the app delegate, last in it, forwards via `KeyWindowEdit`.
     @objc func copy(_ sender: Any?) {
         model?.copySelection()
     }
@@ -535,11 +511,10 @@ final class ChromeController: NSSplitViewController {
         }
     }
 
-    /// The toolbar's sidebar toggle and a divider drag collapse or reveal a column without the
-    /// model; it follows here. `isCollapsed` takes its new value when the animation starts and
-    /// holds it on every frame (measured), so the model's echo back through `setSidebarCollapsed`
-    /// and `setInspectorShown` finds nothing to change, and a model change during an animation
-    /// (Command-B right after a toolbar toggle) simply reverses it.
+    /// The sidebar toggle and divider drags bypass the model; it follows here. `isCollapsed` takes
+    /// its new value when the animation starts and holds it every frame (measured), so the echo
+    /// through `setSidebarCollapsed` and `setInspectorShown` changes nothing, and a model change
+    /// mid-animation (Command-B right after a toolbar toggle) simply reverses it.
     override func splitViewDidResizeSubviews(_ notification: Notification) {
         super.splitViewDidResizeSubviews(notification)
         guard splitViewItems.count == 3 else { return }
@@ -555,8 +530,7 @@ final class ChromeController: NSSplitViewController {
     }
 }
 
-/// The line under the toolbar. Its color is resolved in `updateLayer`, against the view's own
-/// appearance, so a switch between light and dark while it shows recolors it.
+/// The line under the toolbar, colored in `updateLayer` so a light/dark switch recolors it.
 final class HoverLine: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -573,14 +547,12 @@ final class HoverLine: NSView {
 }
 
 /// Window frames as Finder keeps them. A new window opens at the size of the window used last,
-/// cascaded from the front window, or where that window was when no other is open. A window that
-/// state restoration brings back keeps its own frame, and a tab takes its window's.
+/// cascaded from the front window, or where that window was when no other is open. A restored
+/// window keeps its own frame, and a tab takes its window's.
 ///
-/// One frame autosave name cannot serve this: only one open window may hold a name, and a second
-/// window that asks for it is refused and left with none. SwiftUI's own names count windows
-/// (`browser-AppWindow-1`, `-2`, …) and open a new window at the scene's default size. So every
-/// browser window drops its autosave name, and the frame of the window used last is kept here
-/// under one key.
+/// No frame autosave name can do this: only one open window may hold a name, a second is refused
+/// and left with none, and SwiftUI's names count windows (`browser-AppWindow-1`, `-2`, …) and open
+/// at the default size. So windows drop their autosave names; the last-used frame is kept here.
 @MainActor
 public enum WindowFrames {
     private static let key = "transfer.windowFrame"
@@ -609,10 +581,9 @@ public enum WindowFrames {
     }
 }
 
-/// File > New Tab. SwiftUI opens the new window, and it would not become a tab on its own: its
-/// tabbing mode is set only once it is on screen, and `newWindowForTab:` only reaches SwiftUI's
-/// window opener. So the browser window that asked is remembered, and the next browser window
-/// to appear joins it as a tab.
+/// File > New Tab. SwiftUI opens the window, which would not become a tab by itself: its tabbing
+/// mode is set only once on screen, and `newWindowForTab:` only reaches SwiftUI's window opener. So
+/// the window that asked is remembered, and the next browser window to appear joins it as a tab.
 @MainActor
 public enum NewTab {
     private static weak var host: NSWindow?
@@ -638,9 +609,8 @@ public enum NewTab {
 @MainActor
 public enum LinkInbox {
     private static var pending: [SFTPURL] = []
-    /// Windows a link has been handed to. A window stays idle until its login starts, which is
-    /// after `ssh -G` and a DNS lookup, so without this a second link could pick it too and one
-    /// of the two would be lost.
+    /// Windows handed a link. One stays idle until login starts (after `ssh -G` and DNS), so
+    /// without this a second link could pick it too and one of the two would be lost.
     private static var opening: Set<ObjectIdentifier> = []
     /// A window was asked for and none has appeared since.
     private static var requested = false
@@ -659,15 +629,13 @@ public enum LinkInbox {
             return
         }
         pending.append(link)
-        // With no browser window open (launched by the link, or every window closed), SwiftUI
-        // opens one for the link itself, and it takes the link as it appears; so may a window
-        // restored at launch. Otherwise one window is asked for at a time, and each that appears
-        // asks for the next, so every link gets exactly one.
+        // With no browser window open (launched by the link, or all closed), SwiftUI opens one
+        // that takes the link as it appears, as may a window restored at launch. Otherwise windows
+        // are requested one at a time, each asking for the next, so every link gets exactly one.
         if !requested, !browsers.isEmpty { requestWindow() }
     }
 
-    /// A browser window that just appeared takes the oldest waiting link, and asks for another
-    /// window while links still wait.
+    /// A newly appeared window takes the oldest waiting link and asks for another while links wait.
     static func take(into model: TransferModel) {
         requested = false
         guard !pending.isEmpty else { return }
@@ -699,11 +667,10 @@ public enum LinkInbox {
     }
 }
 
-/// Keys that act on the content pane: Command-Down opens the selection, as in Finder (a second
-/// shortcut for File > Open, with no menu item of its own), and Space toggles Quick Look.
-/// `NSBrowser`'s columns take Command-Down as a plain Down arrow before the browser sees the key,
-/// and the table, the browser, and the icon grid would each have to catch Space for themselves, so
-/// both are watched here with one monitor, as Escape is in `Clipboard`.
+/// Content-pane keys: Command-Down opens the selection as in Finder (a second File > Open shortcut
+/// with no menu item), and Space toggles Quick Look. `NSBrowser`'s columns take Command-Down as
+/// Down before the browser sees it, and each view would have to catch Space itself, so one monitor
+/// watches both, as `Clipboard` does Escape.
 @MainActor
 enum ContentKeys {
     private static var monitor: Any?
@@ -715,9 +682,8 @@ enum ContentKeys {
         }
     }
 
-    /// Only for the content pane in any view, or a window with nothing focused: text fields,
-    /// sheets, the sidebar, the inspector, and windows that are not browsers keep the keys.
-    /// Held down, a key acts once.
+    /// Only for the content pane or a window with nothing focused: text fields, sheets, sidebar,
+    /// inspector, and non-browser windows keep the keys. Held down, a key acts once.
     private static func takes(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let open = event.keyCode == 125 && modifiers == .command
@@ -737,8 +703,7 @@ enum ContentKeys {
     }
 }
 
-/// Copy and Paste for the key window when its content holds no focus. The app delegate, last in
-/// the responder chain, sends them here.
+/// Copy and Paste for the key window when its content holds no focus; the app delegate sends them.
 @MainActor
 public enum KeyWindowEdit {
     public static func copy() { ChromeController.keyWindowController?.copy(nil) }
@@ -748,10 +713,9 @@ public enum KeyWindowEdit {
     public static func canPaste() -> Bool { ChromeController.keyWindowController?.model?.canPaste == true }
 }
 
-/// Anchors the AppKit split view to the size SwiftUI assigns. SwiftUI's host view is not part
-/// of the constraint engine, so the engine would otherwise size this subtree to its content.
-/// Explicit width and height constraints on the container, kept equal to its frame, give the
-/// engine a root to solve against.
+/// Anchors the AppKit split view to the size SwiftUI assigns. SwiftUI's host view is outside the
+/// constraint engine, which would otherwise size this subtree to its content; width and height
+/// constraints kept equal to the frame give the engine a root to solve against.
 final class ChromeContainer: NSView {
     let controller: ChromeController
     private var widthConstraint: NSLayoutConstraint!
@@ -824,9 +788,8 @@ final class BelowToolbarView: NSView {
         super.init(frame: .zero)
         hosted.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hosted)
-        // The safe area is what no toolbar, sidebar, or inspector covers. Constraints to its guide
-        // follow it frame by frame through those animations; a frame set in layout() would not,
-        // because AppKit gives a view no callback when only its safe-area insets change.
+        // The safe-area guide follows each frame of sidebar and inspector animations; a frame set
+        // in layout() would not, as AppKit calls nothing when only the safe-area insets change.
         let guide = safeAreaLayoutGuide
         NSLayoutConstraint.activate([
             hosted.leadingAnchor.constraint(equalTo: guide.leadingAnchor),

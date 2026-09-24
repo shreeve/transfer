@@ -48,10 +48,9 @@ struct ColumnBrowser: NSViewRepresentable {
         weak var browser: NSBrowser?
         weak var stack: ColumnStack?
         private var root: RemotePath?
-        /// What each loaded column shows, by folder, and the only listing the browser's callbacks
-        /// read. `sync` fills it from the model and reloads a column exactly when its entry
-        /// changes, so every row AppKit asks about is a row the column was loaded with, and a
-        /// folder is sorted once per change instead of once for every row asked for.
+        /// Each loaded column's rows by folder, the only listing browser callbacks read. `sync`
+        /// reloads a column exactly when its entry changes, so every row AppKit asks about is one
+        /// the column was loaded with, and a folder is sorted once per change, not once per row.
         private var shown: [RemotePath: [RemoteItem]] = [:]
         private var syncing = false
         private let drag = RowDrag()
@@ -65,25 +64,22 @@ struct ColumnBrowser: NSViewRepresentable {
             defer { syncing = false }
             var trail: [ColumnTrail.Column]?
             if root != newRoot {
-                // A new root rebuilds every column, so each one takes its selection from the
-                // trail below, exactly as after a reload; otherwise a view switch, a link to a
-                // file, or Back showed nothing selected.
+                // A new root rebuilds every column, each selected from the trail as after a
+                // reload; else a view switch, a link to a file, or Back showed nothing selected.
                 root = newRoot
                 showsUpEntry = newRoot.parent != nil
                 shown = [newRoot: listing(newRoot)]
                 browser.loadColumnZero()
                 trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
             }
-            // Reloading a column makes it the last one and drops its selection, so a change to any
-            // column but the last (a move out of the parent folder, say) left the location's column
-            // gone and nothing selected while the model still stood in it. From the first reloaded
-            // column on, each column takes its selection back from the model's trail, which brings
-            // back the column after it.
+            // Reloading a column makes it the last and drops its selection, so changing any but
+            // the last (say, a move out of the parent) left the location's column gone while the
+            // model still stood in it. From the first reloaded column on, each column retakes its
+            // selection from the model's trail, which brings back the column after it.
             //
-            // The last column is read again on every pass. Asking the browser about a column it no
-            // longer has throws an Objective-C exception inside SwiftUI's update; AppKit catches it,
-            // but the unwinding leaves the main thread's observation tracking dangling, and the next
-            // observable read crashes.
+            // `lastColumn` is read on every pass. Asking about a column the browser no longer has
+            // throws an Objective-C exception inside SwiftUI's update; AppKit catches it, but the
+            // unwinding leaves observation tracking dangling and the next observable read crashes.
             var loaded: Set<RemotePath> = []
             var column = 0
             while column <= max(browser.lastColumn, 0) {
@@ -142,9 +138,8 @@ struct ColumnBrowser: NSViewRepresentable {
             root ?? model.snapshot.path
         }
 
-        /// The `..` row at the top of the first column, shown whenever the folder has a parent.
-        /// `showsUpEntry` is a plain flag set during sync: AppKit asks for row heights inside its
-        /// layout pass, and touching observable model state there is not safe.
+        /// The first column's `..` row, if its folder has a parent. `showsUpEntry` is a plain flag
+        /// set in `sync`: row heights are asked mid-layout, where observable reads are unsafe.
         private let upEntry = UpEntry()
         private var showsUpEntry = false
 
@@ -165,10 +160,9 @@ struct ColumnBrowser: NSViewRepresentable {
             return list
         }
 
-        /// The rows of `column`, or nil for a column the browser does not have. Every index AppKit
-        /// hands a callback is checked here, before the browser is asked anything about it:
-        /// `item(atRow:inColumn:)` throws for column −1 and for a column past `lastColumn`, and
-        /// forwards row −1 to `child:ofItem:`.
+        /// The rows of `column`, or nil for a column the browser lacks. Every index AppKit hands a
+        /// callback is checked here first: `item(atRow:inColumn:)` throws for column −1 and past
+        /// `lastColumn`, and forwards row −1 to `child:ofItem:`.
         private func rows(ofColumn column: Int) -> (up: Bool, items: [RemoteItem])? {
             guard let browser, column >= 0, column <= browser.lastColumn, let folder = path(forColumn: column) else { return nil }
             return (hasUpEntry(folder), entries(folder))
@@ -229,8 +223,7 @@ struct ColumnBrowser: NSViewRepresentable {
             return root ?? model.snapshot.path
         }
 
-        /// The model's listing of a folder in column order. Read only by `sync` and for a folder
-        /// not shown yet, never per row.
+        /// The model's listing in column order, read only by `sync` and for unshown folders.
         private func listing(_ path: RemotePath) -> [RemoteItem] {
             if let cached = model.columnItems(path) { return cached }
             // Called from inside SwiftUI's update pass; the listing starts on the next turn.
@@ -283,11 +276,10 @@ struct ColumnBrowser: NSViewRepresentable {
 
         // MARK: Context menu
 
-        /// The right-clicked row joins the selection first, as a click would select it, so every
-        /// entry acts on what the menu was opened over. The empty area of a column, and its `..`
-        /// row, stand for the folder the column shows: that folder becomes the location with
-        /// nothing selected in it, as a click there makes it, so New Folder, Upload, Paste, and
-        /// Copy Remote URL act on the folder that was clicked, not on the deepest column.
+        /// A right-clicked row joins the selection first, as a click would, so every entry acts on
+        /// what the menu was opened over. A column's empty area or `..` row makes its folder the
+        /// location with nothing selected, as a click there does, so New Folder, Upload, Paste,
+        /// and Copy Remote URL act on that folder, not on the deepest column.
         func menuNeedsUpdate(_ menu: NSMenu) {
             menu.removeAllItems()
             guard let browser else { return }
@@ -307,9 +299,8 @@ struct ColumnBrowser: NSViewRepresentable {
             ItemMenu.fill(menu, item: clicked, model: model)
         }
 
-        /// Makes the folder `column` shows the location, as a click on the column's empty area
-        /// does: nothing selected in it, no column after it, and the folder itself selected in the
-        /// column before, as a click there left it.
+        /// Makes `column`'s folder the location, as a click on its empty area does: nothing
+        /// selected in it, no column after it, and the folder selected in the column before.
         private func showFolder(ofColumn column: Int, in browser: NSBrowser) {
             guard let folder = path(forColumn: column) else { return }
             if browser.lastColumn > column { browser.lastColumn = column }
@@ -386,22 +377,19 @@ struct ColumnBrowser: NSViewRepresentable {
 /// The `..` row's item in the column view.
 final class UpEntry: NSObject {}
 
-/// Places the browser so its right edge sits on this view's right edge and its width is never
-/// less than its columns, so the browser itself never scrolls sideways. When the columns are wider
-/// than this view, the stack begins left of it, under the floating sidebar, which the split view
-/// draws on top. This view's bounds are the visible region, the content pane's safe area, so each
-/// frame of the inspector or sidebar animation arrives as a new width and the whole stack moves
-/// as one piece: still while the columns fit, then abutting the inspector once they do not.
+/// Keeps the browser's right edge on this view's and its width at least its columns', so the
+/// browser never scrolls sideways itself. Wider columns start left of this view, under the floating
+/// sidebar, which the split view draws on top. The bounds are the visible region (the content
+/// pane's safe area), so each frame of an inspector or sidebar animation is a new width and the
+/// stack moves as one: still while the columns fit, then abutting the inspector once they do not.
 ///
-/// Columns left of the visible region are reached by panning the whole stack to the right, with
-/// Shift and a mouse wheel or a sideways swipe (`ColumnPan`), as far as the first column's left
-/// edge. A column that appears or resizes slides the stack back to rest.
+/// Shift with a wheel, or a sideways swipe, pans the stack right (`ColumnPan`) as far as the first
+/// column's left edge. A column that appears or resizes slides the stack back to rest.
 final class ColumnStack: NSView {
     let browser: TiledBrowser
     private var lastWidth: CGFloat = 0
     private var lastColumns: CGFloat = 0
-    /// How far right of its resting place the stack sits: 0 keeps the last column on this view's
-    /// right edge.
+    /// How far right of rest the stack sits; 0 keeps the last column on this view's right edge.
     private var pan: CGFloat = 0
 
     init(browser: TiledBrowser) {
@@ -416,9 +404,8 @@ final class ColumnStack: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    /// The width of every loaded column, measured from the browser's own tiling so a column the
-    /// user has resized counts at its real width. A column the browser has not tiled yet counts
-    /// at the default width, and `measured` is false so the caller asks again after tiling.
+    /// Loaded columns' width from the browser's own tiling, so resized columns count at real width.
+    /// Untiled columns count at the default width and `measured` is false, so the caller re-asks.
     private var columnsWidth: (width: CGFloat, measured: Bool) {
         let last = browser.lastColumn
         guard last >= 0 else { return (0, true) }
@@ -433,9 +420,8 @@ final class ColumnStack: NSView {
         let (columns, measured) = columnsWidth
         if !measured { DispatchQueue.main.async { [weak self] in self?.needsLayout = true } }
         let width = max(columns, visible)
-        // A column that appears or resizes while the pane is at rest slides the stack, as Finder
-        // does. While the pane itself is animating, each frame is placed directly and the split
-        // view's timing rules.
+        // A column appearing or resizing slides the stack, as in Finder, when the pane is at rest.
+        // While the pane animates, each frame is placed directly and the split view's timing rules.
         let slide = visible == lastWidth && columns != lastColumns && lastColumns > 0 && window != nil
         if columns != lastColumns { pan = 0 }
         pan = min(pan, width - visible)
@@ -470,10 +456,9 @@ final class ColumnStack: NSView {
     }
 }
 
-/// Sideways scrolling over the column view: Shift with a mouse wheel, or a swipe on a trackpad or
-/// Magic Mouse whose sideways motion outweighs its vertical. Each column is its own vertical
-/// scroll view and the browser never scrolls sideways, so nothing else would take these. One
-/// monitor for the app, as `ContentKeys` is; vertical scrolling goes on to the columns.
+/// Sideways scrolling over the column view: Shift and a wheel, or a trackpad or Magic Mouse swipe
+/// more sideways than vertical. Columns scroll only vertically and the browser never sideways, so
+/// nothing else takes these. One monitor for the app, as `ContentKeys`; vertical passes through.
 @MainActor
 enum ColumnPan {
     private static var monitor: Any?
@@ -490,8 +475,7 @@ enum ColumnPan {
     private static func takes(_ event: NSEvent) -> Bool {
         var sideways = event.scrollingDeltaX
         let vertical = event.scrollingDeltaY
-        // macOS turns Shift and a wheel into a sideways scroll itself; should it not, the wheel's
-        // vertical motion is the sideways one.
+        // macOS turns Shift and a wheel sideways itself; if it does not, vertical motion is used.
         if sideways == 0, event.modifierFlags.contains(.shift) { sideways = vertical }
         else if abs(sideways) <= abs(vertical) { return false }
         guard sideways != 0, let stack = stack(under: event) else { return false }
@@ -510,9 +494,8 @@ enum ColumnPan {
 
 /// The column browser: fixed-width columns. Space reaches Quick Look through `ContentKeys`.
 final class TiledBrowser: NSBrowser {
-    /// Columns start at this width and never reflow to fit the pane. `ColumnStack` moves the whole
-    /// set instead. Re-tiling to fit made every column visibly resize during the inspector toggle,
-    /// which read as an overlay rather than a slide.
+    /// Columns never reflow to fit the pane; `ColumnStack` moves the whole set instead. Re-tiling
+    /// made every column resize during the inspector toggle, reading as an overlay, not a slide.
     static let columnWidth: CGFloat = 260
 }
 
@@ -571,9 +554,8 @@ final class CenteredBrowserCell: NSBrowserCell {
     static let gap: CGFloat = 5
     static let chevronInset: CGFloat = 8
 
-    /// The `..` row's content draws 5 points high so its arrow and text land where list view's
-    /// header puts the same arrow and "Name": the column view's rows start 5 points lower than
-    /// the list's header does.
+    /// Column rows start 5 points below list view's header; lifting the `..` row as much puts its
+    /// arrow and text where that header draws the same arrow and "Name".
     static let upRowLift: CGFloat = 5
 
     override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {

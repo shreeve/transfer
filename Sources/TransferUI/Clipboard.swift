@@ -2,14 +2,12 @@ import AppKit
 import Observation
 import TransferCore
 
-/// The app's one clipboard, shared by every window and tab. It mirrors the general pasteboard:
-/// items copied in Transfer, or files copied in Finder. Each window shows it in its clipboard bar
-/// until it is pasted with a move, replaced, or cleared with Escape.
+/// One clipboard for every window and tab, mirroring the general pasteboard (Transfer items or
+/// Finder files). Each window's bar shows it until it is moved, replaced, or cleared with Escape.
 ///
-/// Finder pastes only real file URLs. It ignores a file promise on the general pasteboard, and a
-/// lazily provided URL does not help: the system reads every new pasteboard at once (Spotlight's
-/// clipboard history), not at paste time. So items copied here are downloaded to a staging
-/// folder right after the copy, and their URLs join the pasteboard when they are complete.
+/// Finder pastes only file URLs. It ignores file promises on the general pasteboard, and a lazy URL
+/// is read at once by the system (Spotlight's clipboard history), not at paste time. So copied
+/// items download to a staging folder at once, and their URLs join the pasteboard when complete.
 @MainActor
 @Observable
 public final class Clipboard {
@@ -62,16 +60,15 @@ public final class Clipboard {
         observers.append(center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { Clipboard.shared.leave() }
         })
-        // The pasteboard posts no change notification; its change count is cheap to read. The run
-        // loop keeps the timer.
+        // The pasteboard posts no change notification; its change count is cheap to read, and the
+        // run loop holds the timer.
         RunLoop.main.add(Timer(timeInterval: 0.5, repeats: true) { _ in
             MainActor.assumeIsolated {
                 if NSApp.isActive { Clipboard.shared.poll() }
             }
         }, forMode: .common)
-        // Escape reaches no single responder: a toolbar button or the window itself may hold the
-        // focus, and neither turns Escape into cancelOperation. So it is watched here, and left
-        // alone for text fields, sheets, and any window that is not a browser.
+        // No responder gets Escape as cancelOperation when a button or the window has focus, so it
+        // is watched here, except in text fields, sheets, and non-browser windows.
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             MainActor.assumeIsolated { Clipboard.shared.takesEscape(event) } ? nil : event
         }
@@ -132,9 +129,8 @@ public final class Clipboard {
         if clip?.id == id { clear() }
     }
 
-    /// Finder pastes asynchronously and may still be reading a clip's staged files when the clip
-    /// is replaced or cleared, so they are removed only after a while. Nothing can start a new
-    /// paste from them: their URLs have already left the pasteboard.
+    /// Finder pastes asynchronously and may still read a replaced or cleared clip's staged files,
+    /// so they go later. Their URLs have left the pasteboard, so no new paste can start.
     private func reset() {
         work?.cancel()
         work = nil
@@ -182,8 +178,7 @@ public final class Clipboard {
 
     // MARK: Watching the pasteboard
 
-    /// Another app, or Finder, changed the pasteboard: files from Finder become the clip, and
-    /// anything else clears it.
+    /// Another app changed the pasteboard: Finder files become the clip; anything else clears it.
     private func poll() {
         let pasteboard = NSPasteboard.general
         guard pasteboard.changeCount != seenChangeCount else { return }
@@ -220,10 +215,9 @@ public final class Clipboard {
 
     // MARK: Counting and staging
 
-    /// Counts what the copied folders hold, showing the count at most every 0.2 s as it grows.
-    /// A folder that cannot be walked leaves the count incomplete and Finder without a copy: the
-    /// 1 GB limit and the paste's progress need the whole count. Names the Mac's disk cannot hold
-    /// apart also keep Finder without a copy, since one would stand in for the other.
+    /// Counts what the copied folders hold, shown at most every 0.2 s. A folder that cannot be
+    /// walked leaves the count incomplete and Finder without a copy (the 1 GB limit and paste
+    /// progress need the whole count), as do names this Mac's disk would merge.
     private func countRemote(_ items: [RemoteItem], session: any RemoteSession, id: UUID) async {
         guard var tally = clip?.tally else { return }
         var clash = NameClash(ignoringCase: Self.diskIgnoresCase)
@@ -326,10 +320,10 @@ public final class Clipboard {
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Transfer", isDirectory: true)
     }
 
-    /// This process's own folder under `Staging`, for its clips' staging folders. Two copies of Transfer can run at once (`open -n`, or a development build
-    /// beside the installed app), so neither may remove what the other is using. Each holds an
-    /// exclusive lock on `<its folder>.lock` while it runs, which the kernel drops when the
-    /// process ends, crash or not; a launch removes only the folders whose lock it can take.
+    /// This process's folder under `Staging`, for its clips. Two copies of Transfer can run at once
+    /// (`open -n`, or a development build beside the installed app), so neither may remove the
+    /// other's. Each holds an exclusive lock on `<its folder>.lock`, which the kernel drops when
+    /// the process ends, crash or not; a launch removes only folders whose lock it can take.
     nonisolated static let processFolder: URL = {
         let manager = FileManager.default
         // What 0.1.7 and earlier left at the top level.

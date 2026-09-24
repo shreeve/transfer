@@ -20,7 +20,6 @@ struct RemoteDragPayload: Codable {
 }
 
 extension NSPasteboard {
-    /// The file URLs on the pasteboard, from Finder or another app.
     var fileURLs: [URL] {
         (readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
     }
@@ -72,8 +71,7 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
         let session = session
         let prompts = prompts
         let finish = Locked(completionHandler)
-        // Published for the destination, so Finder draws the download's progress on the icon
-        // it is filling in and can cancel it.
+        // Published so Finder draws progress on the icon it is filling in, and can cancel it.
         let progress = Progress(totalUnitCount: item.kind == .directory ? -1 : Int64(item.size ?? 0))
         progress.kind = .file
         progress.fileOperationKind = .downloading
@@ -111,10 +109,10 @@ struct DropAction {
     var operation: NSDragOperation { moving ? .move : .copy }
 }
 
-/// What a drop onto `folder` does, or nil to refuse it, in the list, column, and icon views.
-/// Remote paths are honored only from a drag that began in this app: any other app could put
-/// paths on a drag pasteboard and have a drop move them. As in Finder, a drag between folders of
-/// one server moves, and copies with Option held; a drag from another server's window copies.
+/// What a drop onto `folder` does in the list, column, and icon views, or nil to refuse it. Remote
+/// paths count only from a drag begun in this app: any other app could put paths on a drag
+/// pasteboard and have a drop move them. As in Finder, a drag within one server moves (copies with
+/// Option); a drag from another server's window copies.
 @MainActor
 func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: TransferModel) -> DropAction? {
     guard let connection = model.snapshot.connectionID else { return nil }
@@ -132,8 +130,8 @@ func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: Tr
     }
     let moving = mask.contains(.move)
     guard moving || mask.contains(.copy) else { return nil }
-    // A folder never goes into itself; a move into the folder an item is already in does nothing,
-    // but a copy there makes "name copy" beside it.
+    // A folder never goes into itself; a move into an item's own folder does nothing, but a copy
+    // there makes "name copy" beside it.
     let paths = payload.remotePaths.filter { !folder.isInside($0) && !(moving && $0.parent == folder) }
     return paths.isEmpty ? nil : DropAction(sources: .server(connection, paths), folder: folder, moving: moving)
 }
@@ -154,9 +152,8 @@ struct FilePromiseLabel: NSViewRepresentable {
     }
 }
 
-/// A whole icon-grid cell: the glyph and the name, both a drag source, so a drag can start
-/// anywhere on the cell as in Finder. Selection, open, the right-click menu, and drop onto
-/// folders live here too.
+/// A whole icon-grid cell, glyph and name, all a drag source as in Finder. Selection, open, the
+/// right-click menu, and drop onto folders live here too.
 final class IconItemView: NSView, NSDraggingSource {
     private var item = RemoteItem(path: RemotePath(string: "/"), kind: .other)
     private weak var model: TransferModel?
@@ -207,8 +204,8 @@ final class IconItemView: NSView, NSDraggingSource {
         }
     }
 
-    /// A clicked cell holds the focus, as a table row does, so the Edit menu reaches the window
-    /// through the responder chain; nothing else in the grid would take it.
+    /// A clicked cell takes focus, as a table row does, so the Edit menu reaches the window through
+    /// the responder chain; nothing else in the grid would take it.
     override var acceptsFirstResponder: Bool { true }
 
     override func mouseDown(with event: NSEvent) {
@@ -227,8 +224,8 @@ final class IconItemView: NSView, NSDraggingSource {
         }
     }
 
-    /// The list and column views' menu. The cell joins the selection first, as a click would
-    /// select it, so every entry acts on what the menu was opened over.
+    /// The list and column views' menu. The cell joins the selection first, as a click would, so
+    /// every entry acts on what the menu was opened over.
     override func menu(for event: NSEvent) -> NSMenu? {
         guard let model else { return nil }
         window?.makeFirstResponder(self)

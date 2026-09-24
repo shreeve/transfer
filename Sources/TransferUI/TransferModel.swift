@@ -33,11 +33,10 @@ public enum SidebarItem: Hashable {
     case conflict(RemotePath)
 }
 
-/// The server a window shows, as one value: made when a connect starts, installed only once the
-/// login has worked, and never changed after that. Switching servers installs a new one and
-/// closes the old, which cancels its event listener and listings. Work that belongs to a server
-/// holds its context, and a result counts only while that context is still the installed one,
-/// so a slow listing or a late login never lands in a window that has moved on.
+/// The server a window shows, as one value: made when a connect starts, installed once the login
+/// works, then never changed. Switching servers installs a new one and closes the old, cancelling
+/// its listener and listings. Work for a server holds its context and counts only while that
+/// context is installed, so a slow listing or late login never lands in a window that has moved on.
 @MainActor
 final class ServerContext {
     let connection: SavedConnection
@@ -69,18 +68,16 @@ final class ServerContext {
     }
 }
 
-/// One folder's listing in flight. A change that arrives while it runs asks for one more pass
-/// instead of starting a second listing of the same folder.
+/// A folder's listing in flight. A change during it asks for one more pass, not a second listing.
 @MainActor
 final class ListingJob {
     var task: Task<Void, Never>?
     var again = false
 }
 
-/// One folder as the window has it: all its items in the list view's order, and the column
-/// view's name order with hidden files already left out when they are hidden. Both are kept
-/// sorted, so reading a column costs nothing. `complete` is false for a listing that stopped
-/// part way, which is shown only until a fresh one replaces it.
+/// One folder as the window has it, in list-view order and in the column view's name order (hidden
+/// files left out when hidden). Both stay sorted, so reading a column costs nothing. `complete` is
+/// false for a listing that stopped part way, shown until a fresh one replaces it.
 struct FolderListing {
     var items: [RemoteItem]
     var byName: [RemoteItem]
@@ -99,8 +96,7 @@ public final class TransferModel {
     /// The server a connect is logging in to, until it lands or fails.
     public private(set) var connectingTo: SavedConnection?
     @ObservationIgnored private var connectGeneration = 0
-    /// Starts from the list the last window loaded, so a new window or tab shows its servers in
-    /// its first frame instead of an empty sidebar that fills in a moment later.
+    /// Seeded from the last window's list, so a new window or tab has servers in its first frame.
     public var connections: [SavedConnection] = TransferModel.lastConnections
     private static var lastConnections: [SavedConnection] = []
     public var snapshot = BrowserSnapshot()
@@ -149,9 +145,8 @@ public final class TransferModel {
         didSet { if filter != oldValue { refreshItems() } }
     }
     public var filterFocusTick = 0
-    /// When an icon cell last took a mouse down, in system uptime, so the grid's background tap
-    /// that follows the same click does not clear the selection the cell just made. A time rather
-    /// than a flag: a click that becomes a drag is never followed by a tap.
+    /// When an icon cell last took a mouse down (system uptime), so the grid's background tap for
+    /// that click keeps the cell's selection. A time, not a flag: a drag never gets the tap.
     @ObservationIgnored public var itemClickTime: TimeInterval = 0
     /// True while a text field in the window has focus, so Space and Return stay with the field.
     public var textEditing = false
@@ -162,9 +157,8 @@ public final class TransferModel {
     public var showsInspector = false {
         didSet { if showsInspector != oldValue { refreshInspectorPreview() } }
     }
-    /// The primary file for the inspector's preview, when it is small enough: its first lines
-    /// when it is text, a decoded picture, else a local copy for Quick Look. Stays on the
-    /// previous file for a moment after the selection moves, so a fast fetch swaps with no gap.
+    /// The primary file's preview, if small: text's first lines, a decoded picture, or a local copy
+    /// for Quick Look. Held briefly after the selection moves so a fast fetch swaps with no gap.
     public var inspectorPreview: InspectorPreview?
     /// What the pane shows while no preview is up: nothing, the file's icon, or the icon with a
     /// spinner once the wait has grown long.
@@ -231,8 +225,7 @@ public final class TransferModel {
         }
     }
 
-    /// Loads the library and follows changes to preferences and to the library. The window
-    /// calls it once it is on screen.
+    /// Loads the library and follows preference and library changes, once the window is on screen.
     public func start() {
         guard observers.isEmpty else { return }
         terminalAvailable = TerminalLauncher.anyInstalled()
@@ -370,10 +363,9 @@ public final class TransferModel {
         status = total == 1 ? "Could not \(verb) \(each)" : "Could not \(verb) \(failures.count) of \(total) items. \(each)"
     }
 
-    /// Logs in and shows the start folder, or `landing` when given: that folder, or the file
-    /// selected in its folder. Nothing in the window changes until the login has worked, so a
-    /// failed or cancelled login leaves the window on the server it showed; when connects
-    /// overlap, the last one asked for wins, whichever finishes first.
+    /// Logs in and shows the start folder, or `landing`: that folder, or its folder with the file
+    /// selected. The window changes only once the login works, so a failed or cancelled one leaves
+    /// it as it was; of overlapping connects, the latest wins whatever the finish order.
     public func connect(_ connection: SavedConnection, landing: RemotePath? = nil) async {
         connectGeneration &+= 1
         let generation = connectGeneration
@@ -474,13 +466,11 @@ public final class TransferModel {
         return (parent, [path])
     }
 
-    /// True while this window shows no server and asks nothing, so a link can open here rather
-    /// than in a new tab.
+    /// While true (no server, no question), a link opens in this window rather than a new tab.
     public var isIdle: Bool { snapshot.connectionID == nil && sheet == nil && connectingTo == nil }
 
-    /// Opens an `sftp://` link here: the saved server it names, at its folder or with its file
-    /// selected. A server not in the library opens the New Connection sheet, filled in from the
-    /// link; nothing is saved until Connect.
+    /// Opens an `sftp://` link here, on the saved server it names. An unknown server opens the New
+    /// Connection sheet filled in from the link; nothing is saved until Connect.
     public func open(link: SFTPURL) async {
         if let connection = await provider.connection(matching: link) {
             await connect(connection, landing: link.path)
@@ -565,10 +555,9 @@ public final class TransferModel {
         return job.task
     }
 
-    /// Streams one listing of `path` into the cache. A complete cached listing stays on screen
-    /// until the new one is complete; without one, the pages that have come are shown every
-    /// 80 ms. True when the whole listing arrived. A cancelled listing publishes nothing more,
-    /// and neither does one for a server the window has left.
+    /// Streams one listing of `path` into the cache. A complete cached listing stays up until the
+    /// new one is complete; without one, pages show every 80 ms. True when the whole listing
+    /// arrived. Nothing more is published once cancelled or once the window has left the server.
     private func stream(_ path: RemotePath, in context: ServerContext) async -> Bool {
         let flushEarly = listings[path]?.complete != true
         var sort = snapshot.sort
@@ -643,8 +632,7 @@ public final class TransferModel {
         }
     }
 
-    /// Whether `path`'s listing is on screen: the location, or in column view a folder on the
-    /// way down to it.
+    /// Whether `path` is on screen: the location, or in column view a column on the way down to it.
     private func isShown(_ path: RemotePath) -> Bool {
         if path == snapshot.path { return true }
         guard snapshot.viewMode == .columns, let root = columnRoot else { return false }
@@ -750,9 +738,8 @@ public final class TransferModel {
         return snapshot.selection.compactMap(listedItem).sorted { $0.path.display < $1.path.display }
     }
 
-    /// A single selected folder becomes the current location, as in Finder, and stays selected.
-    /// Files and multiple selections leave the location at their parent. Listings of folders no
-    /// longer on screen stop.
+    /// A single selected folder becomes the location, as in Finder, and stays selected; files and
+    /// multiple selections leave the location at their parent. Listings no longer on screen stop.
     public func selectInColumns(_ selected: [RemoteItem], parent: RemotePath) {
         snapshot.selection = Set(selected.map(\.path))
         if let folder = selected.first, selected.count == 1, folder.kind == .directory {
@@ -905,10 +892,9 @@ public final class TransferModel {
     }
 
     /// Starts fetching the primary file the instant the selection moves; nothing waits on an
-    /// animation. The old preview stays up for `hold` so a quick fetch swaps with no gap, then
-    /// the pane clears, the icon arrives once the wait is plainly long, and a spinner joins it
-    /// later still. A held arrow key coalesces: only a change that follows another within
-    /// `coalesce` waits.
+    /// animation. The old preview stays up for `hold` so a quick fetch swaps with no gap, then the
+    /// pane clears, the icon arrives once the wait is plainly long, and a spinner later still. A
+    /// held arrow key coalesces: only a change within `coalesce` of the last one waits.
     private func refreshInspectorPreview() {
         for task in inspectorTasks { task.cancel() }
         inspectorTasks.removeAll()
@@ -955,8 +941,7 @@ public final class TransferModel {
     }
 
     /// The preview for one file, ready to draw: text, a decoded picture, or the local copy for
-    /// Quick Look. Nil when it is not a small file after all. The copy is read off the main
-    /// thread.
+    /// Quick Look. Nil when it is not a small file after all. The copy is read off the main thread.
     private static func fetchPreview(_ item: RemoteItem, session: any RemoteSession) async -> InspectorPreview? {
         do {
             let target = try await Self.resolveLink(item, session: session)
@@ -1194,9 +1179,8 @@ public final class TransferModel {
         sheet = .delete
     }
 
-    /// Deletes the selection and says which items could not go. What failed stays selected.
-    /// The Delete sheet has warned about unsynced Live edits under the selection, so those Live
-    /// files are discarded first; the session refuses to remove a path that still holds one.
+    /// Deletes the selection; failures are reported and stay selected. Live files under it are
+    /// discarded first, as the sheet warned: the session will not remove a path holding one.
     public func deleteSelection() async {
         guard let context else { return }
         let paths = snapshot.selection.sorted { $0.display < $1.display }
@@ -1281,8 +1265,7 @@ public final class TransferModel {
         }
     }
 
-    /// Copies each selected file, link, or folder beside itself as "name copy", on the server,
-    /// with its progress on the shelf.
+    /// Copies each selected item beside itself on the server as "name copy", progress on the shelf.
     public func duplicateSelection() async {
         guard let session else { return }
         var taken: [RemotePath: Set<String>] = [:]
@@ -1662,11 +1645,10 @@ public enum AppSheet: Identifiable {
     }
 }
 
-/// Answers the questions sessions and operations ask, with sheets in this window. Questions
-/// wait in line and show one at a time, in the order they came, each once no other sheet is
-/// up; two at once never replace each other. A question whose sheet goes away unanswered, whose
-/// task is cancelled, or whose window closes gets the safe answer: no password, no trust, and no
-/// choice, which fails its operation rather than guess.
+/// Answers sessions' and operations' questions with sheets in this window, one at a time in arrival
+/// order once no other sheet is up, so two never replace each other. A question whose sheet goes
+/// unanswered, whose task is cancelled, or whose window closes gets the safe answer (no password,
+/// no trust, no choice), failing its operation rather than guessing.
 @MainActor
 public final class SheetPrompts {
     weak var model: TransferModel?
@@ -1815,11 +1797,10 @@ private struct LoginPrompts: PromptSink {
     }
 }
 
-/// One user operation's prompts: a download, upload, paste, drag, or clipboard staging. Sheets go
-/// to the window that started it, and Apply to All holds for this operation alone, never for
-/// another operation or window. Bound with `OperationPrompts.$current` around the operation.
-/// The operation's files that collide at once are asked about one at a time, so an Apply to All
-/// answers the ones still waiting too.
+/// One user operation's prompts (a download, upload, paste, drag, or clipboard staging), bound with
+/// `OperationPrompts.$current` around it. Sheets go to the window that started it, and Apply to All
+/// holds for this operation alone. Collisions are asked one at a time, so an Apply to All also
+/// answers the ones still waiting.
 @MainActor
 final class OperationPrompt: PromptSink {
     private let window: SheetPrompts
@@ -1932,9 +1913,8 @@ enum TerminalLauncher {
     }
 }
 
-/// The Quick Look panel, one per app. Quick Look calls its data source and delegate on the main
-/// thread. `close` moves `generation` on, so a fetch that finishes after the user put the panel
-/// away does not bring it back.
+/// The app's one Quick Look panel, whose data source and delegate Quick Look calls on the main
+/// thread. `close` bumps `generation`, so a fetch finishing after a close does not reopen it.
 @MainActor
 final class PreviewPanel: NSObject, @MainActor QLPreviewPanelDataSource, @MainActor QLPreviewPanelDelegate {
     static let shared = PreviewPanel()

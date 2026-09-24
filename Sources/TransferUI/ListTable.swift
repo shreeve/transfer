@@ -3,9 +3,8 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
-/// The list view: an AppKit table with 22-point rows, alternating backgrounds, header sorting,
-/// per-connection column autosave, drag out, drop onto folders, and the row context menu.
-/// It reads the model's items and selection and never owns them.
+/// The list view: an AppKit table with header sorting, per-connection column autosave, drag out,
+/// drop onto folders, and a row menu. It reads the model's items and selection, never owns them.
 struct ListTable: NSViewRepresentable {
     static let rowHeight: CGFloat = 22
     var model: TransferModel
@@ -193,10 +192,9 @@ struct ListTable: NSViewRepresentable {
             model.snapshot.selection = Set(table.selectedRowIndexes.compactMap { items.indices.contains($0) ? items[$0].path : nil })
         }
 
-        /// Name stays the first column, as in Finder: the fitting in `RowMenuTableView.layout`,
-        /// the header's up arrow, and the row inset all measure column 0, and the first-column
-        /// autoresizing style gives the spare width to whichever column is first. AppKit asks with
-        /// a new index of -1 as a drag begins.
+        /// Name stays first, as in Finder: `RowMenuTableView.layout`, the header's up arrow, and
+        /// the row inset all measure column 0, and first-column autoresizing widens whichever
+        /// column is first. AppKit asks with a new index of -1 as a drag begins.
         func tableView(_ tableView: NSTableView, shouldReorderColumn columnIndex: Int, toColumn newColumnIndex: Int) -> Bool {
             columnIndex != 0 && newColumnIndex != 0
         }
@@ -257,9 +255,8 @@ struct ListTable: NSViewRepresentable {
     }
 }
 
-/// The promises of one row drag. A table or browser asks for a writer per dragged row, all in one
-/// turn of the run loop, so the drag's roots, payload, and prompts are worked out once for the
-/// whole drag rather than once for each row.
+/// The promises of one row drag. A table or browser asks for a writer per row in one run-loop turn,
+/// so the drag's roots, payload, and prompts are worked out once per drag, not once per row.
 @MainActor
 final class RowDrag {
     private var promises: [RemotePath: RemoteItemPromise] = [:]
@@ -282,9 +279,8 @@ final class RowMenuTableView: NSTableView {
     weak var coordinator: ListTable.Coordinator?
     private var fittedWidth: CGFloat = 0
 
-    /// The Name column takes whatever width the others leave, down to its minimum, so the table
-    /// reflows with the window and the inspector. Autoresizing alone only tracks changes, and
-    /// misses a restored column set that is already wider than the view.
+    /// Name takes the width the others leave, down to its minimum, following window and inspector.
+    /// Autoresizing only tracks changes and misses restored columns already wider than the view.
     override func layout() {
         super.layout()
         guard let clip = enclosingScrollView?.contentView, let name = tableColumns.first else { return }
@@ -303,9 +299,8 @@ final class RowMenuTableView: NSTableView {
     }
 }
 
-/// The right-click menu of the list and column views: for the clicked item, which the view has
-/// already made part of the selection, or with no item, for the current folder, which the view
-/// has made the location with nothing selected.
+/// The list and column views' right-click menu: for the clicked item, already in the selection, or
+/// with no item, for the current folder, already the location with nothing selected.
 @MainActor
 enum ItemMenu {
     @discardableResult
@@ -384,8 +379,7 @@ enum Format {
     }
 }
 
-/// The Name column's header: an up arrow in the icon slot and the title over the names, on the
-/// same offsets the rows use.
+/// The Name header: an up arrow in the icon slot, the title over the names, at the rows' offsets.
 final class NameHeaderCell: NSTableHeaderCell {
     static let iconInset: CGFloat = 3
     static let textInset: CGFloat = 24

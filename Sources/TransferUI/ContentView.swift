@@ -5,9 +5,8 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
-/// A browser window's SwiftUI content: the sidebar, the content pane with its message,
-/// rename, clipboard, and transfer bars and every sheet, and the inspector. `WindowChrome`
-/// hosts each column once and each observes the model itself (HANDOFF.md, Window chrome).
+/// A browser window's SwiftUI content: sidebar, detail, and inspector columns. `WindowChrome` hosts
+/// each once and each observes the model itself (HANDOFF.md, Window chrome).
 public struct ContentView: View {
     let model: TransferModel
 
@@ -153,9 +152,8 @@ struct DetailColumn: View {
 
     private var iconView: some View {
         ScrollView {
-            // Fixed-width columns packed from the left, not stretched to fill: as the inspector
-            // narrows the pane, items hold their positions and only the column count steps, so the
-            // grid never shimmies. Finder's icon view reflows the same way.
+            // Fixed-width columns packed left, not stretched: as the pane narrows, items hold still
+            // and only the column count steps, as in Finder's icon view.
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 108, maximum: 108), spacing: 16)], alignment: .leading, spacing: 16) {
                 ForEach(model.displayedItems) { item in
                     FilePromiseLabel(item: item, model: model)
@@ -454,7 +452,6 @@ private struct SheetForm<Content: View, Actions: View>: View {
     }
 }
 
-/// The inspector column.
 struct InspectorColumn: View {
     let model: TransferModel
     @AppStorage(Preferences.wrapsPreview) private var wrapsPreview = false
@@ -509,10 +506,9 @@ struct InspectorColumn: View {
         }
     }
 
-    /// A swap inside the hold reads as instant, so it gets no animation, and so does content
-    /// landing in an empty pane. Old content fades out, the icon and spinner fade in, and a
-    /// picture arriving over the icon crossfades. Web and Quick Look views draw late, so a fade
-    /// on them would only show an empty box.
+    /// No animation for a swap inside the hold (it reads as instant) or content landing in an empty
+    /// pane. Old content fades out, the icon and spinner fade in, and a picture over the icon
+    /// crossfades. Web and Quick Look views draw late, so fading them shows an empty box.
     private func animation(from old: PreviewPhase, to new: PreviewPhase) -> Animation? {
         guard !reduceMotion else { return nil }
         if let preview = new.preview {
@@ -692,8 +688,7 @@ private struct FolderMenu: View {
     }
 }
 
-/// The window's message, such as what failed, under the toolbar until it is dismissed or the
-/// next message replaces it.
+/// The window's message, such as a failure, until dismissed or replaced by the next one.
 private struct MessageBar: View {
     let text: String
     let dismiss: () -> Void

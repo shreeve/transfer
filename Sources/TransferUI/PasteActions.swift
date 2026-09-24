@@ -1,12 +1,11 @@
 import AppKit
 import TransferCore
 
-/// Copy, Paste, and Move Item Here. The clipboard itself is `Clipboard.shared`; this is what one
-/// window does with it. Paste always lands in the window's current folder.
+/// Copy, Paste, and Move Item Here: what one window does with `Clipboard.shared`. Paste lands in
+/// the window's current folder.
 ///
-/// What a paste or a drop does is the provider's `transfer`, which runs in TransferIO with its
-/// tests: a move removes an original only once it has checked that this move wrote a complete
-/// copy of it. This side only chooses the folder and queues the operation.
+/// A paste or drop is the provider's `transfer`, tested in TransferIO: a move removes an original
+/// only after checking this move wrote a complete copy. This side picks the folder and queues it.
 extension TransferModel {
     public var canCopy: Bool { session != nil && !snapshot.selection.isEmpty }
 
@@ -31,8 +30,7 @@ extension TransferModel {
         Clipboard.shared.copy(items, session: session, place: "\(connection.displayName):\(folder.display)", prompts: operationPrompts())
     }
 
-    /// A move clears the clipboard only once it has succeeded, so a refused or failed one can be
-    /// tried again.
+    /// A move clears the clipboard only on success, so a refused or failed one can be tried again.
     public func paste(moving: Bool) async {
         guard let session, let clip = Clipboard.shared.clip else { return }
         var folder = snapshot.path
@@ -111,8 +109,7 @@ extension TransferModel {
         }
     }
 
-    /// Operations still queued, running, or paused in every window, for the quit guard. Live
-    /// uploads are counted by the guard's own unsynced count.
+    /// Unfinished operations in all windows, for the quit guard (Live uploads are counted apart).
     public static var unfinishedOperations: Int {
         ChromeController.browsers.compactMap(\.model).reduce(0) { total, model in
             total + model.operations.filter { $0.livePath == nil && [.queued, .active, .paused].contains($0.state) }.count

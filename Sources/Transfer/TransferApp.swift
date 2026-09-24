@@ -5,9 +5,8 @@ import TransferCore
 import TransferIO
 import TransferUI
 
-/// The app: its scenes and menus, and the delegate that opens the library, starts Sparkle, takes
-/// `sftp://` links, and guards Quit. The one target that sees both UI and IO; the windows reach
-/// the library only through `SessionProvider`.
+/// The scenes, menus, and delegate (library, Sparkle, `sftp://` links, the Quit guard). The only
+/// target that sees both UI and IO; windows reach the library only through `SessionProvider`.
 @main
 struct TransferApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
@@ -197,7 +196,6 @@ struct BrowserWindow: View {
     }
 }
 
-/// "Check for Updates…" is enabled only while Sparkle can check.
 struct CheckForUpdatesButton: View {
     let state: UpdaterState
 
@@ -230,9 +228,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let provider: TransferHub?
     /// Why the library could not be opened, such as one written by a newer Transfer.
     let libraryError: String?
-    /// Sparkle reads SUFeedURL and SUPublicEDKey from Info.plist and checks on its own schedule.
-    /// Until a public key is in the plist the updater stays off, so a development build never
-    /// shows Sparkle's "not configured" alert at launch.
+    /// Reads SUFeedURL and SUPublicEDKey from Info.plist and checks on its own schedule. Off until
+    /// the plist has a public key, so a development build never shows the "not configured" alert.
     let updater = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
     let updates: UpdaterState
 
@@ -269,10 +266,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         urls.compactMap(SFTPURL.init(url:)).forEach(LinkInbox.deliver)
     }
 
-    /// Asks before quitting abandons work: Live edits not yet on the server, or transfers still
-    /// running. The Live count comes from the hub's actor, which may be busy (hashing a large
-    /// working copy, say), so it is awaited off the main thread with a time limit, and a count
-    /// that does not arrive in time asks too. Every master is disconnected before the reply.
+    /// Asks before quitting abandons unsynced Live edits or running transfers. The hub's actor may
+    /// be busy (say, hashing a large working copy), so the Live count gets a time limit off the
+    /// main thread, and a late count asks too. Every master disconnects before the reply.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let provider else { return .terminateNow }
         let running = TransferModel.unfinishedOperations
