@@ -8,7 +8,7 @@ actor SFTPChannel {
     /// Packets are written on this queue, not in the actor: uploads keep 2 MB in flight and ssh's
     /// stdin pipe holds 64 KB, and a blocked write(2) would hold the actor, its reader included,
     /// for as long as the server does not read, which for a hung server is forever.
-    private let writer = DispatchQueue(label: "SFTPChannel.writer")
+    private let writer = DispatchQueue(label: "SFTPChannel.writer", qos: .userInitiated)
     private let chunks: AsyncStream<Data>
     private let chunkSink: AsyncStream<Data>.Continuation
     private var buffer = Data()
