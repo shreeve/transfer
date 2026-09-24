@@ -223,6 +223,15 @@ import TransferCore
     #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv")) == nil)
 }
 
+/// A `..` in the destination once hid that it was inside the folder being pasted (SFC-13).
+@Test func pasteRefusalSeesThroughDotSegments() {
+    let site = RemotePath(string: "/srv/site")
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/x/../site/sub")) != nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/./site")) != nil)
+    #expect(PasteRules.refusal(sources: [RemotePath(string: "/srv/a/../site")], into: RemotePath(string: "/srv/site/b")) != nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/site/../site2")) == nil)
+}
+
 @Test func pasteIntoTheSameFolderMakesACopy() {
     let file = RemotePath(string: "/srv/notes.txt")
     #expect(PasteRules.destinationName(for: file, into: RemotePath(string: "/srv"), existing: ["notes.txt"]) == "notes copy.txt")

@@ -98,9 +98,11 @@ public enum ClipText {
 /// Decisions for pasting items that live on the destination's own server.
 public enum PasteRules {
     /// Why the paste cannot go ahead, or nil. A folder cannot be pasted into itself or anything
-    /// inside it; the copy would walk into its own output.
+    /// inside it; the copy would walk into its own output. The test is on normalized paths, so
+    /// `/srv/x/../site/sub` is inside `/srv/site`.
     public static func refusal(sources: [RemotePath], into folder: RemotePath) -> String? {
-        for source in sources where folder.isInside(source) {
+        let folder = folder.normalized
+        for source in sources where folder.isInside(source.normalized) {
             return "“\(source.name)” cannot be pasted into itself."
         }
         return nil
