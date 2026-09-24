@@ -200,8 +200,7 @@ public protocol RemoteSession: Sendable {
     func liveFiles() async -> [LiveFile]
     func events() -> AsyncStream<SessionEvent>
     func stars() async -> [RemotePath]
-    func star(_ path: RemotePath) async
-    func unstar(_ path: RemotePath) async
+    func star(_ path: RemotePath, on: Bool) async
     /// Copies a file, link, or folder tree to `destination` on this server, on the server when it
     /// offers `copy-data`, else via the Mac. Folders merge; file collisions settle as for uploads.
     func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws

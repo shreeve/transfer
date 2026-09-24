@@ -1302,7 +1302,8 @@ public final class TransferModel {
 
     public func setStarred(_ paths: [RemotePath], _ starred: Bool) async {
         for path in paths {
-            if starred { await session?.star(path) } else { await session?.unstar(path); starIsFolder[path] = nil }
+            await session?.star(path, on: starred)
+            if !starred { starIsFolder[path] = nil }
         }
         await reloadSidebars()
     }

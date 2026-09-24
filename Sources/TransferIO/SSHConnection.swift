@@ -374,12 +374,8 @@ public actor SSHConnection: RemoteSession {
         store.stars(connection: connection.id)
     }
 
-    public func star(_ path: RemotePath) async {
-        store.star(connection: connection.id, path: path, on: true)
-    }
-
-    public func unstar(_ path: RemotePath) async {
-        store.star(connection: connection.id, path: path, on: false)
+    public func star(_ path: RemotePath, on: Bool) async {
+        store.star(connection: connection.id, path: path, on: on)
     }
 
     /// Joins the master when up, else logs in with the same port and identity, never as a master on
