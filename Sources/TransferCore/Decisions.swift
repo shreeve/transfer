@@ -1,3 +1,7 @@
+// The app's small pure rules: which files open Live, made-up names, copy dispositions, listing
+// order, the column trail, units, retries, preview-cache eviction, and known-hosts matching.
+// Each is a value or a function of values, tested in Tests/TransferCoreTests.
+
 import Foundation
 import UniformTypeIdentifiers
 

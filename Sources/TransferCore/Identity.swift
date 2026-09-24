@@ -1,3 +1,7 @@
+// The identities everything else is keyed by: connections, Live files, remote paths (bytes, not
+// strings, since a server's names need not be UTF-8), listed items, SFTP times and fingerprints,
+// and saved servers.
+
 import Foundation
 
 public struct ConnectionID: Hashable, Sendable, RawRepresentable {
