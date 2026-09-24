@@ -633,15 +633,7 @@ private struct ClipBar: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: 8)
-            Button {
-                Clipboard.shared.clear()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .help("Clear the clipboard (Escape)")
-            .accessibilityLabel("Clear Clipboard")
+            closeButton(help: "Clear the clipboard (Escape)", label: "Clear Clipboard") { Clipboard.shared.clear() }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -703,19 +695,23 @@ private struct MessageBar: View {
                 .truncationMode(.middle)
                 .textSelection(.enabled)
             Spacer(minLength: 8)
-            Button(action: dismiss) {
-                Image(systemName: "xmark.circle.fill")
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .help("Dismiss")
-            .accessibilityLabel("Dismiss")
+            closeButton(help: "Dismiss", label: "Dismiss", action: dismiss)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
     }
+}
+
+/// The close button at the end of a bar.
+@MainActor
+private func closeButton(help: LocalizedStringKey, label: LocalizedStringKey, action: @escaping () -> Void) -> some View {
+    Button(action: action) { Image(systemName: "xmark.circle.fill") }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help(help)
+        .accessibilityLabel(label)
 }
 
 /// The rename field. Focus state has to live inside the hosted detail subtree, so this is its own view.
