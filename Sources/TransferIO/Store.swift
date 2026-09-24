@@ -38,9 +38,14 @@ final class Store: @unchecked Sendable {
     let cacheRoot: URL
 
     /// `root` defaults to `~/Library/Application Support/Transfer`.
-    init(root customRoot: URL? = nil) throws {
-        let standard = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    /// `~/Library/Application Support/Transfer`, the library when no other root is given.
+    static var standardRoot: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Transfer", isDirectory: true)
+    }
+
+    init(root customRoot: URL? = nil) throws {
+        let standard = Self.standardRoot
         let base = customRoot ?? standard
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)

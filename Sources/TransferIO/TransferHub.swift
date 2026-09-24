@@ -9,11 +9,18 @@ public actor TransferHub: SessionProvider {
     /// Every Live file, for every server. One per app: a connection that is replaced keeps its
     /// files, and one watcher covers them all.
     private let live: LiveSync
+    /// Held for the hub's life: one copy of Transfer per library. The launch sweeps, the temps,
+    /// and the ssh control sockets all assume no other process is using this library.
+    private let libraryLock: Int32
 
     /// `root` defaults to `TRANSFER_LIBRARY` (`LibraryOverride`) when that is set, else to
-    /// `~/Library/Application Support/Transfer`.
+    /// `~/Library/Application Support/Transfer`. Throws when another copy of Transfer has the
+    /// library open.
     public init(root: URL? = nil) throws {
-        store = try Store(root: root ?? LibraryOverride.root)
+        let root = root ?? LibraryOverride.root ?? Store.standardRoot
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        libraryLock = try Self.lockLibrary(root)
+        store = try Store(root: root)
         SSHConnection.removeLoginScratch(in: store.root)
         config = ConfigLoader.load(root: store.root)
         live = LiveSync(store: store)
@@ -21,6 +28,18 @@ public actor TransferHub: SessionProvider {
             try? FileManager.default.removeItem(at: temp)
             store.forgetTemp(local: temp)
         }
+    }
+
+    deinit { close(libraryLock) }
+
+    private static func lockLibrary(_ root: URL) throws -> Int32 {
+        let fd = open(root.appendingPathComponent("transfer.lock").path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw TransferError.failed("Transfer could not open its library at \(root.path)") }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            throw TransferError.failed("Another copy of Transfer is already open. Quit it, then open Transfer again.")
+        }
+        return fd
     }
 
     public func savedConnections() async throws -> [SavedConnection] {

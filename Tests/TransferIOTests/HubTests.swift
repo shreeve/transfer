@@ -33,6 +33,18 @@ struct HubTests {
         #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("transfer.sqlite").path))
     }
 
+    /// Two copies on one library would sweep each other's login scratch, temps, and control
+    /// sockets, so the second copy is refused until the first lets go.
+    @Test func oneCopyOfTransferPerLibrary() throws {
+        let root = TestCaches.fresh("lock")
+        defer { try? FileManager.default.removeItem(at: root) }
+        var first: TransferHub? = try TransferHub(root: root)
+        #expect(throws: TransferError.self) { _ = try TransferHub(root: root) }
+        #expect(first != nil)
+        first = nil
+        _ = try TransferHub(root: root)
+    }
+
     /// A library at a custom root, as in tests and development builds, keeps its caches inside
     /// that root, never in the user's `~/Library/Caches/Transfer`.
     @Test func aCustomLibraryKeepsItsCachesInside() throws {

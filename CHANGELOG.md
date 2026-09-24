@@ -62,6 +62,7 @@ Measured at 20 ms round trip against 0.1.7:
 - Go to Remote Folder understands `~`, `~/path`, relative paths, and `..`.
 - The list view keeps Name as its first column.
 - Transfer refuses to open a library written by a newer version, says why, and quits.
+- Only one copy of Transfer opens a library at a time; a second copy says so and quits. (Two copies swept each other's login files and temps and could end each other's connections.)
 - The installer stops, changing nothing, on a Mac where Gatekeeper's assessments are turned off.
 
 ### The library

@@ -73,7 +73,7 @@ ssh live 'mkdir -p ~/bin ~/.config/transfer && cat > ~/bin/xfer && chmod 755 ~/b
 
 | What | Where |
 | --- | --- |
-| Saved servers, stars, Live file records | `~/Library/Application Support/Transfer/transfer.sqlite`, and the `-wal` and `-shm` files beside it |
+| Saved servers, stars, Live file records | `~/Library/Application Support/Transfer/transfer.sqlite`, and the `-wal` and `-shm` files beside it (`transfer.lock` there keeps a second copy of Transfer out) |
 | Working copies of Live files | `~/Library/Application Support/Transfer/Live/` |
 | Editable file extensions | `~/Library/Application Support/Transfer/config.json` (Settings → Extensions) |
 | Passwords you chose to save | Keychain, service "Transfer" |
