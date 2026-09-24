@@ -8,8 +8,8 @@ import TransferCore
 extension SSHConnection {
     // MARK: Remove
 
-    public func remove(_ path: RemotePath) async throws {
-        try await live.remove(path, on: connection.id) {
+    public func remove(_ path: RemotePath, force: Bool) async throws {
+        try await live.remove(path, on: connection.id, force: force) {
             let link = try await self.walkerLink()
             try await self.removeTree(path, folder: try await link.lstat(path).kind == .directory, link: link)
         }

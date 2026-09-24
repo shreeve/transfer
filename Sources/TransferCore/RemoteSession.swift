@@ -182,7 +182,11 @@ public protocol RemoteSession: Sendable {
     func resolve(_ path: RemotePath) async throws -> RemoteItem
     func mkdir(_ path: RemotePath) async throws
     func rename(_ source: RemotePath, to destination: RemotePath) async throws
-    func remove(_ path: RemotePath) async throws
+    /// Removes a file or a folder tree. While a Live file under `path` holds bytes the server
+    /// lacks, it refuses with `TransferError.liveUnsynced` and removes nothing, unless `force`:
+    /// the user was warned and chose to discard those edits. Even then a Live file is forgotten
+    /// only after the server's delete succeeded, so a failed delete keeps every edit.
+    func remove(_ path: RemotePath, force: Bool) async throws
     func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func openKind(fileName: String) async -> OpenKind
@@ -223,6 +227,11 @@ public enum SessionEvent: Sendable {
 }
 
 public extension RemoteSession {
+    /// A removal that never discards unsynced Live edits.
+    func remove(_ path: RemotePath) async throws {
+        try await remove(path, force: false)
+    }
+
     /// The whole tree `walkTree` streams, by key.
     func tree(_ root: RemotePath) async throws -> [TreeKey: TreeEntry] {
         var entries: [TreeKey: TreeEntry] = [:]
