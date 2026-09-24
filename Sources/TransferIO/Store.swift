@@ -1,6 +1,5 @@
 import Foundation
 import SQLite3
-import Security
 import TransferCore
 
 struct LiveRow: Sendable {
@@ -294,43 +293,5 @@ final class Store: @unchecked Sendable {
         if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
             throw TransferError.failed("Could not prepare the library")
         }
-    }
-}
-
-enum KeychainStore {
-    private static let service = "Transfer"
-
-    static func load(account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let text = String(data: data, encoding: .utf8) else { return nil }
-        return text
-    }
-
-    static func save(account: String, secret: String) {
-        delete(account: account)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecValueData as String: Data(secret.utf8),
-        ]
-        SecItemAdd(query as CFDictionary, nil)
-    }
-
-    static func delete(account: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(query as CFDictionary)
     }
 }
