@@ -1,23 +1,58 @@
 import Foundation
 import TransferCore
 
+/// One SFTP channel: an `ssh -s … sftp` passenger, or a test's pipes, spoken to with the codec in
+/// SFTPWire. Every request, reply, and file transfer on a channel goes through this actor. What
+/// the server sends is untrusted: malformed frames, a silent server, and names that are not one
+/// path component end here (see `readLoop`, `watch`, `readDirectory`).
 actor SFTPChannel {
-    private let process: Process
+    /// The ssh passenger, ended on close. Nil for a channel a test drives over its own pipes.
+    private let process: Process?
     private let input: FileHandle
+    /// Packets are written on this queue, not in the actor: uploads keep 2 MB in flight and ssh's
+    /// stdin pipe holds 64 KB, and a blocked write(2) would hold the actor, its reader included,
+    /// for as long as the server does not read, which for a hung server is forever.
+    private let writer = DispatchQueue(label: "SFTPChannel.writer", qos: .userInitiated)
     private let chunks: AsyncStream<Data>
     private let chunkSink: AsyncStream<Data>.Continuation
-    private var buffer = Data()
+    private var frames = SFTPWire.Frames()
     private var nextID: UInt32 = 1
     private var waiters: [UInt32: CheckedContinuation<SFTPMessage, Error>] = [:]
     private var versionWaiter: CheckedContinuation<UInt32, Error>?
+    /// Whether the server's VERSION has arrived. Anything else before it is not SFTP.
+    private var greeted = false
     /// The extensions the server named in its VERSION reply, such as `copy-data`.
     private(set) var extensions: Set<String> = []
     private var reader: Task<Void, Never>?
+    private var watchdog: Task<Void, Never>?
     private(set) var isOpen = true
 
-    init(process: Process, input: FileHandle, output: FileHandle) {
+    /// A server that answers nothing for this long while requests wait has hung; the channel
+    /// closes and its requests fail with a timeout, which a transfer retries on a new channel.
+    /// Replies arrive every 64 KB during a transfer, so only a dead server is this quiet.
+    private let stallLimit: Duration
+    /// How long the server has to answer INIT.
+    private let handshakeLimit: Duration
+    private var lastHeard = ContinuousClock.now
+    private var handshakeStarted: ContinuousClock.Instant?
+    /// Requests the server may rightly take minutes over, such as `copy-data`, which answers when
+    /// the whole file is written. While one waits, silence is not a stall.
+    private var longCalls = 0
+
+    init(
+        process: Process?,
+        input: FileHandle,
+        output: FileHandle,
+        stallLimit: Duration = .seconds(60),
+        handshakeLimit: Duration = .seconds(15)
+    ) {
         self.process = process
         self.input = input
+        self.stallLimit = stallLimit
+        self.handshakeLimit = handshakeLimit
+        // A write after the server has gone fails with EPIPE, which closes the channel; the default
+        // SIGPIPE would end the whole app first.
+        _ = fcntl(input.fileDescriptor, F_SETNOSIGPIPE, 1)
         let (chunks, sink) = AsyncStream<Data>.makeStream()
         self.chunks = chunks
         chunkSink = sink
@@ -35,14 +70,24 @@ actor SFTPChannel {
 
     func start() {
         reader = Task { await self.readLoop() }
+        watchdog = Task { await self.watch() }
     }
 
+    /// Sends INIT and waits for VERSION, for at most `handshakeLimit`. Cancelling it closes the
+    /// channel.
     func handshake() async throws {
-        var body = Data()
-        body.appendU32(3)
-        try write(SFTPWire.packet(type: SFTPCode.initialize, body: body))
-        let version: UInt32 = try await withCheckedThrowingContinuation { continuation in
-            versionWaiter = continuation
+        handshakeStarted = .now
+        send(SFTPWire.packet(type: SFTPCode.initialize) { $0.appendU32(3) })
+        let version: UInt32 = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if isOpen {
+                    versionWaiter = continuation
+                } else {
+                    continuation.resume(throwing: TransferError.connectionLost("SSH channel closed"))
+                }
+            }
+        } onCancel: {
+            Task { await self.shutDown(.cancelled) }
         }
         if version < 3 {
             throw TransferError.failed("Server SFTP version \(version) is too old")
@@ -50,50 +95,52 @@ actor SFTPChannel {
     }
 
     func realpath(_ path: RemotePath) async throws -> RemotePath {
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        let message = try await call(SFTPCode.realpath, body: body)
+        let message = try await call(SFTPCode.realpath) { $0.appendPath(path) }
         let names = try names(in: message)
         guard let first = names.first else { throw TransferError.failed("Empty realpath") }
         return RemotePath(bytes: Array(first.filename))
     }
 
     func lstat(_ path: RemotePath) async throws -> RemoteItem {
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        let message = try await call(SFTPCode.lstat, body: body)
+        let message = try await call(SFTPCode.lstat) { $0.appendPath(path) }
         return try item(path: path, message: message)
     }
 
-    /// Keeps several READDIR requests in flight. OpenSSH answers each with about a hundred names,
-    /// so a large folder no longer pays one round trip per page.
+    /// Keeps several READDIR requests in flight. OpenSSH answers each with at most a hundred names,
+    /// so a large folder no longer pays one round trip per page. A listing its reader abandons
+    /// stops at once and still closes its handle on the server.
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     let handle = try await openDirectory(path)
-                    do {
-                        var inFlight: [Task<[RemoteItem]?, Error>] = []
-                        var finished = false
-                        while !finished || !inFlight.isEmpty {
-                            while !finished, inFlight.count < 4 {
-                                inFlight.append(Task { try await self.readDirectoryPage(handle, parent: path) })
-                            }
-                            let next = inFlight.removeFirst()
-                            guard let page = try await next.value else {
-                                finished = true
-                                continue
-                            }
-                            if page.isEmpty { finished = true }
-                            for item in page where !item.isDotEntry {
-                                continuation.yield(item)
-                            }
-                            try Task.checkCancellation()
+                    var inFlight: [Task<[RemoteItem]?, Error>] = []
+                    defer {
+                        for page in inFlight { page.cancel() }
+                        closeLater(handle)
+                    }
+                    var finished = false
+                    var pages = 0
+                    while !finished || !inFlight.isEmpty {
+                        // Four pages at first, so a small folder asks for at most three pages
+                        // past its end; sixteen once four have come, so a large one pays about
+                        // one round trip per 1,600 names.
+                        while !finished, inFlight.count < (pages < 4 ? 4 : 16) {
+                            inFlight.append(Task { try await self.readDirectoryPage(handle, parent: path) })
                         }
-                        try? await self.close(handle)
-                    } catch {
-                        try? await self.close(handle)
-                        throw error
+                        let next = inFlight.removeFirst()
+                        let page = try await withTaskCancellationHandler {
+                            try await next.value
+                        } onCancel: {
+                            next.cancel()
+                        }
+                        guard let page, !page.isEmpty else {
+                            finished = true
+                            continue
+                        }
+                        pages += 1
+                        for item in page { continuation.yield(item) }
+                        try Task.checkCancellation()
                     }
                     continuation.finish()
                 } catch {
@@ -108,89 +155,112 @@ actor SFTPChannel {
     private func readDirectoryPage(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem]? {
         do {
             return try await readDirectory(handle, parent: parent)
-        } catch TransferError.failed(let text) where text == "EOF" {
+        } catch is EndOfFile {
             return nil
         }
     }
 
     func mkdir(_ path: RemotePath) async throws {
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        body.append(SFTPAttrs().encoded())
-        _ = try await call(SFTPCode.mkdir, body: body)
+        _ = try await call(SFTPCode.mkdir) {
+            $0.appendPath(path)
+            $0.append(SFTPAttrs().encoded())
+        }
     }
 
     /// A rename or move the user asked for. It never replaces what is already at `destination`:
     /// `posix-rename` would, and plain RENAME refuses a file there but on OpenSSH replaces an empty
     /// folder, so the destination is looked up first. A change of case alone within one folder
-    /// skips the lookup, which on a case-insensitive disk finds the source itself.
+    /// needs `posix-rename` on a case-insensitive disk, where the lookup finds the source itself;
+    /// the folder's listing tells that apart from a second file on a case-sensitive disk.
     func rename(_ source: RemotePath, to destination: RemotePath) async throws {
-        let caseOnly = source.parent == destination.parent && source != destination
-            && source.name.lowercased() == destination.name.lowercased()
-        if caseOnly {
-            if await posixRename(source, to: destination) { return }
-            try await plainRename(source, to: destination)
-            return
+        let taken: Bool
+        do {
+            _ = try await lstat(destination)
+            taken = true
+        } catch TransferError.noSuchFile {
+            taken = false
         }
-        if (try? await lstat(destination)) != nil {
-            throw TransferError.failed("“\(destination.name)” already exists there")
+        if taken {
+            let caseOnly = source.parent == destination.parent && source != destination
+                && source.name.lowercased() == destination.name.lowercased()
+            guard caseOnly, let folder = destination.parent, try await !hasEntry(named: destination.name, in: folder) else {
+                throw TransferError.failed("“\(destination.name)” already exists there")
+            }
+            if (try? await posixRename(source, to: destination)) != nil { return }
         }
         try await plainRename(source, to: destination)
     }
 
-    /// `posix-rename@openssh.com` replaces the destination. False when the server lacks it.
-    func posixRename(_ source: RemotePath, to destination: RemotePath) async -> Bool {
-        var body = Data()
-        body.appendString("posix-rename@openssh.com")
-        body.appendBlob(Data(source.bytes))
-        body.appendBlob(Data(destination.bytes))
-        do {
-            _ = try await call(SFTPCode.extended, body: body)
-            return true
-        } catch {
-            return false
+    /// Whether `folder` lists an entry named `name`. Strings compare as Unicode does, so a name
+    /// that differs only in normalization counts, as it does on APFS.
+    private func hasEntry(named name: String, in folder: RemotePath) async throws -> Bool {
+        for try await item in list(folder) where item.name == name { return true }
+        return false
+    }
+
+    /// `posix-rename@openssh.com`, which replaces the destination.
+    private func posixRename(_ source: RemotePath, to destination: RemotePath) async throws {
+        _ = try await call(SFTPCode.extended) {
+            $0.appendString("posix-rename@openssh.com")
+            $0.appendPath(source)
+            $0.appendPath(destination)
         }
     }
 
     /// Puts `temp` in place of `placed`. With `posix-rename@openssh.com` the swap is atomic and a
     /// failure leaves `placed` untouched. Without it, SFTP v3 rename will not replace a file, so
-    /// `placed` is removed first.
+    /// `placed` steps aside under a hidden name first and comes back if `temp` cannot take its
+    /// place: a failure never leaves the server with neither the old file nor the new one. A
+    /// folder is never replaced, as posix-rename would refuse it.
     func replace(_ temp: RemotePath, onto placed: RemotePath) async throws {
         if extensions.contains("posix-rename@openssh.com") {
-            var body = Data()
-            body.appendString("posix-rename@openssh.com")
-            body.appendBlob(Data(temp.bytes))
-            body.appendBlob(Data(placed.bytes))
-            _ = try await call(SFTPCode.extended, body: body)
+            try await posixRename(temp, to: placed)
             return
         }
-        try? await removeFile(placed)
-        try await plainRename(temp, to: placed)
+        // Once the old file has stepped aside, cancelling must not stop it coming back: the steps
+        // run in a task of their own, which the caller's cancellation does not reach.
+        try await Task { try await self.replaceStepping(temp, onto: placed) }.value
     }
 
-    func plainRename(_ source: RemotePath, to destination: RemotePath) async throws {
-        var body = Data()
-        body.appendBlob(Data(source.bytes))
-        body.appendBlob(Data(destination.bytes))
-        _ = try await call(SFTPCode.rename, body: body)
+    private func replaceStepping(_ temp: RemotePath, onto placed: RemotePath) async throws {
+        let existing: RemoteItem
+        do {
+            existing = try await lstat(placed)
+        } catch TransferError.noSuchFile {
+            try await plainRename(temp, to: placed)
+            return
+        }
+        guard existing.kind != .directory, let folder = placed.parent else { throw TransferError.typeMismatch(placed.name) }
+        // Short, so a long name cannot push it past the server's name limit.
+        let aside = folder.appending(name: Array(".transfer-old-\(UUID().uuidString)".utf8))
+        try await plainRename(placed, to: aside)
+        do {
+            try await plainRename(temp, to: placed)
+        } catch {
+            try? await plainRename(aside, to: placed)
+            throw error
+        }
+        try? await removeFile(aside)
+    }
+
+    /// SSH_FXP_RENAME, which on OpenSSH never replaces a file but does replace an empty folder.
+    private func plainRename(_ source: RemotePath, to destination: RemotePath) async throws {
+        _ = try await call(SFTPCode.rename) {
+            $0.appendPath(source)
+            $0.appendPath(destination)
+        }
     }
 
     func removeFile(_ path: RemotePath) async throws {
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        _ = try await call(SFTPCode.remove, body: body)
+        _ = try await call(SFTPCode.remove) { $0.appendPath(path) }
     }
 
     func removeDirectory(_ path: RemotePath) async throws {
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        _ = try await call(SFTPCode.rmdir, body: body)
+        _ = try await call(SFTPCode.rmdir) { $0.appendPath(path) }
     }
 
     func readlink(_ path: RemotePath) async throws -> String {
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        let message = try await call(SFTPCode.readlink, body: body)
+        let message = try await call(SFTPCode.readlink) { $0.appendPath(path) }
         let names = try names(in: message)
         guard let first = names.first else { throw TransferError.failed("Empty readlink") }
         return String(decoding: first.filename, as: UTF8.self)
@@ -199,38 +269,34 @@ actor SFTPChannel {
     /// OpenSSH's sftp-server reads SYMLINK as (target, link), the reverse of the draft. Every
     /// version-3 server in use follows OpenSSH here.
     func symlink(target: String, link: RemotePath) async throws {
-        var body = Data()
-        body.appendString(target)
-        body.appendBlob(Data(link.bytes))
-        _ = try await call(SFTPCode.symlink, body: body)
+        _ = try await call(SFTPCode.symlink) {
+            $0.appendString(target)
+            $0.appendPath(link)
+        }
     }
 
     /// Copies a file on the server with OpenSSH's `copy-data` extension; no bytes cross the
     /// network. The reply comes when the whole file is written. Callers check `extensions` first.
     func copyData(_ source: RemotePath, to destination: RemotePath) async throws {
         let from = try await openFile(source, flags: SFTPCode.fxRead)
+        defer { closeLater(from) }
+        let to = try await openFile(destination, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
         do {
-            let to = try await openFile(destination, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
-            do {
-                var body = Data()
-                body.appendString("copy-data")
-                body.appendBlob(from)
-                body.appendU64(0)
+            _ = try await call(SFTPCode.extended, long: true) {
+                $0.appendString("copy-data")
+                $0.appendBlob(from)
+                $0.appendU64(0)
                 // A length of zero copies to the end of the file.
-                body.appendU64(0)
-                body.appendBlob(to)
-                body.appendU64(0)
-                _ = try await call(SFTPCode.extended, body: body)
-            } catch {
-                try? await close(to)
-                throw error
+                $0.appendU64(0)
+                $0.appendBlob(to)
+                $0.appendU64(0)
             }
-            try await close(to)
         } catch {
-            try? await close(from)
+            closeLater(to)
             throw error
         }
-        try? await close(from)
+        // Closing the written file can report a failed last write, so this CLOSE is awaited.
+        try await close(to)
     }
 
     func setstat(_ path: RemotePath, mode: UInt32?, mtime: UInt32?) async throws {
@@ -240,10 +306,10 @@ actor SFTPChannel {
             attrs.atime = mtime
             attrs.mtime = mtime
         }
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        body.append(attrs.encoded())
-        _ = try await call(SFTPCode.setstat, body: body)
+        _ = try await call(SFTPCode.setstat) {
+            $0.appendPath(path)
+            $0.append(attrs.encoded())
+        }
     }
 
     func download(
@@ -253,7 +319,7 @@ actor SFTPChannel {
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxRead)
-        defer { Task { try? await self.close(handle) } }
+        defer { closeLater(handle) }
         FileManager.default.createFile(atPath: destination.path, contents: nil)
         let output = try FileHandle(forWritingTo: destination)
         defer { try? output.close() }
@@ -263,6 +329,7 @@ actor SFTPChannel {
         }
         // 32 requests of 64 KB keep 2 MB in flight.
         var plan = ReadPlan(size: limit)
+        var pacer = ProgressPacer(report: progress)
         var inFlight: [(offset: UInt64, length: UInt32, task: Task<Data, Error>)] = []
         defer { for read in inFlight { read.task.cancel() } }
         while true {
@@ -274,18 +341,23 @@ actor SFTPChannel {
             guard !inFlight.isEmpty else { break }
             let read = inFlight.removeFirst()
             do {
-                let chunk = try await read.task.value
+                let chunk = try await withTaskCancellationHandler {
+                    try await read.task.value
+                } onCancel: {
+                    read.task.cancel()
+                }
                 guard chunk.count <= Int(read.length) else { throw TransferError.failed("The server sent more than was asked for") }
                 if !chunk.isEmpty {
                     try output.seek(toOffset: read.offset)
                     try output.write(contentsOf: chunk)
                 }
                 plan.record(offset: read.offset, length: read.length, count: UInt32(chunk.count))
-                progress(TransferProgress(completed: plan.received, total: limit))
-            } catch TransferError.failed(let text) where text == "EOF" {
+                pacer.update(TransferProgress(completed: plan.received, total: limit))
+            } catch is EndOfFile {
                 plan.endOfFile()
             }
         }
+        pacer.finish()
         guard plan.isComplete else { throw TransferError.failed("The file changed on the server while it downloaded") }
     }
 
@@ -293,27 +365,29 @@ actor SFTPChannel {
     /// is not the end; only EOF or a reply with no bytes is.
     private func downloadSequential(handle: Data, output: FileHandle, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         var offset: UInt64 = 0
+        var pacer = ProgressPacer(report: progress)
+        defer { pacer.finish() }
         while true {
             try Task.checkCancellation()
             let chunk: Data
             do {
                 chunk = try await readChunk(handle, offset: offset, length: 65_536)
-            } catch TransferError.failed(let text) where text == "EOF" {
+            } catch is EndOfFile {
                 break
             }
             if chunk.isEmpty { break }
             try output.write(contentsOf: chunk)
             offset += UInt64(chunk.count)
-            progress(TransferProgress(completed: offset))
+            pacer.update(TransferProgress(completed: offset))
         }
     }
 
     private func readChunk(_ handle: Data, offset: UInt64, length: UInt32) async throws -> Data {
-        var body = Data()
-        body.appendBlob(handle)
-        body.appendU64(offset)
-        body.appendU32(length)
-        let message = try await call(SFTPCode.read, body: body)
+        let message = try await call(SFTPCode.read) {
+            $0.appendBlob(handle)
+            $0.appendU64(offset)
+            $0.appendU32(length)
+        }
         guard message.type == SFTPCode.data else { throw TransferError.failed("Expected data") }
         var reader = ByteReader(message.rest)
         return try reader.blob()
@@ -326,34 +400,41 @@ actor SFTPChannel {
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
-        defer { Task { try? await self.close(handle) } }
+        defer { closeLater(handle) }
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
         let total = (try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(UInt64.init)
         var offset: UInt64 = 0
         var acknowledged: UInt64 = 0
+        var pacer = ProgressPacer(report: progress)
         var inFlight: [Task<UInt64, Error>] = []
+        var read = false
         do {
-            while true {
+            while !read || !inFlight.isEmpty {
                 try Task.checkCancellation()
-                let chunk = try input.read(upToCount: 65_536) ?? Data()
-                if chunk.isEmpty { break }
-                let at = offset
-                let count = UInt64(chunk.count)
-                offset += count
-                inFlight.append(Task {
-                    try await self.writeChunk(handle, offset: at, data: chunk)
-                    return count
-                })
-                if inFlight.count >= 32 {
-                    acknowledged += try await inFlight.removeFirst().value
-                    progress(TransferProgress(completed: acknowledged, total: total))
+                if !read, inFlight.count < 32 {
+                    let chunk = try input.read(upToCount: 65_536) ?? Data()
+                    read = chunk.isEmpty
+                    guard !read else { continue }
+                    let at = offset
+                    let count = UInt64(chunk.count)
+                    offset += count
+                    inFlight.append(Task {
+                        try await self.writeChunk(handle, offset: at, data: chunk)
+                        return count
+                    })
+                    continue
                 }
+                // Cancelling the upload cancels this wait, so a stalled server cannot hold it.
+                let oldest = inFlight.removeFirst()
+                acknowledged += try await withTaskCancellationHandler {
+                    try await oldest.value
+                } onCancel: {
+                    oldest.cancel()
+                }
+                pacer.update(TransferProgress(completed: acknowledged, total: total))
             }
-            while !inFlight.isEmpty {
-                acknowledged += try await inFlight.removeFirst().value
-                progress(TransferProgress(completed: acknowledged, total: total))
-            }
+            pacer.finish()
         } catch {
             for task in inFlight { task.cancel() }
             throw error
@@ -361,76 +442,140 @@ actor SFTPChannel {
     }
 
     private func writeChunk(_ handle: Data, offset: UInt64, data: Data) async throws {
-        var body = Data()
-        body.appendBlob(handle)
-        body.appendU64(offset)
-        body.appendBlob(data)
-        _ = try await call(SFTPCode.write, body: body)
+        _ = try await call(SFTPCode.write, capacity: data.count + 64) {
+            $0.appendBlob(handle)
+            $0.appendU64(offset)
+            $0.appendBlob(data)
+        }
+    }
+
+    /// Hands progress on at most ten times a second, and always the last value: the UI hops to
+    /// the main actor for each report, and a fast transfer finishes a 64 KB request every few
+    /// microseconds.
+    private struct ProgressPacer {
+        let report: @Sendable (TransferProgress) -> Void
+        private var last: ContinuousClock.Instant?
+        private var held: TransferProgress?
+
+        init(report: @escaping @Sendable (TransferProgress) -> Void) {
+            self.report = report
+        }
+
+        mutating func update(_ progress: TransferProgress) {
+            let now = ContinuousClock.now
+            if let last, now - last < .milliseconds(100) {
+                held = progress
+                return
+            }
+            last = now
+            held = nil
+            report(progress)
+        }
+
+        mutating func finish() {
+            if let held { report(held) }
+            held = nil
+        }
     }
 
     func closeLink() {
+        shutDown(.cancelled)
+    }
+
+    /// Closes the channel for good: ends ssh, and fails the handshake and every waiting request
+    /// with `error`. Later calls fail as a closed channel.
+    private func shutDown(_ error: TransferError) {
+        guard isOpen else { return }
         isOpen = false
-        process.terminate()
+        process?.terminate()
         reader?.cancel()
+        watchdog?.cancel()
         chunkSink.finish()
-        for waiter in waiters.values {
-            waiter.resume(throwing: TransferError.cancelled)
-        }
-        waiters.removeAll()
-        versionWaiter?.resume(throwing: TransferError.cancelled)
+        versionWaiter?.resume(throwing: error)
         versionWaiter = nil
+        for waiter in waiters.values { waiter.resume(throwing: error) }
+        waiters.removeAll()
+    }
+
+    /// Ends a handshake past `handshakeLimit`, and a channel whose server has said nothing for
+    /// `stallLimit` while requests wait.
+    private func watch() async {
+        while isOpen {
+            try? await Task.sleep(for: (greeted ? stallLimit : min(stallLimit, handshakeLimit)) / 5)
+            let now = ContinuousClock.now
+            if versionWaiter != nil, let handshakeStarted, now - handshakeStarted > handshakeLimit {
+                shutDown(.timeout("The server did not start SFTP"))
+            } else if !waiters.isEmpty, longCalls == 0, now - lastHeard > stallLimit {
+                shutDown(.timeout("The server stopped answering"))
+            }
+        }
     }
 
     private func openDirectory(_ path: RemotePath) async throws -> Data {
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        let message = try await call(SFTPCode.opendir, body: body)
+        let message = try await call(SFTPCode.opendir) { $0.appendPath(path) }
         return try handle(in: message)
     }
 
+    /// One page of `parent`'s entries. A name the server sends is used as a path component, so
+    /// anything that is not exactly one is dropped: `.` and `..`, an empty name, and a name with
+    /// a slash or NUL, which a hostile server could send to reach outside the folder.
     private func readDirectory(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem] {
-        var body = Data()
-        body.appendBlob(handle)
-        let message = try await call(SFTPCode.readdir, body: body)
-        return try names(in: message).map { name in
-            let path = parent.appending(name: Array(name.filename))
-            return item(path: path, attrs: name.attrs)
+        let message = try await call(SFTPCode.readdir) { $0.appendBlob(handle) }
+        return try names(in: message).compactMap { name in
+            guard Self.isSingleComponent(name.filename) else { return nil }
+            return item(path: parent.appending(name: Array(name.filename)), attrs: name.attrs)
         }
     }
 
+    static func isSingleComponent(_ name: Data) -> Bool {
+        !name.isEmpty && name != Data([0x2E]) && name != Data([0x2E, 0x2E])
+            && !name.contains(0x2F) && !name.contains(0)
+    }
+
     private func openFile(_ path: RemotePath, flags: UInt32) async throws -> Data {
-        var body = Data()
-        body.appendBlob(Data(path.bytes))
-        body.appendU32(flags)
-        body.append(SFTPAttrs().encoded())
-        let message = try await call(SFTPCode.open, body: body)
+        let message = try await call(SFTPCode.open) {
+            $0.appendPath(path)
+            $0.appendU32(flags)
+            $0.append(SFTPAttrs().encoded())
+        }
         return try handle(in: message)
     }
 
-    private func close(_ handle: Data) async throws {
-        var body = Data()
-        body.appendBlob(handle)
-        _ = try await call(SFTPCode.close, body: body)
+    /// Closes `handle` in a task of its own, unawaited. Cleanup after a cancellation must still
+    /// reach the server, and `call` refuses to start in a cancelled task.
+    private nonisolated func closeLater(_ handle: Data) {
+        Task { try? await self.close(handle) }
     }
 
-    private var cancelledIDs: Set<UInt32> = []
+    private func close(_ handle: Data) async throws {
+        _ = try await call(SFTPCode.close) { $0.appendBlob(handle) }
+    }
 
-    private func call(_ type: UInt8, body: Data) async throws -> SFTPMessage {
+    /// Sends one request, its fields appended by `fields` after the id, and waits for the reply.
+    /// A failure status throws; end of file throws `EndOfFile`. The waiter is registered in the
+    /// same actor turn that sends the request, so no reply can arrive before it and a
+    /// cancellation, which runs on the actor after it, always finds it or finds it answered.
+    private func call(
+        _ type: UInt8,
+        capacity: Int = 64,
+        long: Bool = false,
+        _ fields: (inout Data) -> Void
+    ) async throws -> SFTPMessage {
         try Task.checkCancellation()
         guard isOpen else { throw TransferError.connectionLost("SSH channel closed") }
         let id = nextID
-        nextID += 1
-        var framed = Data()
-        framed.appendU32(id)
-        framed.append(body)
-        try write(SFTPWire.packet(type: type, body: framed))
+        nextID &+= 1
+        // An idle channel's silence was not a stall; the clock starts with the first request.
+        if waiters.isEmpty { lastHeard = .now }
+        send(SFTPWire.packet(type: type, capacity: capacity) { packet in
+            packet.appendU32(id)
+            fields(&packet)
+        })
+        if long { longCalls += 1 }
+        defer { if long { longCalls -= 1 } }
         let message: SFTPMessage = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                if cancelledIDs.remove(id) != nil {
-                    continuation.resume(throwing: TransferError.cancelled)
-                } else {
-                    waiters[id] = continuation
-                }
+                waiters[id] = continuation
             }
         } onCancel: {
             Task { await self.cancelRequest(id) }
@@ -440,7 +585,7 @@ actor SFTPChannel {
             let code = (try? reader.u32()) ?? SFTPCode.failure
             let text = (try? reader.utf8()) ?? "SFTP error \(code)"
             if code == SFTPCode.ok { return message }
-            if code == SFTPCode.eof { throw TransferError.failed("EOF") }
+            if code == SFTPCode.eof { throw EndOfFile() }
             if code == SFTPCode.noSuchFile { throw TransferError.noSuchFile(text) }
             if code == SFTPCode.permission { throw TransferError.permissionDenied(text) }
             throw TransferError.failed(text)
@@ -448,55 +593,68 @@ actor SFTPChannel {
         return message
     }
 
+    /// The server's EOF status: the end of a directory or a file, not a failure.
+    private struct EndOfFile: Error {}
+
     private func cancelRequest(_ id: UInt32) {
-        if let waiter = waiters.removeValue(forKey: id) {
-            waiter.resume(throwing: TransferError.cancelled)
-        } else {
-            cancelledIDs.insert(id)
-        }
+        waiters.removeValue(forKey: id)?.resume(throwing: TransferError.cancelled)
     }
 
-    private func write(_ packet: Data) throws {
-        do {
-            try input.write(contentsOf: packet)
-        } catch {
-            throw TransferError.connectionLost("Broken SSH channel")
+    /// Queues `packet` for ssh's stdin, in order. A failed write means ssh is gone.
+    private func send(_ packet: Data) {
+        writer.async { [input] in
+            do {
+                try input.write(contentsOf: packet)
+            } catch {
+                Task { await self.shutDown(.connectionLost("Broken SSH channel")) }
+            }
         }
     }
 
     private func readLoop() async {
         for await chunk in chunks {
-            buffer.append(chunk)
-            while let packet = SFTPWire.popPacket(from: &buffer) {
-                if packet.type == SFTPCode.version {
-                    let version = packet.rest.prefix(4).loadU32()
-                    var reader = ByteReader(Data(packet.rest.dropFirst(4)))
-                    while let name = try? reader.utf8(), (try? reader.blob()) != nil {
-                        extensions.insert(name)
-                    }
-                    versionWaiter?.resume(returning: version)
-                    versionWaiter = nil
-                    continue
+            lastHeard = .now
+            frames.append(chunk)
+            do {
+                while let packet = try frames.next() {
+                    try receive(packet)
                 }
-                guard packet.rest.count >= 4 else { continue }
-                let id = packet.rest.prefix(4).loadU32()
-                let rest = packet.rest.dropFirst(4)
-                let message = SFTPMessage(type: packet.type, rest: Data(rest))
-                waiters.removeValue(forKey: id)?.resume(returning: message)
+            } catch {
+                shutDown(greeted
+                    ? .connectionLost("The server sent a malformed SFTP packet")
+                    : .failed(SFTPWire.notSFTP(frames.unread)))
+                return
             }
         }
-        isOpen = false
-        let error = TransferError.connectionLost("SSH channel closed")
-        versionWaiter?.resume(throwing: error)
-        versionWaiter = nil
-        for waiter in waiters.values { waiter.resume(throwing: error) }
-        waiters.removeAll()
+        shutDown(.connectionLost("SSH channel closed"))
+    }
+
+    /// The server's VERSION first, then replies, each matched to its waiter by id. A reply
+    /// nobody waits for answers a cancelled request and is dropped.
+    private func receive(_ packet: SFTPMessage) throws {
+        var reader = ByteReader(packet.rest)
+        guard greeted else {
+            guard packet.type == SFTPCode.version else { throw SFTPWire.BadFrame() }
+            let version = try reader.u32()
+            while let name = try? reader.utf8(), (try? reader.blob()) != nil {
+                extensions.insert(name)
+            }
+            greeted = true
+            versionWaiter?.resume(returning: version)
+            versionWaiter = nil
+            return
+        }
+        let id = try reader.u32()
+        let message = SFTPMessage(type: packet.type, rest: packet.rest.dropFirst(4))
+        waiters.removeValue(forKey: id)?.resume(returning: message)
     }
 
     private func handle(in message: SFTPMessage) throws -> Data {
         guard message.type == SFTPCode.handle else { throw TransferError.failed("Expected a handle") }
         var reader = ByteReader(message.rest)
-        return try reader.blob()
+        // A copy: a handle lives as long as its file is open, and a slice would keep the whole
+        // read it arrived in.
+        return Data(try reader.blob())
     }
 
     private func names(in message: SFTPMessage) throws -> [SFTPName] {
