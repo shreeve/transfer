@@ -27,12 +27,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             inspector: NSHostingController(rootView: AnyView(inspector))
         )
         context.coordinator.controller = controller
-        controller.sidebarToggled = { [weak coordinator = context.coordinator] collapsed in
-            if coordinator?.model.sidebarCollapsed != collapsed { coordinator?.model.sidebarCollapsed = collapsed }
-        }
-        controller.inspectorToggled = { [weak coordinator = context.coordinator] shown in
-            if coordinator?.model.showsInspector != shown { coordinator?.model.showsInspector = shown }
-        }
         let container = ChromeContainer(controller: controller)
         apply(to: controller, context: context)
         return container
@@ -60,7 +54,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         context.coordinator.selectViewMode(viewMode)
         if context.coordinator.searchTick != searchTick {
             context.coordinator.searchTick = searchTick
-            context.coordinator.beginSearch()
+            context.coordinator.beginSearch(nil)
         }
     }
 
@@ -138,7 +132,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 view.field.delegate = self
                 view.field.sendsSearchStringImmediately = true
                 view.button.target = self
-                view.button.action = #selector(expandSearch(_:))
+                view.button.action = #selector(beginSearch(_:))
                 view.onCollapse = { [weak self] in self?.model.textEditing = false }
                 item.view = view
                 view.item = item
@@ -164,12 +158,12 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             if viewGroup?.selectedIndex != wanted { viewGroup?.selectedIndex = wanted }
         }
 
-        func beginSearch() {
+        /// Command-F and the magnifier. The field holds the focus from here on, so Return and
+        /// Space stay with it even before the first character, which is when AppKit reports
+        /// that searching started.
+        @objc func beginSearch(_ sender: Any?) {
             searchView?.expand(focus: true)
-        }
-
-        @objc private func expandSearch(_ sender: Any?) {
-            searchView?.expand(focus: true)
+            model.textEditing = true
         }
 
         @objc private func navigate(_ sender: NSToolbarItemGroup) {
@@ -285,16 +279,16 @@ final class ChromeController: NSSplitViewController {
 
     /// Finder shows a faint line under the toolbar, over the content column only, while the
     /// pointer is in the toolbar. This is that line.
-    private let hoverLine = NSView()
+    private let hoverLine = HoverLine()
     private var hoverTracking: NSTrackingArea?
-    private var keyObservers: [any NSObjectProtocol] = []
+    /// Notification observers on this controller's window, removed when the window closes.
+    private var windowObservers: [any NSObjectProtocol] = []
     var hoverLineEnabled = true {
         didSet { refreshHoverLine(animated: false) }
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        hoverLine.wantsLayer = true
         hoverLine.alphaValue = 0
         view.addSubview(hoverLine, positioned: .above, relativeTo: nil)
     }
@@ -343,7 +337,6 @@ final class ChromeController: NSSplitViewController {
         let target: CGFloat = hoverLineEnabled && (hovering || inspectorOut) ? 1 : 0
         if target > 0 { placeHoverLine() }
         guard hoverLine.alphaValue != target else { return }
-        hoverLine.layer?.backgroundColor = NSColor.separatorColor.cgColor
         guard animated else {
             hoverLine.alphaValue = target
             return
@@ -369,7 +362,6 @@ final class ChromeController: NSSplitViewController {
     /// then stays until something sets the style again, so the window is watched and every
     /// layout re-asserts none. The hover line is the only line under the toolbar.
     private var separatorObservation: NSKeyValueObservation?
-    private var separatorUpdateObserver: (any NSObjectProtocol)?
 
 
     /// AppKit hangs a scroll pocket, the macOS 26 scroll-edge effect, under the toolbar over each
@@ -382,8 +374,9 @@ final class ChromeController: NSSplitViewController {
         guard let frame = view.window?.contentView?.superview, splitViewItems.count == 3 else { return }
         let sidebar = splitViewItems[0].viewController.view
         let sidebarEdge = splitViewItems[0].isCollapsed ? 0 : sidebar.convert(sidebar.bounds, to: nil).maxX
+        guard let pocket = Self.scrollPocketClass else { return }
         func walk(_ v: NSView) {
-            if String(describing: type(of: v)) == "NSScrollPocket" {
+            if v.isKind(of: pocket) {
                 if !v.isHidden, v.convert(v.bounds, to: nil).minX >= sidebarEdge - 1 { v.isHidden = true }
                 return
             }
@@ -391,6 +384,9 @@ final class ChromeController: NSSplitViewController {
         }
         walk(frame)
     }
+
+    /// Looked up once. A future AppKit without the class hides nothing, which only costs a line.
+    private static let scrollPocketClass: AnyClass? = NSClassFromString("NSScrollPocket")
 
     private func keepSeparatorOff() {
         guard let window = view.window, window.titlebarSeparatorStyle != .none else { return }
@@ -420,23 +416,27 @@ final class ChromeController: NSSplitViewController {
         // The window posts this after every pass of event handling, so a style SwiftUI sets after
         // the last layout of an inspector animation is still caught before the next frame draws.
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
-            keyObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
+            windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
                 MainActor.assumeIsolated { self?.refreshHoverLine(animated: true) }
             })
         }
-        separatorUpdateObserver = NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
+        windowObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
-        }
+        })
+        windowObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: nil) { [weak self] _ in
+            MainActor.assumeIsolated { self?.windowWillClose() }
+        })
         window.tabbingMode = .preferred
         // A tab takes its window's frame; any other new window is placed.
         if !NewTab.join(window) {
             WindowFrames.place(window, among: Self.live.allObjects.compactMap { $0 === self ? nil : $0.view.window })
         }
         // Watched only once placed: a new window becomes main at SwiftUI's default size first,
-        // which would otherwise replace the last-used frame it is about to take.
-        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didBecomeMainNotification] {
-            keyObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak window] _ in
-                MainActor.assumeIsolated { if let window { WindowFrames.remember(window) } }
+        // which would otherwise replace the last-used frame it is about to take. A live resize
+        // is written once, when it ends, not on every frame of the drag.
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didEndLiveResizeNotification, NSWindow.didBecomeMainNotification] {
+            windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak window] _ in
+                MainActor.assumeIsolated { if let window, !window.inLiveResize { WindowFrames.remember(window) } }
             })
         }
         ContentKeys.install()
@@ -459,6 +459,16 @@ final class ChromeController: NSSplitViewController {
         window.subtitle = pendingSubtitle
     }
 
+    /// A closed window is no browser: links and New Tab must not pick its controller while it
+    /// waits to be released, and its observers must not outlive it.
+    private func windowWillClose() {
+        Self.live.remove(self)
+        separatorObservation?.invalidate()
+        separatorObservation = nil
+        windowObservers.forEach(NotificationCenter.default.removeObserver)
+        windowObservers.removeAll()
+    }
+
     func setTitle(_ title: String, subtitle: String) {
         pendingTitle = title
         pendingSubtitle = subtitle
@@ -468,10 +478,7 @@ final class ChromeController: NSSplitViewController {
         if window.subtitle != subtitle { window.subtitle = subtitle }
     }
 
-    private var toggling = false
-
     func setSidebarCollapsed(_ collapsed: Bool) {
-        guard !toggling else { return }
         let item = splitViewItems[0]
         if item.isCollapsed != collapsed { animateCollapse { item.animator().isCollapsed = collapsed } }
     }
@@ -535,28 +542,40 @@ final class ChromeController: NSSplitViewController {
         }
     }
 
-    /// Set by the coordinator so the model follows the toolbar's sidebar toggle and divider drags.
-    var sidebarToggled: ((Bool) -> Void)?
-    var inspectorToggled: ((Bool) -> Void)?
-
-    /// A divider drag can collapse or reveal a column without any toggle; the model is told.
+    /// The toolbar's sidebar toggle and a divider drag collapse or reveal a column without the
+    /// model; it follows here. `isCollapsed` takes its new value when the animation starts and
+    /// holds it on every frame (measured), so the model's echo back through `setSidebarCollapsed`
+    /// and `setInspectorShown` finds nothing to change, and a model change during an animation
+    /// (Command-B right after a toolbar toggle) simply reverses it.
     override func splitViewDidResizeSubviews(_ notification: Notification) {
         super.splitViewDidResizeSubviews(notification)
-        guard !toggling, splitViewItems.count == 3 else { return }
-        sidebarToggled?(splitViewItems[0].isCollapsed)
-        inspectorToggled?(!splitViewItems[2].isCollapsed)
+        guard splitViewItems.count == 3 else { return }
+        if let model {
+            let collapsed = splitViewItems[0].isCollapsed
+            let shown = !splitViewItems[2].isCollapsed
+            if model.sidebarCollapsed != collapsed { model.sidebarCollapsed = collapsed }
+            if model.showsInspector != shown { model.showsInspector = shown }
+        }
         keepSeparatorOff()
         hideContentScrollPockets()
         refreshHoverLine(animated: true)
     }
+}
 
-    /// The toolbar's sidebar toggle sends this through the responder chain. The model is told,
-    /// and its echo is ignored until AppKit's animation has finished.
-    override func toggleSidebar(_ sender: Any?) {
-        toggling = true
-        super.toggleSidebar(sender)
-        sidebarToggled?(splitViewItems[0].isCollapsed)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.toggling = false }
+/// The line under the toolbar. Its color is resolved in `updateLayer`, against the view's own
+/// appearance, so a switch between light and dark while it shows recolors it.
+final class HoverLine: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.separatorColor.cgColor
     }
 }
 
