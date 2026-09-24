@@ -691,7 +691,7 @@ public actor SSHConnection: RemoteSession {
     /// first user file `ssh -G` names; Trust Once gives the master the probe's file until disconnect.
     private func trustHostKey(_ failure: HostKeyFailure, prompts: any PromptSink, ask: URL, holding held: inout Held) async throws -> [String] {
         let values = SSHConfigValues.parse(await SSHResolver.config(for: connection, configFile: sshConfigFile) ?? "")
-        let probeDirectory = store.root.appendingPathComponent("hostkey-\(UUID().uuidString)", isDirectory: true)
+        let probeDirectory = store.root.appendingPathComponent(Self.loginScratchName("hostkey-"), isDirectory: true)
         try FileManager.default.createDirectory(at: probeDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         var keep = false
         defer { if !keep { try? FileManager.default.removeItem(at: probeDirectory) } }
@@ -802,12 +802,21 @@ public actor SSHConnection: RemoteSession {
     /// host-key probes. `key-` is what 0.1.7 left for a fingerprint.
     static let loginScratchPrefixes = ["ask-", "hostkey-", "key-"]
 
-    /// Removes per-login scratch left under `root` by a session that never disconnected: the app
-    /// crashed or was force-quit. The hub calls this at launch, before any session exists; the app
-    /// runs as a single instance, so nothing found here is in use.
+    /// A per-login folder's name: the prefix, then the id of the process that owns it.
+    private static func loginScratchName(_ prefix: String) -> String {
+        "\(prefix)\(getpid())-\(UUID().uuidString)"
+    }
+
+    /// Removes per-login scratch under `root` that no running process owns: a copy of Transfer
+    /// crashed or was force-quit. The hub calls this at launch. Two copies can run at once on one
+    /// library (`open -n`, or a development build beside the installed app), so scratch named for
+    /// a live process, maybe mid-login, stays; a name with no owner is from 0.1.7.
     static func removeLoginScratch(in root: URL) {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
-        for name in names where loginScratchPrefixes.contains(where: { name.hasPrefix($0) }) {
+        for name in names {
+            guard let prefix = loginScratchPrefixes.first(where: { name.hasPrefix($0) }) else { continue }
+            if let owner = pid_t(name.dropFirst(prefix.count).prefix { $0 != "-" }), owner > 0,
+               kill(owner, 0) == 0 || errno == EPERM { continue }
             try? FileManager.default.removeItem(at: root.appendingPathComponent(name))
         }
     }
@@ -815,7 +824,7 @@ public actor SSHConnection: RemoteSession {
     /// The folder with the helper ssh runs for each prompt. The helper gives up with the login
     /// (`loginTimeout`) or as soon as its folder is removed, so none outlives a login that ended.
     private func prepareAskpass() throws -> URL {
-        let directory = store.root.appendingPathComponent("ask-\(UUID().uuidString)", isDirectory: true)
+        let directory = store.root.appendingPathComponent(Self.loginScratchName("ask-"), isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
