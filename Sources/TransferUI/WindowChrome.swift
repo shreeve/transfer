@@ -27,12 +27,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             inspector: NSHostingController(rootView: AnyView(inspector))
         )
         context.coordinator.controller = controller
-        controller.sidebarToggled = { [weak coordinator = context.coordinator] collapsed in
-            if coordinator?.model.sidebarCollapsed != collapsed { coordinator?.model.sidebarCollapsed = collapsed }
-        }
-        controller.inspectorToggled = { [weak coordinator = context.coordinator] shown in
-            if coordinator?.model.showsInspector != shown { coordinator?.model.showsInspector = shown }
-        }
         let container = ChromeContainer(controller: controller)
         apply(to: controller, context: context)
         return container
@@ -60,7 +54,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         context.coordinator.selectViewMode(viewMode)
         if context.coordinator.searchTick != searchTick {
             context.coordinator.searchTick = searchTick
-            context.coordinator.beginSearch()
+            context.coordinator.beginSearch(nil)
         }
     }
 
@@ -138,7 +132,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 view.field.delegate = self
                 view.field.sendsSearchStringImmediately = true
                 view.button.target = self
-                view.button.action = #selector(expandSearch(_:))
+                view.button.action = #selector(beginSearch(_:))
                 view.onCollapse = { [weak self] in self?.model.textEditing = false }
                 item.view = view
                 view.item = item
@@ -164,12 +158,12 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             if viewGroup?.selectedIndex != wanted { viewGroup?.selectedIndex = wanted }
         }
 
-        func beginSearch() {
+        /// Command-F and the magnifier. The field holds the focus from here on, so Return and
+        /// Space stay with it even before the first character, which is when AppKit reports
+        /// that searching started.
+        @objc func beginSearch(_ sender: Any?) {
             searchView?.expand(focus: true)
-        }
-
-        @objc private func expandSearch(_ sender: Any?) {
-            searchView?.expand(focus: true)
+            model.textEditing = true
         }
 
         @objc private func navigate(_ sender: NSToolbarItemGroup) {
@@ -227,9 +221,22 @@ enum ChromeItem {
 @MainActor
 final class ChromeController: NSSplitViewController {
     weak var coordinator: (any NSToolbarDelegate)?
+    weak var model: TransferModel?
+    /// Every browser window's controller, while its window is open.
+    private static let live = NSHashTable<ChromeController>.weakObjects()
     private var toolbarInstalled = false
     private var pendingTitle = ""
     private var pendingSubtitle = ""
+    /// Finder shows a faint line under the toolbar, over the content column only, while the
+    /// pointer is in the toolbar. This is that line.
+    private let hoverLine = HoverLine()
+    private var hoverTracking: NSTrackingArea?
+    var hoverLineEnabled = true {
+        didSet { refreshHoverLine(animated: false) }
+    }
+    /// Notification observers on this controller's window, removed when the window closes.
+    private var windowObservers: [any NSObjectProtocol] = []
+    private var separatorObservation: NSKeyValueObservation?
 
     func install(sidebar: NSHostingController<AnyView>, detail: NSHostingController<AnyView>, inspector: NSHostingController<AnyView>) {
         // The split view decides the columns' sizes; the hosted SwiftUI content reports none.
@@ -280,21 +287,14 @@ final class ChromeController: NSSplitViewController {
         addSplitViewItem(sidebarItem)
         addSplitViewItem(detailItem)
         addSplitViewItem(inspectorItem)
+        // One name for every window, as Finder shares its sidebar's width: a new window opens
+        // with the sidebar and inspector as the last one left them, and the model follows the
+        // restored state through splitViewDidResizeSubviews.
         splitView.autosaveName = "Transfer.Split"
-    }
-
-    /// Finder shows a faint line under the toolbar, over the content column only, while the
-    /// pointer is in the toolbar. This is that line.
-    private let hoverLine = NSView()
-    private var hoverTracking: NSTrackingArea?
-    private var keyObservers: [any NSObjectProtocol] = []
-    var hoverLineEnabled = true {
-        didSet { refreshHoverLine(animated: false) }
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        hoverLine.wantsLayer = true
         hoverLine.alphaValue = 0
         view.addSubview(hoverLine, positioned: .above, relativeTo: nil)
     }
@@ -343,7 +343,6 @@ final class ChromeController: NSSplitViewController {
         let target: CGFloat = hoverLineEnabled && (hovering || inspectorOut) ? 1 : 0
         if target > 0 { placeHoverLine() }
         guard hoverLine.alphaValue != target else { return }
-        hoverLine.layer?.backgroundColor = NSColor.separatorColor.cgColor
         guard animated else {
             hoverLine.alphaValue = target
             return
@@ -364,13 +363,6 @@ final class ChromeController: NSSplitViewController {
         refreshHoverLine(animated: true)
     }
 
-    /// SwiftUI re-applies its own titlebar separator style to the window after it appears and
-    /// again around inspector and sidebar changes. Automatic draws a line under the toolbar that
-    /// then stays until something sets the style again, so the window is watched and every
-    /// layout re-asserts none. The hover line is the only line under the toolbar.
-    private var separatorObservation: NSKeyValueObservation?
-    private var separatorUpdateObserver: (any NSObjectProtocol)?
-
 
     /// AppKit hangs a scroll pocket, the macOS 26 scroll-edge effect, under the toolbar over each
     /// section of the window. Over the content section it draws a hard edge for the placeholder
@@ -382,8 +374,9 @@ final class ChromeController: NSSplitViewController {
         guard let frame = view.window?.contentView?.superview, splitViewItems.count == 3 else { return }
         let sidebar = splitViewItems[0].viewController.view
         let sidebarEdge = splitViewItems[0].isCollapsed ? 0 : sidebar.convert(sidebar.bounds, to: nil).maxX
+        guard let pocket = Self.scrollPocketClass else { return }
         func walk(_ v: NSView) {
-            if String(describing: type(of: v)) == "NSScrollPocket" {
+            if v.isKind(of: pocket) {
                 if !v.isHidden, v.convert(v.bounds, to: nil).minX >= sidebarEdge - 1 { v.isHidden = true }
                 return
             }
@@ -392,6 +385,13 @@ final class ChromeController: NSSplitViewController {
         walk(frame)
     }
 
+    /// Looked up once. A future AppKit without the class hides nothing, which only costs a line.
+    private static let scrollPocketClass: AnyClass? = NSClassFromString("NSScrollPocket")
+
+    /// SwiftUI re-applies its own titlebar separator style to the window after it appears and
+    /// again around inspector and sidebar changes. Automatic draws a line under the toolbar that
+    /// then stays until something sets the style again, so the window is watched and every
+    /// layout re-asserts none. The hover line is the only line under the toolbar.
     private func keepSeparatorOff() {
         guard let window = view.window, window.titlebarSeparatorStyle != .none else { return }
         // The title bar keeps the line it drew under the automatic style until it draws again;
@@ -417,29 +417,33 @@ final class ChromeController: NSSplitViewController {
         separatorObservation = window.observe(\.titlebarSeparatorStyle, options: [.new]) { [weak self] _, _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
         }
-        // The window posts this after every pass of event handling, so a style SwiftUI sets after
-        // the last layout of an inspector animation is still caught before the next frame draws.
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
-            keyObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
+            windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
                 MainActor.assumeIsolated { self?.refreshHoverLine(animated: true) }
             })
         }
-        separatorUpdateObserver = NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
+        // The window posts this after every pass of event handling, so a style SwiftUI sets after
+        // the last layout of an inspector animation is still caught before the next frame draws.
+        windowObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
             MainActor.assumeIsolated { self?.keepSeparatorOff() }
-        }
+        })
+        windowObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: nil) { [weak self] _ in
+            MainActor.assumeIsolated { self?.windowWillClose() }
+        })
         window.tabbingMode = .preferred
         // A tab takes its window's frame; any other new window is placed.
         if !NewTab.join(window) {
             WindowFrames.place(window, among: Self.live.allObjects.compactMap { $0 === self ? nil : $0.view.window })
         }
         // Watched only once placed: a new window becomes main at SwiftUI's default size first,
-        // which would otherwise replace the last-used frame it is about to take.
-        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didBecomeMainNotification] {
-            keyObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak window] _ in
-                MainActor.assumeIsolated { if let window { WindowFrames.remember(window) } }
+        // which would otherwise replace the last-used frame it is about to take. A live resize
+        // is written once, when it ends, not on every frame of the drag.
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didEndLiveResizeNotification, NSWindow.didBecomeMainNotification] {
+            windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak window] _ in
+                MainActor.assumeIsolated { if let window, !window.inLiveResize { WindowFrames.remember(window) } }
             })
         }
-        OpenShortcut.install()
+        ContentKeys.install()
         if let model { LinkInbox.take(into: model) }
         window.titlebarSeparatorStyle = .none
         // The opaque title bar over the content column draws its own bottom edge regardless of
@@ -459,6 +463,16 @@ final class ChromeController: NSSplitViewController {
         window.subtitle = pendingSubtitle
     }
 
+    /// A closed window is no browser: links and New Tab must not pick its controller while it
+    /// waits to be released, and its observers must not outlive it.
+    private func windowWillClose() {
+        Self.live.remove(self)
+        separatorObservation?.invalidate()
+        separatorObservation = nil
+        windowObservers.forEach(NotificationCenter.default.removeObserver)
+        windowObservers.removeAll()
+    }
+
     func setTitle(_ title: String, subtitle: String) {
         pendingTitle = title
         pendingSubtitle = subtitle
@@ -468,10 +482,7 @@ final class ChromeController: NSSplitViewController {
         if window.subtitle != subtitle { window.subtitle = subtitle }
     }
 
-    private var toggling = false
-
     func setSidebarCollapsed(_ collapsed: Bool) {
-        guard !toggling else { return }
         let item = splitViewItems[0]
         if item.isCollapsed != collapsed { animateCollapse { item.animator().isCollapsed = collapsed } }
     }
@@ -483,7 +494,7 @@ final class ChromeController: NSSplitViewController {
         refreshHoverLine(animated: true)
     }
 
-    /// `TRANSFER_ANIMATION_SCALE=8` in the environment stretches the sidebar and inspector
+    /// `TRANSFER_ANIMATION_SCALE=6` in the environment stretches the sidebar and inspector
     /// animations for watching them; unset, AppKit's own timing applies.
     private static let animationScale = Double(ProcessInfo.processInfo.environment["TRANSFER_ANIMATION_SCALE"] ?? "") ?? 1
 
@@ -497,15 +508,6 @@ final class ChromeController: NSSplitViewController {
 
     // MARK: Edit menu
 
-    /// Edit > Copy and Paste reach the window here through the responder chain whenever no text
-    /// field has focus; a focused field answers them first and keeps its own text editing. When
-    /// nothing in the content holds the focus (a folder just opened in icon view, or a toolbar
-    /// button has it), the chain skips this controller, and the app delegate, last in the chain,
-    /// forwards them here through `KeyWindowEdit`.
-    weak var model: TransferModel?
-
-    private static let live = NSHashTable<ChromeController>.weakObjects()
-
     static var keyWindowController: ChromeController? {
         guard let key = NSApp.keyWindow else { return nil }
         return live.allObjects.first { $0.view.window === key }
@@ -518,6 +520,11 @@ final class ChromeController: NSSplitViewController {
         return ordered + all.filter { controller in !ordered.contains { $0 === controller } }
     }
 
+    /// Edit > Copy and Paste reach the window here through the responder chain whenever no text
+    /// field has focus; a focused field answers them first and keeps its own text editing. When
+    /// nothing in the content holds the focus (a folder just opened in icon view, or a toolbar
+    /// button has it), the chain skips this controller, and the app delegate, last in the chain,
+    /// forwards them here through `KeyWindowEdit`.
     @objc func copy(_ sender: Any?) {
         model?.copySelection()
     }
@@ -535,28 +542,40 @@ final class ChromeController: NSSplitViewController {
         }
     }
 
-    /// Set by the coordinator so the model follows the toolbar's sidebar toggle and divider drags.
-    var sidebarToggled: ((Bool) -> Void)?
-    var inspectorToggled: ((Bool) -> Void)?
-
-    /// A divider drag can collapse or reveal a column without any toggle; the model is told.
+    /// The toolbar's sidebar toggle and a divider drag collapse or reveal a column without the
+    /// model; it follows here. `isCollapsed` takes its new value when the animation starts and
+    /// holds it on every frame (measured), so the model's echo back through `setSidebarCollapsed`
+    /// and `setInspectorShown` finds nothing to change, and a model change during an animation
+    /// (Command-B right after a toolbar toggle) simply reverses it.
     override func splitViewDidResizeSubviews(_ notification: Notification) {
         super.splitViewDidResizeSubviews(notification)
-        guard !toggling, splitViewItems.count == 3 else { return }
-        sidebarToggled?(splitViewItems[0].isCollapsed)
-        inspectorToggled?(!splitViewItems[2].isCollapsed)
+        guard splitViewItems.count == 3 else { return }
+        if let model {
+            let collapsed = splitViewItems[0].isCollapsed
+            let shown = !splitViewItems[2].isCollapsed
+            if model.sidebarCollapsed != collapsed { model.sidebarCollapsed = collapsed }
+            if model.showsInspector != shown { model.showsInspector = shown }
+        }
         keepSeparatorOff()
         hideContentScrollPockets()
         refreshHoverLine(animated: true)
     }
+}
 
-    /// The toolbar's sidebar toggle sends this through the responder chain. The model is told,
-    /// and its echo is ignored until AppKit's animation has finished.
-    override func toggleSidebar(_ sender: Any?) {
-        toggling = true
-        super.toggleSidebar(sender)
-        sidebarToggled?(splitViewItems[0].isCollapsed)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.toggling = false }
+/// The line under the toolbar. Its color is resolved in `updateLayer`, against the view's own
+/// appearance, so a switch between light and dark while it shows recolors it.
+final class HoverLine: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.separatorColor.cgColor
     }
 }
 
@@ -628,6 +647,12 @@ public enum NewTab {
 @MainActor
 public enum LinkInbox {
     private static var pending: [SFTPURL] = []
+    /// Windows a link has been handed to. A window stays idle until its login starts, which is
+    /// after `ssh -G` and a DNS lookup, so without this a second link could pick it too and one
+    /// of the two would be lost.
+    private static var opening: Set<ObjectIdentifier> = []
+    /// A window was asked for and none has appeared since.
+    private static var requested = false
     /// Opens a new browser window. Set by each browser window as it appears, since only a view
     /// can reach SwiftUI's window opener.
     public static var openWindow: (() -> Void)?
@@ -635,49 +660,61 @@ public enum LinkInbox {
     public static func deliver(_ link: SFTPURL) {
         NSApp.activate()
         let browsers = ChromeController.browsers
-        let idle = browsers.first { $0 === ChromeController.keyWindowController && $0.model?.isIdle == true }
-            ?? browsers.first { $0.model?.isIdle == true }
-        if let idle, let model = idle.model {
-            idle.view.window?.makeKeyAndOrderFront(nil)
-            Task { await model.open(link: link) }
+        let free = browsers.first { $0 === ChromeController.keyWindowController && isFree($0.model) }
+            ?? browsers.first { isFree($0.model) }
+        if let free, let model = free.model {
+            free.view.window?.makeKeyAndOrderFront(nil)
+            open(link, in: model)
             return
         }
         pending.append(link)
-        if browsers.isEmpty {
-            // Launched by the link, or every window closed: open one, and it takes the link as it
-            // appears. A window restored at launch may already be on its way and take it first.
-            newWindow()
-        } else {
-            NewTab.request()
-            newWindow()
-        }
+        // With no browser window open (launched by the link, or every window closed), SwiftUI
+        // opens one for the link itself, and it takes the link as it appears; so may a window
+        // restored at launch. Otherwise one window is asked for at a time, and each that appears
+        // asks for the next, so every link gets exactly one.
+        if !requested, !browsers.isEmpty { requestWindow() }
     }
 
-    /// SwiftUI's window opener once a browser window has lent it; before that, the responder
-    /// chain's `newWindowForTab:`, which reaches SwiftUI's own opener.
-    private static func newWindow() {
-        if let openWindow { return openWindow() }
-        NSApp.sendAction(#selector(NSResponder.newWindowForTab(_:)), to: nil, from: nil)
-    }
-
-    /// A browser window that just appeared takes the oldest waiting link.
+    /// A browser window that just appeared takes the oldest waiting link, and asks for another
+    /// window while links still wait.
     static func take(into model: TransferModel) {
-        guard model.isIdle, !pending.isEmpty else { return }
-        let link = pending.removeFirst()
-        Task { await model.open(link: link) }
-        if !pending.isEmpty {
-            NewTab.request()
-            newWindow()
+        requested = false
+        guard !pending.isEmpty else { return }
+        if isFree(model) { open(pending.removeFirst(), in: model) }
+        if !pending.isEmpty { requestWindow() }
+    }
+
+    private static func isFree(_ model: TransferModel?) -> Bool {
+        guard let model else { return false }
+        return model.isIdle && !opening.contains(ObjectIdentifier(model))
+    }
+
+    private static func open(_ link: SFTPURL, in model: TransferModel) {
+        let id = ObjectIdentifier(model)
+        opening.insert(id)
+        Task {
+            await model.open(link: link)
+            opening.remove(id)
         }
+    }
+
+    /// A new tab of the front window, through SwiftUI's opener. Before any browser window has
+    /// lent the opener there is nothing to ask; the link waits for SwiftUI's own first window.
+    private static func requestWindow() {
+        guard let openWindow else { return }
+        requested = true
+        NewTab.request()
+        openWindow()
     }
 }
 
-/// Command-Down opens the selection, as in Finder: a second shortcut for File > Open, with no menu
-/// item of its own. `NSBrowser`'s columns take Command-Down as a plain Down arrow before the
-/// browser sees the key, so it is watched here, as Escape is in `Clipboard`, and left alone for
-/// text fields, sheets, and any window that is not a browser.
+/// Keys that act on the content pane: Command-Down opens the selection, as in Finder (a second
+/// shortcut for File > Open, with no menu item of its own), and Space toggles Quick Look.
+/// `NSBrowser`'s columns take Command-Down as a plain Down arrow before the browser sees the key,
+/// and the table, the browser, and the icon grid would each have to catch Space for themselves, so
+/// both are watched here with one monitor, as Escape is in `Clipboard`.
 @MainActor
-enum OpenShortcut {
+enum ContentKeys {
     private static var monitor: Any?
 
     static func install() {
@@ -687,15 +724,24 @@ enum OpenShortcut {
         }
     }
 
-    /// Only for the content pane, or a window with nothing focused: in the sidebar or inspector,
-    /// Command-Down keeps its usual meaning. Held down, it opens once.
+    /// Only for the content pane in any view, or a window with nothing focused: text fields,
+    /// sheets, the sidebar, the inspector, and windows that are not browsers keep the keys.
+    /// Held down, a key acts once.
     private static func takes(_ event: NSEvent) -> Bool {
-        guard event.keyCode == 125, !event.isARepeat, event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        let open = event.keyCode == 125 && modifiers == .command
+        let look = event.keyCode == 49 && modifiers.isEmpty
+        guard open || look,
               let window = event.window, window.isKeyWindow, window.attachedSheet == nil, !(window.firstResponder is NSText),
               let controller = ChromeController.keyWindowController, let model = controller.model, model.plainKeysAvailable else { return false }
         if let focused = window.firstResponder as? NSView, focused !== window.contentView,
            !focused.isDescendant(of: controller.splitViewItems[1].viewController.view) { return false }
-        Task { await model.openSelection() }
+        guard !event.isARepeat else { return true }
+        if open {
+            Task { await model.openSelection() }
+        } else {
+            model.togglePreview()
+        }
         return true
     }
 }

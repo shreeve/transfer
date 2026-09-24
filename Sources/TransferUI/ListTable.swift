@@ -90,6 +90,7 @@ struct ListTable: NSViewRepresentable {
         private(set) var items: [RemoteItem] = []
         private var syncing = false
         private var autosaveConnection: ConnectionID?
+        private let drag = RowDrag()
 
         init(model: TransferModel) { self.model = model }
 
@@ -101,6 +102,10 @@ struct ListTable: NSViewRepresentable {
             if autosaveConnection != model.snapshot.connectionID {
                 autosaveConnection = model.snapshot.connectionID
                 table.autosaveName = model.snapshot.connectionID.map { "transfer.list.\($0.rawValue.uuidString)" }
+                // An order saved before Name was kept first may have moved it.
+                if let name = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "name" }), name > 0 {
+                    table.moveColumn(name, toColumn: 0)
+                }
             }
             let hasParent = model.snapshot.path.parent != nil
             if nameHeader?.showsUp != hasParent {
@@ -128,7 +133,7 @@ struct ListTable: NSViewRepresentable {
         func numberOfRows(in tableView: NSTableView) -> Int { items.count }
 
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-            guard let tableColumn, row < items.count else { return nil }
+            guard let tableColumn, items.indices.contains(row) else { return nil }
             let item = items[row]
             let id = tableColumn.identifier
             let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView) ?? makeCell(id)
@@ -185,14 +190,22 @@ struct ListTable: NSViewRepresentable {
         }
 
         func tableView(_ tableView: NSTableView, typeSelectStringFor tableColumn: NSTableColumn?, row: Int) -> String? {
-            row < items.count ? items[row].name : nil
+            items.indices.contains(row) ? items[row].name : nil
         }
 
         // MARK: Selection, sort, open
 
         func tableViewSelectionDidChange(_ notification: Notification) {
             guard !syncing, let table else { return }
-            model.snapshot.selection = Set(table.selectedRowIndexes.compactMap { $0 < items.count ? items[$0].path : nil })
+            model.snapshot.selection = Set(table.selectedRowIndexes.compactMap { items.indices.contains($0) ? items[$0].path : nil })
+        }
+
+        /// Name stays the first column, as in Finder: the fitting in `RowMenuTableView.layout`,
+        /// the header's up arrow, and the row inset all measure column 0, and the first-column
+        /// autoresizing style gives the spare width to whichever column is first. AppKit asks with
+        /// a new index of -1 as a drag begins.
+        func tableView(_ tableView: NSTableView, shouldReorderColumn columnIndex: Int, toColumn newColumnIndex: Int) -> Bool {
+            columnIndex != 0 && newColumnIndex != 0
         }
 
         func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
@@ -201,7 +214,7 @@ struct ListTable: NSViewRepresentable {
         }
 
         @objc func doubleClicked(_ sender: Any?) {
-            guard let table, table.clickedRow >= 0, table.clickedRow < items.count else { return }
+            guard let table, items.indices.contains(table.clickedRow) else { return }
             let item = items[table.clickedRow]
             let model = model
             Task { await model.open(item) }
@@ -210,28 +223,24 @@ struct ListTable: NSViewRepresentable {
         // MARK: Drag and drop
 
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
-            guard let session = model.session, row < items.count else { return nil }
-            // One promise per row; the payload names the whole selection so an internal drop moves every item.
-            return RemoteItemPromise.provider(for: items[row], among: model.dragItems(including: items[row]), session: session, prompts: model.operationPrompts())
+            guard items.indices.contains(row) else { return nil }
+            return drag.writer(for: items[row], model: model)
         }
 
         func tableView(_ tableView: NSTableView, validateDrop info: any NSDraggingInfo, proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
-            guard let connection = model.snapshot.connectionID else { return [] }
             let folder = dropFolder(row: row, operation: operation)
             if folder == model.snapshot.path { tableView.setDropRow(-1, dropOperation: .on) }
-            return dropAction(from: info.draggingPasteboard, onto: folder, connection: connection)?.operation ?? []
+            return dropAction(for: info, onto: folder, model: model)?.operation ?? []
         }
 
         /// A drop on a folder row goes into that folder; anywhere else goes into the current one.
         private func dropFolder(row: Int, operation: NSTableView.DropOperation) -> RemotePath {
-            if operation == .on, row >= 0, row < items.count, items[row].kind == .directory { return items[row].path }
+            if operation == .on, items.indices.contains(row), items[row].kind == .directory { return items[row].path }
             return model.snapshot.path
         }
 
         func tableView(_ tableView: NSTableView, acceptDrop info: any NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
-            guard let connection = model.snapshot.connectionID else { return false }
-            let folder = dropFolder(row: row, operation: dropOperation)
-            guard let action = dropAction(from: info.draggingPasteboard, onto: folder, connection: connection) else { return false }
+            guard let action = dropAction(for: info, onto: dropFolder(row: row, operation: dropOperation), model: model) else { return false }
             let model = model
             Task { await model.perform(action) }
             return true
@@ -239,16 +248,56 @@ struct ListTable: NSViewRepresentable {
 
         // MARK: Context menu
 
+        /// A right-clicked row joins the selection first, as a click would select it. The empty
+        /// area below the rows clears the selection, as a click there does, so the folder's menu
+        /// (Copy Remote URL included) acts on the folder rather than on rows it does not name.
         func menu(forRow row: Int) -> NSMenu? {
             guard let table else { return nil }
-            if row >= 0, row < items.count, !table.selectedRowIndexes.contains(row) {
+            let clicked = items.indices.contains(row) ? items[row] : nil
+            if clicked == nil {
+                table.deselectAll(nil)
+            } else if !table.selectedRowIndexes.contains(row) {
                 table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             }
             let menu = NSMenu()
-            ItemMenu.fill(menu, item: row >= 0 && row < items.count ? items[row] : nil, model: model)
+            ItemMenu.fill(menu, item: clicked, model: model)
             return menu
         }
     }
+}
+
+/// The promises of one row drag. A table or browser asks for a writer per dragged row, all in one
+/// turn of the run loop, so the drag's roots, payload, and prompts are worked out once for the
+/// whole drag rather than once for each row.
+@MainActor
+final class RowDrag {
+    private var promises: [RemotePath: RemoteItemPromise] = [:]
+
+    func writer(for item: RemoteItem, model: TransferModel) -> RemoteItemPromise? {
+        if let promise = promises[item.path] { return promise }
+        guard let session = model.session else { return nil }
+        if promises.isEmpty { DispatchQueue.main.async { [weak self] in self?.promises = [:] } }
+        // The payload names every root, so a drop inside Transfer moves all of them.
+        let roots = model.dragItems(including: item)
+        for (root, promise) in zip(roots, RemoteItemPromise.providers(for: roots, session: session, prompts: model.operationPrompts())) {
+            promises[root.path] = promise
+        }
+        return promises[item.path]
+    }
+}
+
+/// What a drop onto `folder` does in the list and column views, or nil to refuse it. Remote paths
+/// are honored only from a drag that began in this app: any other app could put paths on a drag
+/// pasteboard and have a drop move them. A drag with Option held asks for a copy, and a drop here
+/// only moves remote items, so it is refused rather than turned into a move.
+@MainActor
+func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: TransferModel) -> DropAction? {
+    guard let connection = model.snapshot.connectionID else { return nil }
+    let pasteboard = info.draggingPasteboard
+    if pasteboard.types?.contains(remoteDragType) == true {
+        guard info.draggingSource != nil, info.draggingSourceOperationMask.contains(.move) else { return nil }
+    }
+    return dropAction(from: pasteboard, onto: folder, connection: connection)
 }
 
 /// Serves the coordinator's context menu for the row under the mouse.
@@ -275,19 +324,11 @@ final class RowMenuTableView: NSTableView {
         let point = convert(event.locationInWindow, from: nil)
         return coordinator?.menu(forRow: row(at: point))
     }
-
-    /// Space opens Quick Look, as in Finder; the table would otherwise swallow it.
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
-            coordinator?.model.togglePreview()
-            return
-        }
-        super.keyDown(with: event)
-    }
 }
 
 /// The right-click menu of the list and column views: for the clicked item, which the view has
-/// already made part of the selection, or with no item, for the current folder.
+/// already made part of the selection, or with no item, for the current folder, which the view
+/// has made the location with nothing selected.
 @MainActor
 enum ItemMenu {
     static func fill(_ menu: NSMenu, item: RemoteItem?, model: TransferModel) {
@@ -304,7 +345,7 @@ enum ItemMenu {
             return
         }
         add("Open") { Task { await model.open(item) } }
-        add("Open Live", enabled: item.kind == .file) { Task { await model.openLiveSelection() } }
+        add("Open Live", enabled: item.kind == .file) { Task { await model.open(item, forceLive: true) } }
         add("Quick Look") { model.showPreview() }
         menu.addItem(.separator())
         add("Download Copy…") { Task { await model.downloadCopy() } }
