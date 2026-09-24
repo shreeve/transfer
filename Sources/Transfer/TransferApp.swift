@@ -249,13 +249,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let provider else { return .terminateNow }
         let semaphore = DispatchSemaphore(value: 0)
-        let box = CountBox()
+        let unsynced = Locked(0)
         Task.detached {
-            box.value = await provider.unsyncedLiveCount
+            unsynced.value = await provider.unsyncedLiveCount
             semaphore.signal()
         }
         _ = semaphore.wait(timeout: .now() + 3)
-        return QuitGuard.mayQuit(unsynced: box.value) ? .terminateNow : .terminateCancel
+        return QuitGuard.mayQuit(unsynced: unsynced.value) ? .terminateNow : .terminateCancel
     }
 
     // Last in the responder chain: Copy and Paste for a window whose content holds no focus.
@@ -279,8 +279,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         _ = semaphore.wait(timeout: .now() + 5)
     }
-}
-
-private final class CountBox: @unchecked Sendable {
-    var value = 0
 }

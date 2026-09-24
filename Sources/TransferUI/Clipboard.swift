@@ -174,14 +174,14 @@ public final class Clipboard {
         guard !urls.isEmpty else { return }
         let id = UUID()
         clip = Clip(id: id, source: .finder(urls), name: urls.count == 1 ? urls[0].lastPathComponent : nil, tally: ClipTally(), finder: .notNeeded)
-        let box = TallyBox()
+        let box = Locked(ClipTally())
         work = Task { [weak self] in
             await self?.publishing(box, to: id) {
                 await Task.detached {
                     for url in urls {
                         guard !Task.isCancelled else { return }
                         LocalTree.walk(url) { key, entry in
-                            if key.isEmpty { box.update { $0.add(root: entry) } } else { box.update { $0.add(inside: entry) } }
+                            if key.isEmpty { box.withLock { $0.add(root: entry) } } else { box.withLock { $0.add(inside: entry) } }
                         }
                     }
                 }.value
@@ -195,11 +195,11 @@ public final class Clipboard {
     private func countRemote(_ items: [RemoteItem], session: any RemoteSession, id: UUID) async {
         let folders = items.filter { $0.kind == .directory }
         guard !folders.isEmpty, let start = clip?.tally else { return }
-        let box = TallyBox(start)
+        let box = Locked(start)
         await publishing(box, to: id) {
             for folder in folders {
                 try? await session.walkTree(folder.path) { key, entry in
-                    if !key.isEmpty { box.update { $0.add(inside: entry) } }
+                    if !key.isEmpty { box.withLock { $0.add(inside: entry) } }
                 }
             }
         }
@@ -216,7 +216,7 @@ public final class Clipboard {
         }
         let folder = Self.stagingRoot.appendingPathComponent(id.uuidString, isDirectory: true)
         let total = max(clip.tally.bytes, 1)
-        let done = ByteBox()
+        let done = Locked<UInt64>(0)
         let ticker = Task { [weak self] in
             while !Task.isCancelled {
                 let fraction = min(Double(done.value) / Double(total), 0.99)
@@ -231,7 +231,7 @@ public final class Clipboard {
                 try Task.checkCancellation()
                 let url = folder.appendingPathComponent(item.name)
                 let base = done.value
-                try await session.download(item.path, to: url) { progress in done.set(base + progress.completed) }
+                try await session.download(item.path, to: url) { progress in done.value = base + progress.completed }
                 urls.append(url)
             }
         } catch {
@@ -245,7 +245,7 @@ public final class Clipboard {
     }
 
     /// Runs `body` while copying the box's tally into the clip every 0.2 s, and once at the end.
-    private func publishing(_ box: TallyBox, to id: UUID, _ body: () async -> Void) async {
+    private func publishing(_ box: Locked<ClipTally>, to id: UUID, _ body: () async -> Void) async {
         let ticker = Task { [weak self] in
             while !Task.isCancelled {
                 let tally = box.value
@@ -326,22 +326,4 @@ final class TreeBox: @unchecked Sendable {
         try await session.walkTree(path) { box.add($0, $1) }
         return box.all
     }
-}
-
-private final class TallyBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var tally: ClipTally
-
-    init(_ start: ClipTally = ClipTally()) { tally = start }
-
-    func update(_ change: (inout ClipTally) -> Void) { lock.withLock { change(&tally) } }
-    var value: ClipTally { lock.withLock { tally } }
-}
-
-private final class ByteBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var bytes: UInt64 = 0
-
-    func set(_ value: UInt64) { lock.withLock { bytes = value } }
-    var value: UInt64 { lock.withLock { bytes } }
 }

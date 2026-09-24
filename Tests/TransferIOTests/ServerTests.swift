@@ -108,9 +108,9 @@ struct ServerTests {
             try payload.write(to: local)
             let uploaded = h.remotePath.appending(name: Array("up.bin".utf8))
             var last = TransferProgress(completed: 0)
-            let box = ProgressBox()
-            try await h.session.upload(local, to: uploaded) { box.last = $0 }
-            last = box.last
+            let box = Locked(TransferProgress(completed: 0))
+            try await h.session.upload(local, to: uploaded) { box.value = $0 }
+            last = box.value
             #expect(last.completed == UInt64(payload.count))
             #expect(try Data(contentsOf: h.remote.appendingPathComponent("up.bin")) == payload)
             let leftovers = try FileManager.default.contentsOfDirectory(atPath: h.remote.path).filter { $0.contains(".transfer-") }
@@ -183,9 +183,9 @@ struct ServerTests {
             try FileManager.default.createSymbolicLink(atPath: tree.appendingPathComponent("link").path, withDestinationPath: "one.txt")
 
             let up = h.remotePath.appending(name: Array("tree-up".utf8))
-            let box = ProgressBox()
-            try await h.session.copyDirectory(fromLocal: tree, to: up) { box.last = $0 }
-            #expect(box.last.itemsCompleted == 4)
+            let box = Locked(TransferProgress(completed: 0))
+            try await h.session.copyDirectory(fromLocal: tree, to: up) { box.value = $0 }
+            #expect(box.value.itemsCompleted == 4)
             // Uploading the same tree again merges into it; the link already there is kept.
             try await h.session.copyDirectory(fromLocal: tree, to: up) { _ in }
             #expect(h.prompts.collisions == 0)
@@ -230,9 +230,9 @@ struct ServerTests {
 
             // The Mac's own sftp-server offers copy-data, so this copy never leaves the server.
             let copy = h.remotePath.appending(name: Array("site copy".utf8))
-            let box = ProgressBox()
-            try await h.session.copy(site, to: copy) { box.last = $0 }
-            #expect(box.last.itemsCompleted == 4)
+            let box = Locked(TransferProgress(completed: 0))
+            try await h.session.copy(site, to: copy) { box.value = $0 }
+            #expect(box.value.itemsCompleted == 4)
             let copyURL = h.remote.appendingPathComponent("site copy")
             #expect(try Data(contentsOf: copyURL.appendingPathComponent("a/big.bin")) == big)
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: copyURL.appendingPathComponent("link").path) == "one.txt")
@@ -415,10 +415,6 @@ struct ServerTests {
             #expect(await h.session.isConnected == false)
         }
     }
-}
-
-private final class ProgressBox: @unchecked Sendable {
-    var last = TransferProgress(completed: 0)
 }
 
 private final class EventLog: @unchecked Sendable {

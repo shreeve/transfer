@@ -197,12 +197,19 @@ struct DetailColumn: View {
         }
     }
 
+    /// Gathers the URLs of one drop before starting uploads, so one operation row appears per file in order.
     private func dropFiles(_ providers: [NSItemProvider]) -> Bool {
-        let collector = URLCollector(count: providers.count) { urls in
-            Task { await model.upload(urls: urls) }
-        }
+        let model = model
+        let collected = Locked((urls: [URL](), remaining: providers.count))
         for provider in providers {
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in collector.add(url) }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                let done: [URL]? = collected.withLock { state in
+                    if let url { state.urls.append(url) }
+                    state.remaining -= 1
+                    return state.remaining == 0 ? state.urls : nil
+                }
+                if let done { Task { @MainActor in await model.upload(urls: done) } }
+            }
         }
         return !providers.isEmpty
     }
@@ -631,31 +638,6 @@ struct InspectorColumn: View {
 }
 
 
-
-/// Gathers the URLs of one drop before starting uploads, so one operation row appears per file in order.
-private final class URLCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var urls: [URL] = []
-    private var remaining: Int
-    private let finish: @MainActor ([URL]) -> Void
-
-    init(count: Int, finish: @escaping @MainActor ([URL]) -> Void) {
-        remaining = count
-        self.finish = finish
-    }
-
-    func add(_ url: URL?) {
-        lock.lock()
-        if let url { urls.append(url) }
-        remaining -= 1
-        let done = remaining == 0
-        let collected = urls
-        lock.unlock()
-        if done {
-            Task { @MainActor in self.finish(collected) }
-        }
-    }
-}
 
 struct ConnectionForm: View {
     @Bindable var model: TransferModel

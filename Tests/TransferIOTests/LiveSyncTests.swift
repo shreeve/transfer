@@ -400,8 +400,8 @@ struct LiveSyncTests {
             #expect(await h.fake.contents(path) == nil)
             #expect(await h.fake.contents(inside) == nil)
 
-            let ran = Flag()
-            try await h.live.rename(RemotePath(string: "/srv/elsewhere"), to: RemotePath(string: "/srv/else2"), on: h.connection) { ran.set() }
+            let ran = Locked(false)
+            try await h.live.rename(RemotePath(string: "/srv/elsewhere"), to: RemotePath(string: "/srv/else2"), on: h.connection) { ran.value = true }
             #expect(ran.value)
             #expect(await h.file()?.path == renamed)
         }
@@ -419,10 +419,10 @@ struct LiveSyncTests {
 
             let folder = RemotePath(string: "/srv/dir")
             let moved = RemotePath(string: "/srv/moved")
-            let ran = Flag()
+            let ran = Locked(false)
             let renaming = Task {
                 try await h.live.rename(folder, to: moved, on: h.connection) {
-                    ran.set()
+                    ran.value = true
                     await h.fake.move(folder, to: moved)
                 }
             }
@@ -561,7 +561,7 @@ actor FakeServer: LiveServer {
     private var failing = false
     private var holding = false
     private var held: [CheckedContinuation<Void, Never>] = []
-    private let log = FakeEventLog()
+    private let log = Locked<[SessionEvent]>([])
 
     // Knobs
 
@@ -602,7 +602,7 @@ actor FakeServer: LiveServer {
         }
     }
 
-    nonisolated var events: [SessionEvent] { log.all }
+    nonisolated var events: [SessionEvent] { log.value }
     nonisolated var conflicts: [RemotePath] {
         events.compactMap { if case .conflict(let path, _) = $0 { path } else { nil } }
     }
@@ -658,30 +658,6 @@ actor FakeServer: LiveServer {
     }
 
     nonisolated func liveEmit(_ event: SessionEvent) {
-        log.record(event)
+        log.withLock { $0.append(event) }
     }
-}
-
-private final class FakeEventLog: @unchecked Sendable {
-    private let lock = NSLock()
-    private var events: [SessionEvent] = []
-
-    func record(_ event: SessionEvent) {
-        lock.lock()
-        events.append(event)
-        lock.unlock()
-    }
-
-    var all: [SessionEvent] {
-        lock.lock()
-        defer { lock.unlock() }
-        return events
-    }
-}
-
-private final class Flag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var set_ = false
-    func set() { lock.lock(); set_ = true; lock.unlock() }
-    var value: Bool { lock.lock(); defer { lock.unlock() }; return set_ }
 }

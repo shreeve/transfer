@@ -592,12 +592,12 @@ public actor SSHConnection: RemoteSession {
         let error = Pipe()
         process.standardOutput = output
         process.standardError = error
-        let flag = TimeoutFlag()
+        let fired = Locked(false)
         try process.run()
         let watchdog = Task {
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             if !Task.isCancelled, process.isRunning {
-                flag.fired = true
+                fired.value = true
                 process.terminate()
             }
         }
@@ -609,7 +609,7 @@ public actor SSHConnection: RemoteSession {
             }
         }
         watchdog.cancel()
-        if flag.fired { throw TransferError.timeout((launch as NSString).lastPathComponent) }
+        if fired.value { throw TransferError.timeout((launch as NSString).lastPathComponent) }
         return result
     }
 }
@@ -626,10 +626,6 @@ private struct CommandResult {
     var stderr: String
 }
 
-private final class TimeoutFlag: @unchecked Sendable {
-    var fired = false
-}
-
 extension SSHConnection: LiveServer {
     func liveLookup(_ path: RemotePath) async throws -> RemoteItem? {
         try await existing(path)
@@ -644,7 +640,8 @@ extension SSHConnection: LiveServer {
     }
 
     func liveSave(_ snapshot: URL, to path: RemotePath, expecting: ServerExpectation, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> Fingerprint {
-        let written = WrittenBox()
+        // Carries the fingerprint out of the lane's closure.
+        let written = Locked<Fingerprint?>(nil)
         try await lane.submit(.save) {
             written.value = try await self.uploadBytes(snapshot, to: path, interactive: true, expecting: expecting, measure: true, progress: progress)
         }
@@ -658,16 +655,6 @@ extension SSHConnection: LiveServer {
 
     nonisolated func liveEmit(_ event: SessionEvent) {
         pipe.emit(event)
-    }
-}
-
-/// Carries a save's fingerprint out of the interactive lane's closure.
-private final class WrittenBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: Fingerprint?
-    var value: Fingerprint? {
-        get { lock.withLock { stored } }
-        set { lock.withLock { stored = newValue } }
     }
 }
 

@@ -65,13 +65,13 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
     ) {
         let path = item.path
         let session = session
-        let finish = PromiseFinish(completionHandler)
+        let finish = Locked(completionHandler)
         Task {
             do {
                 try await session.download(path, to: url) { _ in }
-                finish.call(nil)
+                finish.value(nil)
             } catch {
-                finish.call(error)
+                finish.value(error)
             }
         }
     }
@@ -90,11 +90,6 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
         let payload = RemoteDragPayload(connection: session.connection.id.rawValue, paths: items.map(\.path.bytes))
         return (try? JSONEncoder().encode(payload)) ?? Data()
     }
-}
-
-private final class PromiseFinish: @unchecked Sendable {
-    let call: (Error?) -> Void
-    init(_ call: @escaping (Error?) -> Void) { self.call = call }
 }
 
 /// What a drop landed on and what it carried.

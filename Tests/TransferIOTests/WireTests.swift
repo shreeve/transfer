@@ -27,10 +27,10 @@ import TransferCore
 /// upload twice and, for a Live file, meet its own bytes on the server.
 @Test func finishedSaveIsNotRunAgainWhenDisplaced() async throws {
     let lane = InteractiveLane()
-    let runs = RunCount()
+    let runs = Locked(0)
     let save = Task {
         try await lane.submit(.save) {
-            runs.bump()
+            runs.withLock { $0 += 1 }
             // Uninterruptible work, so the save finishes even though it is cancelled mid-way.
             usleep(200_000)
         }
@@ -45,10 +45,10 @@ import TransferCore
 /// dropped: it runs again after the preview and completes.
 @Test func aPreviewWaitsForARunningOpen() async throws {
     let lane = InteractiveLane()
-    let runs = RunCount()
+    let runs = Locked(0)
     let open = Task {
         try await lane.submit(.open) {
-            runs.bump()
+            runs.withLock { $0 += 1 }
             try await Task.sleep(nanoseconds: 200_000_000)
         }
     }
@@ -100,11 +100,4 @@ private actor Gate {
         waiters.forEach { $0.resume() }
         waiters = []
     }
-}
-
-private final class RunCount: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
-    func bump() { lock.withLock { count += 1 } }
-    var value: Int { lock.withLock { count } }
 }
