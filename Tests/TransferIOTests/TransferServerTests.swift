@@ -5,9 +5,8 @@ import TransferCore
 
 /// The transfer engine against the local sshd where copies meet what is already there: nothing
 /// outside the chosen folder is written, and nothing already there is removed or replaced
-/// without the operation's prompt. Serialized: each test logs in, and more logins at once than
-/// the local sshd's MaxStartups (10) drops some.
-@Suite(.serialized, .enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
+/// without the operation's prompt.
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct TransferServerTests {
     /// A remote link over a local folder of the same name deleted the whole folder (SEC-4, SES-01).
     @Test func aLinkNeverReplacesALocalFolder() async throws {

@@ -28,8 +28,9 @@ PubkeyAuthentication yes
 AuthorizedKeysFile $dir/authorized_keys
 StrictModes no
 Subsystem sftp /usr/libexec/sftp-server
-# Each login's host-key probe connects without authenticating; repeated test runs would trip
-# OpenSSH's per-source penalty and have every connection dropped for 15 s or more.
+# A first contact's host-key probe connects without authenticating, and the host-key tests make
+# many; repeated test runs would trip OpenSSH's per-source penalty and have every connection
+# dropped for 15 s or more.
 PerSourcePenalties no
 # Many suites log in at once; the default 10:30:100 drops unauthenticated connections early.
 MaxStartups 100:30:200
