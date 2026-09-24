@@ -1,6 +1,5 @@
-// The identities everything else is keyed by: connections, Live files, remote paths (bytes, not
-// strings, since a server's names need not be UTF-8), listed items, SFTP times and fingerprints,
-// and saved servers.
+// The identities everything else is keyed by: connections, Live files, remote paths (bytes: a
+// server's names need not be UTF-8), listed items, SFTP times and fingerprints, saved servers.
 
 import Foundation
 
@@ -22,9 +21,8 @@ public struct LiveFileID: Hashable, Sendable, RawRepresentable {
     public init() { self.rawValue = UUID() }
 }
 
-/// A path on a server, as bytes: a server's names need not be UTF-8, and the bytes are what go
-/// back on the wire. Trailing slashes are dropped when the path is made, so `/srv/site/` and
-/// `/srv/site` are one path, its name is `site`, and appending to it never makes a `//`.
+/// A server path as bytes: names need not be UTF-8, and the bytes go back on the wire. Trailing
+/// slashes are dropped: `/srv/site/` is `/srv/site`, named `site`, and appending never makes `//`.
 public struct RemotePath: Hashable, Sendable {
     public var bytes: [UInt8]
 
@@ -87,9 +85,8 @@ public struct RemotePath: Hashable, Sendable {
         return self == prefix ? replacement : replacement.appending(name: Array(bytes[(prefix.isRoot ? 1 : prefix.bytes.count + 1)...]))
     }
 
-    /// The path with empty and `.` components dropped and each `..` taking away the one before
-    /// it, as far as the root. Lexical only: a symlinked folder's `..` is where the server says,
-    /// which only the server knows.
+    /// The path with empty and `.` components dropped and each `..` removing the one before it, up
+    /// to the root. Lexical only: a symlinked folder's `..` is wherever the server says.
     public var normalized: RemotePath {
         let absolute = bytes.first == 0x2F
         var kept: [ArraySlice<UInt8>] = []

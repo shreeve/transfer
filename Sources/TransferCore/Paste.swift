@@ -129,9 +129,8 @@ public enum ClipText {
 
 /// Decisions for pasting items that live on the destination's own server.
 public enum PasteRules {
-    /// Why the paste cannot go ahead, or nil. A folder cannot be pasted into itself or anything
-    /// inside it; the copy would walk into its own output. The test is on normalized paths, so
-    /// `/srv/x/../site/sub` is inside `/srv/site`.
+    /// Why the paste cannot go ahead, or nil: a folder pasted into itself or below would walk into
+    /// its own output. Paths are normalized, so `/srv/x/../site/sub` is inside `/srv/site`.
     public static func refusal(sources: [RemotePath], into folder: RemotePath) -> String? {
         let folder = folder.normalized
         return sources.first { folder.isInside($0.normalized) }.map { "“\($0.name)” cannot be pasted into itself." }
@@ -150,13 +149,12 @@ public enum MoveCheck {
         case incomplete([TreeKey])
     }
 
-    /// `source` is the original's tree walked after the copy, so anything added to it meanwhile
-    /// is missing from the copy and keeps it. `before` is the destination before the move reached
-    /// it, empty when nothing was there; `after` is the destination now; `written` holds the keys
-    /// the move itself wrote, over what was there when the user chose Replace. A folder that was
-    /// already there may be merged into; a file or link that was there counts only when replaced.
-    /// A file counts only with the same size and a known, equal time: every copy keeps the time,
-    /// and a time either side does not know proves nothing.
+    /// `source` is the original's tree walked after the copy, so anything added meanwhile is
+    /// missing from the copy and keeps it. `before` is the destination before the move reached it
+    /// (empty if none), `after` the destination now, `written` the keys the move itself wrote over
+    /// what was there when the user chose Replace. A folder already there may be merged into; a
+    /// file or link already there counts only when replaced. A file counts only with an equal size
+    /// and a known, equal time: every copy keeps the time; an unknown one proves nothing.
     public static func verdict(
         source: [TreeKey: TreeEntry],
         before: [TreeKey: TreeEntry],
@@ -189,10 +187,10 @@ public enum MoveCheck {
     }
 }
 
-/// Finds two names in a tree that one folder on this Mac cannot hold apart: `README` and `readme`
-/// on a disk that ignores case, the two Unicode spellings of `café` (APFS ignores that difference
-/// too), or two names that are not valid UTF-8 and decode alike. Fed each key once, so a key that
-/// folds like one seen before is a second name.
+/// Finds two names that one folder on this Mac cannot hold apart: `README` and `readme` on a
+/// case-insensitive disk, the two Unicode spellings of `café` (APFS ignores that too), or two
+/// invalid UTF-8 names that decode alike. Fed each key once; a key folding like an earlier one
+/// clashes.
 public struct NameClash: Sendable {
     public let ignoringCase: Bool
     private var seen: [String: TreeKey] = [:]

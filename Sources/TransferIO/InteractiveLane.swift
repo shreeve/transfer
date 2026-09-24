@@ -1,12 +1,11 @@
 import Foundation
 import TransferCore
 
-/// The file the user is waiting on, one job at a time. Opens and saves run in order and are
-/// never interrupted: a download or upload cancelled partway would only start over. Previews wait
-/// behind them, and only the latest preview counts: a newer one replaces a preview that waits or
-/// runs. A running preview is never interrupted by another job, which could otherwise restart a
-/// large preview download on every autosave and never let it finish. A job whose caller is
-/// cancelled leaves the lane: a waiting one never runs and a running one is cancelled.
+/// The file the user is waiting on, one job at a time. Opens and saves run in order, never
+/// interrupted: a transfer cancelled partway would only start over. Previews wait behind them and
+/// only the latest counts: a newer preview replaces one that waits or runs. No other job interrupts
+/// a running preview, or a large one could restart on every autosave and never finish. A job whose
+/// caller is cancelled leaves the lane: a waiting one never runs and a running one is cancelled.
 actor InteractiveLane {
     /// `preview` is a Quick Look, inspector, or prefetch fetch. `view` is a file the user opened
     /// to view, and `open` a Live file's download the user is waiting to edit: a preview must never

@@ -1,7 +1,6 @@
 /// The library database, `transfer.sqlite` under the library root: saved servers, stars, Live
-/// file records, and the temps a copy has in flight. Its schema version is `PRAGMA user_version`.
-/// Opening a library carries it forward through `migrations`, one transaction per step, and
-/// refuses one written by a newer Transfer rather than guess at its schema.
+/// records, and temps of copies in flight. Its schema version is `PRAGMA user_version`; opening
+/// migrates it one transaction per step and refuses a newer Transfer's library rather than guess.
 
 import Foundation
 import os
@@ -34,9 +33,8 @@ final class Store: @unchecked Sendable {
     private let queue = DispatchQueue(label: "transfer.store")
     private static let log = Logger(subsystem: "com.github.shreeve.transfer", category: "library")
     let root: URL
-    /// Caches that can be rebuilt, such as previews: `~/Library/Caches/Transfer` for the default
-    /// library, else `Caches` under the custom root, so a test or a development build never
-    /// reads or evicts the user's.
+    /// Rebuildable caches (previews): `~/Library/Caches/Transfer` for the default library, else
+    /// `Caches` under the custom root, so a test or dev build never reads or evicts the user's.
     let cacheRoot: URL
 
     /// `root` defaults to `~/Library/Application Support/Transfer`.
@@ -75,12 +73,11 @@ final class Store: @unchecked Sendable {
         // waits for the other's lock instead of failing at once.
         sqlite3_busy_timeout(db, 5_000)
         while try transaction(migrateOneStep) {}
-        // WAL makes a commit one append to the log instead of a rollback journal's create, write,
-        // fsync, and unlink, and lets a reader in the other process proceed during a write. The
-        // mode is kept in the file. It cannot change during another process's transaction; then
-        // this launch keeps the old mode and the next one tries again. FULL still fsyncs the log
-        // at every commit, so a power loss cannot roll back a Live record that was written;
-        // NORMAL would halve the cost again (0.035 ms a temps pair) but give up that promise.
+        // WAL makes a commit one log append, not a rollback journal's create, write, fsync, and
+        // unlink, and lets the other process read during a write. The mode persists in the file but
+        // cannot change during another process's transaction; this launch then keeps the old mode
+        // and the next retries. FULL fsyncs the log each commit, so a power loss never rolls back a
+        // written Live record; NORMAL would halve the cost (0.035 ms a temps pair) but lose that.
         report("switch the library to WAL") { try execute("PRAGMA journal_mode = WAL") }
         try execute("PRAGMA synchronous = FULL")
     }

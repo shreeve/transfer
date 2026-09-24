@@ -4,16 +4,14 @@ import TransferCore
 /// Pastes and drops (`SessionProvider.transfer`): items copied or moved into a folder on a server,
 /// from that server, another one, or this Mac.
 ///
-/// A move is the one operation in Transfer that deletes the user's data. It removes an original,
-/// or puts a file from this Mac in the Trash, only when `MoveCheck` finds that this move wrote a
-/// complete copy of it. The destination is walked before the move first reaches it, and nothing it
-/// held then counts as the copy unless the user chose Replace; a lookalike file already there is
-/// asked about, never skipped. Before anything is copied, a move proves that the two ends are
-/// different folders on the storage itself, since two saved servers may reach one disk.
+/// A move is the only operation that deletes the user's data. It removes an original, or trashes a
+/// file from this Mac, only when `MoveCheck` finds that this move wrote a complete copy of it. The
+/// destination is walked before the move first reaches it, and nothing it held then counts as the
+/// copy unless the user chose Replace; a lookalike already there is asked about, never skipped. A
+/// move first proves the two ends are different folders on disk: two servers may reach one disk.
 ///
-/// A retry passes the same request, whose memo keeps what earlier attempts did: finished items
-/// are not done again, a chosen name is reused, and the first attempt's own copy is never taken
-/// for something that was already there.
+/// A retry passes the same request, whose memo keeps what earlier attempts did: finished items are
+/// skipped, chosen names reused, and the first attempt's copy never taken for what was there.
 struct TransferEngine {
     let request: TransferRequest
     let destination: SSHConnection
@@ -172,10 +170,9 @@ struct TransferEngine {
         CopyTally(progress, memo: memo, moving: request.moving)
     }
 
-    /// Once per move: whether the destination folder is, on the storage itself, the folder the
-    /// originals are in (two saved servers for one host, or two hosts sharing a disk). A folder
-    /// named as nothing else is made in the destination, and `seen` looks for that name beside
-    /// the originals. Only "no such file" there proves two places.
+    /// Once per move: whether the destination folder is, on the storage itself, the originals'
+    /// (two saved servers for one host, or two hosts on one disk). A uniquely named folder is made
+    /// there and `seen` looks for it beside the originals; only "no such file" proves two places.
     private func proveApart(from place: String, seen: @Sendable (String) async throws -> Bool) async throws {
         guard request.moving, !memo.withLock({ $0.checked }) else { return }
         let name = ".transfer-move-check-\(UUID().uuidString)"

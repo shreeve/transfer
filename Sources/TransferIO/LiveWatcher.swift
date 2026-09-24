@@ -1,10 +1,9 @@
 import CoreServices
 import Foundation
 
-/// One FSEvents stream over the Live root. It watches paths, not inodes, so a safe-save that
-/// replaces a working copy needs no re-arming. Every event is only a hint to look at that file
-/// again: FSEvents groups events and carries flags over from earlier ones, so neither the count
-/// nor the flags mean anything. When events were dropped, it asks for everything to be looked at.
+/// One FSEvents stream over the Live root. It watches paths, not inodes, so a safe-save needs no
+/// re-arming. An event only means "look at that file again": FSEvents groups events and carries
+/// flags over, so only the dropped-events flags count, and they ask for everything to be looked at.
 final class LiveWatcher: @unchecked Sendable {
     enum Signal: Sendable {
         case changed([String])

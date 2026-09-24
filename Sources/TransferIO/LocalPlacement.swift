@@ -11,9 +11,8 @@ enum PlacedItem: Equatable, Sendable {
     case other
 }
 
-/// What a copy does with an item whose name is held, or not, at its destination. The same rules
-/// hold for downloads, uploads, and copies on a server, so a link or a folder is settled the
-/// same way in every direction.
+/// What a copy does with an item whose name is held, or not, at its destination. Downloads,
+/// uploads, and server copies share these rules, so links and folders settle alike.
 enum Placement: Equatable {
     /// Nothing holds the name.
     case write

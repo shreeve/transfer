@@ -3,9 +3,8 @@ import Foundation
 import TransferCore
 
 /// One saved server over the Mac's own /usr/bin/ssh: the ControlMaster login (askpass, host keys),
-/// the SFTP passengers riding it (browse, interactive, walker, and at most seven data channels),
-/// and the Live API it forwards to `LiveSync`. The transfer engine is in
-/// SSHConnection+Transfers.swift. HANDOFF.md explains the design and the traps it avoids.
+/// the SFTP passengers on it (browse, interactive, walker, up to seven data channels), and the Live
+/// API forwarded to `LiveSync`. Transfers are in SSHConnection+Transfers.swift; see HANDOFF.md.
 public actor SSHConnection: RemoteSession {
     public nonisolated let connection: SavedConnection
 
@@ -252,9 +251,8 @@ public actor SSHConnection: RemoteSession {
         await release(held, reason: reason)
     }
 
-    /// Stops what `held` started, after any earlier release: when the last release returns, no
-    /// master of this connection runs and the socket path is free. Calls still waiting on its
-    /// channels fail with `reason`.
+    /// Stops what `held` started, after any earlier release, so when the last release returns no
+    /// master of this connection runs and the socket is free. Waiters on its channels get `reason`.
     private func release(_ held: Held, reason: TransferError = .cancelled) async {
         let previous = releasing
         let task = Task {
@@ -384,10 +382,9 @@ public actor SSHConnection: RemoteSession {
         store.star(connection: connection.id, path: path, on: false)
     }
 
-    /// Joins the master when it is up, else logs in on its own with the same port and identity;
-    /// never becomes a master on this connection's socket. Nil when a field holds a control
-    /// character: the command is typed into an interactive shell, where a CR or LF in a folder
-    /// name the server chose would end the line and run the rest.
+    /// Joins the master when up, else logs in with the same port and identity, never as a master on
+    /// this socket. Nil when a field holds a control character: the command is typed into a shell,
+    /// where a CR or LF in a folder name the server chose would end the line and run the rest.
     public func terminalCommand(directory: RemotePath) async -> String? {
         guard isConnected else { return nil }
         let remote = "cd \(Self.quote(directory.display)) && exec \"$SHELL\" -l"
@@ -619,10 +616,9 @@ public actor SSHConnection: RemoteSession {
 
     // MARK: Host keys
 
-    /// After ssh refused the host key: learns the key the server offers with a probe that reads no
-    /// known-hosts file, asks the user, and returns the arguments for the master's second try.
-    /// Always Trust and Replace write the first user file `ssh -G` names; Trust Once hands the
-    /// master the probe's file, removed on disconnect.
+    /// After ssh refused the host key: learns the offered key with a probe reading no known-hosts
+    /// file, asks, and returns arguments for the master's retry. Always Trust and Replace write the
+    /// first user file `ssh -G` names; Trust Once gives the master the probe's file until disconnect.
     private func trustHostKey(_ failure: HostKeyFailure, prompts: any PromptSink, ask: URL, holding held: inout Held) async throws -> [String] {
         let values = SSHConfigValues.parse(await SSHResolver.config(for: connection, configFile: sshConfigFile) ?? "")
         let probeDirectory = store.root.appendingPathComponent("hostkey-\(UUID().uuidString)", isDirectory: true)

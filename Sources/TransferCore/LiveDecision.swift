@@ -116,9 +116,8 @@ public enum LiveLocalChange: Hashable, Sendable {
 /// feeding it more facts (a digest, the server's file) until it stops asking. The commands that
 /// run between passes (Keep Local, a removal, Discard, Remove Server, Quit) ask the helpers.
 public enum LiveDecision {
-    /// How the working copy compares with the last sync. Without an exact stamp (a record from
-    /// before stamps were kept), the whole-second view is compared with the server's, so an edit
-    /// of the same size within the base's own second reads as unchanged.
+    /// Without an exact stamp (a record older than stamps), the whole-second view is compared with
+    /// the server's, so a same-size edit within the base's second reads as unchanged.
     public static func localChange(_ state: LiveState, _ stamp: LiveStamp, digest: String?) -> LiveLocalChange {
         if let synced = state.synced {
             if stamp == synced { return .same }

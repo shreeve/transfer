@@ -1,6 +1,5 @@
-// The app's small pure rules: which files open Live, made-up names, listing order, the column
-// trail, units, retries, preview-cache eviction, known-hosts lines, and what Quit asks. Each is
-// a value or a function of values, tested in Tests/TransferCoreTests.
+// Small pure rules, tested in Tests/TransferCoreTests: Live or view, made-up names, listing order,
+// the column trail, units, retries, cache eviction, known-hosts lines, what Quit asks.
 
 import Foundation
 import UniformTypeIdentifiers
@@ -185,11 +184,10 @@ public struct BrowserSnapshot: Hashable, Sendable {
     public init() {}
 }
 
-/// What the column view shows for a location: one column per folder from the root down to the
-/// location, each with its selection. Every column above the location selects the next folder on
-/// the way down; the location's own column selects the items of `selection` it holds. A selected
-/// folder that is itself the location is therefore selected in its parent's column, and its own
-/// column shows with nothing selected, as it does after a click.
+/// What the column view shows for a location: a column per folder from the root down, each with its
+/// selection. Each column above the location selects the next folder down; the location's own
+/// column selects the items of `selection` it holds. So a selected folder that is the location is
+/// selected in its parent's column, and its own column has nothing selected, as after a click.
 public enum ColumnTrail {
     public struct Column: Hashable, Sendable {
         public var folder: RemotePath
@@ -211,23 +209,20 @@ public enum ColumnTrail {
     }
 }
 
-/// The order of a folder's items. Each item's sort key (its kind, the column's value, its
-/// case-folded name, its name's bytes) is computed once, not in every comparison: a listing is
-/// sorted again on each publish while a big folder streams in.
+/// The order of a folder's items. Each item's sort key is computed once, not per comparison: a
+/// listing is sorted again on each publish while a big folder streams in.
 public enum ListingSort {
-    /// With `foldersFirst`, directories come first in every column and direction. Within each
-    /// group the chosen column applies; ties go to name order, ascending in every direction.
-    /// Names compare case-folded first when `caseInsensitive`, then by their raw bytes. A size
-    /// or time the server did not send counts as 0.
+    /// With `foldersFirst`, directories come first in every column and direction. Then the column
+    /// applies; ties go to name order, ascending in every direction. Names compare case-folded
+    /// first when `caseInsensitive`, then by raw bytes. A missing size or time counts as 0.
     public static func apply(_ items: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
         let order = Order(sort)
         return order.sorted(items) { index, _ in items[index] }
     }
 
-    /// `page`, newly listed, merged into `sorted`, a listing already in `apply`'s order for the
-    /// same `sort`. The result is what `apply(sorted + page, sort:)` gives, for the cost of
-    /// sorting the page and copying the listing: a streaming folder's publishes stop costing a
-    /// full sort each.
+    /// `page`, newly listed, merged into `sorted`, already in `apply`'s order for the same `sort`.
+    /// The result equals `apply(sorted + page, sort:)` for the cost of sorting the page and copying
+    /// the listing, so a streaming folder's publishes stop costing a full sort each.
     public static func merge(_ page: [RemoteItem], into sorted: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
         guard !sorted.isEmpty else { return apply(page, sort: sort) }
         let order = Order(sort)

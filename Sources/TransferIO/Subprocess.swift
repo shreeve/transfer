@@ -10,9 +10,8 @@ enum Subprocess {
         var stderr: String
     }
 
-    /// Runs `launch` to its end, killing it after `timeout` (throws `.timeout`) or when the calling
-    /// task is cancelled (throws `.cancelled`). The blocking reads run on Dispatch's threads, never
-    /// on Swift's cooperative pool.
+    /// Runs `launch` to its end, killing it on `timeout` (throws `.timeout`) or task cancellation
+    /// (throws `.cancelled`). Blocking reads run on Dispatch threads, never Swift's cooperative pool.
     static func run(_ launch: String, _ arguments: [String], environment: [String: String]? = nil, timeout: Duration) async throws -> Result {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launch)

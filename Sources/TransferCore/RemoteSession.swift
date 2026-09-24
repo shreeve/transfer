@@ -1,7 +1,6 @@
-// The seam between the views and the transport. TransferUI sees servers only through
-// SessionProvider and RemoteSession, which TransferIO implements with TransferHub and
-// SSHConnection; prompts go back through PromptSink (OperationPrompts for an operation's own).
-// Also the errors, operations, and events that cross it, and the library-root override.
+// The seam between views and transport. TransferUI reaches servers only via SessionProvider and
+// RemoteSession (TransferIO: TransferHub, SSHConnection); prompts return via PromptSink, or
+// OperationPrompts for an operation's own. Also the errors, operations, events, and library root.
 
 import Foundation
 
@@ -56,18 +55,16 @@ public struct PromptReply: Sendable {
 public protocol PromptSink: Sendable {
     func answer(_ request: PromptRequest) async -> PromptReply
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision
-    /// Nil when nobody can answer, as when the window has closed: the operation then fails
-    /// rather than guess.
+    /// Nil when nobody can answer (the window closed): the operation then fails rather than guess.
     func resolveCollision(fileName: String) async -> NameCollisionChoice?
 }
 
-/// Who answers the questions one user operation raises, such as what to do with a file that
-/// already has the name. A session belongs to every window on its server, so the sink given to
-/// `connect` answers only login prompts (passwords and host keys); an operation's prompts go to
-/// the window that started it. The UI runs each operation's body, retries included, inside
-/// `OperationPrompts.$current.withValue(sink) { … }`, and child tasks inherit it. An operation that
-/// meets an existing file with no sink bound fails with a clear error: nothing is replaced or
-/// skipped without someone having said so.
+/// Who answers one user operation's questions, such as what to do about a name already taken. A
+/// session serves every window on its server, so the sink given to `connect` answers only login
+/// prompts (passwords, host keys); an operation's prompts go to the window that started it. Each
+/// operation's body, retries included, runs in `OperationPrompts.$current.withValue(sink) { … }`,
+/// which child tasks inherit. With no sink bound, an operation meeting an existing file fails with
+/// a clear error: nothing is replaced or skipped unless someone said so.
 public enum OperationPrompts {
     @TaskLocal public static var current: (any PromptSink)?
 }
@@ -135,12 +132,11 @@ public struct LiveFile: Hashable, Sendable, Identifiable {
     public var isSynced: Bool { !dirty && !uploading && !conflict }
 }
 
-/// A library root in place of `~/Library/Application Support/Transfer`, from the
-/// `TRANSFER_LIBRARY` environment variable, for development builds and end-to-end tests. Under
-/// it the app keeps everything it would otherwise keep for the user: the SQLite library, the
-/// config, Live working copies, login scratch, and (in `Caches`) the preview cache and the
-/// clipboard's staging and scratch folders. A build started with it never touches the installed
-/// app's library, caches, or Live files. Nil when unset or empty.
+/// A library root in place of `~/Library/Application Support/Transfer`, from the `TRANSFER_LIBRARY`
+/// environment variable, for development builds and end-to-end tests. Under it go the SQLite
+/// library, the config, Live working copies, login scratch, and (in `Caches`) the preview cache and
+/// the clipboard's staging and scratch folders, so a build started with it never touches the
+/// installed app's library, caches, or Live files. Nil when unset or empty.
 public enum LibraryOverride {
     public static var root: URL? {
         guard let path = ProcessInfo.processInfo.environment["TRANSFER_LIBRARY"], !path.isEmpty else { return nil }
@@ -166,8 +162,8 @@ public protocol SessionProvider: Sendable {
     /// Runs a paste or drop. Items on the destination's own server are copied there, or renamed
     /// when moving; items on another server pass through a scratch folder on this Mac; files from
     /// this Mac upload. Both servers must be logged in. A move removes an original, or puts a file
-    /// from this Mac in the Trash, only once it has checked that this move wrote a complete copy
-    /// of it, and throws `TransferKept` for any it kept. Call again with the same request to retry.
+    /// from this Mac in the Trash, only after checking that this move wrote a complete copy of it,
+    /// and throws `TransferKept` for any it kept. Call again with the same request to retry.
     func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
 }
 
@@ -206,9 +202,8 @@ public protocol RemoteSession: Sendable {
     func stars() async -> [RemotePath]
     func star(_ path: RemotePath) async
     func unstar(_ path: RemotePath) async
-    /// Copies a file, link, or folder tree to `destination` on this same server. Files are copied
-    /// on the server when it offers `copy-data`, else through the Mac. Folders merge into an
-    /// existing folder and file collisions are settled as uploads settle them.
+    /// Copies a file, link, or folder tree to `destination` on this server, on the server when it
+    /// offers `copy-data`, else via the Mac. Folders merge; file collisions settle as for uploads.
     func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     /// Walks `root` on the walker channel and streams every entry, the root first under the
     /// empty key, the rest by their path relative to it.

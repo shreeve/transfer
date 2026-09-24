@@ -19,13 +19,12 @@ protocol LiveServer: AnyObject, Sendable {
     func liveEmit(_ event: SessionEvent)
 }
 
-/// Everything about Live files, in one place: the records and their storage, one watcher over
-/// the Live folder, and one worker per server that runs every pass and every command for that
-/// server's files in turn. Only the worker changes a file's sync state, so nothing races and
-/// nothing needs a lock; the one exception is the paused flag, which Pause sets at once and the
-/// next pass reads. A pass does what `LiveDecision` answers from the facts it gathers: the copy's
-/// stamp, a digest when the stamp moved, and the server's file. One per app, owned by the hub,
-/// so the one watcher and the records outlive any connection.
+/// Everything about Live files: the records and their storage, one watcher over the Live folder,
+/// and one worker per server running every pass and command for its files in turn. Only the worker
+/// changes a file's sync state, so nothing races and nothing needs a lock; the exception is the
+/// paused flag, which Pause sets at once and the next pass reads. A pass does what `LiveDecision`
+/// answers from the facts it gathers: the copy's stamp, a digest when the stamp moved, and the
+/// server's file. One per app, owned by the hub, so the watcher and records outlive any connection.
 actor LiveSync {
     /// How long a working copy must hold still before a pass acts on it.
     static let settle: Duration = .milliseconds(350)
@@ -116,11 +115,10 @@ actor LiveSync {
         (entries, notices) = Self.load(store.liveFiles(), store: store)
     }
 
-    /// Records from their rows, reading only stamps: whether a copy holds edits is worked out when
-    /// it is asked, by a pass or by `isUnsynced`. A copy that is gone takes its record, and its
-    /// folder too unless edits were known; the user hears of those. A copy idle for a day expires
-    /// unless it holds edits; its last activity is the later of its and its folder's mtime, since
-    /// a download gives the file the server's older time.
+    /// Records from their rows, reading only stamps; whether a copy holds edits is worked out when
+    /// asked. A gone copy takes its record, and its folder unless edits were known (the user hears
+    /// of those). A copy idle for a day expires unless it holds edits; its last activity is the
+    /// later of its and its folder's mtime, as a download gives the file the server's older time.
     private static func load(_ rows: [LiveRow], store: Store) -> ([LiveFileID: Entry], [ConnectionID: [String]]) {
         var loaded: [LiveFileID: Entry] = [:]
         var gone: [ConnectionID: [String]] = [:]
