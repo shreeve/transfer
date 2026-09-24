@@ -492,7 +492,7 @@ extension SSHConnection {
         let ext = (item.name as NSString).pathExtension
         let file = try previewURL(path, ext: ext.isEmpty ? "bin" : ext)
         // The copy carries the remote size and mtime; the same pair means the same bytes.
-        if Self.cachedCopyMatches(file, item) { return file }
+        if let print = Fingerprint(item: item), (try? LocalPlacement.occupant(file)) == .file(print) { return file }
         try await lane.submit(.preview) {
             try await self.fetch(path, info: item, to: file, quarantine: true) { _ in }
         }
@@ -500,21 +500,17 @@ extension SSHConnection {
         return file
     }
 
-    private static func cachedCopyMatches(_ file: URL, _ item: RemoteItem) -> Bool {
-        guard let mtime = item.mtime, let size = item.size,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
-              let localSize = attributes[.size] as? UInt64,
-              let localDate = attributes[.modificationDate] as? Date else { return false }
-        return localSize == size && SFTPTime.seconds(localDate) == mtime
-    }
-
     public func preparePreview(_ path: RemotePath) async throws -> URL {
         let item = try await stat(path)
         if EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live {
-            let file = try previewURL(path, ext: "html")
+            // The page is named for the file's size and time too, so an unchanged file reuses it.
+            let print = Fingerprint(item: item)
+            let file = try previewURL(path, ext: "html", version: print.map { "\($0.size):\($0.mtime)" } ?? "")
+            if print != nil, FileManager.default.fileExists(atPath: file.path) { return file }
             let part = try previewURL(path, ext: "part")
+            let limit: UInt64 = 512 * 1024
             try await lane.submit(.preview) {
-                try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: min(item.size ?? 0, 512 * 1024)), to: part) { _ in }
+                try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: min(item.size ?? limit, limit)), to: part) { _ in }
             }
             defer { try? FileManager.default.removeItem(at: part) }
             let data = try Data(contentsOf: part)
@@ -537,13 +533,16 @@ extension SSHConnection {
         store.cacheRoot.appendingPathComponent("Preview", isDirectory: true)
     }
 
-    private func previewURL(_ path: RemotePath, ext: String) throws -> URL {
+    /// The cache file for `path` on this server. Named for the server too, since two servers
+    /// can hold different files at one path.
+    private func previewURL(_ path: RemotePath, ext: String, version: String = "") throws -> URL {
         var cache = previewCacheDirectory
         try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try? cache.setResourceValues(values)
-        let digest = SHA256.hash(data: Data(path.bytes)).map { String(format: "%02x", $0) }.joined()
+        let key = Data(connection.id.rawValue.uuidString.utf8) + Data(path.bytes) + Data([0]) + Data(version.utf8)
+        let digest = SHA256.hash(data: key).map { String(format: "%02x", $0) }.joined()
         return cache.appendingPathComponent("\(digest).\(ext)")
     }
 

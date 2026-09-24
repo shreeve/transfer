@@ -293,6 +293,37 @@ struct TransferServerTests {
             try await h.session.discardLiveFile(h.remotePath.appending(name: Array("note.txt".utf8)), force: true)
         }
     }
+
+    /// Preview files were named for the path alone, so two servers' files at one path shared a
+    /// cache entry (SES-13), and a text preview was rebuilt on every selection (SES-23).
+    @Test func previewsAreKeptPerServerAndReused() async throws {
+        try await withHarness("prev", connected: true) { h in
+            let note = h.remote.appendingPathComponent("note.txt")
+            try Data("first".utf8).write(to: note)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: note.path)
+            let path = h.remotePath.appending(name: Array("note.txt".utf8))
+
+            let page = try await h.session.preparePreview(path)
+            #expect(try String(contentsOf: page, encoding: .utf8).contains("first"))
+            let identity = try page.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
+            let again = try await h.session.preparePreview(path)
+            #expect(again == page)
+            #expect(identity?.isEqual(try again.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier) == true)
+
+            try Data("later".utf8).write(to: note)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_060)], ofItemAtPath: note.path)
+            #expect(try String(contentsOf: try await h.session.preparePreview(path), encoding: .utf8).contains("later"))
+
+            var other = h.session.connection
+            other.id = ConnectionID()
+            let second = SSHConnection(connection: other, store: try Store(root: h.root), editableExtensions: [], sshConfigFile: h.configFile.path)
+            _ = try await second.connect(prompts: h.prompts)
+            let mine = try await h.session.prepareViewFile(path)
+            let theirs = try await second.prepareViewFile(path)
+            await second.disconnect()
+            #expect(mine != theirs)
+        }
+    }
 }
 
 /// A listening unix socket at `url`, as a dev tool leaves in a project folder.
