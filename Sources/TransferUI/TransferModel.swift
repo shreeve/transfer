@@ -148,7 +148,9 @@ public final class TransferModel {
     /// True while a text field in the window has focus, so Space and Return stay with the field.
     public var textEditing = false
     public var folderText = ""
-    public var status = "Not connected"
+    /// What the user should know, such as what failed: shown under the toolbar until dismissed
+    /// or replaced by the next message. A listing that works never clears it.
+    public var status: String?
     public var showsInspector = false {
         didSet { if showsInspector != oldValue { refreshInspectorPreview() } }
     }
@@ -174,6 +176,8 @@ public final class TransferModel {
     public var saveSecret = false
     public var renaming = false
     public var renameText = ""
+    /// What the rename bar renames, fixed when it opens.
+    @ObservationIgnored private var renameTarget: RemotePath?
     public var applyCollisionToAll = false
     public var sidebarSelection: SidebarItem?
     public var inspectorLinkTarget: String?
@@ -313,6 +317,36 @@ public final class TransferModel {
         connections.first { $0.id == snapshot.connectionID }
     }
 
+    /// The window's title: the server it shows, or the one it is logging in to.
+    public var title: String {
+        if let connectingTo { return "Connecting to \(connectingTo.displayName)…" }
+        return currentConnection?.displayName ?? context?.connection.displayName ?? "Not connected"
+    }
+
+    /// Shows what went wrong. A cancellation is not an error.
+    func report(_ error: any Error) {
+        if Self.isCancellation(error) { return }
+        status = error.localizedDescription
+    }
+
+    private static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || (error as? TransferError) == .cancelled
+    }
+
+    /// Runs `body`, showing what it throws.
+    private func reporting(_ body: () async throws -> Void) async {
+        do { try await body() } catch { report(error) }
+    }
+
+    /// One message for the items an action on several could not handle: "Could not delete
+    /// “a”: Permission denied", or "Could not delete 2 of 5 items. “a”: …; “b”: …".
+    private func reportFailures(_ verb: String, _ failures: [(name: String, error: any Error)], of total: Int) {
+        let failures = failures.filter { !Self.isCancellation($0.error) }
+        guard !failures.isEmpty else { return }
+        let each = failures.map { "“\($0.name)”: \($0.error.localizedDescription)" }.joined(separator: "; ")
+        status = total == 1 ? "Could not \(verb) \(each)" : "Could not \(verb) \(failures.count) of \(total) items. \(each)"
+    }
+
     /// Logs in and shows the start folder, or `landing` when given: that folder, or the file
     /// selected in its folder. Nothing in the window changes until the login has worked, so a
     /// failed or cancelled login leaves the window on the server it showed; when connects
@@ -321,7 +355,6 @@ public final class TransferModel {
         connectGeneration &+= 1
         let generation = connectGeneration
         connectingTo = connection
-        status = "Connecting to \(connection.displayName)…"
         var pending: ServerContext?
         defer {
             if let pending, pending !== context { pending.close() }
@@ -347,13 +380,12 @@ public final class TransferModel {
             }
             guard generation == connectGeneration else { return }
             install(fresh, path: path, selection: selection)
-            status = connection.displayName
             await refresh()
             scheduleSidebarReload()
             if let missing { status = "No such file or folder: \(missing.display)" }
         } catch {
             guard generation == connectGeneration else { return }
-            status = error.localizedDescription
+            report(error)
         }
     }
 
@@ -376,7 +408,6 @@ public final class TransferModel {
         snapshot.connectionID = nil
         snapshot.selection = []
         refreshItems()
-        status = "Not connected"
     }
 
     /// Forgets what the window knew about the server it showed, and stops listening to it.
@@ -455,15 +486,13 @@ public final class TransferModel {
         var connection = draft
         if connection.name.isEmpty { connection.name = connection.host }
         let wasEdit = draftIsEdit
-        do {
+        await reporting {
             try await provider.save(connection)
             await reloadConnections()
             sheet = nil
             let landing = pendingLanding
             pendingLanding = nil
             if !wasEdit { await connect(connection, landing: landing) }
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -475,13 +504,11 @@ public final class TransferModel {
     /// worked logs out, so a refusal leaves every window on that server as it was.
     public func removeServer(_ connection: SavedConnection) async {
         sheet = nil
-        do {
+        await reporting {
             try await provider.removeConnection(connection.id)
             UserDefaults.standard.removeObject(forKey: Self.sortKey(connection.id))
             if snapshot.connectionID == connection.id { uninstall() }
             await reloadConnections()
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -551,8 +578,6 @@ public final class TransferModel {
             // A cancelled consumer ends the loop normally rather than by throwing.
             guard !Task.isCancelled, isCurrent(context) else { return false }
             flush(complete: true)
-            // A listing that worked ends any earlier error in the title.
-            if let name = currentConnection?.displayName { status = name }
             return true
         } catch {
             guard !Task.isCancelled, isCurrent(context) else { return false }
@@ -563,7 +588,7 @@ public final class TransferModel {
                 // The server's text is just "No such file"; name the folder instead.
                 status = "No such folder: \(path.display)"
             } else {
-                status = error.localizedDescription
+                report(error)
             }
             return false
         }
@@ -656,11 +681,9 @@ public final class TransferModel {
 
     public func goHome() async {
         guard let context else { return }
-        do {
+        await reporting {
             let path = try await context.session.connect(prompts: prompts.login(context.connection))
             await navigate(path)
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -779,7 +802,10 @@ public final class TransferModel {
         refreshItems()
     }
 
+    /// Leaving column view drops a selected folder that is the location itself: the other views
+    /// show its contents with nothing highlighted, and Delete or Rename would act on it unseen.
     public func setViewMode(_ mode: ViewMode) {
+        if snapshot.viewMode == .columns, mode != .columns, snapshot.selection == [snapshot.path] { snapshot.selection = [] }
         snapshot.viewMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: Preferences.viewMode)
         if mode == .columns { columnRoot = snapshot.path }
@@ -800,7 +826,7 @@ public final class TransferModel {
     /// Follows the double-click rule, or forces Live when asked. Folders navigate.
     public func open(_ item: RemoteItem, forceLive: Bool = false) async {
         guard let session else { return }
-        do {
+        await reporting {
             let target = try await Self.resolveLink(item, session: session)
             if target.kind == .directory {
                 await navigate(target.path)
@@ -808,18 +834,9 @@ public final class TransferModel {
             }
             guard target.kind == .file else { return }
             let rule = await session.openKind(fileName: target.name)
-            let live = forceLive || rule == .live
-            let url: URL
-            if live {
-                url = try await session.prepareLiveFile(target.path)
-            } else {
-                url = try await session.prepareViewFile(target.path)
-            }
+            let url = forceLive || rule == .live ? try await session.prepareLiveFile(target.path) : try await session.prepareViewFile(target.path)
             await FileOpener.open(url)
             await reloadSidebars()
-        } catch TransferError.cancelled {
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -844,8 +861,9 @@ public final class TransferModel {
         showPreview()
     }
 
-    public func showPreview() {
-        guard let session, let item = primaryItem else { return }
+    /// Quick Look on `item`, or on the primary selected item.
+    public func showPreview(_ item: RemoteItem? = nil) {
+        guard let session, let item = item ?? primaryItem else { return }
         previewTask?.cancel()
         previewTask = Task { [weak self] in
             do {
@@ -853,15 +871,14 @@ public final class TransferModel {
                 let url = try await session.preparePreview(target.path)
                 if Task.isCancelled { return }
                 PreviewPanel.shared.show(url)
-            } catch TransferError.cancelled {
-            } catch is CancellationError {
             } catch {
-                self?.status = error.localizedDescription
+                self?.report(error)
             }
         }
     }
 
     public func selectionChanged() {
+        if renaming, let renameTarget, snapshot.selection != [renameTarget] { renaming = false }
         if PreviewPanel.shared.isVisible {
             if primaryItem != nil { showPreview() } else { PreviewPanel.shared.close() }
         }
@@ -1043,13 +1060,15 @@ public final class TransferModel {
     /// folders on screen.
     public func move(_ paths: [RemotePath], into folder: RemotePath) async {
         guard let session else { return }
+        var failures: [(name: String, error: any Error)] = []
         for path in paths {
             do {
                 try await session.rename(path, to: folder.appending(name: path.nameBytes))
             } catch {
-                status = "Could not move \(String(decoding: path.nameBytes, as: UTF8.self)): \(error.localizedDescription)"
+                failures.append((path.name, error))
             }
         }
+        reportFailures("move", failures, of: paths.count)
     }
 
     /// Queues `body` against the server the window shows now; it stays with that server.
@@ -1162,21 +1181,19 @@ public final class TransferModel {
     // MARK: Edits
 
     public func mkdir() async {
-        guard let session else { return }
-        let existing = Set(items.map(\.name))
+        guard let context else { return }
+        let existing = Set((listings[snapshot.path]?.items ?? items).map(\.name))
         var name = "untitled folder"
         var n = 2
         while existing.contains(name) {
             name = "untitled folder \(n)"
             n += 1
         }
-        do {
-            let path = snapshot.path.appending(name: Array(name.utf8))
-            try await session.mkdir(path)
+        let path = snapshot.path.appending(name: Array(name.utf8))
+        await reporting {
+            try await context.session.mkdir(path)
             await refresh()
-            snapshot.selection = [path]
-        } catch {
-            status = error.localizedDescription
+            if isCurrent(context) { snapshot.selection = [path] }
         }
     }
 
@@ -1189,41 +1206,110 @@ public final class TransferModel {
         sheet = .delete
     }
 
+    /// Deletes the selection and says which items could not go. What failed stays selected.
     public func deleteSelection() async {
-        guard let session else { return }
-        for path in snapshot.selection {
-            do { try await session.remove(path) } catch { status = error.localizedDescription }
+        guard let context else { return }
+        let paths = snapshot.selection.sorted { $0.display < $1.display }
+        var removed: [RemotePath] = []
+        var failures: [(name: String, error: any Error)] = []
+        for path in paths {
+            do {
+                try await context.session.remove(path)
+                removed.append(path)
+            } catch {
+                failures.append((path.name, error))
+            }
         }
-        snapshot.selection = []
-        await refresh()
+        guard isCurrent(context) else { return }
+        reportFailures("delete", failures, of: paths.count)
+        snapshot.selection.subtract(removed)
+        await stepOut(of: removed)
         await reloadSidebars()
     }
 
-    public func beginRename() {
-        guard let item = primaryItem else { return }
+    /// After `gone` left their places: a window standing in one of them moves up to its parent,
+    /// keeping the column view's columns when that parent is one, and the location lists again.
+    private func stepOut(of gone: [RemotePath]) async {
+        for path in listings.keys where gone.contains(where: path.isInside) { listings[path] = nil }
+        guard let left = gone.first(where: snapshot.path.isInside), let parent = left.parent else {
+            await refresh()
+            return
+        }
+        if snapshot.viewMode == .columns, let root = columnRoot, parent.isInside(root) {
+            snapshot.path = parent
+            snapshot.selection = []
+            context?.cancelListings(keeping: isShown)
+            refreshItems()
+            await refresh()
+        } else {
+            await show(parent)
+        }
+    }
+
+    /// Opens the rename bar for `item`, or the primary selected item. The rename acts on that
+    /// item whatever is selected when it is confirmed; moving the selection closes the bar.
+    public func beginRename(_ item: RemoteItem? = nil) {
+        guard let item = item ?? primaryItem else { return }
+        renameTarget = item.path
         renameText = item.name
         renaming = true
     }
 
     public func renameSelection(to name: String) async {
         renaming = false
-        guard let session, let item = primaryItem, let parent = item.path.parent, name != item.name, !name.isEmpty else { return }
-        do {
-            let destination = parent.appending(name: Array(name.utf8))
-            try await session.rename(item.path, to: destination)
-            await refresh()
-            snapshot.selection = [destination]
-        } catch {
-            status = error.localizedDescription
+        guard let context, let source = renameTarget, let parent = source.parent else { return }
+        renameTarget = nil
+        guard name != source.name else { return }
+        guard Self.isValidName(name) else {
+            status = "“\(name)” cannot be a name: it must not be empty, “.” or “..”, or hold a “/”."
+            return
+        }
+        let destination = parent.appending(name: Array(name.utf8))
+        await reporting {
+            try await context.session.rename(source, to: destination)
+            guard isCurrent(context) else { return }
+            if snapshot.path.isInside(source) {
+                // The location itself was renamed, as a folder selected in column view is.
+                let moved = RemotePath(bytes: destination.bytes + snapshot.path.bytes.dropFirst(source.bytes.count))
+                await stepOut(of: [source])
+                if snapshot.path == parent, snapshot.viewMode == .columns {
+                    snapshot.selection = [destination]
+                    snapshot.path = moved
+                    refreshItems()
+                    await refresh()
+                } else {
+                    await show(moved)
+                }
+            } else {
+                await refresh()
+                snapshot.selection = [destination]
+            }
         }
     }
 
+    /// One item's name as the server takes it: not empty, not `.` or `..`, and with no `/` or
+    /// NUL, which would put the item somewhere else or fail.
+    private static func isValidName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
+    }
+
+    /// Copies each selected file, link, or folder beside itself as "name copy", on the server,
+    /// with its progress on the shelf.
     public func duplicateSelection() async {
         guard let session else { return }
-        for item in selectedItems where item.kind == .file {
-            do { try await session.duplicate(item.path) } catch { status = error.localizedDescription }
+        var taken: [RemotePath: Set<String>] = [:]
+        for item in selectedItems {
+            guard let parent = item.path.parent else { continue }
+            var existing = taken[parent] ?? Set(listings[parent]?.items.map(\.name) ?? [])
+            let name = KeepBothName.duplicate(existing: existing, original: item.name)
+            existing.insert(name)
+            taken[parent] = existing
+            let source = item.path
+            let destination = parent.appending(name: Array(name.utf8))
+            enqueue(title: "Duplicate \(item.name)", path: destination) { progress in
+                try await session.copy(source, to: destination, progress: progress)
+            }
         }
-        await refresh()
     }
 
     public func isStarred(_ path: RemotePath) -> Bool {
@@ -1272,7 +1358,7 @@ public final class TransferModel {
     /// Opens a starred entry: a folder is entered, a file is revealed in its folder and opened.
     public func openStarred(_ path: RemotePath) async {
         guard let session else { return }
-        do {
+        await reporting {
             let item = try await session.stat(path)
             if item.kind == .directory {
                 await navigate(path)
@@ -1280,11 +1366,8 @@ public final class TransferModel {
                 await reveal(path)
                 await open(item)
             }
-        } catch {
-            status = error.localizedDescription
         }
     }
-
 
     public func discardLive(_ path: RemotePath, force: Bool = false) async {
         guard let session else { return }
@@ -1295,7 +1378,7 @@ public final class TransferModel {
         } catch TransferError.liveUnsynced {
             sheet = .discardLive(path)
         } catch {
-            status = error.localizedDescription
+            report(error)
         }
     }
 
@@ -1333,9 +1416,11 @@ public final class TransferModel {
         await session?.clearPreviewCache()
     }
 
-    public func copyRemoteURL() {
+    /// Puts `sftp://` links on the pasteboard: for `paths` when given, as for the folder of an
+    /// empty-area menu, else for the selection, or the location with nothing selected.
+    public func copyRemoteURL(_ paths: [RemotePath]? = nil) {
         guard let connection = currentConnection else { return }
-        let paths = snapshot.selection.isEmpty ? [snapshot.path] : Array(snapshot.selection)
+        let paths = paths ?? (snapshot.selection.isEmpty ? [snapshot.path] : snapshot.selection.sorted { $0.display < $1.display })
         let text = paths.map { SFTPURL.string(connection: connection, path: $0) }.joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -1369,7 +1454,7 @@ public final class TransferModel {
         do {
             try await session.resolveLive(path, choice: choice)
         } catch {
-            status = error.localizedDescription
+            report(error)
         }
     }
 

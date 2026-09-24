@@ -15,7 +15,7 @@ public struct ContentView: View {
     public var body: some View {
         WindowChrome(
             model: model,
-            title: model.status,
+            title: model.title,
             subtitle: model.snapshot.connectionID == nil ? "" : model.snapshot.path.display,
             viewMode: model.snapshot.viewMode,
             sidebarCollapsed: model.sidebarCollapsed,
@@ -135,6 +135,7 @@ struct DetailColumn: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let status = model.status { MessageBar(text: status) { model.status = nil } }
             if model.renaming { RenameBar(model: model) }
             browser
             if model.snapshot.connectionID != nil, let clip = Clipboard.shared.clip { ClipBar(clip: clip) }
@@ -709,6 +710,37 @@ private struct ClipBar: View {
         case .failed(let text): parts.append("Finder cannot paste it: \(text)")
         }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// The window's message, such as what failed, under the toolbar until it is dismissed or the
+/// next message replaces it.
+private struct MessageBar: View {
+    let text: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(text)
+                .lineLimit(3)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Spacer(minLength: 8)
+            Button(action: dismiss) {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
