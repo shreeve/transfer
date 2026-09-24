@@ -41,7 +41,7 @@ A revamp of the whole app. Transfer looks much the same, but what it does with y
 - A file whose name nearly fills the 255-byte limit copies both ways, and a Live file with such a name still gets its `(server)` copy.
 - Copy Remote URL writes a name that is not UTF-8 byte for byte, and such a link opens that file. A server's error is no longer labeled twice ("Permission denied: Permission denied").
 - A sheet never replaces another: one that arrives meanwhile waits its turn. A sheet about a server closes when the window leaves it, and Upload…, Download Copy…, and pastes act on the server they were started on or do nothing and say so.
-- The rename bar's field takes the focus with Full Keyboard Access on, and emptying the search field keeps its focus, so Return no longer starts a rename. Space on a focused button presses it instead of opening Quick Look.
+- The rename bar's field takes the focus with Full Keyboard Access on, and emptying the search field keeps its focus, so Return no longer starts a rename.
 - An unreadable `config.json` is kept as `config.json.bak` before the defaults take over.
 
 ### Performance
