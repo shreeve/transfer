@@ -6,9 +6,10 @@ import TransferCore
 ///
 /// A move is the only operation that deletes the user's data. It removes an original, or trashes a
 /// file from this Mac, only when `MoveCheck` finds that this move wrote a complete copy of it. The
-/// destination is walked before the move first reaches it, and nothing it held then counts as the
-/// copy unless the user chose Replace; a lookalike already there is asked about, never skipped. A
-/// move first proves the two ends are different folders on disk: two servers may reach one disk.
+/// destination is walked before each item's copy first reaches it, and nothing it held then, an
+/// earlier item's copy of the same name included, counts as that item's copy unless the user chose
+/// Replace; a lookalike already there is asked about, never skipped. A move first proves the two
+/// ends are different folders on disk: two servers may reach one disk.
 ///
 /// A retry passes the same request, whose memo keeps what earlier attempts did: finished items are
 /// skipped, chosen names reused, and the first attempt's copy never taken for what was there.
@@ -68,7 +69,7 @@ struct TransferEngine {
                     target = folder.appending(name: path.nameBytes)
                 }
                 memo.withLock { $0.targets[index] = target }
-                try await destination.copy(path, to: target, tally: tally(sum.next()))
+                try await destination.copy(path, to: target, tally: tally(index, sum.next()))
             }
             finish(index)
         }
@@ -102,7 +103,7 @@ struct TransferEngine {
             let target = request.folder.appending(name: path.nameBytes)
             let reason = try await place(index, at: target) {
                 try await source.download(path, to: local, progress: sum.next())
-                try await destination.upload(local, to: target, tally: tally(sum.next()))
+                try await destination.upload(local, to: target, tally: tally(index, sum.next()))
             } original: {
                 try await source.tree(path)
             } remove: {
@@ -123,7 +124,7 @@ struct TransferEngine {
         for (index, url) in urls.enumerated() where !isDone(index) {
             let target = request.folder.appending(name: Array(url.lastPathComponent.utf8))
             let reason = try await place(index, at: target) {
-                try await destination.upload(url, to: target, tally: tally(sum.next()))
+                try await destination.upload(url, to: target, tally: tally(index, sum.next()))
             } original: {
                 try LocalTree.entries(url)
             } remove: {
@@ -166,8 +167,9 @@ struct TransferEngine {
 
     private func finish(_ index: Int) { memo.withLock { _ = $0.done.insert(index) } }
 
-    private func tally(_ progress: @escaping @Sendable (TransferProgress) -> Void) -> CopyTally {
-        CopyTally(progress, memo: memo, moving: request.moving)
+    /// The tally for source `index`'s copy: it counts only what that copy wrote as its own.
+    private func tally(_ index: Int, _ progress: @escaping @Sendable (TransferProgress) -> Void) -> CopyTally {
+        CopyTally(progress, memo: memo, item: index, moving: request.moving)
     }
 
     /// Once per move: whether the destination folder is, on the storage itself, the originals'
@@ -190,9 +192,11 @@ struct TransferEngine {
         memo.withLock { $0.checked = true }
     }
 
-    /// What `target` held before the move first reached it. Only the root's own absence means
-    /// nothing was there: a walk that loses a folder halfway throws "no such file" too, which is
-    /// no evidence the destination was empty, so it is thrown on.
+    /// What `target` held just before source `index`'s copy first reached it (D9): anything there
+    /// then, an earlier item's copy of the same name too, is not this item's copy unless the user
+    /// chose Replace. Only the root's own absence means nothing was there: a walk that loses a
+    /// folder halfway throws "no such file" too, which is no evidence the destination was empty,
+    /// so it is thrown on.
     private func snapshot(_ index: Int, _ target: RemotePath) async throws {
         guard request.moving, memo.withLock({ $0.before[index] }) == nil else { return }
         let taken = try await destination.existing(target) == nil ? [:] : try await destination.tree(target)
@@ -203,7 +207,7 @@ struct TransferEngine {
     /// now. Each entry is looked for where the copy put it, following Keep Both; what the
     /// destination held before counts only at the very place it was.
     private func keptReason(_ index: Int, target: RemotePath, source: [TreeKey: TreeEntry]) async throws -> TransferKept.Reason? {
-        let (before, written, landed) = memo.withLock { ($0.before[index] ?? [:], $0.written, $0.landed) }
+        let (before, written, landed) = memo.withLock { ($0.before[index] ?? [:], $0.written[index] ?? [], $0.landed[index] ?? [:]) }
         let root = landed[target] ?? target
         let now: [TreeKey: TreeEntry]
         do {

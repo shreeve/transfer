@@ -81,6 +81,69 @@ struct MoveServerTests {
         }
     }
 
+    /// Two items of one move with the same name, p/VERSION and q/VERSION, alike in size and time:
+    /// the second passed for the first's copy, since the memo of what the move wrote was shared by
+    /// every item, and its original was removed unasked (R-T1). Now it is asked about; skipped, it
+    /// stays, as between servers so from this Mac.
+    @Test func twoItemsWithOneNameEachCountOnlyTheirOwnCopy() async throws {
+        try await withHarness("twins", connected: true) { h in
+            try await withAlias(h) { alias in
+                let from = try h.folder("from", files: ["p/VERSION": "one", "q/VERSION": "two"])
+                for path in ["from/p/VERSION", "from/q/VERSION"] { try h.setTime(path, 1_700_000_000) }
+                let destination = try h.folder("to")
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("p").appending("VERSION"), from.appending("q").appending("VERSION")]), into: destination, on: h.session.connection.id, moving: true)
+                let skip = Choosing(.skip)
+                await #expect(throws: TransferKept([.init("VERSION", .alreadyThere)], moving: true, place: "on the other server")) {
+                    try await OperationPrompts.$current.withValue(skip) { try await run(request, on: h.session, from: alias) }
+                }
+                #expect(skip.asked == 1)
+                #expect(try h.read("to/VERSION") == "one")
+                #expect(try h.names("from/p").isEmpty)
+                #expect(try h.read("from/q/VERSION") == "two")
+            }
+
+            let mac = h.staging.appendingPathComponent("mac")
+            for (folder, text) in [("p", "one"), ("q", "two")] {
+                let file = mac.appendingPathComponent(folder).appendingPathComponent("VERSION")
+                try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(text.utf8).write(to: file)
+                try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: file.path)
+            }
+            let sources = ["p", "q"].map { mac.appendingPathComponent($0).appendingPathComponent("VERSION") }
+            let trashed = Locked<[URL]>([])
+            let skip = Choosing(.skip)
+            await #expect(throws: TransferKept([.init("VERSION", .alreadyThere)], moving: true, place: "on this Mac")) {
+                try await OperationPrompts.$current.withValue(skip) {
+                    try await run(TransferRequest(.mac(sources), into: try h.folder("fromMac"), on: h.session.connection.id, moving: true), on: h.session, trash: { url in trashed.withLock { $0.append(url) } })
+                }
+            }
+            #expect(skip.asked == 1)
+            #expect(trashed.value == [sources[0]])
+            #expect(try h.read("fromMac/VERSION") == "one")
+        }
+    }
+
+    /// Keep Both for the first of two same-named items sent the second, unasked, to where the
+    /// first had landed, where the first's copy passed for its own (R-T1). Each item now settles
+    /// its own name.
+    @Test func keepBothForOneItemIsNotFollowedByAnother() async throws {
+        try await withHarness("kb2", connected: true) { h in
+            try await withAlias(h) { alias in
+                let from = try h.folder("from", files: ["p/k.txt": "p", "q/k.txt": "q"])
+                for path in ["from/p/k.txt", "from/q/k.txt"] { try h.setTime(path, 1_700_000_000) }
+                let destination = try h.folder("to", files: ["k.txt": "old"])
+                let keepBoth = Choosing(.keepBoth)
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("p").appending("k.txt"), from.appending("q").appending("k.txt")]), into: destination, on: h.session.connection.id, moving: true)
+                try await OperationPrompts.$current.withValue(keepBoth) { try await run(request, on: h.session, from: alias) }
+                #expect(keepBoth.asked == 2)
+                #expect(try h.read("to/k.txt") == "old")
+                #expect(try h.read("to/k 2.txt") == "p")
+                #expect(try h.read("to/k 3.txt") == "q")
+                #expect(try h.names("from/p").isEmpty && h.names("from/q").isEmpty)
+            }
+        }
+    }
+
     /// A retry ran the whole paste again: a move failed on items it had already moved, and a
     /// paste beside the original made "name copy 2" next to its own partial "name copy" (CLIP-18,
     /// TD-06). Also, a Keep Both name chosen before the failure is reused, not asked again.

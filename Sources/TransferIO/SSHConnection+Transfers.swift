@@ -697,8 +697,9 @@ final class CopyTally: Sendable {
     /// A move's copy: the same file already at a destination is asked about, not skipped.
     let moving: Bool
     /// What a paste wrote and where Keep Both sent items, kept across its retries; nil for a copy
-    /// that is not part of one.
+    /// that is not part of one. Only the entries of source `item` are this copy's.
     private let memo: Locked<TransferMemo>?
+    private let item: Int
 
     /// Twice what the data channels carry at once (seven, sixteen small files each): as many jobs
     /// again have settled their names and wait, so a channel never idles while the walk finds the
@@ -707,28 +708,29 @@ final class CopyTally: Sendable {
     /// 2,194 / 1,624 / 1,482.
     static let jobLimit = 2 * SSHConnection.dataChannels * SSHConnection.DataShare.whole.rawValue
 
-    init(_ report: @escaping @Sendable (TransferProgress) -> Void, memo: Locked<TransferMemo>? = nil, moving: Bool = false) {
+    init(_ report: @escaping @Sendable (TransferProgress) -> Void, memo: Locked<TransferMemo>? = nil, item: Int = 0, moving: Bool = false) {
         self.report = report
         self.memo = memo
+        self.item = item
         self.moving = moving
     }
 
     /// `path` was written by this copy: a file, a link, or a folder it made.
     func record(_ path: RemotePath) {
-        memo?.withLock { _ = $0.written.insert(path) }
+        memo?.withLock { _ = $0.written[item, default: []].insert(path) }
     }
 
     func wrote(_ path: RemotePath) -> Bool {
-        memo?.withLock { $0.written.contains(path) } ?? false
+        memo?.withLock { $0.written[item]?.contains(path) } ?? false
     }
 
-    /// Keep Both sent the item offered at `proposed` to `landed`.
+    /// Keep Both sent the entry offered at `proposed` to `landed`.
     func record(_ landed: RemotePath, for proposed: RemotePath) {
-        memo?.withLock { $0.landed[proposed] = landed }
+        memo?.withLock { $0.landed[item, default: [:]][proposed] = landed }
     }
 
     func landed(_ proposed: RemotePath) -> RemotePath? {
-        memo?.withLock { $0.landed[proposed] }
+        memo?.withLock { $0.landed[item]?[proposed] }
     }
 
     /// A progress handler for one file's bytes, which adds what is new since its last report, so

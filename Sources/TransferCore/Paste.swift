@@ -255,14 +255,17 @@ package struct TransferMemo: Sendable {
     package var done: Set<Int> = []
     /// Where each source goes, once chosen, by index.
     package var targets: [Int: RemotePath] = [:]
-    /// Each destination's tree before the move first reached it, by index.
+    /// Each destination's tree just before that source's copy first reached it, by index: what
+    /// an earlier item wrote there is in it, and counts as already there.
     package var before: [Int: [TreeKey: TreeEntry]] = [:]
     /// Whether the two ends of a move were proven to be different folders.
     package var checked = false
-    /// Every file, link, and folder the copy wrote on the destination.
-    package var written: Set<RemotePath> = []
-    /// Where an item went in place of the path it was offered, after Keep Both.
-    package var landed: [RemotePath: RemotePath] = [:]
+    /// The files, links, and folders each source's copy wrote on the destination, by index. Only
+    /// an item's own writes are its copy: another item of the same name may land at the same path.
+    package var written: [Int: Set<RemotePath>] = [:]
+    /// Where each source's entries went in place of the path they were offered, after Keep Both,
+    /// by index.
+    package var landed: [Int: [RemotePath: RemotePath]] = [:]
 
     package init() {}
 }
