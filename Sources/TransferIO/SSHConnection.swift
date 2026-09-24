@@ -251,16 +251,17 @@ public actor SSHConnection: RemoteSession {
         for waiter in waiters { waiter.continuation.resume(throwing: reason) }
         waiters.removeAll()
         if ownsLive { await live.closeAll() } else { await live.disconnected(connection.id, server: self) }
-        await release(held)
+        await release(held, reason: reason)
     }
 
     /// Stops what `held` started, after any earlier release: when the last release returns, no
-    /// master of this connection runs and the socket path is free.
-    private func release(_ held: Held) async {
+    /// master of this connection runs and the socket path is free. Calls still waiting on its
+    /// channels fail with `reason`.
+    private func release(_ held: Held, reason: TransferError = .cancelled) async {
         let previous = releasing
         let task = Task {
             await previous?.value
-            for link in Array(held.reserved.values) + held.pool { await link.closeLink() }
+            for link in Array(held.reserved.values) + held.pool { await link.closeLink(reason: reason) }
             if let master = held.master {
                 master.terminationHandler = nil
                 if master.isRunning {

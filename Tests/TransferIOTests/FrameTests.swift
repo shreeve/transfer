@@ -172,6 +172,18 @@ import TransferCore
         await server.stop()
     }
 
+    /// The session closes its channels with a lost connection when the master dies, so a call in
+    /// flight fails with an error a transfer retries rather than a user's cancel.
+    @Test func aCallInFlightFailsWithTheReasonTheChannelClosed() async throws {
+        let server = try await ScriptedServer()
+        let call = Task { try await server.channel.lstat(Self.path) }
+        #expect(await eventually { !server.sent(SFTPCode.lstat).isEmpty })
+        await server.channel.closeLink(reason: .connectionLost("The SSH connection closed"))
+        let error = await #expect(throws: TransferError.connectionLost("The SSH connection closed")) { try await call.value }
+        #expect(error.map(RetryPolicy.isRetryable) == true)
+        await server.stop()
+    }
+
     // MARK: Stalls
 
     @Test func aServerThatStopsAnsweringTimesOut() async throws {

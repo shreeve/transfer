@@ -478,8 +478,10 @@ actor SFTPChannel {
         }
     }
 
-    func closeLink() {
-        shutDown(.cancelled)
+    /// Closes the channel; its waiting calls fail with `reason`. A master that died passes a lost
+    /// connection, which a transfer retries, where a disconnect the user asked for cancels.
+    func closeLink(reason: TransferError = .cancelled) {
+        shutDown(reason)
     }
 
     /// Closes the channel for good: ends ssh, and fails the handshake and every waiting request
