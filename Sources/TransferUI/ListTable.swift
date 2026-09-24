@@ -349,7 +349,7 @@ enum ItemMenu {
         add("Quick Look") { model.showPreview() }
         menu.addItem(.separator())
         add("Download Copy…") { Task { await model.downloadCopy() } }
-        add("Duplicate", enabled: item.kind == .file) { Task { await model.duplicateSelection() } }
+        add("Duplicate") { Task { await model.duplicateSelection() } }
         add("Rename") { model.beginRename() }
         let targets = model.dragItems(including: item).map(\.path)
         add(model.starTitle(targets)) { Task { await model.toggleStar(targets) } }

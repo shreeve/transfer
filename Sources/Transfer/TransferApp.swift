@@ -62,7 +62,7 @@ struct TransferApp: App {
                     .disabled(!connected)
                 Button("Duplicate") { Task { await model?.duplicateSelection() } }
                     .keyboardShortcut("d")
-                    .disabled(primary?.kind != .file)
+                    .disabled(primary == nil)
                 Button("Rename") { model?.beginRename() }
                     .keyboardShortcut(.return, modifiers: [])
                     .disabled(primary == nil || !plainKeys)
