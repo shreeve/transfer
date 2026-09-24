@@ -1,0 +1,292 @@
+import Foundation
+import SQLite3
+import Testing
+import TransferCore
+@testable import TransferIO
+
+/// The library database: every older library opens with every row intact, and the Store's own
+/// writes round-trip. Fixtures are built here from the DDL each earlier build ran, through a raw
+/// SQLite connection, as those builds wrote them.
+struct StoreTests {
+    /// Every schema a user's library can have from before `user_version`.
+    enum Shape: CaseIterable {
+        /// 987e85d, the first build: five tables, nothing added.
+        case first
+        /// 912741b: `live_files.dirty` and `temps.connection_id` added.
+        case owners
+        /// 0.1.0 through 0.1.7: and the Live sync columns.
+        case released
+
+        /// The statements that build ran at every launch, verbatim.
+        var ddl: String {
+            let base = """
+            CREATE TABLE IF NOT EXISTS connections (
+              id TEXT PRIMARY KEY, name TEXT, host TEXT, user TEXT, port TEXT,
+              identity TEXT, remote_path TEXT
+            );
+            CREATE TABLE IF NOT EXISTS recents (
+              connection_id TEXT, path TEXT, used_at REAL,
+              PRIMARY KEY (connection_id, path)
+            );
+            CREATE TABLE IF NOT EXISTS pins (
+              connection_id TEXT, path TEXT, PRIMARY KEY (connection_id, path)
+            );
+            CREATE TABLE IF NOT EXISTS live_files (
+              id TEXT PRIMARY KEY, connection_id TEXT, path TEXT,
+              base_size INTEGER, base_mtime INTEGER, local_path TEXT
+            );
+            CREATE TABLE IF NOT EXISTS temps (path TEXT PRIMARY KEY);
+            """
+            let owners = """
+            ALTER TABLE live_files ADD COLUMN dirty INTEGER DEFAULT 0;
+            ALTER TABLE temps ADD COLUMN connection_id TEXT;
+            """
+            let sync = ["paused INTEGER DEFAULT 0", "conflict TEXT", "conflict_size INTEGER", "conflict_mtime INTEGER",
+                        "synced_size INTEGER", "synced_mtime REAL", "synced_digest TEXT"]
+                .map { "ALTER TABLE live_files ADD COLUMN \($0);" }.joined(separator: "\n")
+            switch self {
+            case .first: return base
+            case .owners: return base + owners
+            case .released: return base + owners + sync
+            }
+        }
+
+        /// Rows as that build's Store wrote them: text paths, `Int64(bitPattern:)` sizes.
+        var rows: String {
+            var sql = """
+            INSERT INTO connections VALUES ('\(alpha)', 'Alpha', 'alpha.example', 'ann', '2222', '/Users/ann/.ssh/id_ed25519', '/srv/www');
+            INSERT INTO connections VALUES ('\(beta)', 'Beta', 'beta.example', '', '', '', '');
+            INSERT INTO recents VALUES ('\(alpha)', '/srv', 1.5);
+            INSERT INTO pins VALUES ('\(alpha)', '/srv/www'), ('\(alpha)', '/home/zoë'), ('\(beta)', '/');
+            """
+            switch self {
+            case .first:
+                sql += """
+                INSERT INTO live_files VALUES ('\(one)', '\(alpha)', '/srv/www/café.txt', 1234, 1700000000, '/lib/Live/café.txt');
+                INSERT INTO live_files VALUES ('\(two)', '\(beta)', '/big.bin', -1, NULL, '/lib/Live/big.bin');
+                INSERT INTO temps VALUES ('/tmp/.a.transfer-1');
+                """
+            case .owners:
+                sql += """
+                INSERT INTO live_files VALUES ('\(one)', '\(alpha)', '/srv/www/café.txt', 1234, 1700000000, '/lib/Live/café.txt', 1);
+                INSERT INTO live_files VALUES ('\(two)', '\(beta)', '/big.bin', -1, NULL, '/lib/Live/big.bin', 0);
+                """
+            case .released:
+                sql += """
+                INSERT INTO live_files VALUES ('\(one)', '\(alpha)', '/srv/www/café.txt', 1234, 1700000000, '/lib/Live/café.txt', 1,
+                  1, 'changed', 99, 4294967295, 1234, 780000000.25, 'ab12');
+                INSERT INTO live_files VALUES ('\(two)', '\(beta)', '/big.bin', -1, NULL, '/lib/Live/big.bin', 0,
+                  0, NULL, NULL, NULL, NULL, NULL, NULL);
+                """
+            }
+            if self != .first {
+                sql += """
+                INSERT INTO temps VALUES ('/tmp/.a.transfer-1', ''), ('/srv/.b.transfer-2', '\(alpha)'), ('/tmp/.c.transfer-3', NULL);
+                """
+            }
+            return sql
+        }
+
+        var expectedLive: [LiveRow] {
+            let synced = self == .released
+            return [
+                LiveRow(id: LiveFileID(rawValue: one), connection: ConnectionID(rawValue: alpha),
+                        path: RemotePath(string: "/srv/www/café.txt"), baseSize: 1234, baseMtime: 1_700_000_000,
+                        localPath: "/lib/Live/café.txt", dirty: self != .first, paused: synced,
+                        conflict: synced ? "changed" : nil, conflictSize: synced ? 99 : nil,
+                        conflictMtime: synced ? UInt32.max : nil, syncedSize: synced ? 1234 : nil,
+                        syncedMtime: synced ? 780_000_000.25 : nil, syncedDigest: synced ? "ab12" : nil),
+                LiveRow(id: LiveFileID(rawValue: two), connection: ConnectionID(rawValue: beta),
+                        path: RemotePath(string: "/big.bin"), baseSize: UInt64.max, baseMtime: nil,
+                        localPath: "/lib/Live/big.bin", dirty: false),
+            ]
+        }
+
+        var expectedLocalTemps: [String] {
+            self == .first ? ["/tmp/.a.transfer-1"] : ["/tmp/.a.transfer-1", "/tmp/.c.transfer-3"]
+        }
+
+        var expectedRemoteTemps: [String] {
+            self == .first ? [] : ["/srv/.b.transfer-2"]
+        }
+    }
+
+    static let alpha = UUID(uuidString: "A1A1A1A1-0000-4000-8000-000000000001")!
+    static let beta = UUID(uuidString: "B2B2B2B2-0000-4000-8000-000000000002")!
+    static let one = UUID(uuidString: "11111111-0000-4000-8000-000000000001")!
+    static let two = UUID(uuidString: "22222222-0000-4000-8000-000000000002")!
+
+    @Test(arguments: Shape.allCases)
+    func anOlderLibraryKeepsEveryRow(shape: Shape) throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Raw.fixture(shape, at: root)
+
+        let store = try Store(root: root)
+
+        #expect(store.connections() == [
+            SavedConnection(id: ConnectionID(rawValue: Self.alpha), name: "Alpha", host: "alpha.example", user: "ann",
+                            port: "2222", identityFile: "/Users/ann/.ssh/id_ed25519", remotePath: "/srv/www"),
+            SavedConnection(id: ConnectionID(rawValue: Self.beta), name: "Beta", host: "beta.example"),
+        ])
+        #expect(store.stars(connection: ConnectionID(rawValue: Self.alpha)) == ["/home/zoë", "/srv/www"])
+        #expect(store.stars(connection: ConnectionID(rawValue: Self.beta)) == ["/"])
+        #expect(describe(store.liveFiles()) == describe(shape.expectedLive))
+        #expect(store.localTemps().sorted() == shape.expectedLocalTemps)
+        #expect(store.remoteTemps(connection: ConnectionID(rawValue: Self.alpha)) == shape.expectedRemoteTemps)
+
+        let raw = try Raw(root)
+        #expect(raw.value("PRAGMA user_version") == "\(Store.schemaVersion)")
+        #expect(raw.value("SELECT count(*) FROM sqlite_master WHERE name = 'recents'") == "0")
+        #expect(raw.value("SELECT group_concat(DISTINCT typeof(path)) FROM live_files") == "blob")
+        #expect(raw.value("PRAGMA journal_mode") == "wal")
+    }
+
+    /// Opening again, re-running every step over a migrated library, and a 0.1.7 app launching on it
+    /// in between (it recreates `recents` and writes a text path) all leave the same rows.
+    @Test func migrationIsIdempotentAndSurvivesADowngrade() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Raw.fixture(.released, at: root)
+        let migrated = try dump(Store(root: root))
+
+        #expect(try dump(Store(root: root)) == migrated)
+        try Raw(root).run("PRAGMA user_version = 0")
+        #expect(try dump(Store(root: root)) == migrated)
+
+        let old = try Raw(root)
+        old.launchAs017()
+        let three = UUID()
+        old.run("INSERT OR REPLACE INTO live_files (id, connection_id, path, local_path, dirty) VALUES ('\(three)', '\(Self.beta)', '/old/résumé.txt', '/lib/Live/x', 1)")
+        let store = try Store(root: root)
+        let added = store.liveFiles().first { $0.id.rawValue == three }
+        #expect(added?.path == RemotePath(string: "/old/résumé.txt"))
+        store.deleteLive(LiveFileID(rawValue: three))
+        #expect(dump(store) == migrated)
+    }
+
+    /// A Live file's remote path is the server's bytes, UTF-8 or not (SFC-3, LIVE-07).
+    @Test func aNonUTF8LivePathRoundTripsExactly() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bytes: [UInt8] = Array("/srv/caf".utf8) + [0xE9, 0xFF, 0x80] + Array(".txt".utf8)
+        let row = LiveRow(id: LiveFileID(rawValue: UUID()), connection: ConnectionID(rawValue: Self.alpha),
+                          path: RemotePath(bytes: bytes), localPath: "/lib/Live/caf.txt", dirty: true)
+        try Store(root: root).saveLive(row)
+
+        let read = try Store(root: root).liveFiles()
+        #expect(read.map(\.path.bytes) == [bytes])
+    }
+
+    /// A library from a newer Transfer is refused, with a reason, and left as it was.
+    @Test func aNewerLibraryIsRefusedAndUntouched() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let future = Store.schemaVersion + 1
+        try Raw(root).run("CREATE TABLE future (x); PRAGMA user_version = \(future)")
+
+        let error = #expect(throws: TransferError.self) { try Store(root: root) }
+        #expect(error?.localizedDescription.contains("newer version of Transfer") == true)
+
+        let raw = try Raw(root)
+        #expect(raw.value("PRAGMA user_version") == "\(future)")
+        #expect(raw.value("PRAGMA journal_mode") == "delete")
+        #expect(raw.value("SELECT count(*) FROM sqlite_master WHERE name = 'future'") == "1")
+    }
+
+    /// A write that meets another process's lock waits for it rather than being dropped (SFC-12).
+    @Test func aWriteWaitsForAnotherProcesssLock() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try Store(root: root)
+        let other = try Raw(root)
+        other.run("BEGIN IMMEDIATE; INSERT INTO pins VALUES ('\(Self.beta)', '/held')")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { other.run("COMMIT") }
+
+        store.star(connection: ConnectionID(rawValue: Self.alpha), path: "/waited", on: true)
+
+        #expect(store.stars(connection: ConnectionID(rawValue: Self.alpha)) == ["/waited"])
+        #expect(store.stars(connection: ConnectionID(rawValue: Self.beta)) == ["/held"])
+    }
+
+    /// Removing a server drops its rows from every table and nobody else's.
+    @Test func removeTakesOnlyThatServer() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Raw.fixture(.released, at: root)
+        let store = try Store(root: root)
+
+        store.remove(ConnectionID(rawValue: Self.alpha))
+
+        #expect(store.connections().map(\.name) == ["Beta"])
+        #expect(store.stars(connection: ConnectionID(rawValue: Self.alpha)).isEmpty)
+        #expect(store.stars(connection: ConnectionID(rawValue: Self.beta)) == ["/"])
+        #expect(store.liveFiles().map(\.id.rawValue) == [Self.two])
+        #expect(store.remoteTemps(connection: ConnectionID(rawValue: Self.alpha)).isEmpty)
+        #expect(store.localTemps().sorted() == Shape.released.expectedLocalTemps)
+    }
+
+    private func describe(_ rows: [LiveRow]) -> [String] {
+        rows.map { String(describing: $0) }.sorted()
+    }
+
+    private func dump(_ store: Store) -> [String] {
+        store.connections().map { String(describing: $0) }
+            + [Self.alpha, Self.beta].flatMap { store.stars(connection: ConnectionID(rawValue: $0)) }
+            + describe(store.liveFiles())
+            + store.localTemps().sorted()
+            + store.remoteTemps(connection: ConnectionID(rawValue: Self.alpha))
+    }
+}
+
+/// A plain SQLite connection to `transfer.sqlite` under a root, standing in for an older build or
+/// another process.
+private final class Raw: @unchecked Sendable {
+    private var db: OpaquePointer?
+
+    init(_ root: URL) throws {
+        guard sqlite3_open(root.appendingPathComponent("transfer.sqlite").path, &db) == SQLITE_OK else {
+            throw TransferError.failed("open")
+        }
+        sqlite3_busy_timeout(db, 5_000)
+    }
+
+    deinit {
+        sqlite3_close(db)
+    }
+
+    static func fixture(_ shape: StoreTests.Shape, at root: URL) throws {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let raw = try Raw(root)
+        raw.run(shape.ddl)
+        raw.run(shape.rows)
+    }
+
+    /// What Transfer 0.1.7's `Store.init` ran on every launch, errors ignored as it ignored them.
+    func launchAs017() {
+        run(StoreTests.Shape.first.ddl)
+        for column in ["dirty INTEGER DEFAULT 0", "paused INTEGER DEFAULT 0", "conflict TEXT", "conflict_size INTEGER",
+                       "conflict_mtime INTEGER", "synced_size INTEGER", "synced_mtime REAL", "synced_digest TEXT"] {
+            sqlite3_exec(db, "ALTER TABLE live_files ADD COLUMN \(column)", nil, nil, nil)
+        }
+        sqlite3_exec(db, "ALTER TABLE temps ADD COLUMN connection_id TEXT", nil, nil, nil)
+    }
+
+    func run(_ sql: String) {
+        var message: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, sql, nil, nil, &message)
+        #expect(result == SQLITE_OK, "\(message.map { String(cString: $0) } ?? "")")
+        sqlite3_free(message)
+    }
+
+    /// The first column of the first row, as text.
+    func value(_ sql: String) -> String? {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
+              sqlite3_step(statement) == SQLITE_ROW,
+              let text = sqlite3_column_text(statement, 0) else { return nil }
+        return String(cString: text)
+    }
+}
