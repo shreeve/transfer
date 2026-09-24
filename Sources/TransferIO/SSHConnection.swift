@@ -664,31 +664,26 @@ public actor SSHConnection: RemoteSession {
             throw TransferError.failed("Could not read the host key: \(reason.isEmpty ? "no reply" : reason)")
         }
         let event = HostKeyEvent(situation: failure == .changed ? .changed : .firstSeen, keyType: offered.keyType, fingerprint: Self.fingerprint(offered.key), line: offered.text)
-        switch try await Self.untilCancelled({ await prompts.decideHostKey(event) }) {
-        case .cancel:
-            throw TransferError.hostKeyRejected
-        case .trustOnce:
+        let decision = try await Self.untilCancelled({ await prompts.decideHostKey(event) })
+        if decision == .cancel { throw TransferError.hostKeyRejected }
+        let userFiles = (values["userknownhostsfile"] ?? "").split(separator: " ").map(String.init)
+        guard decision != .trustOnce, let target = userFiles.first, target != "/dev/null", target != "none" else {
+            if decision != .trustOnce {
+                pipe.emit(.notice("Trusted for this login only: the SSH configuration names no known_hosts file to save the key in"))
+            }
             keep = true
             held.scratch.append(probeDirectory)
             return Self.quotedOption("UserKnownHostsFile", probeFile.path)
-        case .alwaysTrust, .replace:
-            let userFiles = (values["userknownhostsfile"] ?? "").split(separator: " ").map(String.init)
-            guard let target = userFiles.first, target != "/dev/null", target != "none" else {
-                pipe.emit(.notice("Trusted for this login only: the SSH configuration names no known_hosts file to save the key in"))
-                keep = true
-                held.scratch.append(probeDirectory)
-                return Self.quotedOption("UserKnownHostsFile", probeFile.path)
-            }
-            if failure == .changed {
-                for file in userFiles where FileManager.default.fileExists(atPath: file) {
-                    for host in offered.host.split(separator: ",") {
-                        _ = try? await Subprocess.run("/usr/bin/ssh-keygen", ["-R", String(host), "-f", file], timeout: .seconds(5))
-                    }
+        }
+        if failure == .changed {
+            for file in userFiles where FileManager.default.fileExists(atPath: file) {
+                for host in offered.host.split(separator: ",") {
+                    _ = try? await Subprocess.run("/usr/bin/ssh-keygen", ["-R", String(host), "-f", file], timeout: .seconds(5))
                 }
             }
-            try Self.append(Self.knownHostsLines(offered, hashed: values["hashknownhosts"] == "yes"), to: target)
-            return []
         }
+        try Self.append(Self.knownHostsLines(offered, hashed: values["hashknownhosts"] == "yes"), to: target)
+        return []
     }
 
     /// The lines for known_hosts, one per host name hashed as ssh's `HashKnownHosts` does when
@@ -914,29 +909,18 @@ extension SSHConnection: LiveServer {
     }
 }
 
-final class EventPipe: @unchecked Sendable {
-    private let lock = NSLock()
-    private var subscribers: [UUID: AsyncStream<SessionEvent>.Continuation] = [:]
+final class EventPipe: Sendable {
+    private let subscribers = Locked<[UUID: AsyncStream<SessionEvent>.Continuation]>([:])
 
     func stream() -> AsyncStream<SessionEvent> {
         AsyncStream { continuation in
             let id = UUID()
-            lock.lock()
-            subscribers[id] = continuation
-            lock.unlock()
-            continuation.onTermination = { [weak self] _ in
-                guard let self else { return }
-                self.lock.lock()
-                self.subscribers[id] = nil
-                self.lock.unlock()
-            }
+            subscribers.withLock { $0[id] = continuation }
+            continuation.onTermination = { [weak self] _ in self?.subscribers.withLock { $0[id] = nil } }
         }
     }
 
     func emit(_ event: SessionEvent) {
-        lock.lock()
-        let targets = Array(subscribers.values)
-        lock.unlock()
-        for target in targets { target.yield(event) }
+        for target in subscribers.withLock({ Array($0.values) }) { target.yield(event) }
     }
 }
