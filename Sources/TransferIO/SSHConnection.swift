@@ -376,11 +376,23 @@ public actor SSHConnection: RemoteSession {
         store.star(connection: connection.id, path: path.display, on: false)
     }
 
+    /// Joins the master when it is up, else logs in on its own with the same port and identity;
+    /// never becomes a master on this connection's socket. Nil when a field holds a control
+    /// character: the command is typed into an interactive shell, where a CR or LF in a folder
+    /// name the server chose would end the line and run the rest.
     public func terminalCommand(directory: RemotePath) async -> String? {
         guard isConnected else { return nil }
         let remote = "cd \(Self.quote(directory.display)) && exec \"$SHELL\" -l"
-        let config = sshConfigFile.map { " -F \(Self.quote($0))" } ?? ""
-        return "/usr/bin/ssh -S \(Self.quote(socketPath))\(config) -o Compression=no -t -- \(Self.quote(connection.destination)) \(Self.quote(remote))"
+        let arguments = ["-S", socketPath] + configArguments + ["-o", "Compression=no", "-o", "ControlMaster=no", "-o", "RemoteCommand=none", "-t"]
+            + destinationArguments + ["--", connection.destination, remote]
+        let flags: Set = ["-S", "-F", "-o", "-t", "-p", "-i", "--"]
+        let command = "/usr/bin/ssh " + arguments.map { flags.contains($0) ? $0 : Self.quote($0) }.joined(separator: " ")
+        guard !command.unicodeScalars.contains(where: Self.isControl) else { return nil }
+        return command
+    }
+
+    static func isControl(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value < 0x20 || (0x7F...0x9F).contains(scalar.value)
     }
 
     private static func quote(_ value: String) -> String {

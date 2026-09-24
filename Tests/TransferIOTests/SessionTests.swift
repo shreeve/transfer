@@ -56,6 +56,13 @@ struct SessionUnitTests {
         #expect(!SSHConnection.takesStoredSecret("(alice@box.example) Verification code: ", user: "alice", host: "box.example"))
     }
 
+    @Test func controlCharactersAreFound() {
+        #expect("a\rb".unicodeScalars.contains(where: SSHConnection.isControl))
+        #expect("a\u{15}b".unicodeScalars.contains(where: SSHConnection.isControl))
+        #expect("a\u{9B}b".unicodeScalars.contains(where: SSHConnection.isControl))
+        #expect(!"/srv/My Files/été".unicodeScalars.contains(where: SSHConnection.isControl))
+    }
+
     /// More output than a pipe holds never stalls the runner, and a slow command is stopped.
     @Test func theRunnerReadsLargeOutputAndTimesOut() async throws {
         let big = try await Subprocess.run("/bin/sh", ["-c", "head -c 1000000 /dev/zero; echo done >&2"], timeout: .seconds(10))
@@ -296,6 +303,22 @@ struct SessionServerTests {
             #expect(await h.session.isConnected == false)
             _ = try await h.session.connect(prompts: h.prompts)
             _ = try await h.session.stat(h.remotePath)
+        }
+    }
+
+    /// Open in Terminal types this command into a shell, so a control byte in a folder name the
+    /// server chose must never reach it.
+    @Test func theTerminalCommandRefusesControlCharacters() async throws {
+        try await withHarness("terminal") { h in
+            try await connectKnown(h)
+            #expect(await h.session.terminalCommand(directory: RemotePath(string: "/tmp/x\r touch /tmp/pwned\r")) == nil)
+            #expect(await h.session.terminalCommand(directory: RemotePath(string: "/tmp/x\u{15}y")) == nil)
+            let command = try #require(await h.session.terminalCommand(directory: RemotePath(string: "/tmp/it's here")))
+            #expect(command.contains("-o 'ControlMaster=no'"))
+            #expect(command.contains("-o 'RemoteCommand=none'"))
+            #expect(command.contains("-p '\(h.session.connection.port)'"))
+            #expect(command.contains("-i '\(h.session.connection.identityFile)'"))
+            #expect(command.contains("-- '\(h.session.connection.destination)'"))
         }
     }
 }
