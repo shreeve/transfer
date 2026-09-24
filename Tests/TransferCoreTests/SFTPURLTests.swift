@@ -67,6 +67,27 @@ struct SFTPURLTests {
         #expect(SFTPURL.string(connection: bracketed, path: RemotePath(string: "/x")) == "sftp://[::1]/x")
     }
 
+    /// A name that is not UTF-8 is written and read back as its exact bytes. It used to be
+    /// written as U+FFFD, a different file, and a link to such a path opened the start folder,
+    /// since the path would not decode to text (R-C2).
+    @Test func aPathThatIsNotUTF8RoundTripsByteForByte() throws {
+        let path = RemotePath(bytes: [0x2F, 0x61, 0xFF])
+        let text = SFTPURL.string(connection: live, path: path)
+        #expect(text == "sftp://live/a%FF")
+        #expect(SFTPURL(url: try #require(URL(string: text)))?.path == path)
+        #expect(SFTPURL(url: URL(string: "sftp://live/caf%E9/%C3%A9t%C3%A9")!)?.path == RemotePath(bytes: Array("/caf".utf8) + [0xE9] + Array("/été".utf8)))
+        let spaced = RemotePath(bytes: Array("/a b/%/".utf8) + [0x80, 0x7E])
+        #expect(SFTPURL(url: try #require(URL(string: SFTPURL.string(connection: live, path: spaced))))?.path == spaced)
+    }
+
+    /// A host goes into the link escaped, as the path does, and comes back as saved.
+    @Test func aHostIsEscapedAndRoundTrips() throws {
+        let saved = SavedConnection(name: "Books", host: "bücher.example", user: "ada")
+        let text = SFTPURL.string(connection: saved, path: RemotePath(string: "/x"))
+        #expect(text == "sftp://ada@b%C3%BCcher.example/x")
+        #expect(SFTPURL(url: try #require(URL(string: text)))?.host == "bücher.example")
+    }
+
     /// A NUL in a path reached the wire and ended the channel (SFC-9).
     @Test func aPathWithAControlCharacterIsNoLink() {
         #expect(SFTPURL(url: URL(string: "sftp://live/tmp/a%00b")!) == nil)

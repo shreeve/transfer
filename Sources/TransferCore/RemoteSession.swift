@@ -23,14 +23,20 @@ public enum TransferError: Error, Equatable, Sendable, LocalizedError {
         case .cancelled: "Cancelled"
         case .hostKeyRejected: "The host key was not trusted"
         case .authenticationFailed(let text): text.isEmpty ? "Login failed" : text
-        case .permissionDenied(let text): "Permission denied: \(text)"
-        case .noSuchFile(let text): "No such file: \(text)"
+        case .permissionDenied(let text): Self.labeled("Permission denied", text)
+        case .noSuchFile(let text): Self.labeled("No such file", text)
         case .failed(let text): text
         case .typeMismatch(let text): "A file and a folder share the name \(text)"
         case .connectionLost(let text): "Connection lost: \(text)"
         case .timeout(let text): "Timed out: \(text)"
         case .liveUnsynced(let count): "\(count) Live file\(count == 1 ? " has" : "s have") unsynced edits"
         }
+    }
+
+    /// `label: text`, or `text` alone when it already says it, as a server's own message does.
+    private static func labeled(_ label: String, _ text: String) -> String {
+        if text.isEmpty { return label }
+        return text.lowercased().hasPrefix(label.lowercased()) ? text : "\(label): \(text)"
     }
 }
 

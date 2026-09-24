@@ -68,6 +68,8 @@ struct RemotePathTests {
         #expect(RemotePath(string: "work/notes").parent == RemotePath(string: "work"))
         #expect(RemotePath(string: "").nameBytes.isEmpty)
         #expect(RemotePath(string: "").parent == nil)
+        // Appending to an empty path stays relative; it never reaches the server's root.
+        #expect(RemotePath(string: "").appending("etc") == RemotePath(string: "etc"))
     }
 
     /// Names are bytes; one that is not UTF-8 keeps its bytes through every step.
