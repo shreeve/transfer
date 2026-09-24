@@ -243,6 +243,14 @@ actor SFTPChannel {
         try? await removeFile(aside)
     }
 
+    /// Renames a finished temp file onto `placed`: replacing what is there, or refusing when
+    /// anything is, so an item that appeared after the name was found free is never overwritten
+    /// unasked. A file never replaces a folder, so plain RENAME is safe for a temp.
+    func place(_ temp: RemotePath, onto placed: RemotePath, replacing: Bool) async throws {
+        if replacing { return try await replace(temp, onto: placed) }
+        try await plainRename(temp, to: placed)
+    }
+
     /// SSH_FXP_RENAME, which on OpenSSH never replaces a file but does replace an empty folder.
     private func plainRename(_ source: RemotePath, to destination: RemotePath) async throws {
         _ = try await call(SFTPCode.rename) {
