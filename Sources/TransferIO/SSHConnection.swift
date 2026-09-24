@@ -553,17 +553,10 @@ public actor SSHConnection: RemoteSession {
         return link
     }
 
-    /// Forgets a recorded temp only once it is gone from the server.
+    /// Removes the temps an earlier run could not; each is forgotten only once it is gone.
     private func removeRecordedRemoteTemps() async {
         for path in store.remoteTemps(connection: connection.id) {
-            do {
-                try await metadataLink().removeFile(RemotePath(string: path))
-                store.forgetTemp(path)
-            } catch TransferError.noSuchFile {
-                store.forgetTemp(path)
-            } catch {
-                continue
-            }
+            await discardRemoteTemp(RemotePath(string: path))
         }
     }
 
