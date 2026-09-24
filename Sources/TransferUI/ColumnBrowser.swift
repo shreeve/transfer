@@ -55,6 +55,7 @@ struct ColumnBrowser: NSViewRepresentable {
         /// folder is sorted once per change instead of once for every row asked for.
         private var shown: [RemotePath: [RemoteItem]] = [:]
         private var syncing = false
+        private let drag = RowDrag()
 
         init(model: TransferModel) { self.model = model }
 
@@ -212,6 +213,7 @@ struct ColumnBrowser: NSViewRepresentable {
             guard let cell = cell as? NSBrowserCell else { return }
             let entry = entry(row: row, column: column)
             cell.image = entry is UpEntry ? ItemIcon.upImage : (entry as? RemoteItem).map(ItemIcon.image(for:))
+            cell.setAccessibilityLabel(entry is UpEntry ? "Parent folder" : nil)
         }
 
         /// The `..` row is as tall as the list view's column header, so the rows beneath it sit
@@ -265,27 +267,61 @@ struct ColumnBrowser: NSViewRepresentable {
             model.selectInColumns(items, parent: parent)
         }
 
+        /// The `..` row goes to the parent folder when it is clicked, never when the keyboard
+        /// lands on it: arrowing up past the first row, or Shift-extending across it, leaves it out.
+        func browser(_ browser: NSBrowser, selectionIndexesForProposedSelection proposed: IndexSet, inColumn column: Int) -> IndexSet {
+            guard column == 0, showsUpEntry, proposed.contains(0), !Self.isClick(NSApp.currentEvent) else { return proposed }
+            let rows = proposed.subtracting(IndexSet(integer: 0))
+            return rows.isEmpty ? browser.selectedRowIndexes(inColumn: 0) ?? IndexSet() : rows
+        }
+
+        private static func isClick(_ event: NSEvent?) -> Bool {
+            switch event?.type {
+            case .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .otherMouseDown: true
+            default: false
+            }
+        }
+
         // MARK: Context menu
 
         /// The right-clicked row joins the selection first, as a click would select it, so every
-        /// entry acts on what the menu was opened over. The `..` row and the empty area below the
-        /// rows get the folder's menu.
+        /// entry acts on what the menu was opened over. The empty area of a column, and its `..`
+        /// row, stand for the folder the column shows: that folder becomes the location with
+        /// nothing selected in it, as a click there makes it, so New Folder, Upload, Paste, and
+        /// Copy Remote URL act on the folder that was clicked, not on the deepest column.
         func menuNeedsUpdate(_ menu: NSMenu) {
             menu.removeAllItems()
             guard let browser else { return }
             let column = browser.clickedColumn
             let row = browser.clickedRow
-            var clicked: RemoteItem?
-            if let item = entry(row: row, column: column) as? RemoteItem {
-                clicked = item
-                if !model.snapshot.selection.contains(item.path) {
+            let clicked = entry(row: row, column: column) as? RemoteItem
+            if let clicked {
+                if !model.snapshot.selection.contains(clicked.path) {
                     if browser.lastColumn > column { browser.lastColumn = column }
                     browser.selectRowIndexes(IndexSet(integer: row), inColumn: column)
-                    if item.kind == .directory { browser.addColumn() }
+                    if clicked.kind == .directory { browser.addColumn() }
                     selectionChanged(nil)
                 }
+            } else {
+                showFolder(ofColumn: column, in: browser)
             }
             ItemMenu.fill(menu, item: clicked, model: model)
+        }
+
+        /// Makes the folder `column` shows the location, as a click on the column's empty area
+        /// does: nothing selected in it, no column after it, and the folder itself selected in the
+        /// column before, as a click there left it.
+        private func showFolder(ofColumn column: Int, in browser: NSBrowser) {
+            guard let folder = path(forColumn: column) else { return }
+            if browser.lastColumn > column { browser.lastColumn = column }
+            if browser.selectedRowIndexes(inColumn: column)?.isEmpty == false {
+                browser.selectRowIndexes(IndexSet(), inColumn: column)
+            }
+            if column > 0, let opened = browser.parentForItems(inColumn: column) as? RemoteItem, let parent = path(forColumn: column - 1) {
+                model.selectInColumns([opened], parent: parent)
+            } else {
+                model.selectInColumns([], parent: folder)
+            }
         }
 
         @objc func doubleClicked(_ sender: Any?) {
@@ -305,8 +341,8 @@ struct ColumnBrowser: NSViewRepresentable {
         }
 
         func browser(_ browser: NSBrowser, pasteboardWriterForRow row: Int, column: Int) -> (any NSPasteboardWriting)? {
-            guard let session = model.session, let item = entry(row: row, column: column) as? RemoteItem else { return nil }
-            return RemoteItemPromise.provider(for: item, among: model.dragItems(including: item), session: session, prompts: model.operationPrompts())
+            guard let item = entry(row: row, column: column) as? RemoteItem else { return nil }
+            return drag.writer(for: item, model: model)
         }
 
         // MARK: Drop in
@@ -321,33 +357,29 @@ struct ColumnBrowser: NSViewRepresentable {
             // The browser's own empty area, outside every column, is no target for its own drag:
             // answering it with an operation makes NSBrowser cancel a drag that crosses it on the
             // way out to Finder. Files arriving from elsewhere still drop there, into this folder.
-            if column.pointee < 0, RemoteDragPayload.read(from: info.draggingPasteboard) != nil { return [] }
-            guard let connection = model.snapshot.connectionID else { return [] }
+            if column.pointee < 0, info.draggingPasteboard.types?.contains(remoteDragType) == true { return [] }
             // A folder row is the target only for a drop on it; between rows means the column's folder.
-            if let target = entry(row: row.pointee, column: column.pointee) as? RemoteItem, target.kind == .directory {
-                dropOperation.pointee = .on
-            } else {
-                row.pointee = -1
-                dropOperation.pointee = .on
-            }
+            if (entry(row: row.pointee, column: column.pointee) as? RemoteItem)?.kind != .directory { row.pointee = -1 }
+            dropOperation.pointee = .on
             guard let folder = dropFolder(row: row.pointee, column: column.pointee) else { return [] }
-            return dropAction(from: info.draggingPasteboard, onto: folder, connection: connection)?.operation ?? []
+            return dropAction(for: info, onto: folder, model: model)?.operation ?? []
         }
 
         func browser(_ browser: NSBrowser, acceptDrop info: any NSDraggingInfo, atRow row: Int, column: Int, dropOperation: NSBrowser.DropOperation) -> Bool {
-            guard let connection = model.snapshot.connectionID,
-                  let folder = dropFolder(row: row, column: column),
-                  let action = dropAction(from: info.draggingPasteboard, onto: folder, connection: connection) else { return false }
+            guard let folder = dropFolder(row: row, column: column),
+                  let action = dropAction(for: info, onto: folder, model: model) else { return false }
             let model = model
             Task { await model.perform(action) }
             return true
         }
 
+        /// A folder row, else the column's folder. Beyond every column it is the location, the
+        /// folder list and icon views drop into too.
         private func dropFolder(row: Int, column: Int) -> RemotePath? {
             if let item = entry(row: row, column: column) as? RemoteItem, item.kind == .directory {
                 return item.path
             }
-            return column >= 0 ? path(forColumn: column) : root
+            return column >= 0 ? path(forColumn: column) : model.snapshot.path
         }
     }
 }
@@ -509,7 +541,7 @@ enum ItemIcon {
     }()
 
     static func image(for item: RemoteItem) -> NSImage {
-        let key: String
+        var key: String
         switch item.kind {
         case .directory: key = "/dir"
         case .symlink: key = "/link"
@@ -522,7 +554,16 @@ enum ItemIcon {
         case .directory: type = .folder
         case .symlink: type = .symbolicLink
         case .other: type = .item
-        case .file: type = UTType(filenameExtension: key) ?? .data
+        case .file:
+            // Extensions come from the server. One the system does not know (`app.log.1`, …
+            // `.100000`) gets the generic icon under one key, so they cannot grow the cache.
+            if let known = UTType(filenameExtension: key), !known.isDynamic {
+                type = known
+            } else {
+                key = "/data"
+                if let cached = cache[key] { return cached }
+                type = .data
+            }
         }
         let icon = NSWorkspace.shared.icon(for: type)
         icon.size = NSSize(width: 16, height: 16)
