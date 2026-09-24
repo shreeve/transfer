@@ -76,15 +76,6 @@ import TransferCore
     try await newer.value
 }
 
-/// Polls `condition` until it holds or five seconds pass.
-private func eventually(_ condition: () async -> Bool) async -> Bool {
-    for _ in 0..<500 {
-        if await condition() { return true }
-        try? await Task.sleep(nanoseconds: 10_000_000)
-    }
-    return await condition()
-}
-
 /// Holds a job running until the test opens it.
 private actor Gate {
     private var isOpen = false

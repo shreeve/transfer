@@ -2,7 +2,8 @@ import Foundation
 import TransferCore
 
 actor SFTPChannel {
-    private let process: Process
+    /// The ssh passenger, ended on close. Nil for a channel a test drives over its own pipes.
+    private let process: Process?
     private let input: FileHandle
     private let chunks: AsyncStream<Data>
     private let chunkSink: AsyncStream<Data>.Continuation
@@ -15,7 +16,7 @@ actor SFTPChannel {
     private var reader: Task<Void, Never>?
     private(set) var isOpen = true
 
-    init(process: Process, input: FileHandle, output: FileHandle) {
+    init(process: Process?, input: FileHandle, output: FileHandle) {
         self.process = process
         self.input = input
         let (chunks, sink) = AsyncStream<Data>.makeStream()
@@ -85,9 +86,7 @@ actor SFTPChannel {
                                 continue
                             }
                             if page.isEmpty { finished = true }
-                            for item in page where !item.isDotEntry {
-                                continuation.yield(item)
-                            }
+                            for item in page { continuation.yield(item) }
                             try Task.checkCancellation()
                         }
                         try? await self.close(handle)
@@ -370,7 +369,7 @@ actor SFTPChannel {
 
     func closeLink() {
         isOpen = false
-        process.terminate()
+        process?.terminate()
         reader?.cancel()
         chunkSink.finish()
         for waiter in waiters.values {
@@ -388,14 +387,22 @@ actor SFTPChannel {
         return try handle(in: message)
     }
 
+    /// One page of `parent`'s entries. A name the server sends is used as a path component, so
+    /// anything that is not exactly one is dropped: `.` and `..`, an empty name, and a name with
+    /// a slash or NUL, which a hostile server could send to reach outside the folder.
     private func readDirectory(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem] {
         var body = Data()
         body.appendBlob(handle)
         let message = try await call(SFTPCode.readdir, body: body)
-        return try names(in: message).map { name in
-            let path = parent.appending(name: Array(name.filename))
-            return item(path: path, attrs: name.attrs)
+        return try names(in: message).compactMap { name in
+            guard Self.isSingleComponent(name.filename) else { return nil }
+            return item(path: parent.appending(name: Array(name.filename)), attrs: name.attrs)
         }
+    }
+
+    static func isSingleComponent(_ name: Data) -> Bool {
+        !name.isEmpty && name != Data([0x2E]) && name != Data([0x2E, 0x2E])
+            && !name.contains(0x2F) && !name.contains(0)
     }
 
     private func openFile(_ path: RemotePath, flags: UInt32) async throws -> Data {
