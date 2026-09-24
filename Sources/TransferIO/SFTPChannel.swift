@@ -122,19 +122,32 @@ actor SFTPChannel {
     /// A rename or move the user asked for. It never replaces what is already at `destination`:
     /// `posix-rename` would, and plain RENAME refuses a file there but on OpenSSH replaces an empty
     /// folder, so the destination is looked up first. A change of case alone within one folder
-    /// skips the lookup, which on a case-insensitive disk finds the source itself.
+    /// needs `posix-rename` on a case-insensitive disk, where the lookup finds the source itself;
+    /// the folder's listing tells that apart from a second file on a case-sensitive disk.
     func rename(_ source: RemotePath, to destination: RemotePath) async throws {
-        let caseOnly = source.parent == destination.parent && source != destination
-            && source.name.lowercased() == destination.name.lowercased()
-        if caseOnly {
-            if await posixRename(source, to: destination) { return }
-            try await plainRename(source, to: destination)
-            return
+        let taken: Bool
+        do {
+            _ = try await lstat(destination)
+            taken = true
+        } catch TransferError.noSuchFile {
+            taken = false
         }
-        if (try? await lstat(destination)) != nil {
-            throw TransferError.failed("“\(destination.name)” already exists there")
+        if taken {
+            let caseOnly = source.parent == destination.parent && source != destination
+                && source.name.lowercased() == destination.name.lowercased()
+            guard caseOnly, let folder = destination.parent, try await !hasEntry(named: destination.name, in: folder) else {
+                throw TransferError.failed("“\(destination.name)” already exists there")
+            }
+            if await posixRename(source, to: destination) { return }
         }
         try await plainRename(source, to: destination)
+    }
+
+    /// Whether `folder` lists an entry named `name`. Strings compare as Unicode does, so a name
+    /// that differs only in normalization counts, as it does on APFS.
+    private func hasEntry(named name: String, in folder: RemotePath) async throws -> Bool {
+        for try await item in list(folder) where item.name == name { return true }
+        return false
     }
 
     /// `posix-rename@openssh.com` replaces the destination. False when the server lacks it.

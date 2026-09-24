@@ -40,4 +40,62 @@ import TransferCore
         #expect(names == [Array("good".utf8), Array(".hidden".utf8)])
         await server.stop()
     }
+
+    /// A server whose folder /srv lists `names`, where LSTAT finds what `lookup` says, and which
+    /// has posix-rename.
+    private static func renaming(_ names: [String], lookup: @escaping @Sendable (String) -> UInt32?) async throws -> ScriptedServer {
+        let listing = folder(names.map { Array($0.utf8) })
+        return try await ScriptedServer(extensions: ["posix-rename@openssh.com"]) { request in
+            switch request.type {
+            case SFTPCode.lstat:
+                let path = request.paths[0]
+                if let code = lookup(path) { return ScriptedServer.status(request.id, code) }
+                return ScriptedServer.attrs(request.id)
+            case SFTPCode.rename, SFTPCode.extended: return ScriptedServer.ok(request.id)
+            default: return listing(request)
+            }
+        }
+    }
+
+    /// On a case-sensitive server `Notes.txt` is a second file, not the source under another case.
+    /// Renaming `notes.txt` to it must refuse, not posix-rename over it.
+    @Test func aCaseOnlyRenameNeverReplacesASecondFile() async throws {
+        let server = try await Self.renaming(["notes.txt", "Notes.txt"]) { _ in nil }
+        await #expect(throws: TransferError.failed("“Notes.txt” already exists there")) {
+            try await server.channel.rename(RemotePath(string: "/srv/notes.txt"), to: RemotePath(string: "/srv/Notes.txt"))
+        }
+        #expect(server.sent(SFTPCode.extended).isEmpty)
+        #expect(server.sent(SFTPCode.rename).isEmpty)
+        await server.stop()
+    }
+
+    /// On a case-insensitive server the lookup finds the source itself; the listing shows no
+    /// second file, so the case change goes through posix-rename.
+    @Test func aCaseOnlyRenameOnACaseInsensitiveServerUsesPosixRename() async throws {
+        let server = try await Self.renaming(["notes.txt"]) { _ in nil }
+        try await server.channel.rename(RemotePath(string: "/srv/notes.txt"), to: RemotePath(string: "/srv/Notes.txt"))
+        let sent = server.sent(SFTPCode.extended)
+        #expect(sent.count == 1)
+        #expect(sent.first?.paths == ["posix-rename@openssh.com", "/srv/notes.txt", "/srv/Notes.txt"])
+        await server.stop()
+    }
+
+    /// With nothing at the new name, a case-only rename is a plain RENAME, like any other.
+    @Test func aCaseOnlyRenameToAFreeNameIsAPlainRename() async throws {
+        let server = try await Self.renaming(["notes.txt"]) { $0 == "/srv/Notes.txt" ? SFTPCode.noSuchFile : nil }
+        try await server.channel.rename(RemotePath(string: "/srv/notes.txt"), to: RemotePath(string: "/srv/Notes.txt"))
+        #expect(server.sent(SFTPCode.rename).first?.paths == ["/srv/notes.txt", "/srv/Notes.txt"])
+        #expect(server.sent(SFTPCode.extended).isEmpty)
+        await server.stop()
+    }
+
+    /// A lookup that fails for any reason but "no such file" is not evidence the name is free.
+    @Test func aRenameWhoseLookupFailsRenamesNothing() async throws {
+        let server = try await Self.renaming([]) { _ in SFTPCode.permission }
+        await #expect(throws: TransferError.permissionDenied("")) {
+            try await server.channel.rename(RemotePath(string: "/srv/a"), to: RemotePath(string: "/srv/b"))
+        }
+        #expect(server.sent(SFTPCode.rename).isEmpty)
+        await server.stop()
+    }
 }
