@@ -284,6 +284,17 @@ struct SessionServerTests {
         }
     }
 
+    /// Cancel on a first contact's key is a plain Cancel; Cancel on a changed key refuses it.
+    @Test func cancellingAHostKeyQuestion() async throws {
+        try await withHarness("hkcancel", knownHost: false) { h in
+            await #expect(throws: TransferError.cancelled) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            try "\(try hostPattern()) \(try await otherKey(h))\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
+            await #expect(throws: TransferError.hostKeyRejected) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            #expect(try await processes(h, "").isEmpty)
+            #expect(try loginScratch(h).isEmpty)
+        }
+    }
+
     @Test func aRevokedKeyIsRefusedWithoutAQuestion() async throws {
         try await withHarness("revoked") { h in
             try "@revoked \(try hostPattern()) \(try ServerHarness.hostKey())\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)

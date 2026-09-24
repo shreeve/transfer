@@ -739,7 +739,9 @@ public actor SSHConnection: RemoteSession {
         }
         let event = HostKeyEvent(situation: failure == .changed ? .changed : .firstSeen, keyType: offered.keyType, fingerprint: Self.fingerprint(offered.key), line: offered.text)
         let decision = try await Self.untilCancelled({ await prompts.decideHostKey(event) })
-        if decision == .cancel { throw TransferError.hostKeyRejected }
+        // Declining a new server's key is a Cancel like any other; declining to replace a key
+        // that changed is a refusal of that key.
+        if decision == .cancel { throw failure == .changed ? TransferError.hostKeyRejected : TransferError.cancelled }
         let target = decision == .trustOnce ? nil : try Self.knownHostsFile(sshConfig: config)
         guard let target else {
             if decision != .trustOnce {
