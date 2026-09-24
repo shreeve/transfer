@@ -356,7 +356,7 @@ struct TransferServerTests {
         try await withHarness("fifo", connected: true) { h in
             let site = h.remote.appendingPathComponent("site")
             try FileManager.default.createDirectory(at: site.appendingPathComponent("deep/er"), withIntermediateDirectories: true)
-            for index in 0..<250 { try Data("\(index)".utf8).write(to: site.appendingPathComponent("deep/er/f\(index)")) }
+            for index in 0..<3 { try Data("\(index)".utf8).write(to: site.appendingPathComponent("deep/er/f\(index)")) }
             #expect(mkfifo(site.appendingPathComponent("pipe").path, 0o600) == 0)
             let source = h.remotePath.appending(name: Array("site".utf8))
 
@@ -367,8 +367,49 @@ struct TransferServerTests {
             let copied = try await h.session.tree(destination)
             #expect(TreeCheck.missing(source: original, destination: copied) == ["pipe"])
 
+            // Removal empties folders of many entries, several levels deep, special files too.
+            for index in 0..<250 { try Data("\(index)".utf8).write(to: site.appendingPathComponent("deep/er/g\(index)")) }
             try await h.session.remove(source)
             #expect(!FileManager.default.fileExists(atPath: site.path))
+        }
+    }
+
+    /// A copy into a folder already there decides from one listing of it (PERF-03), so a name the
+    /// listing did not hold may be taken by the time the file lands: the rename then refuses
+    /// instead of replacing it. A name held in another case on a case-insensitive disk is still
+    /// asked about.
+    @Test func aNameTakenAfterTheListingIsNeverReplaced() async throws {
+        try await withHarness("taken", connected: true) { h in
+            let tree = h.staging.appendingPathComponent("tree")
+            try FileManager.default.createDirectory(at: tree, withIntermediateDirectories: true)
+            try Data("mine".utf8).write(to: tree.appendingPathComponent("Readme.txt"))
+            let up = h.remote.appendingPathComponent("up")
+            try FileManager.default.createDirectory(at: up, withIntermediateDirectories: true)
+            try Data("theirs".utf8).write(to: up.appendingPathComponent("taken.txt"))
+            try Data("THEIRS".utf8).write(to: up.appendingPathComponent("README.txt"))
+
+            let caseSensitive = try up.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames == true
+            try await h.session.upload(tree, to: h.remotePath.appending(name: Array("up".utf8))) { _ in }
+            #expect(h.prompts.collisions == (caseSensitive ? 0 : 1))
+
+            // As if the listing had found the name free.
+            let source = h.staging.appendingPathComponent("new.txt")
+            try Data("new".utf8).write(to: source)
+            let taken = h.remotePath.appending(name: Array("up".utf8)).appending(name: Array("taken.txt".utf8))
+            await #expect(throws: TransferError.self) {
+                try await h.session.uploadBytes(source, to: taken, interactive: false, replacing: false) { _ in }
+            }
+            #expect(try Data(contentsOf: up.appendingPathComponent("taken.txt")) == Data("theirs".utf8))
+            let leftovers = try FileManager.default.contentsOfDirectory(atPath: up.path).filter { $0.contains(".transfer-") }
+            #expect(leftovers.isEmpty)
+
+            let local = h.staging.appendingPathComponent("taken.txt")
+            try Data("local".utf8).write(to: local)
+            let item = try await h.session.stat(taken)
+            await #expect(throws: TransferError.self) {
+                try await h.session.fetch(taken, info: item, to: local, replacing: false) { _ in }
+            }
+            #expect(try Data(contentsOf: local) == Data("local".utf8))
         }
     }
 }
