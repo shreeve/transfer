@@ -29,6 +29,7 @@ public struct ContentView: View {
         .focusedSceneValue(\.transferModel, model)
         .onChange(of: model.snapshot.selection) { model.selectionChanged() }
         .onChange(of: model.sidebarSelection) { _, item in Task { await model.sidebarSelected(item) } }
+        .task { model.start() }
         .frame(minWidth: 640, idealWidth: 960, minHeight: 400, idealHeight: 640)
     }
 }
@@ -77,9 +78,10 @@ struct SidebarColumn: View {
                         Label {
                             Text(live.path.name)
                         } icon: {
-                            Image(systemName: liveSymbol(live))
+                            Image(systemName: live.state.symbolName)
                         }
-                        .help(liveHelp(live))
+                        .help("\(live.path.display)\n\(live.state.help)")
+                        .accessibilityValue(live.state.label)
                         .tag(SidebarItem.live(live.path))
                         .contextMenu {
                             if live.paused {
@@ -87,8 +89,8 @@ struct SidebarColumn: View {
                             }
                             Button("Discard Live File") { Task { await model.discardLive(live.path) } }
                                 .disabled(live.uploading)
-                            Button("Forget All Synced Live Files") { Task { await model.forgetSyncedLive() } }
-                                .disabled(!model.liveFiles.contains { !$0.dirty && !$0.uploading && !$0.conflict })
+                            Button("Forget Synced Live Files") { Task { await model.forgetSyncedLive() } }
+                                .disabled(!model.liveFiles.contains(where: \.isSynced))
                         }
                     }
                 }
@@ -111,22 +113,6 @@ struct SidebarColumn: View {
         path.isRoot ? "/" : path.name
     }
 
-    private func liveSymbol(_ live: LiveFile) -> String {
-        if live.conflict { return "exclamationmark.triangle.fill" }
-        if live.uploading { return "arrow.up.circle.fill" }
-        if live.paused { return "pause.circle" }
-        return live.dirty ? "pencil.circle.fill" : "checkmark.circle"
-    }
-
-    private func liveHelp(_ live: LiveFile) -> String {
-        let state: String
-        if live.conflict { state = "Changed on the server; needs a decision" }
-        else if live.uploading { state = "Uploading" }
-        else if live.paused { state = "Paused" }
-        else if live.dirty { state = "Edited here, not yet uploaded" }
-        else { state = "Synced; saves in the editor upload" }
-        return "\(live.path.display)\n\(state)"
-    }
 }
 
 /// The content column: browser, rename bar, shelf, and every sheet.
@@ -580,8 +566,8 @@ struct InspectorColumn: View {
                 content(preview, item).id(previewID).transition(.opacity)
             } else if shown.wait != .nothing {
                 VStack(spacing: 12) {
-                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 96, height: 96)
-                    if shown.wait == .spinner { ProgressView().controlSize(.small).transition(.opacity) }
+                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 96, height: 96).accessibilityLabel(item.kindLabel)
+                    if shown.wait == .spinner { ProgressView().controlSize(.small).accessibilityLabel("Loading preview").transition(.opacity) }
                 }
                 .padding(.top, 24)
                 .transition(.opacity)
@@ -734,6 +720,7 @@ private struct ClipBar: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Clear the clipboard (Escape)")
+            .accessibilityLabel("Clear Clipboard")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)

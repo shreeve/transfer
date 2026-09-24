@@ -18,7 +18,12 @@ public struct GeneralSettings: View {
             }
             Section("Browsing") {
                 Toggle("Show hidden files", isOn: $showsHidden)
-                Picker("View", selection: $viewMode) {
+                // Chosen here, the view mode changes every open window; chosen in a window, it
+                // is only the default for the next one.
+                Picker("View", selection: Binding(get: { viewMode }, set: { mode in
+                    viewMode = mode
+                    NotificationCenter.default.post(name: Preferences.viewModeChosen, object: nil)
+                })) {
                     ForEach(ViewMode.allCases, id: \.rawValue) { Text($0.title).tag($0.rawValue) }
                 }
             }

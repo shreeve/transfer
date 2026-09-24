@@ -17,6 +17,11 @@ public enum Preferences {
     }
     public static let showsHidden = "transfer.showsHidden"
     public static let viewMode = "transfer.viewMode"
+    /// Posted when Settings sets the view mode, which every open window then takes. A window's
+    /// own choice is only the default for new windows.
+    public static let viewModeChosen = Notification.Name("TransferViewModeChosen")
+    /// Posted when a window adds, edits, or removes a server, so every window's sidebar follows.
+    public static let libraryChanged = Notification.Name("TransferLibraryChanged")
     /// Off unless turned on: the inspector's source preview wraps long lines.
     public static let wrapsPreview = "transfer.wrapsPreview"
 }
@@ -127,7 +132,7 @@ public final class TransferModel {
     public var liveFiles: [LiveFile] = [] {
         didSet { liveByPath = Dictionary(liveFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first }) }
     }
-    @ObservationIgnored private var liveByPath: [RemotePath: LiveFile] = [:]
+    private var liveByPath: [RemotePath: LiveFile] = [:]
     /// Live files the server changed under an edit, from the Live files themselves.
     public var conflicts: [RemotePath] { liveFiles.filter(\.conflict).map(\.path) }
     /// Whether Compare can open each conflict, as its event said. A conflict from before a
@@ -181,7 +186,8 @@ public final class TransferModel {
     public var applyCollisionToAll = false
     public var sidebarSelection: SidebarItem?
     public var inspectorLinkTarget: String?
-    public var terminalAvailable = TerminalLauncher.anyInstalled()
+    /// Whether Terminal, iTerm2, or Ghostty is installed, learned in `start`.
+    public var terminalAvailable = false
 
     public private(set) var prompts: SheetPrompts
 
@@ -208,29 +214,55 @@ public final class TransferModel {
         var task: Task<Void, Never>?
     }
 
+    /// Reads the preferences and nothing else: SwiftUI may build a window's model more than once
+    /// and keep only the first, so the work waits for `start`.
     public init(provider: any SessionProvider) {
         self.provider = provider
         let prompts = SheetPrompts()
         self.prompts = prompts
         prompts.model = self
         applyPreferences()
-        Task { await reloadConnections() }
-        defaultsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
-            Task { @MainActor in self?.applyPreferences() }
+        if let stored = UserDefaults.standard.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored) {
+            snapshot.viewMode = mode
         }
     }
 
-    @ObservationIgnored nonisolated(unsafe) private var defaultsObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var observers: [any NSObjectProtocol] = []
 
-    /// A closed window stops listening and listing. Its queued transfers run on without it.
+    /// Loads the library and follows changes to preferences and to the library. The window
+    /// calls it once it is on screen.
+    public func start() {
+        guard observers.isEmpty else { return }
+        terminalAvailable = TerminalLauncher.anyInstalled()
+        let center = NotificationCenter.default
+        func observe(_ name: Notification.Name, _ act: @escaping @MainActor (TransferModel) async -> Void) -> any NSObjectProtocol {
+            center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                Task { @MainActor in if let self { await act(self) } }
+            }
+        }
+        observers = [
+            observe(UserDefaults.didChangeNotification) { $0.applyPreferences() },
+            observe(Preferences.libraryChanged) { await $0.reloadConnections() },
+            observe(Preferences.viewModeChosen) { model in
+                if let stored = UserDefaults.standard.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored) {
+                    model.setViewMode(mode)
+                }
+            },
+        ]
+        Task { await reloadConnections() }
+    }
+
+    /// A closed window stops listening and listing. Its queued transfers run on without it, and
+    /// its waiting questions get the safe answer.
     isolated deinit {
-        if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
         context?.close()
         sidebarReload?.cancel()
         prompts.cancelAll()
     }
 
-    /// Reads the global preferences at launch and whenever Settings changes them.
+    /// Reads the global preferences at launch and whenever they change. Hidden files and the sort
+    /// switches are global, as in Finder; the view mode is not, and follows `viewModeChosen`.
     private func applyPreferences() {
         let defaults = UserDefaults.standard
         var changed = false
@@ -247,10 +279,6 @@ public final class TransferModel {
             snapshot.sort.foldersFirst = foldersFirst
             resortListings(names: true)
             changed = true
-        }
-        if let stored = defaults.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored), mode != snapshot.viewMode {
-            snapshot.viewMode = mode
-            if mode == .columns { columnRoot = snapshot.path }
         }
         if changed { refreshItems() }
     }
@@ -307,10 +335,12 @@ public final class TransferModel {
 
     // MARK: Servers
 
+    /// Reads the saved servers. A window whose server another window removed shows none.
     public func reloadConnections() async {
-        let loaded = (try? await provider.savedConnections()) ?? []
+        guard let loaded = try? await provider.savedConnections() else { return }
         Self.lastConnections = loaded
         if connections != loaded { connections = loaded }
+        if let id = snapshot.connectionID, !loaded.contains(where: { $0.id == id }) { uninstall() }
     }
 
     public var currentConnection: SavedConnection? {
@@ -400,6 +430,7 @@ public final class TransferModel {
         columnRoot = path
         loadPreferences(for: fresh.connection.id)
         refreshItems()
+        syncSidebarSelection()
     }
 
     /// Leaves the window showing no server.
@@ -408,6 +439,7 @@ public final class TransferModel {
         snapshot.connectionID = nil
         snapshot.selection = []
         refreshItems()
+        syncSidebarSelection()
     }
 
     /// Forgets what the window knew about the server it showed, and stops listening to it.
@@ -489,6 +521,7 @@ public final class TransferModel {
         await reporting {
             try await provider.save(connection)
             await reloadConnections()
+            NotificationCenter.default.post(name: Preferences.libraryChanged, object: nil)
             sheet = nil
             let landing = pendingLanding
             pendingLanding = nil
@@ -509,6 +542,7 @@ public final class TransferModel {
             UserDefaults.standard.removeObject(forKey: Self.sortKey(connection.id))
             if snapshot.connectionID == connection.id { uninstall() }
             await reloadConnections()
+            NotificationCenter.default.post(name: Preferences.libraryChanged, object: nil)
         }
     }
 
@@ -778,12 +812,7 @@ public final class TransferModel {
 
     /// The Status column and inspector text for a path: Live state or an active transfer.
     public func statusText(for path: RemotePath) -> String {
-        if let live = liveByPath[path] {
-            if live.conflict { return "Conflict" }
-            if live.uploading { return "Uploading" }
-            if live.paused { return "Paused" }
-            return live.dirty ? "Live, unsynced" : "Live"
-        }
+        if let live = liveByPath[path] { return live.state.label }
         if operations.contains(where: { $0.state == .active && $0.path == path }) {
             return "Transferring"
         }
@@ -1414,7 +1443,7 @@ public final class TransferModel {
     /// file is the source of truth and the next open downloads it again.
     public func forgetSyncedLive() async {
         guard let session else { return }
-        for live in liveFiles where !live.dirty && !live.uploading && !live.conflict {
+        for live in liveFiles where live.isSynced {
             try? await session.discardLiveFile(live.path, force: false)
         }
         await reloadSidebars()
@@ -1429,11 +1458,11 @@ public final class TransferModel {
     /// Live files with something happening: edited, uploading, paused, or in conflict. A synced
     /// mapping keeps working in the background but is not worth a sidebar row.
     public var activeLiveFiles: [LiveFile] {
-        liveFiles.filter { $0.dirty || $0.uploading || $0.paused || $0.conflict }
+        liveFiles.filter { $0.state != .synced }
     }
 
     public func liveFile(for path: RemotePath) -> LiveFile? {
-        liveFiles.first { $0.path == path }
+        liveByPath[path]
     }
 
     public func clearPreviewCache() async {
@@ -1516,6 +1545,15 @@ public final class TransferModel {
         case .conflict(let path):
             showConflict(path)
         }
+        // A row is a command: the selection goes back to the server shown, so clicking the
+        // same star, Live file, or conflict again acts again.
+        syncSidebarSelection()
+    }
+
+    /// Selects the sidebar row of the server the window shows.
+    private func syncSidebarSelection() {
+        let shown = snapshot.connectionID.map(SidebarItem.server)
+        if sidebarSelection != shown { sidebarSelection = shown }
     }
 
     public func reveal(_ path: RemotePath) async {
@@ -1625,6 +1663,55 @@ public extension ViewMode {
         case .columns: "Columns"
         }
     }
+}
+
+/// What a Live file is doing, the most pressing first: a conflict, then an upload, a pause, and
+/// unsynced edits. Every label, symbol, and tooltip for it comes from here.
+public enum LiveState: Equatable {
+    case conflict, uploading, paused, dirty, synced
+
+    public var label: String {
+        switch self {
+        case .conflict: "Conflict"
+        case .uploading: "Uploading"
+        case .paused: "Paused"
+        case .dirty: "Live, unsynced"
+        case .synced: "Live"
+        }
+    }
+
+    public var symbolName: String {
+        switch self {
+        case .conflict: "exclamationmark.triangle.fill"
+        case .uploading: "arrow.up.circle.fill"
+        case .paused: "pause.circle"
+        case .dirty: "pencil.circle.fill"
+        case .synced: "checkmark.circle"
+        }
+    }
+
+    public var help: String {
+        switch self {
+        case .conflict: "Changed on the server; needs a decision"
+        case .uploading: "Uploading"
+        case .paused: "Paused"
+        case .dirty: "Edited here, not yet uploaded"
+        case .synced: "Synced; saves in the editor upload"
+        }
+    }
+}
+
+public extension LiveFile {
+    var state: LiveState {
+        if conflict { return .conflict }
+        if uploading { return .uploading }
+        if paused { return .paused }
+        return dirty ? .dirty : .synced
+    }
+
+    /// The working copy matches the server, so forgetting the mapping loses nothing. A paused
+    /// file with nothing unsynced counts.
+    var isSynced: Bool { !dirty && !uploading && !conflict }
 }
 
 public extension RemoteItem {
