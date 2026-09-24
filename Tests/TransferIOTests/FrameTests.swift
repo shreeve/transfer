@@ -27,25 +27,47 @@ import TransferCore
 
     // MARK: Frames
 
-    @Test func popPacketWaitsForAWholePacket() throws {
-        let packet = SFTPWire.packet(type: SFTPCode.status) { $0.appendU32(7) }
-        var buffer = packet.prefix(6)
-        #expect(try SFTPWire.popPacket(from: &buffer) == nil)
-        buffer.append(packet.dropFirst(6))
-        let message = try SFTPWire.popPacket(from: &buffer)
-        #expect(message?.type == SFTPCode.status)
-        #expect(message?.rest == Data([0, 0, 0, 7]))
-        #expect(buffer.isEmpty)
+    /// Every packet of the stream, fed in reads of `size` bytes.
+    private static func split(_ stream: Data, reads size: Int) throws -> [SFTPMessage] {
+        var frames = SFTPWire.Frames()
+        var messages: [SFTPMessage] = []
+        for start in stride(from: 0, to: stream.count, by: size) {
+            frames.append(stream.subdata(in: start..<min(start + size, stream.count)))
+            while let message = try frames.next() { messages.append(message) }
+        }
+        return messages
     }
 
-    @Test func popPacketRefusesZeroAndOversizedLengths() {
-        var zero = Self.length(0)
-        #expect(throws: SFTPWire.BadFrame.self) { try SFTPWire.popPacket(from: &zero) }
-        var oversized = Self.length(UInt32(SFTPWire.maxPacket + 1))
-        #expect(throws: SFTPWire.BadFrame.self) { try SFTPWire.popPacket(from: &oversized) }
+    /// Packets arrive cut anywhere: inside the length, inside the body, several to a read, and
+    /// one across many reads. Each comes out whole and in order.
+    @Test func framesPutPacketsTogetherWhereverReadsCutThem() throws {
+        var stream = Data()
+        for count in [0, 1, 3, 70_000, 5, 65_536, 0] {
+            stream.append(SFTPWire.packet(type: SFTPCode.data) {
+                $0.appendU32(UInt32(count))
+                $0.appendBlob(Data(repeating: UInt8(count % 251), count: count))
+            })
+        }
+        for size in [1, 2, 3, 4, 5, 7, 4_096, 65_536, stream.count] {
+            let messages = try Self.split(stream, reads: size)
+            #expect(messages.count == 7)
+            for (message, count) in zip(messages, [0, 1, 3, 70_000, 5, 65_536, 0]) {
+                var reader = ByteReader(message.rest)
+                #expect(message.type == SFTPCode.data)
+                #expect(try reader.u32() == UInt32(count))
+                #expect(try reader.blob() == Data(repeating: UInt8(count % 251), count: count))
+            }
+        }
+    }
+
+    @Test func framesRefuseZeroAndOversizedLengths() {
+        for bad in [Self.length(0), Self.length(UInt32(SFTPWire.maxPacket + 1)), Self.length(.max)] {
+            // Refused as soon as the length is in, however it arrives.
+            #expect(throws: SFTPWire.BadFrame.self) { _ = try Self.split(bad + Data([1, 2]), reads: 1) }
+            #expect(throws: SFTPWire.BadFrame.self) { _ = try Self.split(bad, reads: 4) }
+        }
         // The longest allowed length only waits for its bytes.
-        var longest = Self.length(UInt32(SFTPWire.maxPacket))
-        #expect(throws: Never.self) { try SFTPWire.popPacket(from: &longest) }
+        #expect(throws: Never.self) { _ = try Self.split(Self.length(UInt32(SFTPWire.maxPacket)) + Data([1]), reads: 2) }
     }
 
     /// A zero-length frame used to be left unconsumed, so the reader stalled and every request

@@ -123,18 +123,67 @@ enum SFTPWire {
     /// hold its id, or anything but VERSION first.
     struct BadFrame: Error {}
 
-    /// The next whole packet off the front of `buffer`, or nil until one has arrived.
-    static func popPacket(from buffer: inout Data) throws -> SFTPMessage? {
-        guard buffer.count >= 4 else { return nil }
-        let length = Int(buffer.prefix(4).loadU32())
-        guard length > 0, length <= maxPacket else { throw BadFrame() }
-        let total = 4 + length
-        guard buffer.count >= total else { return nil }
-        let payload = buffer.subdata(in: 4..<total)
-        buffer.removeSubrange(0..<total)
-        let type = payload[payload.startIndex]
-        let rest = payload.dropFirst()
-        return SFTPMessage(type: type, rest: Data(rest))
+    /// Cuts the server's byte stream into packets. A packet that arrives whole within one read is
+    /// a slice of that read, not a copy; only a packet split across reads is copied, once, as it
+    /// is put together. A length of zero or over `maxPacket` throws `BadFrame`.
+    struct Frames {
+        /// A packet that has begun to arrive; empty between packets.
+        private var partial = Data()
+        /// The latest read, taken from `offset` on.
+        private var read = Data()
+        private var offset = 0
+
+        /// Adds the next read. Call `next` until it returns nil before adding another.
+        mutating func append(_ bytes: Data) {
+            read = bytes
+            offset = bytes.startIndex
+        }
+
+        /// What has arrived and not been taken, for an error message.
+        var unread: Data { partial + read[offset...] }
+
+        /// The next whole packet, or nil until more has arrived.
+        mutating func next() throws -> SFTPMessage? {
+            if partial.isEmpty {
+                let available = read.endIndex - offset
+                guard available > 0 else { return nil }
+                if available >= 4 {
+                    let total = try Self.total(read[offset..<offset + 4])
+                    if available >= total {
+                        defer { offset += total }
+                        return Self.message(read[offset..<offset + total])
+                    }
+                    partial.reserveCapacity(total)
+                }
+                take(available)
+                return nil
+            }
+            if partial.count < 4 {
+                take(min(4 - partial.count, read.endIndex - offset))
+                if partial.count < 4 { return nil }
+            }
+            let total = try Self.total(partial.prefix(4))
+            take(min(total - partial.count, read.endIndex - offset))
+            guard partial.count == total else { return nil }
+            defer { partial = Data() }
+            return Self.message(partial)
+        }
+
+        private mutating func take(_ count: Int) {
+            partial.append(read[offset..<offset + count])
+            offset += count
+        }
+
+        private static func total(_ header: Data) throws -> Int {
+            let length = Int(header.loadU32())
+            guard length > 0, length <= maxPacket else { throw BadFrame() }
+            return 4 + length
+        }
+
+        private static func message(_ packet: Data) -> SFTPMessage {
+            let type = packet.startIndex + 4
+            return SFTPMessage(type: packet[type], rest: packet[(type + 1)...])
+        }
     }
 
     /// Why a channel's first bytes were not SFTP, for the person connecting. Usually the server's
@@ -152,6 +201,8 @@ enum SFTPWire {
     }
 }
 
+/// Reads big-endian fields from a packet, checking each length against what is there. Strings are
+/// slices of the packet, not copies.
 struct ByteReader {
     var data: Data
     var index: Int
@@ -163,25 +214,22 @@ struct ByteReader {
 
     mutating func u32() throws -> UInt32 {
         guard index + 4 <= data.count else { throw TransferError.failed("Short SFTP packet") }
-        let value = data.subdata(in: (data.startIndex + index)..<(data.startIndex + index + 4)).loadU32()
-        index += 4
-        return value
+        defer { index += 4 }
+        return data.withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: index, as: UInt32.self)) }
     }
 
     mutating func u64() throws -> UInt64 {
         guard index + 8 <= data.count else { throw TransferError.failed("Short SFTP packet") }
-        let value = data.subdata(in: (data.startIndex + index)..<(data.startIndex + index + 8)).loadU64()
-        index += 8
-        return value
+        defer { index += 8 }
+        return data.withUnsafeBytes { UInt64(bigEndian: $0.loadUnaligned(fromByteOffset: index, as: UInt64.self)) }
     }
 
     mutating func blob() throws -> Data {
         let length = Int(try u32())
         guard index + length <= data.count else { throw TransferError.failed("Short SFTP string") }
         let start = data.startIndex + index
-        let value = data.subdata(in: start..<(start + length))
         index += length
-        return value
+        return data[start..<(start + length)]
     }
 
     mutating func utf8() throws -> String {
@@ -216,12 +264,6 @@ extension Data {
     func loadU32() -> UInt32 {
         var value: UInt32 = 0
         for byte in prefix(4) { value = (value << 8) | UInt32(byte) }
-        return value
-    }
-
-    func loadU64() -> UInt64 {
-        var value: UInt64 = 0
-        for byte in prefix(8) { value = (value << 8) | UInt64(byte) }
         return value
     }
 

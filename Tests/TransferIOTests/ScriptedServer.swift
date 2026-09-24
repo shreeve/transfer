@@ -30,7 +30,7 @@ final class ScriptedServer: @unchecked Sendable {
     let requests = Locked<[Request]>([])
     private let toServer = Pipe()
     private let toChannel = Pipe()
-    private let buffer = Locked(Data())
+    private let frames = Locked(SFTPWire.Frames())
 
     /// With `extensions`, INIT is answered with a VERSION that lists them and the handshake is done
     /// before this returns. With nil, nothing is answered until the test sends it. After answering a
@@ -51,17 +51,17 @@ final class ScriptedServer: @unchecked Sendable {
             handshakeLimit: handshakeLimit
         )
         let replies = toChannel.fileHandleForWriting
-        let (buffer, requests) = (buffer, requests)
+        let (frames, requests) = (frames, requests)
         toServer.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
                 return
             }
-            let packets: [Request] = buffer.withLock { buffer in
-                buffer.append(data)
+            let packets: [Request] = frames.withLock { frames in
+                frames.append(data)
                 var packets: [Request] = []
-                while let packet = try? SFTPWire.popPacket(from: &buffer) {
+                while let packet = try? frames.next() {
                     var reader = ByteReader(packet.rest)
                     let id = (try? reader.u32()) ?? 0
                     packets.append(Request(type: packet.type, id: id, body: Data(packet.rest.dropFirst(4))))

@@ -15,7 +15,7 @@ actor SFTPChannel {
     private let writer = DispatchQueue(label: "SFTPChannel.writer", qos: .userInitiated)
     private let chunks: AsyncStream<Data>
     private let chunkSink: AsyncStream<Data>.Continuation
-    private var buffer = Data()
+    private var frames = SFTPWire.Frames()
     private var nextID: UInt32 = 1
     private var waiters: [UInt32: CheckedContinuation<SFTPMessage, Error>] = [:]
     private var versionWaiter: CheckedContinuation<UInt32, Error>?
@@ -565,15 +565,15 @@ actor SFTPChannel {
     private func readLoop() async {
         for await chunk in chunks {
             lastHeard = .now
-            buffer.append(chunk)
+            frames.append(chunk)
             do {
-                while let packet = try SFTPWire.popPacket(from: &buffer) {
+                while let packet = try frames.next() {
                     try receive(packet)
                 }
             } catch {
                 shutDown(greeted
                     ? .connectionLost("The server sent a malformed SFTP packet")
-                    : .failed(SFTPWire.notSFTP(buffer)))
+                    : .failed(SFTPWire.notSFTP(frames.unread)))
                 return
             }
         }
@@ -596,14 +596,16 @@ actor SFTPChannel {
             return
         }
         let id = try reader.u32()
-        let message = SFTPMessage(type: packet.type, rest: Data(packet.rest.dropFirst(4)))
+        let message = SFTPMessage(type: packet.type, rest: packet.rest.dropFirst(4))
         waiters.removeValue(forKey: id)?.resume(returning: message)
     }
 
     private func handle(in message: SFTPMessage) throws -> Data {
         guard message.type == SFTPCode.handle else { throw TransferError.failed("Expected a handle") }
         var reader = ByteReader(message.rest)
-        return try reader.blob()
+        // A copy: a handle lives as long as its file is open, and a slice would keep the whole
+        // read it arrived in.
+        return Data(try reader.blob())
     }
 
     private func names(in message: SFTPMessage) throws -> [SFTPName] {
