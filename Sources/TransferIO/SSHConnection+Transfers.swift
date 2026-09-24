@@ -2,9 +2,11 @@ import CryptoKit
 import Foundation
 import TransferCore
 
-/// The transfer engine: removal, single files, directory copies both ways, copies on the server,
-/// tree walks, the view and preview cache, and name collisions. Login, channels, and Live
-/// forwarding are in `SSHConnection.swift`.
+/// The transfer engine: removal, downloads, uploads, copies on the server, tree walks, the view
+/// and preview cache, and name collisions. Login, channels, and Live forwarding are in
+/// `SSHConnection.swift`. Every name from a server reaches this Mac's disk through
+/// `LocalPlacement`, and whatever already holds a destination's name is settled by `Placement`,
+/// the same way in every direction.
 extension SSHConnection {
     // MARK: Remove
 
@@ -22,15 +24,24 @@ extension SSHConnection {
     }
 
     private func removeTree(_ path: RemotePath, link: SFTPChannel) async throws {
-        let item = try await link.lstat(path)
-        if item.kind == .directory {
-            for try await child in await link.list(path) {
-                try await removeTree(child.path, link: link)
+        guard try await link.lstat(path).kind == .directory else { return try await link.removeFile(path) }
+        try await removeFolder(path, link: link)
+    }
+
+    /// Lists the folder in full, closing its handle, before removing what it holds: one handle
+    /// open at a time however deep the tree, and nothing is unlinked while the server reads it.
+    private func removeFolder(_ path: RemotePath, link: SFTPChannel) async throws {
+        var children: [RemoteItem] = []
+        for try await child in await link.list(path) { children.append(child) }
+        for child in children {
+            try Task.checkCancellation()
+            if child.kind == .directory {
+                try await removeFolder(child.path, link: link)
+            } else {
+                try await link.removeFile(child.path)
             }
-            try await link.removeDirectory(path)
-        } else {
-            try await link.removeFile(path)
         }
+        try await link.removeDirectory(path)
     }
 
     // MARK: Single files
@@ -476,7 +487,8 @@ extension SSHConnection {
     private func walk(_ folder: RemotePath, prefix: String, link: SFTPChannel, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {
         for try await child in await link.list(folder) {
             try Task.checkCancellation()
-            guard child.kind != .other else { continue }
+            // Special files are reported too: no copy writes them, so a move that compares the
+            // trees keeps a folder holding one instead of removing it unseen.
             let key = prefix + child.name
             visit(key, TreeEntry(child))
             if child.kind == .directory {
@@ -561,19 +573,11 @@ extension SSHConnection {
 
     // MARK: Duplicate
 
+    /// A copy beside the item, file, link, or folder, made on the server like any other copy.
     public func duplicate(_ path: RemotePath) async throws {
-        let item = try await stat(path)
-        guard item.kind == .file, let parent = path.parent else {
-            throw TransferError.failed("Only a file can be duplicated")
-        }
-        let names = try await listedNames(parent)
-        let copyName = KeepBothName.duplicate(existing: names, original: item.name)
-        let destination = parent.appending(name: Array(copyName.utf8))
-        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: scratch) }
-        try await fetch(path, info: item, to: scratch) { _ in }
-        try await uploadBytes(scratch, to: destination, interactive: false) { _ in }
-        pipe.emit(.directoryChanged(parent))
+        guard let parent = path.parent else { throw TransferError.failed("The root folder cannot be duplicated") }
+        let name = KeepBothName.duplicate(existing: try await listedNames(parent), original: path.name)
+        try await copy(path, to: parent.appending(name: Array(name.utf8))) { _ in }
     }
 
     // MARK: Collisions

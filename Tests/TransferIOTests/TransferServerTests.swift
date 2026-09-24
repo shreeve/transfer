@@ -324,6 +324,53 @@ struct TransferServerTests {
             #expect(mine != theirs)
         }
     }
+
+    /// Duplicate worked only on files and went down to the Mac and back (SES-22, UIM-31).
+    @Test func duplicateCopiesAnyItemOnTheServer() async throws {
+        try await withHarness("dup", connected: true) { h in
+            let site = h.remote.appendingPathComponent("site")
+            try FileManager.default.createDirectory(at: site.appendingPathComponent("a"), withIntermediateDirectories: true)
+            try Data("deep".utf8).write(to: site.appendingPathComponent("a/deep.txt"))
+            try FileManager.default.createSymbolicLink(atPath: site.appendingPathComponent("link").path, withDestinationPath: "a")
+            let note = h.remote.appendingPathComponent("note.txt")
+            try Data("note".utf8).write(to: note)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: note.path)
+
+            try await h.session.duplicate(h.remotePath.appending(name: Array("site".utf8)))
+            try await h.session.duplicate(h.remotePath.appending(name: Array("note.txt".utf8)))
+            try await h.session.duplicate(h.remotePath.appending(name: Array("note.txt".utf8)))
+            let copy = h.remote.appendingPathComponent("site copy")
+            #expect(try Data(contentsOf: copy.appendingPathComponent("a/deep.txt")) == Data("deep".utf8))
+            #expect(try FileManager.default.destinationOfSymbolicLink(atPath: copy.appendingPathComponent("link").path) == "a")
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("note copy.txt")) == Data("note".utf8))
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("note copy 2.txt")) == Data("note".utf8))
+            let time = try FileManager.default.attributesOfItem(atPath: h.remote.appendingPathComponent("note copy.txt").path)[.modificationDate] as? Date
+            #expect(time == Date(timeIntervalSince1970: 1_700_000_000))
+            #expect(h.prompts.collisions == 0)
+        }
+    }
+
+    /// Removal deleted special files that walkTree never reported, so a move between servers
+    /// removed them unseen (CLIP-17); and it unlinked entries while the folder was still being read (SES-38).
+    @Test func specialFilesAreWalkedSoAMoveKeepsThem() async throws {
+        try await withHarness("fifo", connected: true) { h in
+            let site = h.remote.appendingPathComponent("site")
+            try FileManager.default.createDirectory(at: site.appendingPathComponent("deep/er"), withIntermediateDirectories: true)
+            for index in 0..<250 { try Data("\(index)".utf8).write(to: site.appendingPathComponent("deep/er/f\(index)")) }
+            #expect(mkfifo(site.appendingPathComponent("pipe").path, 0o600) == 0)
+            let source = h.remotePath.appending(name: Array("site".utf8))
+
+            let original = try await h.session.tree(source)
+            #expect(original["pipe"] != nil)
+            let destination = h.remotePath.appending(name: Array("moved".utf8))
+            try await h.session.copy(source, to: destination) { _ in }
+            let copied = try await h.session.tree(destination)
+            #expect(TreeCheck.missing(source: original, destination: copied) == ["pipe"])
+
+            try await h.session.remove(source)
+            #expect(!FileManager.default.fileExists(atPath: site.path))
+        }
+    }
 }
 
 /// A listening unix socket at `url`, as a dev tool leaves in a project folder.
