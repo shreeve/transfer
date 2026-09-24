@@ -28,24 +28,102 @@ public enum SidebarItem: Hashable {
     case conflict(RemotePath)
 }
 
+/// The server a window shows, as one value: made when a connect starts, installed only once the
+/// login has worked, and never changed after that. Switching servers installs a new one and
+/// closes the old, which cancels its event listener and listings. Work that belongs to a server
+/// holds its context, and a result counts only while that context is still the installed one,
+/// so a slow listing or a late login never lands in a window that has moved on.
+@MainActor
+final class ServerContext {
+    let connection: SavedConnection
+    let session: any RemoteSession
+    /// Which connect made it, so a notice raised during that login can be shown before it lands.
+    let generation: Int
+    var listener: Task<Void, Never>?
+    /// The listing running for each folder, at most one per folder.
+    var jobs: [RemotePath: ListingJob] = [:]
+
+    init(connection: SavedConnection, session: any RemoteSession, generation: Int) {
+        self.connection = connection
+        self.session = session
+        self.generation = generation
+    }
+
+    func close() {
+        listener?.cancel()
+        for job in jobs.values { job.task?.cancel() }
+        jobs.removeAll()
+    }
+
+    /// Stops the listings of folders the window no longer shows.
+    func cancelListings(keeping kept: (RemotePath) -> Bool) {
+        for (path, job) in jobs where !kept(path) {
+            job.task?.cancel()
+            jobs[path] = nil
+        }
+    }
+}
+
+/// One folder's listing in flight. A change that arrives while it runs asks for one more pass
+/// instead of starting a second listing of the same folder.
+@MainActor
+final class ListingJob {
+    var task: Task<Void, Never>?
+    var again = false
+}
+
+/// One folder as the window has it: all its items in the list view's order, and the column
+/// view's name order with hidden files already left out when they are hidden. Both are kept
+/// sorted, so reading a column costs nothing. `complete` is false for a listing that stopped
+/// part way, which is shown only until a fresh one replaces it.
+struct FolderListing {
+    var items: [RemoteItem]
+    var byName: [RemoteItem]
+    var columnItems: [RemoteItem]
+    var complete: Bool
+}
+
 /// One window's state. Windows and tabs share sessions through the provider.
 @MainActor
 @Observable
 public final class TransferModel {
     public let provider: any SessionProvider
-    public private(set) var session: (any RemoteSession)?
+    private var context: ServerContext?
+    /// The server this window shows; nil before the first login and while none is chosen.
+    public var session: (any RemoteSession)? { context?.session }
+    /// The server a connect is logging in to, until it lands or fails.
+    public private(set) var connectingTo: SavedConnection?
+    @ObservationIgnored private var connectGeneration = 0
     /// Starts from the list the last window loaded, so a new window or tab shows its servers in
     /// its first frame instead of an empty sidebar that fills in a moment later.
     public var connections: [SavedConnection] = TransferModel.lastConnections
     private static var lastConnections: [SavedConnection] = []
     public var snapshot = BrowserSnapshot()
-    public var items: [RemoteItem] = []
-    public var columns: [RemotePath: [RemoteItem]] = [:]
+    /// The location's items in list order, hidden ones left out unless shown.
+    public private(set) var items: [RemoteItem] = []
+    /// `items` narrowed by the toolbar filter: what the icon and list views draw.
+    public private(set) var displayedItems: [RemoteItem] = []
+    /// Each displayed item's row, built when a selection first needs it.
+    @ObservationIgnored private var displayedIndexCache: [RemotePath: Int]?
+    private var displayedIndex: [RemotePath: Int] {
+        if let displayedIndexCache { return displayedIndexCache }
+        let index = Dictionary(displayedItems.enumerated().map { ($1.path, $0) }, uniquingKeysWith: { first, _ in first })
+        displayedIndexCache = index
+        return index
+    }
+    /// The location's column narrowed by the filter; nil while no filter is typed.
+    private var filteredColumn: [RemoteItem]?
+    private var listings: [RemotePath: FolderListing] = [:]
+    /// When each cached listing was last shown, for keeping only the recent ones.
+    @ObservationIgnored private var listingUse: [RemotePath: Int] = [:]
+    @ObservationIgnored private var useClock = 0
+    private static let cachedListingLimit = 64
+    private static let historyLimit = 100
     public var columnRoot: RemotePath?
     public var operations: [TransferOperation] = []
     public var stars: [RemotePath] = []
     /// Whether each starred path is a folder, from the server, so a starred file is never listed.
-    @ObservationIgnored private var starIsFolder: [RemotePath: Bool] = [:]
+    private var starIsFolder: [RemotePath: Bool] = [:]
     public var liveFiles: [LiveFile] = [] {
         didSet { liveByPath = Dictionary(liveFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first }) }
     }
@@ -53,7 +131,9 @@ public final class TransferModel {
     public var conflicts: [RemotePath] = []
     public var conflictComparable = false
     public var conflictConfirm: LiveConflictChoice?
-    public var filter = ""
+    public var filter = "" {
+        didSet { if filter != oldValue { refreshItems() } }
+    }
     public var filterFocusTick = 0
     /// When an icon cell last took a mouse down, in system uptime, so the grid's background tap
     /// that follows the same click does not clear the selection the cell just made. A time rather
@@ -99,18 +179,24 @@ public final class TransferModel {
 
     /// Where a connection made from an `sftp://` link's filled-in sheet lands.
     @ObservationIgnored private var pendingLanding: RemotePath?
-    @ObservationIgnored private var connecting = false
     private var backStack: [RemotePath] = []
     private var forwardStack: [RemotePath] = []
-    private var listener: Task<Void, Never>?
-    private var listing: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
-    private var runners: [String: Runner] = [:]
+    @ObservationIgnored private var runners: [String: Runner] = [:]
+    /// The session behind each Live row on the shelf, which the session's own events put there,
+    /// so Pause and Resume reach that server whatever the window shows now.
+    @ObservationIgnored private var liveRowSessions: [String: any RemoteSession] = [:]
+    @ObservationIgnored private var sidebarReload: Task<Void, Never>?
+    @ObservationIgnored private var sidebarReloadAgain = false
 
+    /// One queued transfer. It keeps the server it was queued for: a retry, a Resume, or a
+    /// Retry after a failure runs there even when the window has moved to another server.
     private struct Runner {
         var body: @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void
         /// This operation's own prompts, kept across retries and Resume.
         var prompts: OperationPrompt
+        let connection: SavedConnection
+        let session: any RemoteSession
         var task: Task<Void, Never>?
     }
 
@@ -128,8 +214,11 @@ public final class TransferModel {
 
     @ObservationIgnored nonisolated(unsafe) private var defaultsObserver: (any NSObjectProtocol)?
 
-    deinit {
+    /// A closed window stops listening and listing. Its queued transfers run on without it.
+    isolated deinit {
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
+        context?.close()
+        sidebarReload?.cancel()
     }
 
     /// Reads the global preferences at launch and whenever Settings changes them.
@@ -139,6 +228,7 @@ public final class TransferModel {
         let hidden = defaults.bool(forKey: Preferences.showsHidden)
         if hidden != snapshot.showsHidden {
             snapshot.showsHidden = hidden
+            refilterListings()
             changed = true
         }
         let folded = defaults.bool(forKey: Preferences.caseInsensitiveSort)
@@ -146,7 +236,7 @@ public final class TransferModel {
         if folded != snapshot.sort.caseInsensitive || foldersFirst != snapshot.sort.foldersFirst {
             snapshot.sort.caseInsensitive = folded
             snapshot.sort.foldersFirst = foldersFirst
-            resortColumns()
+            resortListings(names: true)
             changed = true
         }
         if let stored = defaults.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored), mode != snapshot.viewMode {
@@ -156,12 +246,54 @@ public final class TransferModel {
         if changed { refreshItems() }
     }
 
-    private func resortColumns() {
-        for (path, list) in columns { columns[path] = ListingSort.apply(list, sort: snapshot.sort) }
+    /// Puts every cached listing in the current order: the list order always, and the column
+    /// view's name order too when `names`, since only case and folders-first change that.
+    private func resortListings(names: Bool) {
+        let byName = Self.nameOrder(snapshot.sort)
+        for (path, listing) in listings {
+            var sorted = listing
+            sorted.items = ListingSort.apply(listing.items, sort: snapshot.sort)
+            if names { sorted.byName = ListingSort.apply(listing.byName, sort: byName) }
+            sorted.columnItems = visible(sorted.byName)
+            listings[path] = sorted
+        }
     }
 
+    /// Hidden files were shown or hidden: the columns follow.
+    private func refilterListings() {
+        for (path, listing) in listings { listings[path]?.columnItems = visible(listing.byName) }
+    }
+
+    /// The column view is always in name order, like Finder's, while honoring the case and
+    /// folders-first settings. The list view's column choice applies to the other views.
+    private static func nameOrder(_ sort: SortConfiguration) -> SortConfiguration {
+        var byName = sort
+        byName.column = "name"
+        byName.ascending = true
+        return byName
+    }
+
+    /// `sorted` with `page` merged in. Only the page is sorted; the standard library's sort finds
+    /// the two sorted runs and merges them in linear time, so a listing that streams in pages
+    /// never sorts what it already has. A Core merge helper is on its way; this is the stopgap.
+    private static func merged(_ sorted: [RemoteItem], _ page: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
+        let page = ListingSort.apply(page, sort: sort)
+        return sorted.isEmpty ? page : ListingSort.apply(sorted + page, sort: sort)
+    }
+
+    /// Derives what the views draw from the location's listing, the filter, and hidden files.
     private func refreshItems() {
-        items = visible(columns[snapshot.path] ?? [])
+        let listing = listings[snapshot.path]
+        let shown = visible(listing?.items ?? [])
+        let query = filter.trimmingCharacters(in: .whitespaces).lowercased()
+        let displayed = query.isEmpty ? shown : shown.filter { $0.name.lowercased().contains(query) }
+        let column = query.isEmpty ? nil : listing?.columnItems.filter { $0.name.lowercased().contains(query) }
+        if items != shown { items = shown }
+        if displayedItems != displayed {
+            displayedItems = displayed
+            displayedIndexCache = nil
+        }
+        if filteredColumn != column { filteredColumn = column }
     }
 
     // MARK: Servers
@@ -177,15 +309,26 @@ public final class TransferModel {
     }
 
     /// Logs in and shows the start folder, or `landing` when given: that folder, or the file
-    /// selected in its folder.
+    /// selected in its folder. Nothing in the window changes until the login has worked, so a
+    /// failed or cancelled login leaves the window on the server it showed; when connects
+    /// overlap, the last one asked for wins, whichever finishes first.
     public func connect(_ connection: SavedConnection, landing: RemotePath? = nil) async {
+        connectGeneration &+= 1
+        let generation = connectGeneration
+        connectingTo = connection
         status = "Connecting to \(connection.displayName)…"
-        connecting = true
-        defer { connecting = false }
+        var pending: ServerContext?
+        defer {
+            if let pending, pending !== context { pending.close() }
+            if generation == connectGeneration { connectingTo = nil }
+        }
         do {
             let session = try await provider.session(for: connection.id)
-            self.session = session
-            listen(to: session)
+            guard generation == connectGeneration else { return }
+            let fresh = ServerContext(connection: connection, session: session, generation: generation)
+            pending = fresh
+            // Listening before the login catches the notices the login itself raises.
+            listen(fresh)
             let start = try await session.connect(prompts: prompts)
             var path = start
             var selection: Set<RemotePath> = []
@@ -197,22 +340,69 @@ public final class TransferModel {
                     missing = landing
                 }
             }
-            snapshot.connectionID = connection.id
-            snapshot.selection = selection
-            backStack.removeAll()
-            forwardStack.removeAll()
-            columns.removeAll()
-            starIsFolder.removeAll()
-            loadPreferences(for: connection.id)
+            guard generation == connectGeneration else { return }
+            install(fresh, path: path, selection: selection)
             status = connection.displayName
-            snapshot.path = path
-            columnRoot = path
             await refresh()
-            await reloadSidebars()
+            scheduleSidebarReload()
             if let missing { status = "No such file or folder: \(missing.display)" }
         } catch {
+            guard generation == connectGeneration else { return }
             status = error.localizedDescription
         }
+    }
+
+    /// Makes `fresh` the window's server in one step: its session, listener, location, and
+    /// empty caches. The old server's listener and listings stop; its queued transfers go on.
+    private func install(_ fresh: ServerContext, path: RemotePath, selection: Set<RemotePath>) {
+        let old = context
+        context = fresh
+        old?.close()
+        snapshot.connectionID = fresh.connection.id
+        snapshot.path = path
+        snapshot.selection = selection
+        columnRoot = path
+        backStack.removeAll()
+        forwardStack.removeAll()
+        listings.removeAll()
+        listingUse.removeAll()
+        starIsFolder.removeAll()
+        stars = []
+        liveFiles = []
+        dropLiveRows(keeping: fresh.connection.id)
+        loadPreferences(for: fresh.connection.id)
+        refreshItems()
+    }
+
+    /// Leaves the window showing no server.
+    private func uninstall() {
+        context?.close()
+        context = nil
+        snapshot.connectionID = nil
+        snapshot.selection = []
+        listings.removeAll()
+        listingUse.removeAll()
+        starIsFolder.removeAll()
+        stars = []
+        liveFiles = []
+        dropLiveRows(keeping: nil)
+        refreshItems()
+        status = "Not connected"
+    }
+
+    /// Live rows arrive from the shown server's events; once the window leaves that server
+    /// nothing would update or remove them.
+    private func dropLiveRows(keeping id: ConnectionID?) {
+        let gone = operations.filter { $0.livePath != nil && liveRowSessions[$0.id]?.connection.id != id }.map(\.id)
+        guard !gone.isEmpty else { return }
+        operations.removeAll { gone.contains($0.id) }
+        for id in gone { liveRowSessions[id] = nil }
+        if operations.isEmpty { showsShelf = false }
+    }
+
+    /// True while `context` is still the window's server.
+    private func isCurrent(_ context: ServerContext) -> Bool {
+        context === self.context
     }
 
     /// Where a link to `path` lands: the folder itself, or a file's folder with the file selected.
@@ -226,7 +416,7 @@ public final class TransferModel {
 
     /// True while this window shows no server and asks nothing, so a link can open here rather
     /// than in a new tab.
-    public var isIdle: Bool { snapshot.connectionID == nil && sheet == nil && !connecting }
+    public var isIdle: Bool { snapshot.connectionID == nil && sheet == nil && connectingTo == nil }
 
     /// Opens an `sftp://` link here: the saved server it names, at its folder or with its file
     /// selected. A server not in the library opens the New Connection sheet, filled in from the
@@ -240,16 +430,6 @@ public final class TransferModel {
         draftIsEdit = false
         pendingLanding = link.path
         sheet = .connection
-    }
-
-    public func disconnect() async {
-        await session?.disconnect()
-        snapshot.connectionID = nil
-        items = []
-        columns.removeAll()
-        starIsFolder.removeAll()
-        liveFiles = []
-        status = "Not connected"
     }
 
     public func newConnection() {
@@ -285,11 +465,14 @@ public final class TransferModel {
         sheet = .removeServer(connection)
     }
 
+    /// The library refuses while the server has unsynced Live edits, and only a removal that
+    /// worked logs out, so a refusal leaves every window on that server as it was.
     public func removeServer(_ connection: SavedConnection) async {
         sheet = nil
         do {
-            if snapshot.connectionID == connection.id { await disconnect() }
             try await provider.removeConnection(connection.id)
+            UserDefaults.standard.removeObject(forKey: Self.sortKey(connection.id))
+            if snapshot.connectionID == connection.id { uninstall() }
             await reloadConnections()
         } catch {
             status = error.localizedDescription
@@ -298,97 +481,165 @@ public final class TransferModel {
 
     // MARK: Listing
 
+    /// Lists the location again and returns once that listing is done.
     public func refresh() async {
-        let path = snapshot.path
-        guard let session else { return }
-        listing?.cancel()
-        // A cached listing stays on screen until the new one is complete; a fresh one streams in.
-        let flushEarly = columns[path] == nil
-        let task = Task { [weak self] in
-            guard await self?.stream(path, from: session, flushEarly: flushEarly) == true else { return }
-            await self?.reloadSidebars()
-        }
-        listing = task
-        await task.value
+        await relist(snapshot.path)?.value
     }
 
-    /// Lists `path` into `columns`, publishing pages every 80 ms when asked. False when cancelled.
-    private func stream(_ path: RemotePath, from session: any RemoteSession, flushEarly: Bool) async -> Bool {
+    /// Lists `path`, or asks the listing already running for it to go once more, so a burst of
+    /// changes costs one or two listings rather than one each.
+    @discardableResult
+    private func relist(_ path: RemotePath) -> Task<Void, Never>? {
+        guard let context else { return nil }
+        if let job = context.jobs[path] {
+            job.again = true
+            return job.task
+        }
+        let job = ListingJob()
+        context.jobs[path] = job
+        job.task = Task { [weak self] in
+            repeat {
+                job.again = false
+                guard let self, await stream(path, in: context) else { break }
+            } while job.again
+            if context.jobs[path] === job { context.jobs[path] = nil }
+        }
+        return job.task
+    }
+
+    /// Streams one listing of `path` into the cache. A complete cached listing stays on screen
+    /// until the new one is complete; without one, the pages that have come are shown every
+    /// 80 ms. True when the whole listing arrived. A cancelled listing publishes nothing more,
+    /// and neither does one for a server the window has left.
+    private func stream(_ path: RemotePath, in context: ServerContext) async -> Bool {
+        let flushEarly = listings[path]?.complete != true
+        var sort = snapshot.sort
+        var listOrder: [RemoteItem] = []
+        var nameOrder: [RemoteItem] = []
         var page: [RemoteItem] = []
         var lastFlush = ContinuousClock.now
+        func flush(complete: Bool) {
+            if sort != snapshot.sort {
+                if Self.nameOrder(sort) != Self.nameOrder(snapshot.sort) {
+                    nameOrder = ListingSort.apply(nameOrder, sort: Self.nameOrder(snapshot.sort))
+                }
+                sort = snapshot.sort
+                listOrder = ListingSort.apply(listOrder, sort: sort)
+            }
+            let byName = Self.nameOrder(sort)
+            listOrder = Self.merged(listOrder, page, sort: sort)
+            // A list already in name order, as by default, serves the columns too.
+            nameOrder = byName == sort ? listOrder : Self.merged(nameOrder, page, sort: byName)
+            page.removeAll()
+            publish(FolderListing(items: listOrder, byName: nameOrder, columnItems: visible(nameOrder), complete: complete), for: path)
+        }
         do {
-            for try await item in session.list(path) {
-                if Task.isCancelled { return false }
+            for try await item in context.session.list(path) {
                 page.append(item)
                 if flushEarly, lastFlush.duration(to: .now) > .milliseconds(80) {
-                    publish(page, for: path)
+                    guard !Task.isCancelled, isCurrent(context) else { return false }
+                    flush(complete: false)
                     lastFlush = .now
                 }
             }
-            publish(page, for: path)
+            // A cancelled consumer ends the loop normally rather than by throwing.
+            guard !Task.isCancelled, isCurrent(context) else { return false }
+            flush(complete: true)
             // A listing that worked ends any earlier error in the title.
             if let name = currentConnection?.displayName { status = name }
             return true
-        } catch is CancellationError {
-            return false
-        } catch TransferError.noSuchFile {
-            // The server's text is just "No such file"; name the folder instead.
-            status = "No such folder: \(path.display)"
-            return false
         } catch {
-            if !page.isEmpty { publish(page, for: path) }
-            status = error.localizedDescription
+            guard !Task.isCancelled, isCurrent(context) else { return false }
+            // What arrived is shown, marked incomplete, so the column stops asking for it and the
+            // next visit lists it again.
+            flush(complete: false)
+            if case .noSuchFile? = error as? TransferError {
+                // The server's text is just "No such file"; name the folder instead.
+                status = "No such folder: \(path.display)"
+            } else {
+                status = error.localizedDescription
+            }
             return false
         }
     }
 
-    private func publish(_ page: [RemoteItem], for path: RemotePath) {
-        columns[path] = ListingSort.apply(page, sort: snapshot.sort)
+    private func publish(_ listing: FolderListing, for path: RemotePath) {
+        listings[path] = listing
+        touch(path)
+        trimListings()
         if path == snapshot.path { refreshItems() }
     }
 
-    /// The column view is always in name order, like Finder's, while honoring the case and
-    /// folders-first settings. The list view's column choice applies to the other views.
-    public func columnItems(_ path: RemotePath) -> [RemoteItem]? {
-        guard let list = columns[path] else { return nil }
-        var byName = snapshot.sort
-        byName.column = "name"
-        byName.ascending = true
-        return visible(ListingSort.apply(list, sort: byName))
+    /// Marks `path` as just shown, for `trimListings`.
+    private func touch(_ path: RemotePath) {
+        useClock += 1
+        listingUse[path] = useClock
     }
 
-    /// Lists one folder for the column view without navigating. Pages show as they arrive.
+    /// Keeps the folders shown most recently, and always the ones on screen.
+    private func trimListings() {
+        let excess = listings.count - Self.cachedListingLimit
+        guard excess > 0 else { return }
+        let oldest = listings.keys.filter { !isShown($0) }.sorted { (listingUse[$0] ?? 0) < (listingUse[$1] ?? 0) }
+        for path in oldest.prefix(excess) {
+            listings[path] = nil
+            listingUse[path] = nil
+        }
+    }
+
+    /// Whether `path`'s listing is on screen: the location, or in column view a folder on the
+    /// way down to it.
+    private func isShown(_ path: RemotePath) -> Bool {
+        if path == snapshot.path { return true }
+        guard snapshot.viewMode == .columns, let root = columnRoot else { return false }
+        return snapshot.path.isInside(path) && path.isInside(root)
+    }
+
+    /// A folder's items in the column view's order, or nil before it has been listed. The
+    /// location's column follows the toolbar filter, as Finder's search narrows it.
+    public func columnItems(_ path: RemotePath) -> [RemoteItem]? {
+        if path == snapshot.path, let filteredColumn { return filteredColumn }
+        return listings[path]?.columnItems
+    }
+
+    /// Lists a folder the column view shows and has no listing for. Pages show as they arrive.
     public func loadColumn(_ path: RemotePath) {
-        guard let session, columns[path] == nil else { return }
-        columns[path] = []
-        Task { [weak self] in _ = await self?.stream(path, from: session, flushEarly: true) }
+        guard listings[path] == nil, context?.jobs[path] == nil else { return }
+        relist(path)
     }
 
     public func navigate(_ path: RemotePath) async {
         if path != snapshot.path {
-            backStack.append(snapshot.path)
+            remember(snapshot.path, in: &backStack)
             forwardStack.removeAll()
         }
         await show(path)
+    }
+
+    private func remember(_ path: RemotePath, in stack: inout [RemotePath]) {
+        stack.append(path)
+        if stack.count > Self.historyLimit { stack.removeFirst() }
     }
 
     private func show(_ path: RemotePath) async {
         snapshot.path = path
         snapshot.selection = []
         columnRoot = path
+        context?.cancelListings(keeping: isShown)
+        touch(path)
         refreshItems()
         await refresh()
     }
 
     public func goBack() async {
         guard let path = backStack.popLast() else { return }
-        forwardStack.append(snapshot.path)
+        remember(snapshot.path, in: &forwardStack)
         await show(path)
     }
 
     public func goForward() async {
         guard let path = forwardStack.popLast() else { return }
-        backStack.append(snapshot.path)
+        remember(snapshot.path, in: &backStack)
         await show(path)
     }
 
@@ -414,51 +665,50 @@ public final class TransferModel {
         await navigate(path)
     }
 
-    public var displayedItems: [RemoteItem] {
-        let query = filter.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !query.isEmpty else { return items }
-        return items.filter { $0.name.lowercased().contains(query) }
-    }
-
     public func visible(_ items: [RemoteItem]) -> [RemoteItem] {
-        items.filter { snapshot.showsHidden || !$0.isHidden }
+        snapshot.showsHidden ? items : items.filter { !$0.isHidden }
     }
 
-    /// Selected items may live in another column's listing when a folder is selected in column
-    /// view, so the lookup falls back to every cached listing.
+    /// A selected item the location does not list. In column view a selected folder is the
+    /// location itself, so it is in its parent's listing.
+    private func listedItem(_ path: RemotePath) -> RemoteItem? {
+        guard let parent = path.parent else { return nil }
+        return listings[parent]?.items.first { $0.path == path }
+    }
+
     public var primaryItem: RemoteItem? {
-        if let item = displayedItems.first(where: { snapshot.selection.contains($0.path) }) { return item }
-        for list in columns.values {
-            if let item = list.first(where: { snapshot.selection.contains($0.path) }) { return item }
-        }
-        return nil
+        let shown = displayedItems
+        guard !snapshot.selection.isEmpty else { return nil }
+        if let index = snapshot.selection.compactMap({ displayedIndex[$0] }).min() { return shown[index] }
+        return snapshot.selection.compactMap(listedItem).min { $0.path.display < $1.path.display }
     }
 
     /// Menu items whose shortcut is a plain key stay out of the way of text entry.
     public var plainKeysAvailable: Bool { !textEditing && sheet == nil }
 
     public var selectedItems: [RemoteItem] {
-        let shown = displayedItems.filter { snapshot.selection.contains($0.path) }
-        if shown.count == snapshot.selection.count { return shown }
-        var found: [RemotePath: RemoteItem] = [:]
-        for list in columns.values {
-            for item in list where snapshot.selection.contains(item.path) { found[item.path] = item }
-        }
-        return found.values.sorted { $0.path.display < $1.path.display }
+        let shown = displayedItems
+        guard !snapshot.selection.isEmpty else { return [] }
+        let indexes = snapshot.selection.compactMap { displayedIndex[$0] }
+        if indexes.count == snapshot.selection.count { return indexes.sorted().map { shown[$0] } }
+        return snapshot.selection.compactMap(listedItem).sorted { $0.path.display < $1.path.display }
     }
 
     /// A single selected folder becomes the current location, as in Finder, and stays selected.
-    /// Files and multiple selections leave the location at their parent.
+    /// Files and multiple selections leave the location at their parent. Listings of folders no
+    /// longer on screen stop.
     public func selectInColumns(_ selected: [RemoteItem], parent: RemotePath) {
         snapshot.selection = Set(selected.map(\.path))
         if let folder = selected.first, selected.count == 1, folder.kind == .directory {
-            loadColumn(folder.path)
             snapshot.path = folder.path
-            items = visible(columns[folder.path] ?? [])
+            touch(folder.path)
+            // Revealing a folder lists it again, as opening one does in the other views.
+            relist(folder.path)
         } else {
             snapshot.path = parent
-            items = visible(columns[parent] ?? [])
         }
+        context?.cancelListings(keeping: isShown)
+        refreshItems()
     }
 
     /// The roots of a drag: the selection when it holds the dragged row, else that row alone.
@@ -473,17 +723,21 @@ public final class TransferModel {
         snapshot.sort.column = column
         snapshot.sort.ascending = ascending
         if let id = snapshot.connectionID, let data = try? JSONEncoder().encode(snapshot.sort) {
-            UserDefaults.standard.set(data, forKey: "transfer.sort.\(id.rawValue.uuidString)")
+            UserDefaults.standard.set(data, forKey: Self.sortKey(id))
         }
-        resortColumns()
+        resortListings(names: false)
         refreshItems()
     }
 
+    /// Where a server's list-view column and direction are kept.
+    private static func sortKey(_ id: ConnectionID) -> String {
+        "transfer.sort.\(id.rawValue.uuidString)"
+    }
+
     private func loadPreferences(for id: ConnectionID) {
-        let key = id.rawValue.uuidString
         let folded = UserDefaults.standard.bool(forKey: Preferences.caseInsensitiveSort)
         let foldersFirst = Preferences.foldersFirstValue()
-        if let data = UserDefaults.standard.data(forKey: "transfer.sort.\(key)"),
+        if let data = UserDefaults.standard.data(forKey: Self.sortKey(id)),
            var sort = try? JSONDecoder().decode(SortConfiguration.self, from: data) {
             sort.caseInsensitive = folded
             sort.foldersFirst = foldersFirst
@@ -515,6 +769,7 @@ public final class TransferModel {
     public func toggleHidden() {
         snapshot.showsHidden.toggle()
         UserDefaults.standard.set(snapshot.showsHidden, forKey: Preferences.showsHidden)
+        refilterListings()
         refreshItems()
     }
 
@@ -727,11 +982,11 @@ public final class TransferModel {
     // MARK: Transfers
 
     public func downloadSelection(to directory: URL) async {
+        guard let session else { return }
         for item in selectedItems {
             let destination = directory.appendingPathComponent(item.name)
             let path = item.path
-            enqueue(title: "Download \(item.name)", path: path) { [weak self] progress in
-                guard let session = await self?.session else { throw TransferError.notConnected }
+            enqueue(title: "Download \(item.name)", path: path) { progress in
                 try await session.download(path, to: destination, progress: progress)
             }
         }
@@ -749,11 +1004,11 @@ public final class TransferModel {
     }
 
     public func upload(urls: [URL], into folder: RemotePath? = nil) async {
+        guard let session else { return }
         let target = folder ?? snapshot.path
         for url in urls {
             let destination = target.appending(name: Array(url.lastPathComponent.utf8))
-            enqueue(title: "Upload \(url.lastPathComponent)", path: destination) { [weak self] progress in
-                guard let session = await self?.session else { throw TransferError.notConnected }
+            enqueue(title: "Upload \(url.lastPathComponent)", path: destination) { progress in
                 try await session.upload(url, to: destination, progress: progress)
             }
         }
@@ -778,7 +1033,8 @@ public final class TransferModel {
         }
     }
 
-    /// One SFTP rename per item. Never copy-then-delete.
+    /// One SFTP rename per item. Never copy-then-delete. The server's change events relist the
+    /// folders on screen.
     public func move(_ paths: [RemotePath], into folder: RemotePath) async {
         guard let session else { return }
         for path in paths {
@@ -788,14 +1044,14 @@ public final class TransferModel {
                 status = "Could not move \(String(decoding: path.nameBytes, as: UTF8.self)): \(error.localizedDescription)"
             }
         }
-        columns[folder] = nil
-        await refresh()
     }
 
+    /// Queues `body` against the server the window shows now; it stays with that server.
     func enqueue(title: String, path: RemotePath, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
+        guard let context else { return }
         let id = UUID().uuidString
         operations.append(TransferOperation(id: id, title: title, state: .queued, path: path))
-        runners[id] = Runner(body: body, prompts: operationPrompts(), task: nil)
+        runners[id] = Runner(body: body, prompts: operationPrompts(), connection: context.connection, session: context.session, task: nil)
         showsShelf = true
         start(id)
     }
@@ -805,6 +1061,7 @@ public final class TransferModel {
         runner.task?.cancel()
         update(id) { $0.state = .active; $0.message = nil }
         let body = runner.body
+        let session = runner.session
         let prompts = prompts
         let operationPrompts = runner.prompts
         let report: @Sendable (TransferProgress) -> Void = { [weak self] progress in
@@ -814,7 +1071,7 @@ public final class TransferModel {
             var attempt = 0
             while true {
                 do {
-                    if let session = self?.session, !(await session.isConnected) {
+                    if !(await session.isConnected) {
                         _ = try await session.connect(prompts: prompts)
                     }
                     try await OperationPrompts.$current.withValue(operationPrompts) { try await body(report) }
@@ -845,6 +1102,8 @@ public final class TransferModel {
         change(&operations[index])
     }
 
+    /// Ends a row. What changed on the server arrives as change events, which relist the
+    /// folders on screen, so nothing is relisted here.
     private func finish(_ id: String, state: OperationState, message: String?) {
         update(id) { $0.state = state; $0.message = message }
         if state == .succeeded {
@@ -854,7 +1113,6 @@ public final class TransferModel {
             status = message
         }
         if operations.isEmpty { showsShelf = false }
-        Task { await refresh() }
     }
 
     /// Prompts for one new user operation: its collision sheets come to this window, and its
@@ -863,9 +1121,16 @@ public final class TransferModel {
         OperationPrompt(window: prompts)
     }
 
+    /// The server a shelf row belongs to, named when it is not the one the window shows.
+    public func otherServerName(for operation: TransferOperation) -> String? {
+        let owner = runners[operation.id]?.connection ?? liveRowSessions[operation.id]?.connection
+        guard let owner, owner.id != snapshot.connectionID else { return nil }
+        return connections.first { $0.id == owner.id }?.displayName ?? owner.displayName
+    }
+
     public func pause(_ operation: TransferOperation) async {
         if let path = operation.livePath {
-            await session?.setLivePaused(path, paused: true)
+            await (liveRowSessions[operation.id] ?? session)?.setLivePaused(path, paused: true)
             return
         }
         update(operation.id) { $0.state = .paused; $0.message = nil }
@@ -874,7 +1139,7 @@ public final class TransferModel {
 
     public func resume(_ operation: TransferOperation) async {
         if let path = operation.livePath {
-            await session?.setLivePaused(path, paused: false)
+            await (liveRowSessions[operation.id] ?? session)?.setLivePaused(path, paused: false)
             return
         }
         start(operation.id)
@@ -883,6 +1148,7 @@ public final class TransferModel {
     public func remove(_ operation: TransferOperation) {
         runners[operation.id]?.task?.cancel()
         runners[operation.id] = nil
+        liveRowSessions[operation.id] = nil
         operations.removeAll { $0.id == operation.id }
         if operations.isEmpty { showsShelf = false }
     }
@@ -962,8 +1228,7 @@ public final class TransferModel {
     /// user has seen listed, so its kind is in a cached listing.
     public func starredIsFolder(_ path: RemotePath) -> Bool {
         if let known = starIsFolder[path] { return known }
-        guard let parent = path.parent, let item = columns[parent]?.first(where: { $0.path == path }) else { return true }
-        return item.kind == .directory
+        return listedItem(path).map { $0.kind == .directory } ?? true
     }
 
     /// Asks the server about `path` once, following a link, and remembers the answer.
@@ -1131,46 +1396,93 @@ public final class TransferModel {
         TerminalLauncher.open(command: command)
     }
 
+    /// Reads the server's stars and Live files. A star whose kind is not known yet is published
+    /// first and learned after, all at once, so a slow server never holds the sidebar back.
     private func reloadSidebars() async {
-        guard let session else { return }
+        guard let context else { return }
+        let session = context.session
         let starred = await session.stars()
-        // Learn each star's kind before publishing, so the sidebar draws the right icon at once.
-        for path in starred { await learnStarred(path, session: session) }
-        stars = starred
-        liveFiles = await session.liveFiles()
-        conflicts = liveFiles.filter(\.conflict).map(\.path)
-    }
-
-    private func listen(to session: any RemoteSession) {
-        listener?.cancel()
-        listener = Task { [weak self] in
-            for await event in session.events() {
-                guard let self else { return }
-                switch event {
-                case .notice(let text), .disconnected(let text):
-                    status = text
-                case .conflict(let path, let comparable):
-                    conflictPath = path
-                    conflictComparable = comparable
-                    conflictConfirm = nil
-                    if !conflicts.contains(path) { conflicts.append(path) }
-                    if sheet == nil { sheet = .conflict }
-                case .liveChanged:
-                    await reloadSidebars()
-                case .directoryChanged(let path):
-                    columns[path] = nil
-                    if path == snapshot.path { await refresh() }
-                case .operation(let operation):
-                    if operation.state == .succeeded {
-                        operations.removeAll { $0.id == operation.id }
-                    } else if let index = operations.firstIndex(where: { $0.id == operation.id }) {
-                        operations[index] = operation
-                    } else {
-                        operations.append(operation)
-                    }
-                    showsShelf = !operations.isEmpty
+        let live = await session.liveFiles()
+        guard isCurrent(context) else { return }
+        if stars != starred { stars = starred }
+        if liveFiles != live { liveFiles = live }
+        let unknown = starred.filter { starIsFolder[$0] == nil }
+        guard !unknown.isEmpty else { return }
+        let learned = await withTaskGroup(of: (RemotePath, Bool)?.self) { group in
+            for path in unknown {
+                group.addTask {
+                    guard let item = try? await session.stat(path), let target = try? await Self.resolveLink(item, session: session) else { return nil }
+                    return (path, target.kind == .directory)
                 }
             }
+            var found: [(RemotePath, Bool)] = []
+            for await answer in group { if let answer { found.append(answer) } }
+            return found
+        }
+        guard isCurrent(context) else { return }
+        for (path, isFolder) in learned { starIsFolder[path] = isFolder }
+    }
+
+    /// Reloads the sidebar soon, once however many changes ask for it meanwhile.
+    private func scheduleSidebarReload() {
+        guard sidebarReload == nil else {
+            sidebarReloadAgain = true
+            return
+        }
+        sidebarReload = Task { [weak self] in
+            repeat {
+                self?.sidebarReloadAgain = false
+                await self?.reloadSidebars()
+            } while self?.sidebarReloadAgain == true && !Task.isCancelled
+            self?.sidebarReload = nil
+        }
+    }
+
+    /// Starts `context`'s event listener. Events are handled at once, never awaited, so a long
+    /// listing or a slow star lookup never holds a conflict or an operation update back.
+    private func listen(_ context: ServerContext) {
+        let events = context.session.events()
+        context.listener = Task { [weak self, weak context] in
+            for await event in events {
+                guard let self, let context else { return }
+                handle(event, from: context)
+            }
+        }
+    }
+
+    private func handle(_ event: SessionEvent, from source: ServerContext) {
+        guard isCurrent(source) else {
+            // Before its login lands, a server's notices still matter to the window that asked.
+            if case .notice(let text) = event, source.generation == connectGeneration { status = text }
+            return
+        }
+        switch event {
+        case .notice(let text), .disconnected(let text):
+            status = text
+        case .conflict(let path, let comparable):
+            conflictPath = path
+            conflictComparable = comparable
+            conflictConfirm = nil
+            if !conflicts.contains(path) { conflicts.append(path) }
+            if sheet == nil { sheet = .conflict }
+        case .liveChanged:
+            scheduleSidebarReload()
+        case .directoryChanged(let path):
+            // A folder on screen is listed again, its cached listing shown until the new one is
+            // complete; any other is listed again when it is next shown.
+            if isShown(path) { relist(path) }
+        case .operation(let operation):
+            liveRowSessions[operation.id] = source.session
+            if operation.state == .succeeded {
+                operations.removeAll { $0.id == operation.id }
+                liveRowSessions[operation.id] = nil
+            } else if let index = operations.firstIndex(where: { $0.id == operation.id }) {
+                operations[index] = operation
+            } else {
+                operations.append(operation)
+                showsShelf = true
+            }
+            if operations.isEmpty { showsShelf = false }
         }
     }
 }
