@@ -80,7 +80,8 @@ extension SSHConnection {
         let temp = folder.appendingPathComponent(CopyRules.tempName(for: destination.lastPathComponent, transferID: UUID().uuidString))
         store.rememberTemp(local: temp)
         do {
-            try await withData { link in
+            // A small file shares its data channel with others.
+            try await withData(DataShare(size: info.size)) { link in
                 try await link.download(path, to: temp, size: info.size, progress: progress)
             }
             var attributes: [FileAttributeKey: Any] = [:]
@@ -122,19 +123,28 @@ extension SSHConnection {
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws -> Fingerprint? {
         try await withRemoteTemp(for: placed) { temp in
-            if interactive {
-                try await withInteractive { link in try await link.upload(source, to: temp, progress: progress) }
-            } else {
-                try await withData { link in try await link.upload(source, to: temp, progress: progress) }
-            }
             let attributes = try? FileManager.default.attributesOfItem(atPath: source.path)
             let mode = (attributes?[.posixPermissions] as? NSNumber)?.uint32Value
             let mtime = (attributes?[.modificationDate] as? Date).map(SFTPTime.seconds)
-            let link = try await metadataLink()
             // A Live save keeps the server file's permissions, set below: the working copy is
             // private (0600), and its mode would take a script's execute bit and make a web page
             // unreadable. Any other upload carries the local file's mode, as a copy does.
-            try? await link.setstat(temp, mode: expecting == nil ? mode : nil, mtime: mtime)
+            let stamp = SFTPAttrs.stamp(mode: expecting == nil ? mode : nil, mtime: mtime)
+            let share = DataShare(size: (attributes?[.size] as? NSNumber)?.uint64Value)
+            guard interactive || measure || expecting != nil else {
+                // The temp is renamed on the channel that wrote it, once every write is acknowledged.
+                return try await withData(share) { link in
+                    try await link.upload(source, to: temp, stamp: stamp, progress: progress)
+                    try await link.place(temp, onto: placed, replacing: replacing)
+                    return nil
+                }
+            }
+            if interactive {
+                try await withInteractive { link in try await link.upload(source, to: temp, stamp: stamp, progress: progress) }
+            } else {
+                try await withData(share) { link in try await link.upload(source, to: temp, stamp: stamp, progress: progress) }
+            }
+            let link = try await metadataLink()
             var written: Fingerprint?
             if measure || expecting != nil { written = Fingerprint(item: try await link.lstat(temp)) }
             if let expecting {
@@ -454,22 +464,24 @@ extension SSHConnection {
 
     /// Temp-and-rename on the server, keeping the source's mode and time so a later copy of the
     /// same file is skipped. `copy-data` when the server has it; else down to the Mac and back.
+    /// The temp is renamed on the channel that wrote it, once the copy and its close are acknowledged.
     private func copyFile(_ item: RemoteItem, to placed: RemotePath, replacing: Bool) async throws {
+        let stamp = SFTPAttrs.stamp(mode: item.mode.map { $0 & 0o7777 }, mtime: item.mtime)
         try await withRemoteTemp(for: placed) { temp in
-            let onServer = try await withData { link in
+            let onServer = try await withData(DataShare(size: item.size)) { link in
                 guard await link.extensions.contains("copy-data") else { return false }
-                try await link.copyData(item.path, to: temp)
+                try await link.copyData(item.path, to: temp, stamp: stamp)
+                try await link.place(temp, onto: placed, replacing: replacing)
                 return true
             }
-            if !onServer {
-                let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-                defer { try? FileManager.default.removeItem(at: scratch) }
-                try await fetch(item.path, info: item, to: scratch) { _ in }
-                try await withData { link in try await link.upload(scratch, to: temp) { _ in } }
+            guard !onServer else { return }
+            let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            try await fetch(item.path, info: item, to: scratch) { _ in }
+            try await withData(DataShare(size: item.size)) { link in
+                try await link.upload(scratch, to: temp, stamp: stamp) { _ in }
+                try await link.place(temp, onto: placed, replacing: replacing)
             }
-            let link = try await metadataLink()
-            try? await link.setstat(temp, mode: item.mode.map { $0 & 0o7777 }, mtime: item.mtime)
-            try await link.place(temp, onto: placed, replacing: replacing)
         }
     }
 
@@ -681,10 +693,12 @@ final class CopyTally: Sendable {
     /// File jobs in the copy's task group not yet taken back from it.
     private let jobs = Locked(0)
 
-    /// About two jobs per data channel: while one renames its temp over the browse channel, the
-    /// next already holds the data channel. With seven, a 2,000-file copy on the server at 20 ms
-    /// ran at 40 files/s; with sixteen, at 57.
-    static let jobLimit = 16
+    /// Twice what the data channels carry at once (seven, sixteen small files each): as many jobs
+    /// again have settled their names and wait, so a channel never idles while the walk finds the
+    /// next. Only a job holding a channel has a file open. 2,000 small files at 20 ms, files/s
+    /// down / up / server copy: 16 jobs 339 / 226 / 199; 112 jobs 1,590 / 1,578 / 1,269; 224 jobs
+    /// 2,194 / 1,624 / 1,482.
+    static let jobLimit = 2 * SSHConnection.dataChannels * SSHConnection.DataShare.whole.rawValue
 
     init(_ report: @escaping @Sendable (TransferProgress) -> Void) {
         self.report = report
