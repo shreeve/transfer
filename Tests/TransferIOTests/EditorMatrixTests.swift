@@ -34,7 +34,7 @@ struct EditorMatrix {
     private final class TestPrompts: PromptSink, @unchecked Sendable {
         func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
         func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
-        func resolveCollision(fileName: String) async -> NameCollisionChoice { .replace }
+        func resolveCollision(fileName: String) async -> NameCollisionChoice? { .replace }
     }
 
     private func harness(_ name: String) throws -> Harness? {

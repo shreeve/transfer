@@ -51,7 +51,20 @@ public struct PromptReply: Sendable {
 public protocol PromptSink: Sendable {
     func answer(_ request: PromptRequest) async -> PromptReply
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision
-    func resolveCollision(fileName: String) async -> NameCollisionChoice
+    /// Nil when nobody can answer, as when the window has closed: the operation then fails
+    /// rather than guess.
+    func resolveCollision(fileName: String) async -> NameCollisionChoice?
+}
+
+/// Who answers the questions one user operation raises, such as what to do with a file that
+/// already has the name. A session belongs to every window on its server, so the sink given to
+/// `connect` answers only login prompts (passwords and host keys); an operation's prompts go to
+/// the window that started it. The UI runs each operation's body, retries included, inside
+/// `OperationPrompts.$current.withValue(sink) { … }`, and child tasks inherit it. An operation that
+/// meets an existing file with no sink bound fails with a clear error: nothing is replaced or
+/// skipped without someone having said so.
+public enum OperationPrompts {
+    @TaskLocal public static var current: (any PromptSink)?
 }
 
 public struct TransferOperation: Identifiable, Hashable, Sendable {

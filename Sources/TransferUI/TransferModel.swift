@@ -95,8 +95,7 @@ public final class TransferModel {
     public private(set) var prompts: SheetPrompts
     var pendingPrompt: CheckedContinuation<PromptReply, Never>?
     var pendingHost: CheckedContinuation<HostKeyDecision, Never>?
-    var pendingCollision: CheckedContinuation<NameCollisionChoice, Never>?
-    var applyToAll: NameCollisionChoice?
+    var pendingCollision: CheckedContinuation<(choice: NameCollisionChoice, toAll: Bool)?, Never>?
 
     /// Where a connection made from an `sftp://` link's filled-in sheet lands.
     @ObservationIgnored private var pendingLanding: RemotePath?
@@ -110,6 +109,8 @@ public final class TransferModel {
 
     private struct Runner {
         var body: @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void
+        /// This operation's own prompts, kept across retries and Resume.
+        var prompts: OperationPrompt
         var task: Task<Void, Never>?
     }
 
@@ -792,10 +793,9 @@ public final class TransferModel {
     }
 
     func enqueue(title: String, path: RemotePath, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
-        forgetCollisionChoiceWhenIdle()
         let id = UUID().uuidString
         operations.append(TransferOperation(id: id, title: title, state: .queued, path: path))
-        runners[id] = Runner(body: body, task: nil)
+        runners[id] = Runner(body: body, prompts: operationPrompts(), task: nil)
         showsShelf = true
         start(id)
     }
@@ -806,6 +806,7 @@ public final class TransferModel {
         update(id) { $0.state = .active; $0.message = nil }
         let body = runner.body
         let prompts = prompts
+        let operationPrompts = runner.prompts
         let report: @Sendable (TransferProgress) -> Void = { [weak self] progress in
             Task { @MainActor in self?.update(id) { $0.progress = progress } }
         }
@@ -816,7 +817,7 @@ public final class TransferModel {
                     if let session = self?.session, !(await session.isConnected) {
                         _ = try await session.connect(prompts: prompts)
                     }
-                    try await body(report)
+                    try await OperationPrompts.$current.withValue(operationPrompts) { try await body(report) }
                     self?.finish(id, state: .succeeded, message: nil)
                     return
                 } catch {
@@ -853,17 +854,13 @@ public final class TransferModel {
             status = message
         }
         if operations.isEmpty { showsShelf = false }
-        forgetCollisionChoiceWhenIdle()
         Task { await refresh() }
     }
 
-    /// "Apply to all" covers the operation it was chosen in. Operations can overlap and share
-    /// one prompt, so the choice is kept while any transfer is waiting or running, and forgotten
-    /// once none is: the next operation asks again, with the box unchecked.
-    private func forgetCollisionChoiceWhenIdle() {
-        guard !operations.contains(where: { $0.state == .active || $0.state == .queued }) else { return }
-        applyToAll = nil
-        applyCollisionToAll = false
+    /// Prompts for one new user operation: its collision sheets come to this window, and its
+    /// Apply to All is its own.
+    func operationPrompts() -> OperationPrompt {
+        OperationPrompt(window: prompts)
     }
 
     public func pause(_ operation: TransferOperation) async {
@@ -888,7 +885,6 @@ public final class TransferModel {
         runners[operation.id] = nil
         operations.removeAll { $0.id == operation.id }
         if operations.isEmpty { showsShelf = false }
-        forgetCollisionChoiceWhenIdle()
     }
 
     // MARK: Edits
@@ -1240,11 +1236,18 @@ public final class SheetPrompts: PromptSink {
         }
     }
 
-    public func resolveCollision(fileName: String) async -> NameCollisionChoice {
-        guard let model else { return .skip }
-        if let remembered = model.applyToAll { return remembered }
+    /// One answer, with no operation to remember Apply to All for; nil once the window is gone.
+    public func resolveCollision(fileName: String) async -> NameCollisionChoice? {
+        await askCollision(fileName)?.choice
+    }
+
+    /// Shows the collision sheet, with Apply to All unchecked. The choice, and whether it covers
+    /// the rest of the operation; nil once the window is gone.
+    func askCollision(_ fileName: String) async -> (choice: NameCollisionChoice, toAll: Bool)? {
+        guard let model else { return nil }
         return await withCheckedContinuation { continuation in
             model.pendingCollision = continuation
+            model.applyCollisionToAll = false
             model.sheet = .collision(fileName)
         }
     }
@@ -1255,6 +1258,34 @@ public final class SheetPrompts: PromptSink {
             model.pendingHost = continuation
             model.sheet = .hostKey(event)
         }
+    }
+}
+
+/// One user operation's prompts: a download, upload, paste, drag, or clipboard staging. Sheets go
+/// to the window that started it, and Apply to All holds for this operation alone, never for
+/// another operation or window. Bound with `OperationPrompts.$current` around the operation.
+@MainActor
+final class OperationPrompt: PromptSink {
+    private let window: SheetPrompts
+    private var applyToAll: NameCollisionChoice?
+
+    init(window: SheetPrompts) {
+        self.window = window
+    }
+
+    func answer(_ request: PromptRequest) async -> PromptReply {
+        await window.answer(request)
+    }
+
+    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
+        await window.decideHostKey(event)
+    }
+
+    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
+        if let applyToAll { return applyToAll }
+        guard let answer = await window.askCollision(fileName) else { return nil }
+        if answer.toAll { applyToAll = answer.choice }
+        return answer.choice
     }
 }
 
@@ -1273,8 +1304,7 @@ extension TransferModel {
     }
 
     func finishCollision(_ choice: NameCollisionChoice, applyToAll: Bool) {
-        if applyToAll { self.applyToAll = choice }
-        pendingCollision?.resume(returning: choice)
+        pendingCollision?.resume(returning: (choice, applyToAll))
         pendingCollision = nil
         sheet = nil
     }

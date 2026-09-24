@@ -30,7 +30,7 @@ struct ServerTests {
 
         func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
         func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { hostDecision }
-        func resolveCollision(fileName: String) async -> NameCollisionChoice {
+        func resolveCollision(fileName: String) async -> NameCollisionChoice? {
             collisions += 1
             return collision
         }
@@ -55,12 +55,12 @@ struct ServerTests {
         }
     }
 
-    /// Runs `body` with a fresh harness and always awaits its cleanup, when it throws too. Does
-    /// nothing without a server.
+    /// Runs `body` with a fresh harness and always awaits its cleanup, when it throws too. Its
+    /// prompts answer for every operation, as a window's do. Does nothing without a server.
     private func withHarness(_ name: String, _ body: (Harness) async throws -> Void) async throws {
         guard let h = try harness(name) else { return }
         do {
-            try await body(h)
+            try await OperationPrompts.$current.withValue(h.prompts) { try await body(h) }
         } catch {
             await h.cleanUp()
             throw error
@@ -135,6 +135,18 @@ struct ServerTests {
             try await h.session.download(uploaded, to: down) { _ in }
             #expect(h.prompts.collisions == 1)
             #expect(try Data(contentsOf: down) == payload)
+
+            // With nobody to ask, a collision fails the operation and leaves the file alone; the
+            // login's prompts are never asked.
+            let other = randomData(100)
+            try other.write(to: down)
+            await OperationPrompts.$current.withValue(nil) {
+                await #expect(throws: TransferError.self) { try await h.session.download(uploaded, to: down) { _ in } }
+                await #expect(throws: TransferError.self) { try await h.session.upload(down, to: uploaded) { _ in } }
+            }
+            #expect(h.prompts.collisions == 1)
+            #expect(try Data(contentsOf: down) == other)
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("up.bin")) == payload)
 
             let command = await h.session.terminalCommand(directory: h.remotePath)
             #expect(command?.hasPrefix("/usr/bin/ssh -S ") == true)

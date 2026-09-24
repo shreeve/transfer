@@ -6,7 +6,6 @@ public actor SSHConnection: RemoteSession {
 
     let store: Store
     private(set) var editableExtensions: Set<String>
-    private(set) var promptSink: (any PromptSink)?
     private var master: Process?
     private var socketPath = ""
     /// Per-login folders under the library root, removed on disconnect. Lists, not single values:
@@ -53,7 +52,6 @@ public actor SSHConnection: RemoteSession {
     public func connect(prompts: any PromptSink) async throws -> RemotePath {
         if let startPath, master?.isRunning == true { return startPath }
         await disconnect()
-        promptSink = prompts
         prompted = false
         let directory = store.root.appendingPathComponent("ssh", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

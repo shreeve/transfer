@@ -92,7 +92,8 @@ public final class Clipboard {
     // MARK: Copy and clear
 
     /// Puts `items` on the pasteboard, counts what they hold, and makes them ready for Finder.
-    public func copy(_ items: [RemoteItem], session: any RemoteSession, place: String) {
+    /// `prompts` answers for the staging download, the copy's own operation.
+    public func copy(_ items: [RemoteItem], session: any RemoteSession, place: String, prompts: any PromptSink) {
         guard !items.isEmpty else { return }
         reset()
         let payload = (try? JSONEncoder().encode(RemoteDragPayload(connection: session.connection.id.rawValue, paths: items.map(\.path.bytes)))) ?? Data()
@@ -111,8 +112,10 @@ public final class Clipboard {
             finder: .preparing(0)
         )
         work = Task { [weak self] in
-            await self?.countRemote(items, session: session, id: id)
-            await self?.stageForFinder(items, session: session, id: id)
+            await OperationPrompts.$current.withValue(prompts) {
+                await self?.countRemote(items, session: session, id: id)
+                await self?.stageForFinder(items, session: session, id: id)
+            }
         }
     }
 

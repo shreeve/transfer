@@ -24,7 +24,7 @@ extension TransferModel {
         let items = selectedItems
         guard let first = items.first else { return }
         let folder = first.path.parent ?? snapshot.path
-        Clipboard.shared.copy(items, session: session, place: "\(connection.displayName):\(folder.display)")
+        Clipboard.shared.copy(items, session: session, place: "\(connection.displayName):\(folder.display)", prompts: operationPrompts())
     }
 
     /// Items on this window's server are copied on the server, or renamed when moving. Items on

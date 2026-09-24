@@ -23,11 +23,14 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
     private let item: RemoteItem
     private let session: any RemoteSession
     private let payload: Data
+    /// The drag's prompts: a file already at the drop's destination is asked about there.
+    private let prompts: any PromptSink
 
-    init(item: RemoteItem, session: any RemoteSession, payload: Data) {
+    init(item: RemoteItem, session: any RemoteSession, payload: Data, prompts: any PromptSink) {
         self.item = item
         self.session = session
         self.payload = payload
+        self.prompts = prompts
         let ext = (item.name as NSString).pathExtension
         let type: UTType
         if item.kind == .directory {
@@ -65,10 +68,13 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
     ) {
         let path = item.path
         let session = session
+        let prompts = prompts
         let finish = Locked(completionHandler)
         Task {
             do {
-                try await session.download(path, to: url) { _ in }
+                try await OperationPrompts.$current.withValue(prompts) {
+                    try await session.download(path, to: url) { _ in }
+                }
                 finish.value(nil)
             } catch {
                 finish.value(error)
@@ -76,14 +82,14 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
         }
     }
 
-    static func providers(for items: [RemoteItem], session: any RemoteSession) -> [RemoteItemPromise] {
+    static func providers(for items: [RemoteItem], session: any RemoteSession, prompts: any PromptSink) -> [RemoteItemPromise] {
         let data = payload(for: items, session: session)
-        return items.map { RemoteItemPromise(item: $0, session: session, payload: data) }
+        return items.map { RemoteItemPromise(item: $0, session: session, payload: data, prompts: prompts) }
     }
 
     /// One provider for `item`, whose payload names every item in `roots`, for row-based drags.
-    static func provider(for item: RemoteItem, among roots: [RemoteItem], session: any RemoteSession) -> RemoteItemPromise {
-        RemoteItemPromise(item: item, session: session, payload: payload(for: roots, session: session))
+    static func provider(for item: RemoteItem, among roots: [RemoteItem], session: any RemoteSession, prompts: any PromptSink) -> RemoteItemPromise {
+        RemoteItemPromise(item: item, session: session, payload: payload(for: roots, session: session), prompts: prompts)
     }
 
     private static func payload(for items: [RemoteItem], session: any RemoteSession) -> Data {
@@ -223,7 +229,7 @@ final class IconItemView: NSView, NSDraggingSource {
         let moved = hypot(event.locationInWindow.x - down.x, event.locationInWindow.y - down.y)
         guard moved > 4, let model, let session = model.session else { return }
         let roots = model.dragItems(including: item)
-        let providers = RemoteItemPromise.providers(for: roots, session: session)
+        let providers = RemoteItemPromise.providers(for: roots, session: session, prompts: model.operationPrompts())
         let dragging = providers.enumerated().map { index, provider -> NSDraggingItem in
             let dragItem = NSDraggingItem(pasteboardWriter: provider)
             let frame = index == 0 ? icon.frame : NSRect(x: icon.frame.minX, y: icon.frame.minY - CGFloat(index) * 4, width: icon.frame.width, height: icon.frame.height)

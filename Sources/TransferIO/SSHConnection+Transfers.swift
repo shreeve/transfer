@@ -497,6 +497,15 @@ extension SSHConnection {
 
     // MARK: Collisions
 
+    /// The operation's answer for a file that already has the name. Never the login sink, which
+    /// belongs to whichever window logged in; with nobody to ask, the operation fails.
+    private func collisionChoice(for name: String) async throws -> NameCollisionChoice {
+        guard let choice = await OperationPrompts.current?.resolveCollision(fileName: name) else {
+            throw TransferError.failed("“\(name)” already exists there, and there is no window to ask whether to replace it")
+        }
+        return choice
+    }
+
     private func resolvedUploadDestination(_ source: URL, proposed: RemotePath) async throws -> RemotePath? {
         let local = Self.stamp(source)
         return try await resolvedDestination(size: local?.size ?? 0, mtime: local?.mtime ?? 0, proposed: proposed)
@@ -515,7 +524,7 @@ extension SSHConnection {
         case .write:
             return proposed
         case .collide:
-            let choice = await promptSink?.resolveCollision(fileName: sourceItem.name) ?? .skip
+            let choice = try await collisionChoice(for: sourceItem.name)
             switch choice {
             case .skip:
                 return nil
@@ -548,7 +557,7 @@ extension SSHConnection {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return url }
         if isDirectory.boolValue { throw TransferError.typeMismatch(url.lastPathComponent) }
-        let choice = await promptSink?.resolveCollision(fileName: item.name) ?? .skip
+        let choice = try await collisionChoice(for: item.name)
         switch choice {
         case .skip:
             return nil

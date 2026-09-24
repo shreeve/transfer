@@ -212,7 +212,7 @@ struct ListTable: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
             guard let session = model.session, row < items.count else { return nil }
             // One promise per row; the payload names the whole selection so an internal drop moves every item.
-            return RemoteItemPromise.provider(for: items[row], among: model.dragItems(including: items[row]), session: session)
+            return RemoteItemPromise.provider(for: items[row], among: model.dragItems(including: items[row]), session: session, prompts: model.operationPrompts())
         }
 
         func tableView(_ tableView: NSTableView, validateDrop info: any NSDraggingInfo, proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {

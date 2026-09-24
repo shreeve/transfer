@@ -262,7 +262,7 @@ struct ColumnBrowser: NSViewRepresentable {
 
         func browser(_ browser: NSBrowser, pasteboardWriterForRow row: Int, column: Int) -> (any NSPasteboardWriting)? {
             guard let session = model.session, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return nil }
-            return RemoteItemPromise.provider(for: item, among: model.dragItems(including: item), session: session)
+            return RemoteItemPromise.provider(for: item, among: model.dragItems(including: item), session: session, prompts: model.operationPrompts())
         }
 
         // MARK: Drop in
