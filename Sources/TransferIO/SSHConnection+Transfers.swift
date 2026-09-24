@@ -357,13 +357,24 @@ extension SSHConnection {
         }
     }
 
-    public func walkTree(_ root: RemotePath, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {
-        let link: SFTPChannel
-        if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
-        let item = try await link.lstat(root)
-        visit("", TreeEntry(item))
-        guard item.kind == .directory else { return }
-        try await walk(root, prefix: "", link: link, visit: visit)
+    public nonisolated func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(String, TreeEntry), Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let link: SFTPChannel
+                    if let walker = await self.liveLink(.walker) { link = walker } else { link = try await self.metadataLink() }
+                    let item = try await link.lstat(root)
+                    continuation.yield(("", TreeEntry(item)))
+                    if item.kind == .directory {
+                        try await self.walk(root, prefix: "", link: link) { continuation.yield(($0, $1)) }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     private func walk(_ folder: RemotePath, prefix: String, link: SFTPChannel, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws {

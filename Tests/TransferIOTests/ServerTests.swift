@@ -223,9 +223,8 @@ struct ServerTests {
             try FileManager.default.createSymbolicLink(atPath: tree.appendingPathComponent("link").path, withDestinationPath: "one.txt")
             let site = h.remotePath.appending(name: Array("site".utf8))
 
-            let entries = TreeBox()
-            try await h.session.walkTree(site) { key, entry in entries.add(key, entry) }
-            #expect(entries.all == ["": .directory, "one.txt": .file(size: 3), "a": .directory, "a/big.bin": .file(size: UInt64(big.count)),
+            let entries = try await sizes(h.session.tree(site))
+            #expect(entries == ["": .directory, "one.txt": .file(size: 3), "a": .directory, "a/big.bin": .file(size: UInt64(big.count)),
                                     "a/b": .directory, "a/b/deep.txt": .file(size: 4), "link": .link])
 
             // The Mac's own sftp-server offers copy-data, so this copy never leaves the server.
@@ -236,9 +235,8 @@ struct ServerTests {
             let copyURL = h.remote.appendingPathComponent("site copy")
             #expect(try Data(contentsOf: copyURL.appendingPathComponent("a/big.bin")) == big)
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: copyURL.appendingPathComponent("link").path) == "one.txt")
-            let copied = TreeBox()
-            try await h.session.walkTree(copy) { key, entry in copied.add(key, entry) }
-            #expect(TreeCheck.missing(source: entries.all, destination: copied.all).isEmpty)
+            let copied = try await sizes(h.session.tree(copy))
+            #expect(TreeCheck.missing(source: entries, destination: copied).isEmpty)
             let sourceTime = try FileManager.default.attributesOfItem(atPath: tree.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
             let copyTime = try FileManager.default.attributesOfItem(atPath: copyURL.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
             #expect(sourceTime.map { Int($0.timeIntervalSince1970) } == copyTime.map { Int($0.timeIntervalSince1970) })
@@ -434,20 +432,9 @@ private final class EventLog: @unchecked Sendable {
     }
 }
 
-private final class TreeBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var entries: [String: TreeEntry] = [:]
-
-    /// Files are kept by size alone; the times are the server's.
-    func add(_ key: String, _ entry: TreeEntry) {
-        lock.lock()
-        if case .file(let size, _) = entry { entries[key] = .file(size: size) } else { entries[key] = entry }
-        lock.unlock()
-    }
-
-    var all: [String: TreeEntry] {
-        lock.lock()
-        defer { lock.unlock() }
-        return entries
+/// A walked tree with files kept by size alone; the times are the server's.
+private func sizes(_ tree: [String: TreeEntry]) -> [String: TreeEntry] {
+    tree.mapValues { entry in
+        if case .file(let size, _) = entry { .file(size: size) } else { entry }
     }
 }

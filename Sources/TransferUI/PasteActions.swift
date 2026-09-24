@@ -102,8 +102,8 @@ extension TransferModel {
                 try await source.download(path, to: local, progress: sum.next())
                 try await session.upload(local, to: destination, progress: sum.next())
                 guard moving else { continue }
-                let original = try await TreeBox.collect(path, on: source)
-                let copied = try await TreeBox.collect(destination, on: session)
+                let original = try await source.tree(path)
+                let copied = try await session.tree(destination)
                 if TreeCheck.missing(source: original, destination: copied).isEmpty {
                     try await source.remove(path)
                 } else {
@@ -121,7 +121,7 @@ extension TransferModel {
             let destination = folder.appending(name: Array(url.lastPathComponent.utf8))
             enqueue(title: "Move \(url.lastPathComponent)", path: destination) { progress in
                 try await session.upload(url, to: destination, progress: progress)
-                let copied = try await TreeBox.collect(destination, on: session)
+                let copied = try await session.tree(destination)
                 guard TreeCheck.missing(source: LocalTree.entries(url), destination: copied).isEmpty else {
                     throw TransferError.failed(Self.keptMessage([url.lastPathComponent], where: "on this Mac"))
                 }

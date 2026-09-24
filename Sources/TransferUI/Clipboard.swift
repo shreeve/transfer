@@ -192,18 +192,28 @@ public final class Clipboard {
 
     // MARK: Counting and staging
 
+    /// Counts what the copied folders hold, showing the count at most every 0.2 s as it grows.
     private func countRemote(_ items: [RemoteItem], session: any RemoteSession, id: UUID) async {
         let folders = items.filter { $0.kind == .directory }
-        guard !folders.isEmpty, let start = clip?.tally else { return }
-        let box = Locked(start)
-        await publishing(box, to: id) {
-            for folder in folders {
-                try? await session.walkTree(folder.path) { key, entry in
-                    if !key.isEmpty { box.withLock { $0.add(inside: entry) } }
+        guard !folders.isEmpty, var tally = clip?.tally else { return }
+        var shown = ContinuousClock.now
+        for folder in folders {
+            do {
+                for try await (key, entry) in session.walkTree(folder.path) where !key.isEmpty {
+                    tally.add(inside: entry)
+                    if shown.duration(to: .now) >= .milliseconds(200) {
+                        update(id) { $0.tally = tally }
+                        shown = .now
+                    }
                 }
+            } catch {
+                // A folder that cannot be walked adds what was seen before the error.
             }
         }
-        update(id) { $0.tally.complete = true }
+        update(id) {
+            $0.tally = tally
+            $0.tally.complete = true
+        }
     }
 
     /// Downloads the clip into its own staging folder, then adds the file URLs to the pasteboard,
@@ -307,23 +317,5 @@ enum LocalTree {
         if values.isSymbolicLink == true { return .link }
         if values.isDirectory == true { return .directory }
         return .file(size: UInt64(values.fileSize ?? 0), mtime: values.contentModificationDate.map(SFTPTime.seconds))
-    }
-}
-
-/// A remote tree collected from `walkTree`'s callbacks.
-final class TreeBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var entries: [String: TreeEntry] = [:]
-
-    func add(_ key: String, _ entry: TreeEntry) {
-        lock.withLock { entries[key] = entry }
-    }
-
-    var all: [String: TreeEntry] { lock.withLock { entries } }
-
-    static func collect(_ path: RemotePath, on session: any RemoteSession) async throws -> [String: TreeEntry] {
-        let box = TreeBox()
-        try await session.walkTree(path) { box.add($0, $1) }
-        return box.all
     }
 }
