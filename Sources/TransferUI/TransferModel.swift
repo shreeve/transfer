@@ -778,7 +778,12 @@ public final class TransferModel {
         await reporting {
             let home = try await context.session.connect(prompts: prompts.login(context.connection))
             guard isCurrent(context), let path = RemotePath.typed(text, from: from, home: home) else { return }
-            await navigate(path)
+            // A file opens its folder with the file selected, as a link to one does. When nothing
+            // answers the lookup, the listing says why.
+            let found = await Self.landing(path, session: context.session)
+            guard isCurrent(context) else { return }
+            await navigate(found?.0 ?? path)
+            if let found, isCurrent(context) { snapshot.selection = found.1 }
         }
     }
 
