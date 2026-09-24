@@ -59,16 +59,47 @@ import TransferCore
     try await open.value
 }
 
-/// Previews still displace each other: a queued preview is dropped by a newer one.
+/// Previews still displace each other: a queued preview is dropped by a newer one. Each step
+/// waits for the lane to reach the state it needs; fixed sleeps lost that race under load.
 @Test func aNewerPreviewDropsAQueuedOne() async throws {
     let lane = InteractiveLane()
-    let blocker = Task { try await lane.submit(.save) { usleep(200_000) } }
-    try await Task.sleep(nanoseconds: 50_000_000)
+    let gate = Gate()
+    let blocker = Task { try await lane.submit(.save) { await gate.wait() } }
+    #expect(await eventually { await lane.isRunning })
     let older = Task { try await lane.submit(.preview) {} }
-    try await Task.sleep(nanoseconds: 20_000_000)
-    try await lane.submit(.preview) {}
+    #expect(await eventually { await lane.waiting == 1 })
+    let newer = Task { try await lane.submit(.preview) {} }
     await #expect(throws: TransferError.cancelled) { try await older.value }
+    #expect(await lane.waiting == 1)
+    await gate.open()
     try await blocker.value
+    try await newer.value
+}
+
+/// Polls `condition` until it holds or five seconds pass.
+private func eventually(_ condition: () async -> Bool) async -> Bool {
+    for _ in 0..<500 {
+        if await condition() { return true }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    return await condition()
+}
+
+/// Holds a job running until the test opens it.
+private actor Gate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters = []
+    }
 }
 
 private final class RunCount: @unchecked Sendable {

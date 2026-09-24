@@ -24,6 +24,10 @@ actor InteractiveLane {
     private var running: (job: Job, task: Task<Void, Never>)?
     private var queue: [Job] = []
 
+    /// Whether a job is running, and how many wait: tests order their steps by it.
+    var isRunning: Bool { running != nil }
+    var waiting: Int { queue.count }
+
     func submit(_ kind: Kind, _ body: @escaping @Sendable () async throws -> Void) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             enqueue(Job(kind: kind, body: body, finish: continuation))
