@@ -105,6 +105,23 @@ public struct RemotePath: Hashable, Sendable {
         if absolute { return RemotePath(bytes: [0x2F] + joined) }
         return RemotePath(bytes: joined.isEmpty ? [0x2E] : joined)
     }
+
+    /// Where Go to Remote Folder goes for `text`: `/…` is absolute, `~` and `~/…` start at `home`
+    /// (the folder the login started in), and anything else is relative to `current`. `.` and
+    /// `..` are taken lexically, as `normalized` does. Nil when `text` is blank.
+    public static func typed(_ text: String, from current: RemotePath, home: RemotePath) -> RemotePath? {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        let path: RemotePath
+        if text.hasPrefix("/") {
+            path = RemotePath(string: text)
+        } else if text == "~" || text.hasPrefix("~/") {
+            path = home.appending(String(text.dropFirst()))
+        } else {
+            path = current.appending(text)
+        }
+        return path.normalized
+    }
 }
 
 public enum ItemKind: String, Hashable, Sendable {

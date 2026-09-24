@@ -713,10 +713,12 @@ public final class TransferModel {
     }
 
     public func goToFolder(_ text: String) async {
-        let trimmed = text.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        let path = trimmed.hasPrefix("/") ? RemotePath(string: trimmed) : snapshot.path.appending(name: Array(trimmed.utf8))
-        await navigate(path)
+        guard let context else { return }
+        await reporting {
+            let home = try await context.session.connect(prompts: prompts.login(context.connection))
+            guard let path = RemotePath.typed(text, from: snapshot.path, home: home) else { return }
+            await navigate(path)
+        }
     }
 
     public func visible(_ items: [RemoteItem]) -> [RemoteItem] {

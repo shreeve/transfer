@@ -18,6 +18,29 @@ struct RemotePathTests {
         #expect(RemotePath(string: "//").isRoot)
     }
 
+    /// Go to Remote Folder joined anything not starting with `/` onto the location as one name, so
+    /// `~` and `~/x` looked for a folder named `~`, and `..` stayed in the path (UIM-32).
+    @Test func aTypedFolderIsAbsoluteHomeOrRelative() {
+        let current = RemotePath(string: "/srv/site")
+        let home = RemotePath(string: "/home/ann")
+        func go(_ text: String) -> String? { RemotePath.typed(text, from: current, home: home)?.display }
+        #expect(go("/etc/nginx/") == "/etc/nginx")
+        #expect(go("  /tmp \n") == "/tmp")
+        #expect(go("~") == "/home/ann")
+        #expect(go("~/") == "/home/ann")
+        #expect(go("~/logs/today") == "/home/ann/logs/today")
+        #expect(go("~/../bob") == "/home/bob")
+        #expect(go("~bob") == "/srv/site/~bob")
+        #expect(go("public/css") == "/srv/site/public/css")
+        #expect(go("..") == "/srv")
+        #expect(go("../other/./x") == "/srv/other/x")
+        #expect(go("../../../..") == "/")
+        #expect(go(".") == "/srv/site")
+        #expect(go("/a//b/../c") == "/a/c")
+        #expect(go("") == nil)
+        #expect(go("   ") == nil)
+    }
+
     @Test func appendingNeverMakesADoubleSlash() {
         let root = RemotePath(string: "/")
         #expect(root.appending("etc").display == "/etc")
