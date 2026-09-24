@@ -481,6 +481,28 @@ final class ChromeController: NSSplitViewController {
         return live.allObjects.first { $0.view.window === key }
     }
 
+    /// Gives the keyboard back to the browser in `model`'s window when nothing there holds it, as
+    /// once the rename bar closes: the list's table, the column browser, or the icon grid's
+    /// selected cell, else its background. Arrow keys, Space, and Return then act at once.
+    static func refocusBrowser(of model: TransferModel) {
+        guard let controller = live.allObjects.first(where: { $0.model === model }), let window = controller.view.window,
+              window.firstResponder == nil || window.firstResponder === window else { return }
+        let pane = controller.splitViewItems[1].viewController.view
+        let selection = model.snapshot.selection
+        let target = firstView(in: pane) { view in
+            view is NSTableView || view is NSBrowser || (view as? IconItemView).map { selection.contains($0.item.path) } == true
+        } ?? firstView(in: pane) { $0 is IconGridBackgroundView }
+        if let target { window.makeFirstResponder(target) }
+    }
+
+    private static func firstView(in view: NSView, where matches: (NSView) -> Bool) -> NSView? {
+        if matches(view) { return view }
+        for subview in view.subviews {
+            if let found = firstView(in: subview, where: matches) { return found }
+        }
+        return nil
+    }
+
     /// Every browser window's controller, those on screen front to back first.
     static var browsers: [ChromeController] {
         let all = live.allObjects

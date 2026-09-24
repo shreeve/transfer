@@ -155,7 +155,7 @@ final class IconItemView: NSView, NSDraggingSource {
     /// The cell with its highlight's margin.
     static let size = NSSize(width: 108, height: 100)
     private static let inset: CGFloat = 6
-    private var item = RemoteItem(path: RemotePath(string: "/"), kind: .other)
+    private(set) var item = RemoteItem(path: RemotePath(string: "/"), kind: .other)
     private weak var model: TransferModel?
     private var down: NSPoint = .zero
     private let icon = NSImageView()

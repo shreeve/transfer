@@ -1387,6 +1387,10 @@ public final class TransferModel {
             } else {
                 await refresh()
                 snapshot.selection = [destination]
+                // The icon view makes a new cell for the new name; the old one had the keyboard.
+                DispatchQueue.main.async { [weak self] in
+                    if let self { ChromeController.refocusBrowser(of: self) }
+                }
             }
         }
     }

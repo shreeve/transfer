@@ -53,6 +53,8 @@ struct ColumnBrowser: NSViewRepresentable {
         /// the column was loaded with, and a folder is sorted once per change, not once per row.
         private var shown: [RemotePath: [RemoteItem]] = [:]
         private var syncing = false
+        /// The model's selection as of the last `sync`, so one the model makes itself is shown.
+        private var syncedSelection: Set<RemotePath> = []
         private let drag = RowDrag()
 
         init(model: TransferModel) { self.model = model }
@@ -72,6 +74,14 @@ struct ColumnBrowser: NSViewRepresentable {
                 browser.loadColumnZero()
                 trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
             }
+            // A selection the model made (a renamed item, a file Go to or a link reveals) is shown
+            // too; else it waited for the next reload, which often came first, with the old one.
+            // The browser's own clicks reach the model already shown here, and restoring them
+            // changes nothing.
+            if trail == nil, model.snapshot.selection != syncedSelection {
+                trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
+            }
+            syncedSelection = model.snapshot.selection
             // Reloading a column makes it the last and drops its selection, so changing any but
             // the last (say, a move out of the parent) left the location's column gone while the
             // model still stood in it. From the first reloaded column on, each column retakes its

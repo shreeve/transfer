@@ -728,7 +728,13 @@ private struct RenameBar: View {
             DispatchQueue.main.async { focused = true }
         }
         .onChange(of: focused) { model.textEditing = focused }
-        .onDisappear { model.textEditing = false }
+        .onDisappear {
+            model.textEditing = false
+            // Escape or Return leaves the keyboard with the window itself; it goes back to the
+            // list, column, or icon view the rename started from, once the field has let go.
+            let model = model
+            DispatchQueue.main.async { ChromeController.refocusBrowser(of: model) }
+        }
     }
 }
 
