@@ -93,39 +93,33 @@ actor SFTPChannel {
                 }
             }
         } onCancel: {
-            Task { await self.shutDown(.cancelled) }
+            Task { await self.closeLink() }
         }
-        if version < 3 {
-            throw TransferError.failed("Server SFTP version \(version) is too old")
-        }
+        guard version >= 3 else { throw TransferError.failed("Server SFTP version \(version) is too old") }
     }
 
     func realpath(_ path: RemotePath) async throws -> RemotePath {
-        let message = try await call(SFTPCode.realpath) { $0.appendPath(path) }
-        let names = try names(in: message)
-        guard let first = names.first else { throw TransferError.failed("Empty realpath") }
+        guard let first = try names(in: await call(SFTPCode.realpath) { $0.appendPath(path) }).first else { throw TransferError.failed("Empty realpath") }
         return RemotePath(bytes: Array(first.filename))
     }
 
     func lstat(_ path: RemotePath) async throws -> RemoteItem {
-        let message = try await call(SFTPCode.lstat) { $0.appendPath(path) }
-        return try item(path: path, message: message)
+        try item(path: path, message: await call(SFTPCode.lstat) { $0.appendPath(path) })
     }
 
     /// The size and time of the file `handle` has open, which its path may no longer name.
     private func fstat(_ handle: Data) async throws -> Fingerprint? {
-        let message = try await call(SFTPCode.fstat) { $0.appendBlob(handle) }
-        return Fingerprint(item: try item(path: RemotePath(string: "/"), message: message))
+        Fingerprint(item: try item(path: RemotePath(string: "/"), message: await call(SFTPCode.fstat) { $0.appendBlob(handle) }))
     }
 
     /// Keeps several READDIR requests in flight. OpenSSH answers each with at most a hundred names,
-    /// so a large folder no longer pays one round trip per page. A listing its reader abandons
-    /// stops at once and still closes its handle on the server.
+    /// so a large folder does not pay a round trip per page. A listing its reader abandons stops at
+    /// once and still closes its handle on the server.
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let handle = try await openDirectory(path)
+                    let handle = try self.handle(in: await call(SFTPCode.opendir) { $0.appendPath(path) })
                     var inFlight: [Task<[RemoteItem]?, Error>] = []
                     defer {
                         for page in inFlight { page.cancel() }
@@ -138,7 +132,7 @@ actor SFTPChannel {
                         // past its end; sixteen once four have come, so a large one pays about
                         // one round trip per 1,600 names.
                         while !finished, inFlight.count < (pages < 4 ? 4 : 16) {
-                            inFlight.append(Task { try await self.readDirectoryPage(handle, parent: path) })
+                            inFlight.append(Task { try await self.readDirectory(handle, parent: path) })
                         }
                         let next = inFlight.removeFirst()
                         let page = try await withTaskCancellationHandler {
@@ -160,15 +154,6 @@ actor SFTPChannel {
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-
-    /// One page, or nil at the end of the directory.
-    private func readDirectoryPage(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem]? {
-        do {
-            return try await readDirectory(handle, parent: parent)
-        } catch is EndOfFile {
-            return nil
         }
     }
 
@@ -280,9 +265,7 @@ actor SFTPChannel {
     }
 
     func readlink(_ path: RemotePath) async throws -> String {
-        let message = try await call(SFTPCode.readlink) { $0.appendPath(path) }
-        let names = try names(in: message)
-        guard let first = names.first else { throw TransferError.failed("Empty readlink") }
+        guard let first = try names(in: await call(SFTPCode.readlink) { $0.appendPath(path) }).first else { throw TransferError.failed("Empty readlink") }
         return String(decoding: first.filename, as: UTF8.self)
     }
 
@@ -352,10 +335,6 @@ actor SFTPChannel {
         return handles
     }
 
-    func setstat(_ path: RemotePath, mode: UInt32?, mtime: UInt32?) async throws {
-        try await setstat(path, SFTPAttrs.stamp(mode: mode, mtime: mtime))
-    }
-
     func setstat(_ path: RemotePath, _ stamp: SFTPAttrs) async throws {
         _ = try await call(SFTPCode.setstat) {
             $0.appendPath(path)
@@ -372,20 +351,8 @@ actor SFTPChannel {
     }
 
     /// Downloads `path` into `destination` over this channel alone.
-    func download(
-        _ path: RemotePath,
-        to destination: URL,
-        size: UInt64?,
-        progress: @escaping @Sendable (TransferProgress) -> Void
-    ) async throws {
-        FileManager.default.createFile(atPath: destination.path, contents: nil)
-        let output = try FileHandle(forWritingTo: destination)
-        defer { try? output.close() }
-        guard let size else {
-            try await downloadSequential(path, output: output, progress: progress)
-            return
-        }
-        let parts = DownloadParts(size: size, output: output, progress: progress)
+    func download(_ path: RemotePath, to destination: URL, size: UInt64?, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+        let parts = try DownloadParts(destination, size: size, progress: progress)
         try await receive(path, into: parts)
         try parts.finish()
     }
@@ -414,44 +381,15 @@ actor SFTPChannel {
             guard !inFlight.isEmpty else { break }
             let read = inFlight.removeFirst()
             do {
-                let chunk = try data(in: await reply(read.id))
+                let message = try await reply(read.id)
+                guard message.type == SFTPCode.data else { throw TransferError.failed("Expected data") }
+                var reader = ByteReader(message.rest)
+                let chunk = try reader.blob()
                 try parts.write(chunk, offset: read.offset, length: read.length)
             } catch is EndOfFile {
                 parts.endOfFile()
             }
         }
-    }
-
-    /// For a file with no listed size: reads in order until the server says EOF. A short reply
-    /// is not the end; only EOF or a reply with no bytes is.
-    private func downloadSequential(_ path: RemotePath, output: FileHandle, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
-        let handle = try await openFile(path, flags: SFTPCode.fxRead)
-        defer { closeSoon([handle]) }
-        var offset: UInt64 = 0
-        var pacer = ProgressPacer()
-        defer { if let last = pacer.finish() { progress(last) } }
-        while true {
-            let chunk: Data
-            do {
-                chunk = try data(in: await call(SFTPCode.read) {
-                    $0.appendBlob(handle)
-                    $0.appendU64(offset)
-                    $0.appendU32(65_536)
-                })
-            } catch is EndOfFile {
-                break
-            }
-            if chunk.isEmpty { break }
-            try output.write(contentsOf: chunk)
-            offset += UInt64(chunk.count)
-            if let due = pacer.due(TransferProgress(completed: offset)) { progress(due) }
-        }
-    }
-
-    private func data(in message: SFTPMessage) throws -> Data {
-        guard message.type == SFTPCode.data else { throw TransferError.failed("Expected data") }
-        var reader = ByteReader(message.rest)
-        return try reader.blob()
     }
 
     /// Uploads `source` to `path` over this channel alone, creating or truncating it. With
@@ -516,25 +454,20 @@ actor SFTPChannel {
         _ = try await reply(finishing[finishing.count - 1])
     }
 
-    /// Closes the channel; its waiting calls fail with `reason`. A master that died passes a lost
-    /// connection, which a transfer retries, where a disconnect the user asked for cancels.
-    func closeLink(reason: TransferError = .cancelled) {
-        shutDown(reason)
-    }
-
     /// Closes the channel for good: ends ssh, and fails the handshake and every waiting request
-    /// with `error`. Later calls fail as a closed channel.
-    private func shutDown(_ error: TransferError) {
+    /// with `reason`. A master that died passes a lost connection, which a transfer retries, where
+    /// a disconnect the user asked for cancels.
+    func closeLink(reason: TransferError = .cancelled) {
         guard isOpen else { return }
         isOpen = false
         process?.terminate()
         reader?.cancel()
         watchdog?.cancel()
         chunkSink.finish()
-        versionWaiter?.resume(throwing: error)
+        versionWaiter?.resume(throwing: reason)
         versionWaiter = nil
-        closedWith = error
-        for waiter in waiters.values { waiter.resume(throwing: error) }
+        closedWith = reason
+        for waiter in waiters.values { waiter.resume(throwing: reason) }
         waiters.removeAll()
         pending.removeAll()
         early.removeAll()
@@ -548,23 +481,23 @@ actor SFTPChannel {
             try? await Task.sleep(for: (greeted ? stallLimit : min(stallLimit, handshakeLimit)) / 5)
             let now = ContinuousClock.now
             if versionWaiter != nil, let handshakeStarted, now - handshakeStarted > handshakeLimit {
-                shutDown(.timeout("The server did not start SFTP"))
+                closeLink(reason: .timeout("The server did not start SFTP"))
             } else if !pending.isEmpty, longCalls.isEmpty, now - lastHeard > stallLimit {
-                shutDown(.timeout("The server stopped answering"))
+                closeLink(reason: .timeout("The server stopped answering"))
             }
         }
     }
 
-    private func openDirectory(_ path: RemotePath) async throws -> Data {
-        let message = try await call(SFTPCode.opendir) { $0.appendPath(path) }
-        return try handle(in: message)
-    }
-
-    /// One page of `parent`'s entries. A name the server sends is used as a path component, so
-    /// anything that is not exactly one is dropped: `.` and `..`, an empty name, and a name with
-    /// a slash or NUL, which a hostile server could send to reach outside the folder.
-    private func readDirectory(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem] {
-        let message = try await call(SFTPCode.readdir) { $0.appendBlob(handle) }
+    /// One page of `parent`'s entries, nil at the end. A name the server sends is used as a path
+    /// component, so anything that is not exactly one is dropped: `.` and `..`, an empty name, and
+    /// a name with a slash or NUL, which a hostile server could send to reach outside the folder.
+    private func readDirectory(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem]? {
+        let message: SFTPMessage
+        do {
+            message = try await call(SFTPCode.readdir) { $0.appendBlob(handle) }
+        } catch is EndOfFile {
+            return nil
+        }
         return try names(in: message).compactMap { name in
             guard Self.isSingleComponent(name.filename) else { return nil }
             return item(path: parent.appending(name: Array(name.filename)), attrs: name.attrs)
@@ -671,7 +604,7 @@ actor SFTPChannel {
             do {
                 try input.write(contentsOf: packet)
             } catch {
-                Task { await self.shutDown(.connectionLost("Broken SSH channel")) }
+                Task { await self.closeLink(reason: .connectionLost("Broken SSH channel")) }
             }
         }
     }
@@ -685,13 +618,13 @@ actor SFTPChannel {
                     try receive(packet)
                 }
             } catch {
-                shutDown(greeted
+                closeLink(reason: greeted
                     ? .connectionLost("The server sent a malformed SFTP packet")
                     : .failed(SFTPWire.notSFTP(frames.unread)))
                 return
             }
         }
-        shutDown(.connectionLost("SSH channel closed"))
+        closeLink(reason: .connectionLost("SSH channel closed"))
     }
 
     /// The server's VERSION first, then replies, each matched to its request by id. A reply to a
@@ -728,19 +661,15 @@ actor SFTPChannel {
         return Data(try reader.blob())
     }
 
-    private func names(in message: SFTPMessage) throws -> [SFTPName] {
+    private func names(in message: SFTPMessage) throws -> [(filename: Data, attrs: SFTPAttrs)] {
         guard message.type == SFTPCode.name else { throw TransferError.failed("Expected names") }
         var reader = ByteReader(message.rest)
-        let count = Int(try reader.u32())
-        var values: [SFTPName] = []
-        for _ in 0..<count {
+        return try (0..<reader.u32()).map { _ in
             let filename = try reader.blob()
             // The `ls -l` style long name is not used.
             _ = try reader.blob()
-            let attrs = try reader.attrs()
-            values.append(SFTPName(filename: filename, attrs: attrs))
+            return (filename, try reader.attrs())
         }
-        return values
     }
 
     private func item(path: RemotePath, message: SFTPMessage) throws -> RemoteItem {
@@ -791,19 +720,25 @@ struct ProgressPacer {
 /// One download's shared state: what is left to ask for (`ReadPlan`, which asks again for the
 /// rest of a short reply), the local file each reply is written into at its offset, and
 /// progress. Several channels may read into one download at once, each through its own handle,
-/// so a large file is not held to one channel's 2 MB window (PERF-07).
+/// so a large file is not held to one channel's 2 MB window (PERF-07). A file with no listed
+/// size is read until the server says it ends.
 final class DownloadParts: Sendable {
-    let size: UInt64
+    private let size: UInt64?
     private let descriptor: Int32
     private let state: Locked<(plan: ReadPlan, pacer: ProgressPacer)>
     private let report: @Sendable (TransferProgress) -> Void
 
-    /// `output` stays open until the download is done; its caller closes it.
-    init(size: UInt64, output: FileHandle, progress: @escaping @Sendable (TransferProgress) -> Void) {
+    /// Creates `file`, or cuts it to nothing, to write the download into.
+    init(_ file: URL, size: UInt64?, progress: @escaping @Sendable (TransferProgress) -> Void) throws {
+        descriptor = open(file.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o666)
+        guard descriptor >= 0 else { throw TransferError.failed("Could not write the download: \(String(cString: strerror(errno)))") }
         self.size = size
-        descriptor = output.fileDescriptor
-        state = Locked((ReadPlan(size: size), ProgressPacer()))
+        state = Locked((ReadPlan(size: size ?? .max), ProgressPacer()))
         report = progress
+    }
+
+    deinit {
+        close(descriptor)
     }
 
     func nextRequest() -> (offset: UInt64, length: UInt32)? {

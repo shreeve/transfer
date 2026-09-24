@@ -64,16 +64,13 @@ import TransferCore
         let servers = [try await Self.reading(content, cap: 20_000, slow: true), try await Self.reading(content, cap: 50_000)]
         let file = Self.scratchFile()
         defer { try? FileManager.default.removeItem(at: file) }
-        FileManager.default.createFile(atPath: file.path, contents: nil)
-        let output = try FileHandle(forWritingTo: file)
         let reports = Locked<[TransferProgress]>([])
-        let parts = DownloadParts(size: UInt64(content.count), output: output) { progress in reports.withLock { $0.append(progress) } }
+        let parts = try DownloadParts(file, size: UInt64(content.count)) { progress in reports.withLock { $0.append(progress) } }
         try await withThrowingTaskGroup(of: Void.self) { group in
             for server in servers { group.addTask { try await server.channel.receive(Self.path, into: parts) } }
             try await group.waitForAll()
         }
         try parts.finish()
-        try output.close()
         #expect(try Data(contentsOf: file) == content)
         #expect(servers.allSatisfy { !$0.sent(SFTPCode.read).isEmpty })
         #expect(reports.value.last?.completed == UInt64(content.count))
@@ -87,10 +84,7 @@ import TransferCore
         let failing = try await Self.reading(content, cap: 65_536, failAfter: 3)
         let file = Self.scratchFile()
         defer { try? FileManager.default.removeItem(at: file) }
-        FileManager.default.createFile(atPath: file.path, contents: nil)
-        let output = try FileHandle(forWritingTo: file)
-        defer { try? output.close() }
-        let parts = DownloadParts(size: UInt64(content.count), output: output) { _ in }
+        let parts = try DownloadParts(file, size: UInt64(content.count)) { _ in }
         await #expect(throws: TransferError.failed("disk error")) {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for server in [good, failing] { group.addTask { try await server.channel.receive(Self.path, into: parts) } }
@@ -116,10 +110,7 @@ import TransferCore
         }
         let file = Self.scratchFile()
         defer { try? FileManager.default.removeItem(at: file) }
-        FileManager.default.createFile(atPath: file.path, contents: nil)
-        let output = try FileHandle(forWritingTo: file)
-        defer { try? output.close() }
-        let parts = DownloadParts(size: UInt64(content.count), output: output) { _ in }
+        let parts = try DownloadParts(file, size: UInt64(content.count)) { _ in }
         try await server.channel.receive(Self.path, into: parts, matching: Fingerprint(size: 200_000, mtime: 8))
         #expect(server.sent(SFTPCode.read).isEmpty)
         #expect(await eventually { server.sent(SFTPCode.close).count == 1 })

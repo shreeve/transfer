@@ -99,11 +99,6 @@ struct SFTPAttrs: Equatable {
     }
 }
 
-struct SFTPName: Equatable {
-    var filename: Data
-    var attrs: SFTPAttrs
-}
-
 struct SFTPMessage {
     var type: UInt8
     var rest: Data
@@ -275,17 +270,11 @@ extension Data {
     }
 
     mutating func appendU32(_ value: UInt32) {
-        append(contentsOf: [
-            UInt8((value >> 24) & 0xff),
-            UInt8((value >> 16) & 0xff),
-            UInt8((value >> 8) & 0xff),
-            UInt8(value & 0xff),
-        ])
+        Swift.withUnsafeBytes(of: value.bigEndian) { append(contentsOf: $0) }
     }
 
     mutating func appendU64(_ value: UInt64) {
-        appendU32(UInt32((value >> 32) & 0xffff_ffff))
-        appendU32(UInt32(value & 0xffff_ffff))
+        Swift.withUnsafeBytes(of: value.bigEndian) { append(contentsOf: $0) }
     }
 
     mutating func appendBlob(_ data: Data) {

@@ -162,7 +162,7 @@ extension SSHConnection {
                 // A save that runs again after it already landed finds its own bytes there.
                 if !matches, now == nil || now != written { throw LiveRemoteChanged() }
                 // A new file keeps the mode the server gave the temp when it was created.
-                if let kept = found?.mode { try? await link.setstat(temp, mode: kept & 0o7777, mtime: nil) }
+                if let kept = found?.mode { try? await link.setstat(temp, SFTPAttrs(permissions: kept & 0o7777)) }
             }
             try await link.place(temp, onto: placed, replacing: replacing)
             return written
@@ -187,10 +187,7 @@ extension SSHConnection {
             }
         }
         try await withData(.whole) { link in
-            FileManager.default.createFile(atPath: file.path, contents: nil)
-            let output = try FileHandle(forWritingTo: file)
-            defer { try? output.close() }
-            let parts = DownloadParts(size: size, output: output, progress: progress)
+            let parts = try DownloadParts(file, size: size, progress: progress)
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await link.receive(path, into: parts) }
                 for _ in 1..<Self.stripeWidth {
