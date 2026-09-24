@@ -8,19 +8,21 @@ A revamp of the whole app. Transfer looks much the same, but what it does with y
 
 ### Data safety
 
-- A move removes an original only once it has checked that this move wrote a complete copy. A file of the same name, size, and time already at the destination no longer passes for the copy: it is asked about, and an original the user did not replace it with stays. Two saved servers that reach one disk, or a destination that is the originals' own folder reached another way, never copy an item onto itself and delete it. A folder holding a socket or FIFO, which no copy can write, keeps its original.
-- Live files never lose edits the server lacks: a delete or move of a folder above one, Discard, Forget Synced Live Files, a conflict choice, and Remove Server all leave unsynced bytes alone unless you confirm, and Keep Remote or Keep Both never overwrite a save made after the choice. A save by someone else with the same size and second is no longer taken for your own upload, which left your edit marked synced and never uploaded.
+- A move removes an original only once it has checked that this move wrote a complete copy. A file of the same name, size, and time already at the destination no longer passes for the copy: it is asked about, and an original the user did not replace it with stays. Two saved servers that reach one disk, or a destination that is the originals' own folder reached another way, never copy an item onto itself and delete it. A folder holding a socket or FIFO, which no copy can write, keeps its original. Two items of one move with the same name (`p/VERSION` and `q/VERSION`) never count each other's copy. Between servers a move removes only what it checked: anything added to the original or changed after the check stays and is named, and so does an original whose Live file saved during the move.
+- Live files never lose edits the server lacks: a delete or move of a folder above one, Discard, Forget Synced Live Files, a conflict choice, and Remove Server all leave unsynced bytes alone unless you confirm. Delete discards only the edits its sheet named, and only after the server's delete succeeded. Keep Local and Keep Both wait until the working copy holds still, Keep Remote or Keep Both never overwrite a save made after the choice, and Keep Remote on a file removed from the server since keeps both copies. A save by someone else with the same size and second is no longer taken for your own upload, which left your edit marked synced and never uploaded.
 - A server's names can no longer reach outside the folder you chose: a name that is not one path component is dropped from listings, and a link on the Mac is never followed or removed while downloading. A server link that met a local folder of the same name used to delete that folder.
-- A change of case alone (`a.txt` to `A.txt`) no longer replaces a different file on a case-sensitive server. A server without `posix-rename` keeps the old file until the new one is in place. A name that appears after a folder was listed is never overwritten without asking.
+- A change of case alone (`a.txt` to `A.txt`) no longer replaces a different file on a case-sensitive server. A server without `posix-rename` keeps the old file until the new one is in place. A name that appears after a folder was listed is never overwritten without asking, and a Replace removes only what you were asked about: a file that took the name while the question was up stays.
 - A folder copy into itself through a link on the server is refused; it used to copy until the disk filled.
-- A temp that could not be removed stays recorded, and the next login removes it.
-- Quit asks when Transfer cannot tell within 3 s whether Live edits are unsynced (it used to quit without asking), and names transfers that have not finished.
+- A temp that could not be removed stays recorded, and the next login removes it. On a server without `posix-rename`, a file a replace set aside is recorded too, and the next login puts it back.
+- A download checks the file it opened against its listing, so a file that changed on the server since is read again, never placed cut short.
+- Quit asks when Transfer cannot tell within 3 s whether Live edits are unsynced (it used to quit without asking), and names transfers that have not finished, closed windows' included; its question comes to the front.
 - Stars, Live files, and temps whose names are not UTF-8 keep their exact bytes.
 
 ### Security
 
 - Downloads are quarantined as a browser's are, so Gatekeeper checks an app or script before it first runs, and never take setuid, setgid, or sticky bits from the server.
-- A saved password or passphrase answers only that server's own prompt, never a `ProxyJump` host's.
+- A saved password or passphrase answers only that server's own prompt, never a `ProxyJump` host's. A saved key passphrase is stored apart from the server's password, so it is never sent to the server as a password.
+- A channel whose login has gone fails at once instead of logging in on its own with the default port and keys.
 - A drop honors remote paths only from a drag that began in Transfer, so another app cannot have a drop rename files on your server.
 - An `sftp://` link with a control character in its path is refused, and Copy Remote URL brackets an IPv6 host.
 - Open in Terminal refuses a folder name holding a control character, which would have run the rest of the line as a command.
@@ -30,12 +32,16 @@ A revamp of the whole app. Transfer looks much the same, but what it does with y
 ### Logins and reliability
 
 - ssh checks host keys itself, so keys known through a global known-hosts file, `@cert-authority`, or `KnownHostsCommand` log in without a question, a known host costs one connection instead of two, and a `@revoked` key is refused. Always Trust honors `HashKnownHosts`.
-- Two windows or a retry logging in to one server share one login instead of asking twice and leaving a stray master behind. A login no longer runs a remote `performance-version` command.
+- Two windows or a retry logging in to one server share one login instead of asking twice and leaving a stray master behind. Cancel on any login question stops the login at once, with no error, and a window that moves to another server takes back that login's questions. Always Trust fails with a message when `ssh -G` cannot read the configuration, instead of trusting for one login only. A login no longer runs a remote `performance-version` command.
 - `ControlPersist`, `ForkAfterAuthentication`, `RemoteCommand`, `RequestTTY`, `LocalForward`, and `PermitLocalCommand` in `~/.ssh/config` no longer break channels, hold your forwarded ports, or leave a master Transfer cannot stop.
 - A server whose shell prints text before SFTP starts fails with a clear error within 15 s, and one that stops answering for 60 s fails its requests, which then retry.
 - Every `sftp://` link in a burst gets its own window; one could be lost before.
 - The column view no longer crashes when a drag crosses the area beyond its last column.
-- A folder copy goes on past an item that fails and names every failure at the end.
+- A paste or folder copy goes on past an item that fails and names every failure at the end.
+- A file whose name nearly fills the 255-byte limit copies both ways, and a Live file with such a name still gets its `(server)` copy.
+- Copy Remote URL writes a name that is not UTF-8 byte for byte, and such a link opens that file. A server's error is no longer labeled twice ("Permission denied: Permission denied").
+- A sheet never replaces another: one that arrives meanwhile waits its turn. A sheet about a server closes when the window leaves it, and Upload…, Download Copy…, and pastes act on the server they were started on or do nothing and say so.
+- The rename bar's field takes the focus with Full Keyboard Access on, and emptying the search field keeps its focus, so Return no longer starts a rename. Space on a focused button presses it instead of opening Quick Look.
 - An unreadable `config.json` is kept as `config.json.bak` before the defaults take over.
 
 ### Performance
@@ -52,14 +58,16 @@ Measured at 20 ms round trip against 0.1.7:
 
 - A name collision with no window left to ask fails its operation instead of skipping the file.
 - Dragging between folders on one server moves; Option-drag copies (it used to move). A drag from another server's window copies (it used to be refused).
-- Right-clicking an empty area acts on that folder: the list view clears the selection, the column view makes that column's folder the location, and the icon view shows the folder's menu.
+- Right-clicking an empty area acts on that folder: the list and icon views clear the selection, and the column view makes that column's folder the location.
 - Command-Down and Space act once when held.
 - A transfer's shelf row offers Stop and Restart, since a stopped transfer starts its current file over; a Live file's row keeps Pause and Resume.
-- Duplicate works on folders and links, not only files.
+- Duplicate works on folders and links, not only files, and a folder keeps its whole name: `v1.2 copy`, and `v1.2 2` for Keep Both.
+- Keep Both for a Live conflict names the Mac's copy `notes (from this Mac).txt`, so it keeps its extension.
+- A move that kept originals reads Kept on the shelf, in grey, with the reason. Later on a Live conflict keeps its sheet away until you click its sidebar row.
 - Opening a link follows the whole chain, as the server resolves it, not one hop.
 - Errors stay in a bar at the top of the window until dismissed; a successful listing used to clear them at once.
-- A paste or move between servers of a folder holding two names this Mac's disk cannot tell apart (`README` and `readme`) keeps that item and says why; such a copy is not staged for the Finder either.
-- Go to Remote Folder understands `~`, `~/path`, relative paths, and `..`.
+- A paste or move between servers of a folder holding two names this Mac's disk cannot tell apart (`README` and `readme`, or `Straße` and `STRASSE`) keeps that item and says why; such a copy is not staged for the Finder either.
+- Go to Remote Folder understands `~` (the server's start folder), `~/path`, relative paths, and `..`.
 - The list view keeps Name as its first column.
 - Transfer refuses to open a library written by a newer version, says why, and quits.
 - Only one copy of Transfer opens a library at a time; a second copy says so and quits. (Two copies swept each other's login files and temps and could end each other's connections.)
@@ -67,7 +75,7 @@ Measured at 20 ms round trip against 0.1.7:
 
 ### The library
 
-`transfer.sqlite` now carries a schema version and upgrades itself on first launch, one step at a time: version 1 is the 0.1.0–0.1.7 schema; version 2 drops the unused recents table and stores Live paths as the server's exact bytes; version 3 does the same for stars and temps. The file switches to WAL mode, so `transfer.sqlite-wal` and `transfer.sqlite-shm` appear beside it. Transfer 0.1.7 can still open an upgraded library. The preview cache is keyed per server, so existing previews are fetched again once, and clipboard staging moves into a `Staging` folder per running copy.
+`transfer.sqlite` now carries a schema version and upgrades itself on first launch, one step at a time: version 1 is the 0.1.0–0.1.7 schema; version 2 drops the unused recents table; version 3 changes no row and marks that paths are kept as the server's exact bytes, as text when they are UTF-8 (as before) and as bytes only when not. The file switches to WAL mode, so `transfer.sqlite-wal` and `transfer.sqlite-shm` appear beside it. Transfer 0.1.7 can still open an upgraded library, and still unstars and forgets what it finds there. The preview cache is keyed per server, so existing previews are fetched again once, and clipboard staging moves into one `Staging` folder, emptied at launch.
 
 ### For maintainers
 
