@@ -47,13 +47,23 @@ struct SessionUnitTests {
         }
     }
 
-    /// A ProxyJump host's password prompt, or a one-time code, never gets the server's stored secret.
+    /// A ProxyJump host's password prompt, or a one-time code, never gets the server's stored
+    /// secret, and a key's passphrase is kept apart from the password, so it never reaches a server.
     @Test func aStoredSecretAnswersOnlyThisServersPassword() {
-        #expect(SSHConnection.takesStoredSecret("alice@box.example's password: ", user: "alice", host: "box.example"))
-        #expect(SSHConnection.takesStoredSecret("(alice@box.example) Password: ", user: "alice", host: "box.example"))
-        #expect(SSHConnection.takesStoredSecret("Enter passphrase for key '/Users/alice/.ssh/id_ed25519': ", user: "alice", host: "box.example"))
-        #expect(!SSHConnection.takesStoredSecret("alice@jump.example's password: ", user: "alice", host: "box.example"))
-        #expect(!SSHConnection.takesStoredSecret("(alice@box.example) Verification code: ", user: "alice", host: "box.example"))
+        #expect(SSHConnection.storedSecretKind("alice@box.example's password: ", user: "alice", host: "box.example") == .password)
+        #expect(SSHConnection.storedSecretKind("(alice@box.example) Password: ", user: "alice", host: "box.example") == .password)
+        #expect(SSHConnection.storedSecretKind("Enter passphrase for key '/Users/alice/.ssh/id_ed25519': ", user: "alice", host: "box.example") == .passphrase)
+        #expect(SSHConnection.storedSecretKind("alice@jump.example's password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("(alice@box.example) Verification code: ", user: "alice", host: "box.example") == nil)
+    }
+
+    /// Always Trust saves where `ssh -G` says; when `ssh -G` failed it says so rather than
+    /// quietly trusting for this login only.
+    @Test func alwaysTrustNeedsTheSSHConfiguration() throws {
+        #expect(try SSHConnection.knownHostsFile(sshConfig: "user alice\nuserknownhostsfile /Users/alice/.ssh/known_hosts /Users/alice/.ssh/known_hosts2\n") == "/Users/alice/.ssh/known_hosts")
+        #expect(try SSHConnection.knownHostsFile(sshConfig: "userknownhostsfile /dev/null\n") == nil)
+        #expect(try SSHConnection.knownHostsFile(sshConfig: "user alice\n") == nil)
+        #expect(throws: TransferError.self) { try SSHConnection.knownHostsFile(sshConfig: nil) }
     }
 
     @Test func controlCharactersAreFound() {
@@ -77,6 +87,16 @@ struct SessionUnitTests {
         try await Task.sleep(for: .milliseconds(200))
         slow.cancel()
         await #expect(throws: TransferError.cancelled) { _ = try await slow.value }
+    }
+
+    /// A child the process left running, as an askpass helper still waiting for a reply is, may
+    /// hold its pipes open: the runner returns soon after the process itself exits (R-S1).
+    @Test func theRunnerDoesNotWaitForAChildHoldingItsPipes() async throws {
+        let started = ContinuousClock.now
+        let result = try await Subprocess.run("/bin/sh", ["-c", "sleep 8 & echo out; echo err >&2"], timeout: .seconds(20))
+        #expect(ContinuousClock.now - started < .seconds(4))
+        #expect(result.stdout == "out\n")
+        #expect(result.stderr == "err\n")
     }
 }
 
@@ -113,10 +133,108 @@ struct SessionServerTests {
             again.cancel()
             await #expect(throws: TransferError.cancelled) { _ = try await again.value }
             #expect(await h.session.isConnected == false)
+            // Both sheets were taken back, not left up for an answer nobody reads (R-S2).
+            #expect(await waitUntil(3) { prompts.withdrawn.value == 2 })
             let running = try await processes(h, "")
             let scratch = try loginScratch(h)
             #expect(running.isEmpty)
             #expect(scratch.isEmpty)
+        }
+    }
+
+    /// A caller arriving while a login it could join is stopping, its callers all gone, gets a
+    /// login of its own rather than that one's cancellation (R-S4).
+    @Test func aLoginEveryoneLeftIsNotJoined() async throws {
+        try await withHarness("rejoin", knownHost: false) { h in
+            let stalled = StalledPrompts()
+            let first = Task { try await h.session.connect(prompts: stalled) }
+            #expect(await waitUntil { stalled.asked.value > 0 })
+            first.cancel()
+            let prompts = RecordingPrompts(.trustOnce)
+            _ = try await h.session.connect(prompts: prompts)
+            #expect(prompts.events.count == 1)
+            await #expect(throws: TransferError.cancelled) { _ = try await first.value }
+        }
+    }
+
+    /// Cancel on a question a ProxyJump host asks during the host-key probe stops the login at
+    /// once. The probe's askpass helper, still waiting for a reply, used to hold the probe's
+    /// stderr open, and the login hung until the helper gave up minutes later (R-S1).
+    @Test(.timeLimit(.minutes(1))) func cancellingAQuestionDuringTheProbeStopsTheLogin() async throws {
+        try await withHarness("probe") { h in
+            let port = try #require(ProcessInfo.processInfo.environment["TRANSFER_TEST_PORT"])
+            let key = h.base.appendingPathComponent("jump_key")
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: h.session.connection.identityFile), to: key)
+            _ = try await Subprocess.run("/usr/bin/ssh-keygen", ["-q", "-p", "-P", "", "-N", "jump secret", "-f", key.path], timeout: .seconds(10))
+            // The jump host is known and asks for its key's passphrase; the server behind it,
+            // under another key alias, is not known, so the login gets as far as the probe.
+            try """
+            Host *
+              UserKnownHostsFile "\(knownHosts(h).path)"
+              GlobalKnownHostsFile /dev/null
+              IdentityAgent none
+            Host jump
+              HostName 127.0.0.1
+              Port \(port)
+              IdentityFile "\(key.path)"
+              IdentitiesOnly yes
+            Host 127.0.0.1
+              ProxyJump jump
+              HostKeyAlias transfer-probe-test
+
+            """.write(to: h.configFile, atomically: true, encoding: .utf8)
+            let prompts = PassphraseOnce("jump secret")
+            let started = ContinuousClock.now
+            await #expect(throws: TransferError.cancelled) { _ = try await h.session.connect(prompts: prompts) }
+            #expect(ContinuousClock.now - started < .seconds(15))
+            #expect(prompts.asked.value == 2)
+            #expect(try await processes(h, "").isEmpty)
+            #expect(try loginScratch(h).isEmpty)
+        }
+    }
+
+    /// Trust Once writes no known-hosts file, and the next login asks again.
+    @Test func trustOnceIsForOneLogin() async throws {
+        try await withHarness("once", knownHost: false) { h in
+            let prompts = RecordingPrompts(.trustOnce)
+            _ = try await h.session.connect(prompts: prompts)
+            _ = try await h.session.stat(h.remotePath)
+            #expect(!FileManager.default.fileExists(atPath: knownHosts(h).path))
+            await h.session.disconnect()
+            #expect(try loginScratch(h).isEmpty)
+            _ = try await h.session.connect(prompts: prompts)
+            #expect(prompts.events.map(\.situation) == [.firstSeen, .firstSeen])
+        }
+    }
+
+    /// A passenger whose master is gone fails; it never logs in on its own, with none of the
+    /// master's settings (R-S3). The config here would let such a login succeed.
+    @Test func aPassengerNeverLogsInOnItsOwn() async throws {
+        try await withHarness("nomux") { h in
+            let port = try #require(ProcessInfo.processInfo.environment["TRANSFER_TEST_PORT"])
+            try writeConfig(h, extra: "Port \(port)\n  IdentityFile \"\(h.session.connection.identityFile)\"\n  IdentitiesOnly yes")
+            try await connectKnown(h)
+            try FileManager.default.removeItem(atPath: socketPath(h))
+            try await killPassengers(h)
+            await #expect(throws: (any Error).self) { _ = try await h.session.stat(h.remotePath) }
+        }
+    }
+
+    /// A session that replaces another for the same server, as the hub makes when its settings
+    /// change, logs in once the old one is gone, and the old one's teardown leaves it working.
+    @Test func aReplacingSessionOutlivesTheOneItReplaced() async throws {
+        try await withHarness("replace") { h in
+            try await connectKnown(h)
+            let replacement = SSHConnection(connection: h.session.connection, store: try Store(root: h.root), editableExtensions: [],
+                                            live: h.live, sshConfigFile: h.configFile.path, replacing: h.session)
+            _ = try await replacement.connect(prompts: RecordingPrompts(.cancel))
+            #expect(await h.session.isConnected == false)
+            await h.session.disconnect()
+            try await killPassengers(h)
+            _ = try await replacement.stat(h.remotePath)
+            #expect(await replacement.isConnected)
+            await replacement.disconnect()
+            #expect(try await processes(h, "").isEmpty)
         }
     }
 
@@ -341,16 +459,32 @@ private final class RecordingPrompts: PromptSink {
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
 }
 
-/// A host-key sheet nobody answers.
+/// A host-key sheet nobody answers, taken back when its question is cancelled.
 private final class StalledPrompts: PromptSink {
     let asked = Locked(0)
+    let withdrawn = Locked(0)
 
     func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
         asked.withLock { $0 += 1 }
-        try? await Task.sleep(for: .seconds(120))
+        do { try await Task.sleep(for: .seconds(120)) } catch { withdrawn.withLock { $0 += 1 } }
         return .cancel
     }
+    func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
+}
+
+/// Types the passphrase the first time it is asked, and Cancel after that.
+private final class PassphraseOnce: PromptSink {
+    let passphrase: String
+    let asked = Locked(0)
+
+    init(_ passphrase: String) { self.passphrase = passphrase }
+
+    func answer(_ request: PromptRequest) async -> PromptReply {
+        let count = asked.withLock { $0 += 1; return $0 }
+        return PromptReply(text: count == 1 ? passphrase : nil)
+    }
+    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
 }
 
@@ -396,9 +530,13 @@ private func writeConfig(_ h: ServerHarness, global: String = "/dev/null", extra
     """.write(to: h.configFile, atomically: true, encoding: .utf8)
 }
 
+private func socketPath(_ h: ServerHarness) -> String {
+    h.root.appendingPathComponent("ssh/\(h.session.connection.id.socketName)").path
+}
+
 /// The ssh processes on this harness's control socket whose command line contains `marker`.
 private func processes(_ h: ServerHarness, _ marker: String) async throws -> [(pid: pid_t, command: String)] {
-    let socket = h.root.appendingPathComponent("ssh/\(h.session.connection.id.socketName)").path
+    let socket = socketPath(h)
     let listed = try await Subprocess.run("/bin/ps", ["-axwwo", "pid=,command="], timeout: .seconds(5))
     return listed.stdout.split(separator: "\n").compactMap { line in
         let text = line.trimmingCharacters(in: .whitespaces)

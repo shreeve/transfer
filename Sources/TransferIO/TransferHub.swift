@@ -48,11 +48,10 @@ public actor TransferHub: SessionProvider {
 
     public func save(_ connection: SavedConnection) async throws {
         store.save(connection)
-        // A session that is not logged in, perhaps mid-login with the old settings, is dropped and
-        // stopped, so no orphaned master finishes that login.
+        // A session that is not logged in, perhaps mid-login with the old settings, is replaced
+        // and stopped, so no orphaned master finishes that login.
         guard let existing = sessions[connection.id], !(await existing.isConnected), sessions[connection.id] === existing else { return }
-        sessions[connection.id] = nil
-        await existing.disconnect()
+        makeSession(connection, replacing: existing)
     }
 
     public func removeConnection(_ id: ConnectionID) async throws {
@@ -60,10 +59,11 @@ public actor TransferHub: SessionProvider {
         // so no edit can land between the check and the removal.
         try await live.closeIfSynced(id)
         try? FileManager.default.removeItem(at: store.root.appendingPathComponent("Live/\(id.rawValue.uuidString)", isDirectory: true))
+        // Out of the library first, so no caller makes a new session while this one disconnects.
+        store.remove(id)
+        KeychainStore.delete(id)
         let session = sessions.removeValue(forKey: id)
         await session?.disconnect()
-        store.remove(id)
-        KeychainStore.delete(account: id.rawValue.uuidString)
     }
 
     public func session(for id: ConnectionID) async throws -> any RemoteSession {
@@ -85,13 +85,14 @@ public actor TransferHub: SessionProvider {
         // Another caller may have replaced it meanwhile; theirs is the one to share.
         if let current = sessions[id], current !== existing { return current }
         if connected { return existing }
-        let session = makeSession(saved)
-        await existing.disconnect()
-        return session
+        return makeSession(saved, replacing: existing)
     }
 
-    private func makeSession(_ saved: SavedConnection) -> SSHConnection {
-        let session = SSHConnection(connection: saved, store: store, editableExtensions: config.extensionSet, live: live)
+    /// The new session's first login waits for `replacing` to be gone, so the old master's
+    /// teardown never reaches the new one on their shared socket path.
+    @discardableResult
+    private func makeSession(_ saved: SavedConnection, replacing old: SSHConnection? = nil) -> SSHConnection {
+        let session = SSHConnection(connection: saved, store: store, editableExtensions: config.extensionSet, live: live, replacing: old)
         sessions[saved.id] = session
         return session
     }

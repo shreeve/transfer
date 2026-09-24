@@ -6,8 +6,8 @@ import TransferCore
 /// `TransferHub` with no server.
 struct HubTests {
     /// A crash or force-quit leaves a login's askpass folder, host-key probe, and fingerprint scratch
-    /// under the library root. The next launch removes them and nothing else. Another copy of
-    /// Transfer on the same library may be mid-login: scratch a running process owns stays.
+    /// under the library root. The next launch removes them all, whatever process id a name
+    /// carries (the library lock means no other copy is mid-login), and nothing else.
     @Test func launchRemovesLeftoverLoginScratch() throws {
         let base = TestCaches.fresh("hub")
         defer { try? FileManager.default.removeItem(at: base) }
@@ -29,7 +29,7 @@ struct HubTests {
         #expect(!FileManager.default.fileExists(atPath: probe.path))
         #expect(!FileManager.default.fileExists(atPath: key.path))
         #expect(FileManager.default.fileExists(atPath: kept.path))
-        #expect(FileManager.default.fileExists(atPath: running.path))
+        #expect(!FileManager.default.fileExists(atPath: running.path))
         #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("transfer.sqlite").path))
     }
 

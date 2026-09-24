@@ -11,55 +11,46 @@ enum Subprocess {
     }
 
     /// Runs `launch` to its end, killing it on `timeout` (throws `.timeout`) or task cancellation
-    /// (throws `.cancelled`). Blocking reads run on Dispatch threads, never Swift's cooperative pool.
+    /// (throws `.cancelled`). Its output is read as it arrives, and once it exits the runner waits
+    /// at most a second more for the pipes to close: a child it left running, such as an askpass
+    /// helper still polling for a reply, may hold them open for minutes.
     static func run(_ launch: String, _ arguments: [String], environment: [String: String]? = nil, timeout: Duration) async throws -> Result {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launch)
         process.arguments = arguments
         if let environment { process.environment = environment }
         process.standardInput = FileHandle.nullDevice
-        let output = Pipe()
-        let errors = Pipe()
-        process.standardOutput = output
-        process.standardError = errors
+        let output = OutputTail(limit: .max)
+        let errors = OutputTail()
+        process.standardOutput = output.pipe
+        process.standardError = errors.pipe
         let stopped = Locked((timedOut: false, cancelled: false))
         let name = (launch as NSString).lastPathComponent
-        let result: Result = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                DispatchQueue.global().async {
-                    do {
-                        try process.run()
-                    } catch {
-                        continuation.resume(throwing: TransferError.failed("Could not run \(name)"))
-                        return
-                    }
-                    if stopped.value.cancelled { process.terminate() }
-                    let watchdog = DispatchWorkItem {
-                        guard process.isRunning else { return }
-                        stopped.withLock { $0.timedOut = true }
-                        process.terminate()
-                    }
-                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout / .seconds(1), execute: watchdog)
-                    let stderr = Locked(Data())
-                    let reading = DispatchGroup()
-                    DispatchQueue.global().async(group: reading) { stderr.value = errors.fileHandleForReading.readDataToEndOfFile() }
-                    let stdout = output.fileHandleForReading.readDataToEndOfFile()
-                    reading.wait()
-                    process.waitUntilExit()
-                    watchdog.cancel()
-                    continuation.resume(returning: Result(
-                        status: process.terminationStatus,
-                        stdout: String(decoding: stdout, as: UTF8.self),
-                        stderr: String(decoding: stderr.value, as: UTF8.self)))
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (exited: CheckedContinuation<Void, Error>) in
+                process.terminationHandler = { _ in exited.resume() }
+                do {
+                    try process.run()
+                } catch {
+                    exited.resume(throwing: TransferError.failed("Could not run \(name)"))
+                    return
+                }
+                if stopped.value.cancelled { process.terminate() }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout / .seconds(1)) {
+                    guard process.isRunning else { return }
+                    stopped.withLock { $0.timedOut = true }
+                    process.terminate()
                 }
             }
         } onCancel: {
             stopped.withLock { $0.cancelled = true }
             if process.isRunning { process.terminate() }
         }
+        await output.waitForEnd()
+        await errors.waitForEnd()
         if stopped.value.cancelled { throw TransferError.cancelled }
         if stopped.value.timedOut { throw TransferError.timeout(name) }
-        return result
+        return Result(status: process.terminationStatus, stdout: output.text, stderr: errors.text)
     }
 }
 
