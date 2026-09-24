@@ -269,6 +269,30 @@ struct TransferServerTests {
             #expect(records.remoteTemps(connection: h.session.connection.id).isEmpty)
         }
     }
+
+    /// Downloads carried no quarantine, so Gatekeeper never checked a downloaded app or script,
+    /// and took setuid, setgid, and sticky bits from the server (SES-19).
+    @Test func downloadsAreQuarantinedAndNeverSetuid() async throws {
+        try await withHarness("quar", connected: true) { h in
+            let tool = h.remote.appendingPathComponent("kit/tool")
+            try FileManager.default.createDirectory(at: tool.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("#!/bin/sh\n".utf8).write(to: tool)
+            try FileManager.default.setAttributes([.posixPermissions: 0o4755], ofItemAtPath: tool.path)
+            try Data("note".utf8).write(to: h.remote.appendingPathComponent("note.txt"))
+
+            let local = h.staging.appendingPathComponent("kit")
+            try await h.session.download(h.remotePath.appending(name: Array("kit".utf8)), to: local) { _ in }
+            let mode = try FileManager.default.attributesOfItem(atPath: local.appendingPathComponent("tool").path)[.posixPermissions] as? Int
+            #expect(mode == 0o755)
+            #expect(quarantined(local))
+            #expect(quarantined(local.appendingPathComponent("tool")))
+
+            // A Live working copy opens only in an editor and is not marked.
+            let live = try await h.session.prepareLiveFile(h.remotePath.appending(name: Array("note.txt".utf8)))
+            #expect(!quarantined(live))
+            try await h.session.discardLiveFile(h.remotePath.appending(name: Array("note.txt".utf8)), force: true)
+        }
+    }
 }
 
 /// A listening unix socket at `url`, as a dev tool leaves in a project folder.
@@ -286,4 +310,8 @@ private func bindSocket(at url: URL) throws -> Int32 {
     }
     guard bound == 0 else { throw TransferError.failed("bind: \(String(cString: strerror(errno)))") }
     return fd
+}
+
+private func quarantined(_ url: URL) -> Bool {
+    getxattr(url.path, "com.apple.quarantine", nil, 0, 0, XATTR_NOFOLLOW) > 0
 }

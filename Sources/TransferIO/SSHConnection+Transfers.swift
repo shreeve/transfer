@@ -51,8 +51,11 @@ extension SSHConnection {
         try tally.check()
     }
 
-    /// Temp-and-rename onto the local disk. No collision check.
-    func fetch(_ path: RemotePath, info: RemoteItem, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    /// Temp-and-rename onto the local disk. No collision check. The file takes the server's
+    /// permissions without setuid, setgid, or sticky, which an untrusted server must not grant.
+    /// `quarantine` marks it for Gatekeeper, as a browser marks its downloads; a Live working copy
+    /// is not marked, since it only ever opens in an editor.
+    func fetch(_ path: RemotePath, info: RemoteItem, to destination: URL, quarantine: Bool = false, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let folder = destination.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let temp = folder.appendingPathComponent(CopyRules.tempName(for: destination.lastPathComponent, transferID: UUID().uuidString))
@@ -62,9 +65,10 @@ extension SSHConnection {
                 try await link.download(path, to: temp, size: info.size, progress: progress)
             }
             var attributes: [FileAttributeKey: Any] = [:]
-            if let mode = info.mode { attributes[.posixPermissions] = Int(mode & 0o7777) }
+            if let mode = info.mode { attributes[.posixPermissions] = Int(mode & 0o777) }
             if let mtime = info.mtime { attributes[.modificationDate] = Date(timeIntervalSince1970: TimeInterval(mtime)) }
             if !attributes.isEmpty { try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path) }
+            if quarantine { LocalPlacement.quarantine(temp) }
             // One rename replaces the destination, so a watched Live copy is never briefly missing.
             guard Darwin.rename(temp.path, destination.path) == 0 else {
                 throw TransferError.failed("Could not place \(destination.lastPathComponent): \(String(cString: strerror(errno)))")
@@ -178,7 +182,7 @@ extension SSHConnection {
             }
             group.addTask {
                 do {
-                    try await self.fetch(item.path, info: item, to: placed.url, progress: tally.file())
+                    try await self.fetch(item.path, info: item, to: placed.url, quarantine: true, progress: tally.file())
                     tally.finished()
                 } catch {
                     try tally.failed(name, error)
@@ -216,7 +220,10 @@ extension SSHConnection {
     /// The real folder a server folder named `name` merges into or is made as; nil to skip it.
     private func localFolder(named name: String, in folder: URL, taken: Bool = false) async throws -> URL? {
         guard let spot = try await settleLocally(.folder, named: name, in: folder, taken: taken) else { return nil }
-        if spot.found != .folder { try LocalPlacement.makeFolder(spot.url, replacing: spot.found != nil) }
+        if spot.found != .folder {
+            try LocalPlacement.makeFolder(spot.url, replacing: spot.found != nil)
+            LocalPlacement.quarantine(spot.url)
+        }
         return spot.url
     }
 
@@ -487,7 +494,7 @@ extension SSHConnection {
         // The copy carries the remote size and mtime; the same pair means the same bytes.
         if Self.cachedCopyMatches(file, item) { return file }
         try await lane.submit(.preview) {
-            try await self.fetch(path, info: item, to: file) { _ in }
+            try await self.fetch(path, info: item, to: file, quarantine: true) { _ in }
         }
         trimPreviewCache()
         return file
