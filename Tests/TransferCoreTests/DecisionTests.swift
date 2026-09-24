@@ -180,13 +180,13 @@ import Testing
 @Test func unitsScaleToThreeCharacters() {
     #expect(Units.bytes(0) == "  0 B")
     #expect(Units.bytes(959) == "959 B")
-    #expect(Units.bytes(1000) == "1.0kB")
-    #expect(Units.bytes(14336) == " 14kB")
-    #expect(Units.bytes(999_499) == "999kB")
-    #expect(Units.bytes(999_500) == "1.0MB")
-    #expect(Units.bytes(1_500_000_000) == "1.5GB")
-    #expect(Units.scale(0.0025, unit: "s") == "2.5ms")
-    #expect(Units.scale(0.000_000_4, unit: "s") == "400ns")
+    #expect(Units.bytes(1000) == "1.0 kB")
+    #expect(Units.bytes(14336) == " 14 kB")
+    #expect(Units.bytes(999_499) == "999 kB")
+    #expect(Units.bytes(999_500) == "1.0 MB")
+    #expect(Units.bytes(1_500_000_000) == "1.5 GB")
+    #expect(Units.scale(0.0025, unit: "s") == "2.5 ms")
+    #expect(Units.scale(0.000_000_4, unit: "s") == "400 ns")
     #expect(Units.scale(.infinity, unit: "B") == "??? B")
     #expect(Units.scale(1e16, unit: "B") == "??? B")
 }
@@ -195,7 +195,7 @@ import Testing
     var tally = ClipTally()
     tally.add(root: .file(size: 2100))
     tally.complete = true
-    #expect(ClipText.summary(tally, name: "notes.txt") == "“notes.txt” (2.1kB)")
+    #expect(ClipText.summary(tally, name: "notes.txt") == "“notes.txt” (2.1 kB)")
 }
 
 @Test func clipTextCountsFilesInsideFolders() {
@@ -206,7 +206,7 @@ import Testing
     for _ in 0..<28 { tally.add(inside: .file(size: 1000)) }
     tally.add(inside: .directory)
     tally.complete = true
-    #expect(ClipText.summary(tally, name: nil) == "3 files and 1 folder (31 files in all, 31kB)")
+    #expect(ClipText.summary(tally, name: nil) == "3 files and 1 folder (31 files in all, 31 kB)")
 }
 
 @Test func clipTextForFoldersAlone() {

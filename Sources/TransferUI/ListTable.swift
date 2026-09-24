@@ -350,7 +350,7 @@ final class ClosureMenuItem: NSMenuItem {
 }
 
 enum Format {
-    /// `959 B`, `1.2kB`, ` 14kB`: see `Units`.
+    /// `959 B`, `1.2 kB`, ` 14 kB`: see `Units`.
     static func si(_ size: UInt64?) -> String {
         size.map(Units.bytes) ?? ""
     }
