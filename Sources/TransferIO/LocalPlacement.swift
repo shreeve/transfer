@@ -51,6 +51,17 @@ enum Placement: Equatable {
     static func fold(_ name: String) -> String {
         name.precomposedStringWithCanonicalMapping.lowercased()
     }
+
+    /// Keep Both's name for `name`: the next that no name in `names` folds to.
+    static func keepBoth(_ name: String, among names: Set<String>) -> String {
+        let folded = Set(names.map(fold))
+        var taken = names
+        while true {
+            let next = KeepBothName.next(existing: taken, original: name)
+            if !folded.contains(fold(next)) { return next }
+            taken.insert(next)
+        }
+    }
 }
 
 /// The one place a name from a server becomes a path on this Mac (ledger D4). A server is
@@ -98,7 +109,7 @@ enum LocalPlacement {
         let folder = url.deletingLastPathComponent()
         var taken = Set(try FileManager.default.contentsOfDirectory(atPath: folder.path))
         while true {
-            let name = KeepBothName.next(existing: taken, original: url.lastPathComponent)
+            let name = Placement.keepBoth(url.lastPathComponent, among: taken)
             let candidate = try child(folder, name: name)
             if try occupant(candidate) == nil { return candidate }
             taken.insert(name)

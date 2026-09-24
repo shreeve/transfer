@@ -127,10 +127,10 @@ struct ServerTests {
 
             let up = h.remotePath.appending(name: Array("tree-up".utf8))
             let box = Locked(TransferProgress(completed: 0))
-            try await h.session.copyDirectory(fromLocal: tree, to: up) { box.value = $0 }
+            try await h.session.upload(tree, to: up) { box.value = $0 }
             #expect(box.value.itemsCompleted == 4)
             // Uploading the same tree again merges into it; the link already there is kept.
-            try await h.session.copyDirectory(fromLocal: tree, to: up) { _ in }
+            try await h.session.upload(tree, to: up) { _ in }
             #expect(h.prompts.collisions == 0)
             let upURL = h.remote.appendingPathComponent("tree-up")
             #expect(try Data(contentsOf: upURL.appendingPathComponent("a/b/deep.txt")) == Data("deep".utf8))

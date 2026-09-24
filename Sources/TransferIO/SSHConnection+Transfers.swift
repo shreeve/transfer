@@ -10,11 +10,15 @@ extension SSHConnection {
 
     public func remove(_ path: RemotePath) async throws {
         try await live.remove(path, on: connection.id) {
-            let link: SFTPChannel
-            if let walker = await self.liveLink(.walker) { link = walker } else { link = try await self.metadataLink() }
-            try await self.removeTree(path, link: link)
+            try await self.removeTree(path, link: try await self.walkerLink())
         }
         if let parent = path.parent { pipe.emit(.directoryChanged(parent)) }
+    }
+
+    /// The walker passenger, else the browse one.
+    private func walkerLink() async throws -> SFTPChannel {
+        if let walker = await liveLink(.walker) { return walker }
+        return try await metadataLink()
     }
 
     private func removeTree(_ path: RemotePath, link: SFTPChannel) async throws {
@@ -35,28 +39,16 @@ extension SSHConnection {
     /// links, plus the name to give the item there. Everything below it comes from the server and
     /// is placed through `LocalPlacement`.
     public func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
-        let info = try await stat(path)
+        let item = try await stat(path)
         let folder = destination.deletingLastPathComponent()
-        let name = destination.lastPathComponent
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        switch info.kind {
-        case .directory:
-            let tally = ProgressTally(progress)
-            guard let local = try await localFolder(named: name, in: folder) else { return }
-            let link: SFTPChannel
-            if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                try await walkDownload(path, into: local, link: link, group: &group, tally: tally)
-                try await group.waitForAll()
-            }
-        case .symlink:
-            try await localLink(try await readlink(path), named: name, in: folder)
-        case .other:
-            return
-        case .file:
-            guard let placed = try await settleLocally(.file(Fingerprint(item: info)), named: name, in: folder) else { return }
-            try await fetch(path, info: info, to: placed.url, progress: progress)
+        let link = try await walkerLink()
+        let tally = CopyTally(progress)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            try await placeDown(item, named: destination.lastPathComponent, in: folder, link: link, group: &group, tally: tally)
+            try await group.waitForAll()
         }
+        try tally.check()
     }
 
     /// Temp-and-rename onto the local disk. No collision check.
@@ -86,23 +78,7 @@ extension SSHConnection {
     }
 
     public func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
-        let values = try source.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        if values.isSymbolicLink == true {
-            // A link already at the destination is left alone, as a copy on the server does.
-            if (try? await stat(destination)) == nil {
-                let target = try FileManager.default.destinationOfSymbolicLink(atPath: source.path)
-                try await metadataLink().symlink(target: target, link: destination)
-            }
-            if let parent = destination.parent { pipe.emit(.directoryChanged(parent)) }
-            return
-        }
-        if values.isDirectory == true {
-            try await copyDirectory(fromLocal: source, to: destination, progress: progress)
-            return
-        }
-        guard let placed = try await resolvedUploadDestination(source, proposed: destination) else { return }
-        try await uploadBytes(source, to: placed, interactive: false, progress: progress)
-        if let parent = placed.parent { pipe.emit(.directoryChanged(parent)) }
+        try await copyToServer(.mac(source), at: destination, progress: progress)
     }
 
     /// Temp-and-rename onto the server. No collision check. A Live save passes `expecting`, what
@@ -175,39 +151,50 @@ extension SSHConnection {
 
     // MARK: Directory copy
 
-    /// Copies the server folder `remote` into `local`, a real folder this download found or made.
-    private func walkDownload(
-        _ remote: RemotePath,
-        into local: URL,
+    /// Places the server's `item` as `name` in `folder`, a real folder on this Mac: a folder is
+    /// merged or made and walked, a link is made, and a file's bytes go to the data channels.
+    /// `taken` says an earlier entry of the same listing claimed the name.
+    private func placeDown(
+        _ item: RemoteItem,
+        named name: String,
+        in folder: URL,
+        taken: Bool = false,
         link: SFTPChannel,
         group: inout ThrowingTaskGroup<Void, Error>,
-        tally: ProgressTally
+        tally: CopyTally
     ) async throws {
-        // Names this listing already used. A later one that folds the same (a duplicate, or two
-        // names this Mac's disk takes for one) collides even before the first has landed.
-        var used: Set<String> = []
-        for try await item in await link.list(remote) {
-            try Task.checkCancellation()
-            let taken = !used.insert(Placement.fold(item.name)).inserted
-            switch item.kind {
-            case .directory:
-                guard let folder = try await localFolder(named: item.name, in: local, taken: taken) else { continue }
-                try await walkDownload(item.path, into: folder, link: link, group: &group, tally: tally)
-            case .symlink:
-                try await localLink(try await link.readlink(item.path), named: item.name, in: local, taken: taken)
-                tally.finished(bytes: 0)
-            case .file:
-                guard let placed = try await settleLocally(.file(Fingerprint(item: item)), named: item.name, in: local, taken: taken) else {
-                    tally.finished(bytes: 0)
-                    continue
+        switch item.kind {
+        case .directory:
+            guard let local = try await localFolder(named: name, in: folder, taken: taken) else { return }
+            // Names this listing already used. A later one that folds the same (a duplicate, or two
+            // names this Mac's disk takes for one) collides even before the first has landed.
+            var used: Set<String> = []
+            for try await child in await link.list(item.path) {
+                try Task.checkCancellation()
+                let taken = !used.insert(Placement.fold(child.name)).inserted
+                do {
+                    try await placeDown(child, named: child.name, in: local, taken: taken, link: link, group: &group, tally: tally)
+                } catch {
+                    try tally.failed(child.name, error)
                 }
-                group.addTask {
-                    try await self.fetch(item.path, info: item, to: placed.url) { _ in }
-                    tally.finished(bytes: item.size ?? 0)
-                }
-            case .other:
-                continue
             }
+        case .symlink:
+            try await localLink(try await link.readlink(item.path), named: name, in: folder, taken: taken)
+            tally.finished()
+        case .file:
+            guard let placed = try await settleLocally(.file(Fingerprint(item: item)), named: name, in: folder, taken: taken) else {
+                return tally.finished()
+            }
+            group.addTask {
+                do {
+                    try await self.fetch(item.path, info: item, to: placed.url, progress: tally.file())
+                    tally.finished()
+                } catch {
+                    try tally.failed(name, error)
+                }
+            }
+        case .other:
+            return
         }
     }
 
@@ -247,131 +234,180 @@ extension SSHConnection {
         try LocalPlacement.makeLink(spot.url, target: target)
     }
 
-    func copyDirectory(fromLocal local: URL, to remote: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
-        let tally = ProgressTally(progress)
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            try await walkUpload(local, to: remote, group: &group, tally: tally)
-            try await group.waitForAll()
-        }
-        if let parent = remote.parent { pipe.emit(.directoryChanged(parent)) }
-    }
-
-    private func walkUpload(
-        _ local: URL,
-        to remote: RemotePath,
-        group: inout ThrowingTaskGroup<Void, Error>,
-        tally: ProgressTally
-    ) async throws {
-        do {
-            try await metadataLink().mkdir(remote)
-        } catch {
-            if (try? await stat(remote))?.kind != .directory { throw error }
-        }
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
-        let children = try FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: Array(keys), options: [])
-        for child in children {
-            try Task.checkCancellation()
-            let values = try child.resourceValues(forKeys: keys)
-            let destination = remote.appending(name: Array(child.lastPathComponent.utf8))
-            if values.isSymbolicLink == true {
-                if (try? await stat(destination)) == nil {
-                    let target = try FileManager.default.destinationOfSymbolicLink(atPath: child.path)
-                    try await metadataLink().symlink(target: target, link: destination)
-                }
-                tally.finished(bytes: 0)
-            } else if values.isDirectory == true {
-                try await walkUpload(child, to: destination, group: &group, tally: tally)
-            } else {
-                guard let placed = try await resolvedUploadDestination(child, proposed: destination) else {
-                    tally.finished(bytes: 0)
-                    continue
-                }
-                let size = UInt64(values.fileSize ?? 0)
-                group.addTask {
-                    try await self.uploadBytes(child, to: placed, interactive: false) { _ in }
-                    tally.finished(bytes: size)
-                }
-            }
-        }
-    }
-
-    // MARK: Copy on the server
+    // MARK: Copies onto the server
 
     public func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         if let refusal = PasteRules.refusal(sources: [source], into: destination) { throw TransferError.failed(refusal) }
-        let item = try await stat(source)
-        let tally = ProgressTally(progress)
-        switch item.kind {
-        case .directory:
-            let link: SFTPChannel
-            if let walker = await liveLink(.walker) { link = walker } else { link = try await metadataLink() }
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                try await walkCopy(source, to: destination, link: link, group: &group, tally: tally)
-                try await group.waitForAll()
-            }
-        case .symlink:
-            try await copyLink(source, to: destination, link: try await metadataLink())
-            tally.finished(bytes: 0)
-        case .file:
-            try await copyFile(item, to: destination)
-            tally.finished(bytes: item.size ?? 0)
-        case .other:
+        try await copyToServer(.server(try await stat(source)), at: destination, progress: progress)
+    }
+
+    /// Where a copy onto the server comes from: this Mac, or the same server.
+    private enum Source: Sendable {
+        case mac(URL)
+        case server(RemoteItem)
+    }
+
+    /// Copies an upload or a copy on the server to `destination`. A folder copy goes on past an
+    /// item that fails and reports them all at the end.
+    private func copyToServer(_ source: Source, at destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+        let link = try await walkerLink()
+        guard let incoming = try await incoming(source, link: link) else {
+            if case .mac(let url) = source { throw TransferError.noSuchFile(url.path) }
             return
         }
+        let found = try await existing(destination)
+        let tally = CopyTally(progress)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            try await placeUp(source, incoming, at: destination, found: found, link: link, group: &group, tally: tally)
+            try await group.waitForAll()
+        }
         if let parent = destination.parent { pipe.emit(.directoryChanged(parent)) }
+        try tally.check()
     }
 
-    private func walkCopy(
-        _ source: RemotePath,
-        to destination: RemotePath,
+    /// Places `source`, which is `incoming`, at `destination` on the server, where `found` is: a
+    /// folder is merged or made and walked, a link is made, and a file's bytes go to the data channels.
+    private func placeUp(
+        _ source: Source,
+        _ incoming: PlacedItem,
+        at destination: RemotePath,
+        found: RemoteItem?,
         link: SFTPChannel,
         group: inout ThrowingTaskGroup<Void, Error>,
-        tally: ProgressTally
+        tally: CopyTally
     ) async throws {
-        do {
-            try await metadataLink().mkdir(destination)
-        } catch {
-            let existing = try? await stat(destination)
-            if existing?.kind != .directory {
-                if existing != nil { throw TransferError.typeMismatch(destination.display) }
-                throw error
-            }
-        }
-        for try await child in await link.list(source) {
-            try Task.checkCancellation()
-            let target = destination.appending(name: child.path.nameBytes)
-            switch child.kind {
-            case .directory:
-                try await walkCopy(child.path, to: target, link: link, group: &group, tally: tally)
-            case .symlink:
-                try await copyLink(child.path, to: target, link: link)
-                tally.finished(bytes: 0)
-            case .file:
-                group.addTask {
-                    try await self.copyFile(child, to: target)
-                    tally.finished(bytes: child.size ?? 0)
+        switch incoming {
+        case .other:
+            // A socket, FIFO, or device has no bytes to copy, and opening a FIFO blocks until
+            // someone writes to it. Skipped, as a download skips the server's.
+            return
+        case .link(let target):
+            try await remoteLink(target, at: destination, found: found)
+            tally.finished()
+        case .folder:
+            guard let folder = try await remoteFolder(destination, found: found) else { return }
+            switch source {
+            case .mac(let url):
+                for child in try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
+                    try Task.checkCancellation()
+                    try await placeChild(.mac(child), in: folder, link: link, group: &group, tally: tally)
                 }
-            case .other:
-                continue
+            case .server(let item):
+                for try await child in await link.list(item.path) {
+                    try Task.checkCancellation()
+                    try await placeChild(.server(child), in: folder, link: link, group: &group, tally: tally)
+                }
+            }
+        case .file:
+            guard let placed = try await settleRemotely(incoming, at: destination, found: found) else { return tally.finished() }
+            group.addTask {
+                do {
+                    switch source {
+                    case .mac(let url):
+                        try await self.uploadBytes(url, to: placed.path, interactive: false, progress: tally.file())
+                        tally.finished()
+                    case .server(let item):
+                        try await self.copyFile(item, to: placed.path)
+                        tally.finished(bytes: item.size ?? 0)
+                    }
+                } catch {
+                    try tally.failed(destination.name, error)
+                }
             }
         }
     }
 
-    /// A link is copied as a link. One already at the destination is left alone.
-    private func copyLink(_ source: RemotePath, to destination: RemotePath, link: SFTPChannel) async throws {
-        if (try? await stat(destination)) != nil { return }
-        let target = try await link.readlink(source)
-        try await metadataLink().symlink(target: target, link: destination)
+    /// One entry of a folder being copied onto the server. Its failure is recorded, not thrown,
+    /// unless it ends the whole copy.
+    private func placeChild(_ source: Source, in folder: RemotePath, link: SFTPChannel, group: inout ThrowingTaskGroup<Void, Error>, tally: CopyTally) async throws {
+        let name: [UInt8]
+        switch source {
+        case .mac(let url): name = Array(url.lastPathComponent.utf8)
+        case .server(let item): name = item.path.nameBytes
+        }
+        let destination = folder.appending(name: name)
+        do {
+            guard let incoming = try await incoming(source, link: link) else { return }
+            try await placeUp(source, incoming, at: destination, found: try await existing(destination), link: link, group: &group, tally: tally)
+        } catch {
+            try tally.failed(destination.name, error)
+        }
+    }
+
+    /// What `source` is to the placement rules, read without following a link; nil when a file
+    /// on this Mac is gone.
+    private func incoming(_ source: Source, link: SFTPChannel) async throws -> PlacedItem? {
+        switch source {
+        case .mac(let url): try LocalPlacement.occupant(url)
+        case .server(let item): try await placedItem(item, link: link)
+        }
+    }
+
+    /// What the server's `item` is to the placement rules; a link's target is read from the server.
+    private func placedItem(_ item: RemoteItem?, link: SFTPChannel? = nil) async throws -> PlacedItem? {
+        guard let item else { return nil }
+        switch item.kind {
+        case .file: return .file(Fingerprint(item: item))
+        case .directory: return .folder
+        case .symlink:
+            let reader = if let link { link } else { try await metadataLink() }
+            return .link(try await reader.readlink(item.path))
+        case .other: return .other
+        }
+    }
+
+    /// The server's twin of `settleLocally`: where `incoming` lands at `proposed`, where `found`
+    /// is, and what holds that spot; nil to skip it.
+    private func settleRemotely(_ incoming: PlacedItem, at proposed: RemotePath, found: RemoteItem?) async throws -> (path: RemotePath, found: PlacedItem?)? {
+        let there = try await placedItem(found)
+        switch Placement.settle(incoming, onto: there) {
+        case .write, .merge:
+            return (proposed, there)
+        case .skip:
+            return nil
+        case .typeMismatch:
+            throw TransferError.typeMismatch(proposed.display)
+        case .collide:
+            switch try await collisionChoice(for: proposed.name) {
+            case .skip:
+                return nil
+            case .replace:
+                return (proposed, there)
+            case .keepBoth:
+                let parent = proposed.parent ?? RemotePath(string: "/")
+                let name = Placement.keepBoth(proposed.name, among: try await listedNames(parent))
+                return (parent.appending(name: Array(name.utf8)), nil)
+            }
+        }
+    }
+
+    /// The server folder a folder merges into or is made as; nil to skip it. A link or special
+    /// file in the way goes only when the user chose Replace, and a folder never does.
+    private func remoteFolder(_ path: RemotePath, found: RemoteItem?) async throws -> RemotePath? {
+        guard let spot = try await settleRemotely(.folder, at: path, found: found) else { return nil }
+        if spot.found == .folder { return spot.path }
+        let link = try await metadataLink()
+        if spot.found != nil { try await link.removeFile(spot.path) }
+        try await link.mkdir(spot.path)
+        return spot.path
+    }
+
+    /// A link is copied as a link, settled like a file: the same link is kept, anything else is
+    /// asked about, and Replace swaps it in with one rename.
+    private func remoteLink(_ target: String, at destination: RemotePath, found: RemoteItem?) async throws {
+        guard let spot = try await settleRemotely(.link(target), at: destination, found: found) else { return }
+        let link = try await metadataLink()
+        guard spot.found != nil else { return try await link.symlink(target: target, link: spot.path) }
+        try await withRemoteTemp(for: spot.path) { temp in
+            try await link.symlink(target: target, link: temp)
+            try await link.replace(temp, onto: spot.path)
+        }
     }
 
     /// Temp-and-rename on the server, keeping the source's mode and time so a later copy of the
     /// same file is skipped. `copy-data` when the server has it; else down to the Mac and back.
-    private func copyFile(_ item: RemoteItem, to proposed: RemotePath) async throws {
-        guard let placed = try await resolvedDestination(size: item.size ?? 0, mtime: item.mtime ?? 0, proposed: proposed) else { return }
-        let parent = placed.parent ?? RemotePath(string: "/")
-        let temp = parent.appending(name: Array(CopyRules.tempName(for: placed.name, transferID: UUID().uuidString).utf8))
-        store.rememberTemp(temp.display, connection: connection.id)
-        do {
+    private func copyFile(_ item: RemoteItem, to placed: RemotePath) async throws {
+        try await withRemoteTemp(for: placed) { temp in
             let onServer = try await withData { link in
                 guard await link.extensions.contains("copy-data") else { return false }
                 try await link.copyData(item.path, to: temp)
@@ -386,7 +422,19 @@ extension SSHConnection {
             let link = try await metadataLink()
             try? await link.setstat(temp, mode: item.mode.map { $0 & 0o7777 }, mtime: item.mtime)
             try await link.replace(temp, onto: placed)
+        }
+    }
+
+    /// Runs `body` on a hidden temp beside `placed`, recorded so a later login removes it if this
+    /// run cannot. `body` writes the temp and renames it into place.
+    private func withRemoteTemp<T>(for placed: RemotePath, _ body: (RemotePath) async throws -> T) async throws -> T {
+        let parent = placed.parent ?? RemotePath(string: "/")
+        let temp = parent.appending(name: Array(CopyRules.tempName(for: placed.name, transferID: UUID().uuidString).utf8))
+        store.rememberTemp(temp.display, connection: connection.id)
+        do {
+            let result = try await body(temp)
             store.forgetTemp(temp.display)
+            return result
         } catch {
             try? await metadataLink().removeFile(temp)
             store.forgetTemp(temp.display)
@@ -398,8 +446,7 @@ extension SSHConnection {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let link: SFTPChannel
-                    if let walker = await self.liveLink(.walker) { link = walker } else { link = try await self.metadataLink() }
+                    let link = try await self.walkerLink()
                     let item = try await link.lstat(root)
                     continuation.yield(("", TreeEntry(item)))
                     if item.kind == .directory {
@@ -501,19 +548,6 @@ extension SSHConnection {
         }
     }
 
-    private struct LocalStamp: Equatable {
-        var size: UInt64
-        var mtime: UInt32
-    }
-
-    /// Read through FileManager: `URL.resourceValues` caches per URL instance and would report stale stamps.
-    private static func stamp(_ url: URL) -> LocalStamp? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = (attributes[.size] as? NSNumber)?.uint64Value,
-              let date = attributes[.modificationDate] as? Date else { return nil }
-        return LocalStamp(size: size, mtime: SFTPTime.seconds(date))
-    }
-
     // MARK: Duplicate
 
     public func duplicate(_ path: RemotePath) async throws {
@@ -542,39 +576,6 @@ extension SSHConnection {
         return choice
     }
 
-    private func resolvedUploadDestination(_ source: URL, proposed: RemotePath) async throws -> RemotePath? {
-        let local = Self.stamp(source)
-        return try await resolvedDestination(size: local?.size ?? 0, mtime: local?.mtime ?? 0, proposed: proposed)
-    }
-
-    /// Where a file of this size and time lands at `proposed`: nil to skip it, else the path to
-    /// write, after asking the user when a different file already has the name.
-    private func resolvedDestination(size: UInt64, mtime: UInt32, proposed: RemotePath) async throws -> RemotePath? {
-        let sourceItem = RemoteItem(path: proposed, kind: .file, size: size, mtime: mtime)
-        let existing = try? await stat(proposed)
-        switch CopyRules.fileDisposition(source: sourceItem, destination: existing) {
-        case .skip:
-            return nil
-        case .typeMismatch:
-            throw TransferError.typeMismatch(proposed.display)
-        case .write:
-            return proposed
-        case .collide:
-            let choice = try await collisionChoice(for: sourceItem.name)
-            switch choice {
-            case .skip:
-                return nil
-            case .replace:
-                return proposed
-            case .keepBoth:
-                let parent = proposed.parent ?? RemotePath(string: "/")
-                let names = try await listedNames(parent)
-                let next = KeepBothName.next(existing: names, original: sourceItem.name)
-                return parent.appending(name: Array(next.utf8))
-            }
-        }
-    }
-
     func listedNames(_ path: RemotePath) async throws -> Set<String> {
         var names: Set<String> = []
         let link = try await metadataLink()
@@ -585,23 +586,64 @@ extension SSHConnection {
     }
 }
 
-/// Byte and item counts for one directory copy, safe to bump from any task.
-final class ProgressTally: @unchecked Sendable {
-    private let lock = NSLock()
-    private var bytes: UInt64 = 0
-    private var items = 0
+/// One copy's byte and item counts and the items that failed, safe to touch from any task. A
+/// folder copy goes on past an item that fails and reports them all at the end; a cancel, a
+/// dropped connection, or a timeout ends it at once, so the operation can stop or retry.
+final class CopyTally: Sendable {
+    private struct State {
+        var bytes: UInt64 = 0
+        var items = 0
+        var failures: [(name: String, error: any Error)] = []
+    }
+
+    private let state = Locked(State())
     private let report: @Sendable (TransferProgress) -> Void
 
     init(_ report: @escaping @Sendable (TransferProgress) -> Void) {
         self.report = report
     }
 
-    func finished(bytes count: UInt64) {
-        lock.lock()
-        bytes += count
-        items += 1
-        let progress = TransferProgress(completed: bytes, itemsCompleted: items)
-        lock.unlock()
+    /// A progress handler for one file's bytes, which adds what is new since its last report, so
+    /// a large file inside a folder moves the bar as it goes.
+    func file() -> @Sendable (TransferProgress) -> Void {
+        let seen = Locked<UInt64>(0)
+        return { [self] progress in
+            let added = seen.withLock { last in
+                defer { last = max(last, progress.completed) }
+                return progress.completed > last ? progress.completed - last : 0
+            }
+            add(bytes: added, items: 0)
+        }
+    }
+
+    /// An item is done: copied, or skipped as already there. `bytes` are those not reported as they went.
+    func finished(bytes: UInt64 = 0) {
+        add(bytes: bytes, items: 1)
+    }
+
+    /// Records that `name` failed and lets the copy go on, or rethrows an error that ends it.
+    func failed(_ name: String, _ error: any Error) throws {
+        if error is CancellationError || RetryPolicy.isRetryable(error) { throw error }
+        if let error = error as? TransferError, error == .cancelled || error == .notConnected { throw error }
+        state.withLock { $0.failures.append((name, error)) }
+    }
+
+    /// Throws the one failure as it was, or one error that names them all.
+    func check() throws {
+        let failures = state.value.failures
+        guard let first = failures.first else { return }
+        if failures.count == 1 { throw first.error }
+        let shown = failures.prefix(3).map { "“\($0.name)”" }.joined(separator: ", ")
+        let more = failures.count > 3 ? " and \(failures.count - 3) more" : ""
+        throw TransferError.failed("\(failures.count) items could not be copied: \(shown)\(more). \(first.error.localizedDescription)")
+    }
+
+    private func add(bytes: UInt64, items: Int) {
+        let progress = state.withLock { state in
+            state.bytes += bytes
+            state.items += items
+            return TransferProgress(completed: state.bytes, itemsCompleted: state.items)
+        }
         report(progress)
     }
 }
