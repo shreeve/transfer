@@ -742,7 +742,7 @@ actor LiveSync {
             defer { try? FileManager.default.removeItem(at: snapshot) }
             guard Self.stamp(entry.local) == before else { throw TransferError.failed("\(entry.name) is still being written") }
             let parent = entry.path.parent ?? RemotePath(string: "/")
-            let name = Self.keepBothName(entry.name, existing: try await server.liveNames(in: parent))
+            let name = KeepBothName.fromThisMac(existing: try await server.liveNames(in: parent), original: entry.name)
             do {
                 _ = try await server.liveSave(snapshot, to: parent.appending(name: Array(name.utf8)), expecting: .absent) { _ in }
             } catch is LiveRemoteChanged {
@@ -772,13 +772,6 @@ actor LiveSync {
     }
 
     /// The first free "name (from this Mac)", "name (from this Mac 2)", … beside the server file.
-    private static func keepBothName(_ name: String, existing: Set<String>) -> String {
-        var n = 1
-        var candidate: String { n == 1 ? "\(name) (from this Mac)" : "\(name) (from this Mac \(n))" }
-        while existing.contains(candidate) { n += 1 }
-        return candidate
-    }
-
     private func compare(_ entry: Entry) async throws {
         if !FileManager.default.fileExists(atPath: entry.serverCopy.path) {
             guard let server = liveServer(for: entry.connection), let item = try await server.liveLookup(entry.path), item.kind == .file else {
