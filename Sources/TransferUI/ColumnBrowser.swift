@@ -3,7 +3,7 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
-/// The column view. It reads `BrowserModel` state through `TransferModel` and owns none of it.
+/// The column view. It reads `TransferModel` state and owns none of it.
 struct ColumnBrowser: NSViewRepresentable {
     var model: TransferModel
 
@@ -49,6 +49,10 @@ struct ColumnBrowser: NSViewRepresentable {
         weak var browser: NSBrowser?
         weak var stack: ColumnStack?
         private var root: RemotePath?
+        /// What each loaded column shows, by folder, and the only listing the browser's callbacks
+        /// read. `sync` fills it from the model and reloads a column exactly when its entry
+        /// changes, so every row AppKit asks about is a row the column was loaded with, and a
+        /// folder is sorted once per change instead of once for every row asked for.
         private var shown: [RemotePath: [RemoteItem]] = [:]
         private var syncing = false
 
@@ -59,12 +63,16 @@ struct ColumnBrowser: NSViewRepresentable {
             let newRoot = model.columnRoot ?? model.snapshot.path
             syncing = true
             defer { syncing = false }
+            var trail: [ColumnTrail.Column]?
             if root != newRoot {
+                // A new root rebuilds every column, so each one takes its selection from the
+                // trail below, exactly as after a reload; otherwise a view switch, a link to a
+                // file, or Back showed nothing selected.
                 root = newRoot
                 showsUpEntry = newRoot.parent != nil
-                shown.removeAll()
+                shown = [newRoot: listing(newRoot)]
                 browser.loadColumnZero()
-                return
+                trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
             }
             // Reloading a column makes it the last one and drops its selection, so a change to any
             // column but the last (a move out of the parent folder, say) left the location's column
@@ -76,11 +84,11 @@ struct ColumnBrowser: NSViewRepresentable {
             // longer has throws an Objective-C exception inside SwiftUI's update; AppKit catches it,
             // but the unwinding leaves the main thread's observation tracking dangling, and the next
             // observable read crashes.
-            var trail: [ColumnTrail.Column]?
+            var loaded: Set<RemotePath> = []
             var column = 0
             while column <= max(browser.lastColumn, 0) {
                 let path = self.path(forColumn: column) ?? newRoot
-                let current = children(path)
+                let current = listing(path)
                 if shown[path] != current {
                     shown[path] = current
                     browser.reloadColumn(column)
@@ -91,9 +99,12 @@ struct ColumnBrowser: NSViewRepresentable {
                         trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
                     }
                 }
+                loaded.insert(path)
                 if let trail { restoreSelection(browser, column: column, folder: path, items: current, trail: trail) }
                 column += 1
             }
+            // A folder whose column closed is read from the model afresh when it opens again.
+            shown = shown.filter { loaded.contains($0.key) }
         }
 
         /// Selects in `column` what the trail selects there, when the column still shows the
@@ -115,8 +126,10 @@ struct ColumnBrowser: NSViewRepresentable {
             }
         }
 
+        /// The folder `column` shows, or nil for a column the browser does not have. Column −1,
+        /// which AppKit proposes for the area beyond the columns, is no column.
         private func path(forColumn column: Int) -> RemotePath? {
-            guard let browser else { return nil }
+            guard let browser, column >= 0 else { return nil }
             if column == 0 { return root }
             guard column <= browser.lastColumn else { return nil }
             guard let parent = browser.parentForItems(inColumn: column) as? RemoteItem else { return nil }
@@ -139,9 +152,39 @@ struct ColumnBrowser: NSViewRepresentable {
             showsUpEntry && path == root
         }
 
+        /// What `child:ofItem:` answers for an index the folder does not have. AppKit asks about
+        /// row −1 while a drop is proposed between rows (measured); the answer is never drawn.
+        private static let noItem = RemoteItem(path: RemotePath(string: "/"), kind: .other)
+
+        /// A folder's rows as its column was loaded. The browser opens a clicked folder's column
+        /// before the model hears of the click, so a folder not shown yet is read once from the model.
+        private func entries(_ path: RemotePath) -> [RemoteItem] {
+            if let list = shown[path] { return list }
+            let list = listing(path)
+            shown[path] = list
+            return list
+        }
+
+        /// The rows of `column`, or nil for a column the browser does not have. Every index AppKit
+        /// hands a callback is checked here, before the browser is asked anything about it:
+        /// `item(atRow:inColumn:)` throws for column −1 and for a column past `lastColumn`, and
+        /// forwards row −1 to `child:ofItem:`.
+        private func rows(ofColumn column: Int) -> (up: Bool, items: [RemoteItem])? {
+            guard let browser, column >= 0, column <= browser.lastColumn, let folder = path(forColumn: column) else { return nil }
+            return (hasUpEntry(folder), entries(folder))
+        }
+
+        /// The `..` entry, a `RemoteItem`, or nil for a row or column that is not there.
+        private func entry(row: Int, column: Int) -> Any? {
+            guard row >= 0, let (up, items) = rows(ofColumn: column) else { return nil }
+            let index = up ? row - 1 : row
+            if index < 0 { return upEntry }
+            return index < items.count ? items[index] : nil
+        }
+
         func browser(_ browser: NSBrowser, numberOfChildrenOfItem item: Any?) -> Int {
             let path = path(of: item)
-            return children(path).count + (hasUpEntry(path) ? 1 : 0)
+            return entries(path).count + (hasUpEntry(path) ? 1 : 0)
         }
 
         func browser(_ browser: NSBrowser, child index: Int, ofItem item: Any?) -> Any {
@@ -151,8 +194,8 @@ struct ColumnBrowser: NSViewRepresentable {
                 if index == 0 { return upEntry }
                 index -= 1
             }
-            let list = children(path)
-            return index < list.count ? list[index] : RemoteItem(path: RemotePath(string: "/"), kind: .other)
+            let list = entries(path)
+            return list.indices.contains(index) ? list[index] : Self.noItem
         }
 
         func browser(_ browser: NSBrowser, isLeafItem item: Any?) -> Bool {
@@ -167,12 +210,8 @@ struct ColumnBrowser: NSViewRepresentable {
 
         func browser(_ browser: NSBrowser, willDisplayCell cell: Any, atRow row: Int, column: Int) {
             guard let cell = cell as? NSBrowserCell else { return }
-            if browser.item(atRow: row, inColumn: column) is UpEntry {
-                cell.image = ItemIcon.upImage
-                return
-            }
-            guard let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return }
-            cell.image = ItemIcon.image(for: item)
+            let entry = entry(row: row, column: column)
+            cell.image = entry is UpEntry ? ItemIcon.upImage : (entry as? RemoteItem).map(ItemIcon.image(for:))
         }
 
         /// The `..` row is as tall as the list view's column header, so the rows beneath it sit
@@ -189,7 +228,9 @@ struct ColumnBrowser: NSViewRepresentable {
             return root ?? model.snapshot.path
         }
 
-        private func children(_ path: RemotePath) -> [RemoteItem] {
+        /// The model's listing of a folder in column order. Read only by `sync` and for a folder
+        /// not shown yet, never per row.
+        private func listing(_ path: RemotePath) -> [RemoteItem] {
             if let cached = model.columnItems(path) { return cached }
             // Called from inside SwiftUI's update pass; the listing starts on the next turn.
             let model = model
@@ -211,14 +252,15 @@ struct ColumnBrowser: NSViewRepresentable {
         @objc func selectionChanged(_ sender: Any?) {
             guard !syncing, let browser else { return }
             let column = browser.selectedColumn
-            guard column >= 0 else { return }
+            guard let (up, list) = rows(ofColumn: column) else { return }
             let selected = browser.selectedRowIndexes(inColumn: column) ?? IndexSet()
-            if selected.contains(where: { browser.item(atRow: $0, inColumn: column) is UpEntry }) {
+            if up, selected.contains(0) {
                 let model = model
                 Task { await model.goParent() }
                 return
             }
-            let items = selected.compactMap { browser.item(atRow: $0, inColumn: column) as? RemoteItem }
+            let offset = up ? 1 : 0
+            let items = selected.compactMap { list.indices.contains($0 - offset) ? list[$0 - offset] : nil }
             let parent = path(forColumn: column) ?? model.snapshot.path
             model.selectInColumns(items, parent: parent)
         }
@@ -234,7 +276,7 @@ struct ColumnBrowser: NSViewRepresentable {
             let column = browser.clickedColumn
             let row = browser.clickedRow
             var clicked: RemoteItem?
-            if column >= 0, column <= browser.lastColumn, row >= 0, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem {
+            if let item = entry(row: row, column: column) as? RemoteItem {
                 clicked = item
                 if !model.snapshot.selection.contains(item.path) {
                     if browser.lastColumn > column { browser.lastColumn = column }
@@ -247,8 +289,10 @@ struct ColumnBrowser: NSViewRepresentable {
         }
 
         @objc func doubleClicked(_ sender: Any?) {
-            guard let browser, browser.selectedColumn >= 0,
-                  let item = browser.item(atRow: browser.selectedRow(inColumn: browser.selectedColumn), inColumn: browser.selectedColumn) as? RemoteItem
+            guard let browser else { return }
+            let column = browser.selectedColumn
+            guard column >= 0, column <= browser.lastColumn,
+                  let item = entry(row: browser.selectedRow(inColumn: column), column: column) as? RemoteItem
             else { return }
             let model = model
             Task { await model.open(item) }
@@ -261,7 +305,7 @@ struct ColumnBrowser: NSViewRepresentable {
         }
 
         func browser(_ browser: NSBrowser, pasteboardWriterForRow row: Int, column: Int) -> (any NSPasteboardWriting)? {
-            guard let session = model.session, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return nil }
+            guard let session = model.session, let item = entry(row: row, column: column) as? RemoteItem else { return nil }
             return RemoteItemPromise.provider(for: item, among: model.dragItems(including: item), session: session, prompts: model.operationPrompts())
         }
 
@@ -280,27 +324,27 @@ struct ColumnBrowser: NSViewRepresentable {
             if column.pointee < 0, RemoteDragPayload.read(from: info.draggingPasteboard) != nil { return [] }
             guard let connection = model.snapshot.connectionID else { return [] }
             // A folder row is the target only for a drop on it; between rows means the column's folder.
-            if let target = browser.item(atRow: row.pointee, inColumn: column.pointee) as? RemoteItem, target.kind == .directory {
+            if let target = entry(row: row.pointee, column: column.pointee) as? RemoteItem, target.kind == .directory {
                 dropOperation.pointee = .on
             } else {
                 row.pointee = -1
                 dropOperation.pointee = .on
             }
-            guard let folder = dropFolder(browser, row: row.pointee, column: column.pointee) else { return [] }
+            guard let folder = dropFolder(row: row.pointee, column: column.pointee) else { return [] }
             return dropAction(from: info.draggingPasteboard, onto: folder, connection: connection)?.operation ?? []
         }
 
         func browser(_ browser: NSBrowser, acceptDrop info: any NSDraggingInfo, atRow row: Int, column: Int, dropOperation: NSBrowser.DropOperation) -> Bool {
             guard let connection = model.snapshot.connectionID,
-                  let folder = dropFolder(browser, row: row, column: column),
+                  let folder = dropFolder(row: row, column: column),
                   let action = dropAction(from: info.draggingPasteboard, onto: folder, connection: connection) else { return false }
             let model = model
             Task { await model.perform(action) }
             return true
         }
 
-        private func dropFolder(_ browser: NSBrowser, row: Int, column: Int) -> RemotePath? {
-            if row >= 0, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem, item.kind == .directory {
+        private func dropFolder(row: Int, column: Int) -> RemotePath? {
+            if let item = entry(row: row, column: column) as? RemoteItem, item.kind == .directory {
                 return item.path
             }
             return column >= 0 ? path(forColumn: column) : root
