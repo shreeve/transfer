@@ -284,7 +284,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
+    /// Quit can come while Transfer is in the background (the Dock's menu, a logout), where the
+    /// alert would open behind the front app; the app comes forward first.
     private static func ask(_ question: QuitQuestion) -> Bool {
+        NSApp.activate()
         let alert = NSAlert()
         alert.messageText = question.message
         alert.informativeText = question.detail
