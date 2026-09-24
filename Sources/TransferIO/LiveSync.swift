@@ -60,6 +60,16 @@ actor LiveSync {
 
         var name: String { path.name }
         var folder: URL { local.deletingLastPathComponent() }
+
+        /// The working copy with `stamp` and `digest` holds what the server holds as `print`.
+        mutating func recordSync(_ print: Fingerprint, _ stamp: LiveStamp?, _ digest: String?) {
+            state.base = print
+            state.synced = stamp
+            state.syncedDigest = digest
+            state.pending = nil
+            pendingDigest = nil
+            state.dirty = false
+        }
         /// Named after the working copy, which keeps its name when the remote file is renamed.
         var serverCopy: URL { folder.appendingPathComponent("\(local.lastPathComponent) (server)") }
     }
@@ -276,8 +286,7 @@ actor LiveSync {
     /// or a late one for a delete already seen, and must not restart retries or a grace.
     func localChanged(_ id: LiveFileID) {
         guard let entry = entries[id], Self.stamp(entry.local) != entry.observed else { return }
-        entries[id]?.attempts = 0
-        look(id)
+        lookAgain(id)
     }
 
     // MARK: Watching
@@ -477,14 +486,7 @@ actor LiveSync {
             case .adopt(let print):
                 // Only if nothing was saved during the lookup: those bytes would go unsent.
                 guard Self.stamp(entry.local) == stamp else { return look(id) }
-                return change(id) {
-                    $0.state.base = print
-                    $0.state.synced = stamp
-                    $0.state.syncedDigest = $0.pendingDigest
-                    $0.state.pending = nil
-                    $0.pendingDigest = nil
-                    $0.state.dirty = false
-                }
+                return change(id) { $0.recordSync(print, stamp, $0.pendingDigest) }
             case .failRetryable(let reason): return retry(id, reason: reason)
             case .conflict(let kind): return await raiseConflict(id, kind: kind, item: item)
             case .upload(let base):
@@ -562,11 +564,7 @@ actor LiveSync {
             }
             guard let saved = update(id, {
                 $0.uploading = false
-                $0.state.base = print
-                $0.state.synced = before
-                $0.state.syncedDigest = digest
-                $0.state.pending = nil
-                $0.pendingDigest = nil
+                $0.recordSync(print, before, digest)
                 $0.state.dirty = Self.stamp($0.local) != before
                 $0.attempts = 0
             }) else { return .done }
@@ -667,12 +665,7 @@ actor LiveSync {
     /// The working copy now holds the server's `print`, with this stamp and digest: record it as synced.
     private func adopt(_ id: LiveFileID, server print: Fingerprint, stamp: LiveStamp?, digest: String?) {
         update(id) {
-            $0.state.base = print
-            $0.state.synced = stamp
-            $0.state.syncedDigest = digest
-            $0.state.pending = nil
-            $0.pendingDigest = nil
-            $0.state.dirty = false
+            $0.recordSync(print, stamp, digest)
             $0.state.conflict = false
             $0.conflict = nil
             $0.missingSeen = false
@@ -771,7 +764,6 @@ actor LiveSync {
         throw TransferError.failed("\(entry.name) was saved again meanwhile; its conflict stays")
     }
 
-    /// The first free "name (from this Mac)", "name (from this Mac 2)", … beside the server file.
     private func compare(_ entry: Entry) async throws {
         if !FileManager.default.fileExists(atPath: entry.serverCopy.path) {
             guard let server = liveServer(for: entry.connection), let item = try await server.liveLookup(entry.path), item.kind == .file else {
@@ -838,18 +830,18 @@ actor LiveSync {
     /// Changes a record and stores it. Nil, and no change, when it is gone.
     @discardableResult
     private func update(_ id: LiveFileID, _ body: (inout Entry) -> Void) -> Entry? {
-        guard var entry = entries[id] else { return nil }
-        body(&entry)
-        entries[id] = entry
+        guard let entry = mark(id, body) else { return nil }
         store.saveLive(Self.row(entry))
         return entry
     }
 
     /// Changes what only memory keeps (upload, retry, and missing bookkeeping); nothing is stored.
-    private func mark(_ id: LiveFileID, _ body: (inout Entry) -> Void) {
-        guard var entry = entries[id] else { return }
+    @discardableResult
+    private func mark(_ id: LiveFileID, _ body: (inout Entry) -> Void) -> Entry? {
+        guard var entry = entries[id] else { return nil }
         body(&entry)
         entries[id] = entry
+        return entry
     }
 
     private func change(_ id: LiveFileID, _ body: (inout Entry) -> Void) {
