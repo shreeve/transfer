@@ -377,6 +377,24 @@ struct TransferServerTests {
         }
     }
 
+    /// A temp is named ".<name>.transfer-<UUID>", 47 bytes longer than the name, so a file whose
+    /// name took more than 208 of the 255 bytes a name may have could not be copied either way
+    /// (R-T5). The name in the temp is cut to fit, and a long name goes up and down whole.
+    @Test func aNameNearTheLimitGoesBothWays() async throws {
+        try await withHarness("long", connected: true) { h in
+            let name = String(repeating: "a", count: 246) + ".txt"
+            #expect(name.utf8.count == 250)
+            try Data("long".utf8).write(to: h.staging.appendingPathComponent(name))
+            let remote = h.remotePath.appending(name: Array(name.utf8))
+            try await h.session.upload(h.staging.appendingPathComponent(name), to: remote) { _ in }
+            #expect(try FileManager.default.contentsOfDirectory(atPath: h.remote.path) == [name])
+            let down = h.staging.appendingPathComponent("down")
+            try FileManager.default.createDirectory(at: down, withIntermediateDirectories: true)
+            try await h.session.download(remote, to: down.appendingPathComponent(name)) { _ in }
+            #expect(try Data(contentsOf: down.appendingPathComponent(name)) == Data("long".utf8))
+        }
+    }
+
     /// A copy into a folder already there decides from one listing of it (PERF-03), so a name the
     /// listing did not hold may be taken by the time the file lands: the rename then refuses
     /// instead of replacing it. A name held in another case on a case-insensitive disk is still

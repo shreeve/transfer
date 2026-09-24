@@ -92,8 +92,19 @@ public enum KeepBothName {
 }
 
 public enum CopyRules {
+    /// The hidden temp beside `basename`: ".notes.txt.transfer-<id>". The name in it is cut, never
+    /// inside a character, so the temp fits the 255 bytes a file name may take even when
+    /// `basename` nearly does.
     public static func tempName(for basename: String, transferID: String) -> String {
-        ".\(basename).transfer-\(transferID)"
+        let suffix = ".transfer-\(transferID)"
+        var room = 255 - 1 - suffix.utf8.count
+        var kept = String.UnicodeScalarView()
+        for scalar in basename.unicodeScalars {
+            room -= scalar.utf8.count
+            guard room >= 0 else { break }
+            kept.append(scalar)
+        }
+        return ".\(String(kept))\(suffix)"
     }
 }
 

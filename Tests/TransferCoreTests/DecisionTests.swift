@@ -64,6 +64,19 @@ import Testing
     #expect(KeepBothName.next(existing: [], original: "Makefile") == "Makefile 2")
 }
 
+/// A temp added 47 bytes to its file's name, past the 255 a name may have when the name took more
+/// than 208 (R-T5). The name in it is cut to fit, never inside a character.
+@Test func aTempNameFitsTheNameLimit() {
+    let id = UUID().uuidString
+    #expect(CopyRules.tempName(for: "notes.txt", transferID: id) == ".notes.txt.transfer-\(id)")
+    for name in [String(repeating: "a", count: 255), String(repeating: "é", count: 127), String(repeating: "😀", count: 63)] {
+        let temp = CopyRules.tempName(for: name, transferID: id)
+        #expect(temp.utf8.count <= 255 && temp.utf8.count > 250)
+        #expect(temp.hasSuffix(".transfer-\(id)"))
+        #expect(name.hasPrefix(temp.dropFirst().dropLast(".transfer-\(id)".count)))
+    }
+}
+
 /// New Folder and a Live conflict's Keep Both named files with their own loops, outside Core.
 @Test func everyMadeUpNameIsTheFirstFreeOne() {
     #expect(KeepBothName.untitledFolder(existing: []) == "untitled folder")
