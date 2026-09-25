@@ -2,7 +2,7 @@
 
 What changed in each release of Transfer. `Scripts/release.sh <version>` publishes that version's section as the GitHub release notes and as the notes Sparkle shows in the update dialog, and refuses to release a version that has no section here. Changes not yet released collect under Unreleased, whose heading becomes the version's when it ships.
 
-## Unreleased
+## 0.2.0 — 2026-09-24
 
 A revamp of the whole app. Transfer looks much the same, but what it does with your files is safer, logins are sturdier, copies are much faster, and a few behaviors change (listed below). The library upgrades itself on first launch.
 
