@@ -13,7 +13,7 @@ public struct LiveStamp: Hashable, Sendable {
 
     /// The whole-second view the server would record for these bytes.
     public var fingerprint: Fingerprint {
-        Fingerprint(kind: .file, size: size, mtime: SFTPTime.seconds(mtime))
+        Fingerprint(size: size, mtime: SFTPTime.seconds(mtime))
     }
 }
 
@@ -27,14 +27,20 @@ public struct LiveState: Hashable, Sendable {
     public var dirty = false
     public var paused = false
     public var conflict = false
+    /// The working copy's stamp at an upload that was sent but never confirmed. A server that
+    /// holds its fingerprint afterwards holds our own bytes: the reply was lost, not the save.
+    /// Kept in memory only: after a relaunch such a server reads as a conflict, which is safe.
+    public var pending: LiveStamp?
 
-    public init(base: Fingerprint?, synced: LiveStamp? = nil, syncedDigest: String? = nil, dirty: Bool = false, paused: Bool = false, conflict: Bool = false) {
+    public init(base: Fingerprint?, synced: LiveStamp? = nil, syncedDigest: String? = nil, dirty: Bool = false,
+                paused: Bool = false, conflict: Bool = false, pending: LiveStamp? = nil) {
         self.base = base
         self.synced = synced
         self.syncedDigest = syncedDigest
         self.dirty = dirty
         self.paused = paused
         self.conflict = conflict
+        self.pending = pending
     }
 }
 
@@ -68,6 +74,12 @@ public enum LiveConflictKind: Hashable, Sendable {
     case notAFile
 }
 
+/// What the server must hold just before a Live save's rename. Anything else makes it a conflict.
+public enum ServerExpectation: Hashable, Sendable {
+    case file(Fingerprint)
+    case absent
+}
+
 /// What a pass does next. The worker gathers facts until the decision stops asking for them.
 public enum LiveAction: Hashable, Sendable {
     case none
@@ -84,8 +96,8 @@ public enum LiveAction: Hashable, Sendable {
     case needDigest
     case needServer
     case upload(expecting: Fingerprint)
-    /// The server already holds these bytes, as when a save landed but its reply was lost:
-    /// take its fingerprint as the base, upload nothing.
+    /// The server holds our own last upload of exactly this copy, whose reply was lost: take its
+    /// fingerprint as the base, upload nothing.
     case adopt(Fingerprint)
     case refreshLocal(Fingerprint)
     case conflict(LiveConflictKind)
@@ -100,9 +112,12 @@ public enum LiveLocalChange: Hashable, Sendable {
     case needDigest
 }
 
-/// The Live sync rules as one pure function. Every pass of the Live worker asks this what to do,
-/// feeding it more facts (a digest, the server's file) until it stops asking.
+/// The Live sync rules as pure functions. Every pass of the Live worker asks `decide` what to do,
+/// feeding it more facts (a digest, the server's file) until it stops asking. The commands that
+/// run between passes (Keep Local, a removal, Discard, Remove Server, Quit) ask the helpers.
 public enum LiveDecision {
+    /// Without an exact stamp (a record older than stamps), the whole-second view is compared with
+    /// the server's, so a same-size edit within the base's second reads as unchanged.
     public static func localChange(_ state: LiveState, _ stamp: LiveStamp, digest: String?) -> LiveLocalChange {
         if let synced = state.synced {
             if stamp == synced { return .same }
@@ -111,25 +126,76 @@ public enum LiveDecision {
             guard let digest else { return .needDigest }
             return digest == known ? .touched : .changed
         }
-        // After a relaunch without an exact stamp: the whole-second view against the server's.
         guard let base = state.base else { return .changed }
-        return stamp.fingerprint == Fingerprint(kind: .file, size: base.size, mtime: base.mtime) ? .same : .changed
+        return stamp.fingerprint == base ? .same : .changed
+    }
+
+    /// Whether the working copy may hold bytes the server lacks: an edit a pass has seen, an
+    /// unresolved conflict, or an edit no pass has seen yet. `change` is nil for a missing copy;
+    /// `.needDigest` counts, since nothing has shown the bytes unchanged.
+    public static func isUnsynced(_ state: LiveState, _ change: LiveLocalChange?) -> Bool {
+        state.dirty || state.conflict || change == .changed || change == .needDigest
+    }
+
+    /// The conflict an edited copy meets when the server holds `server`, or nil when that is
+    /// unknown or still the base.
+    public static func conflictKind(for server: LiveServerFact) -> LiveConflictKind? {
+        switch server {
+        case .file(let print): .changed(print)
+        case .missing: .removed
+        case .notFile: .notAFile
+        case .notChecked, .unreachable: nil
+        }
+    }
+
+    /// What Keep Local expects the server to hold: the file seen when the conflict was raised, so
+    /// an edit made there since is not overwritten. Nil when that was not a file.
+    public static func keepLocalExpectation(_ state: LiveState, conflict: LiveConflictKind?) -> ServerExpectation? {
+        switch conflict {
+        case .changed(let print): .file(print)
+        case .removed: .absent
+        case .notAFile: nil
+        case nil: state.base.map(ServerExpectation.file) ?? .absent
+        }
+    }
+
+    /// Keep Remote when the server holds no file: the record is forgotten only when the conflict
+    /// the user answered already showed that (removed, or replaced by something not a file). A
+    /// server file that vanished after the user chose it leaves nothing to take, so the working
+    /// copy stays and the conflict is asked again.
+    public static func keepRemoteForgets(_ conflict: LiveConflictKind?, server: LiveServerFact) -> Bool {
+        switch (conflict, server) {
+        case (.removed, .missing), (.notAFile, .notFile): true
+        default: false
+        }
+    }
+
+    /// The name of a file kept beside a working copy named `name` (its "(server)" copy, a refresh
+    /// download): `prefix`, the name, `suffix`. The name is cut, on a Unicode scalar boundary, so
+    /// the whole fits the Mac's 255-byte limit, and further when the cut would give back `name`
+    /// itself, which writing the sibling would then overwrite.
+    public static func siblingName(of name: String, prefix: String = "", suffix: String) -> String {
+        var kept = name.unicodeScalars[...]
+        while true {
+            let candidate = prefix + String(String.UnicodeScalarView(kept)) + suffix
+            if candidate.utf8.count <= 255, candidate != name { return candidate }
+            guard !kept.isEmpty else { return candidate }
+            kept.removeLast()
+        }
+    }
+
+    /// A Live file whose remote path was just removed: forgotten when its copy held nothing the
+    /// server lacked, or the user chose to discard it; else kept, as removed from the server.
+    public static func afterRemoval(_ state: LiveState, _ change: LiveLocalChange?, force: Bool) -> LiveAction {
+        force || !isUnsynced(state, change) ? .forget : .conflict(.removed)
     }
 
     public static func decide(_ state: LiveState, local: LiveLocal, server: LiveServerFact, intent: LiveIntent = .sync) -> LiveAction {
-        let stamp: LiveStamp
-        let digest: String?
-        switch local {
-        case .missing(again: false):
-            return .recheckMissing
-        case .missing(again: true):
+        guard case .present(let stamp, let digest) = local else {
+            if local == .missing(again: false) { return .recheckMissing }
             return state.dirty || state.conflict ? .failMissing : .forget
-        case .present(let found, let foundDigest):
-            stamp = found
-            digest = foundDigest
         }
-        let change = localChange(state, stamp, digest: digest)
-        switch change {
+        switch localChange(state, stamp, digest: digest) {
         case .needDigest:
             return .needDigest
         case .touched:
@@ -141,20 +207,17 @@ public enum LiveDecision {
             return state.dirty ? .markClean : .none
         case .changed:
             if state.conflict || state.paused { return state.dirty ? .none : .markDirty }
-            switch server {
-            case .notChecked:
-                return .needServer
-            case .unreachable(let reason):
-                return .failRetryable(reason)
-            case .missing:
-                return .conflict(.removed)
-            case .notFile:
-                return .conflict(.notAFile)
-            case .file(let now):
+            if case .unreachable(let reason) = server { return .failRetryable(reason) }
+            if case .file(let now) = server {
+                // The base first: two saves within one second share a fingerprint, and both upload.
                 if let base = state.base, now == base { return .upload(expecting: base) }
-                if now == stamp.fingerprint { return .adopt(now) }
-                return .conflict(.changed(now))
+                // Our own unconfirmed upload landed: adopted when it was this very copy, else it
+                // is what the next upload replaces.
+                if let pending = state.pending, now == pending.fingerprint {
+                    return stamp == pending ? .adopt(now) : .upload(expecting: now)
+                }
             }
+            return conflictKind(for: server).map(LiveAction.conflict) ?? .needServer
         }
     }
 }

@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import TransferCore
+@testable import TransferCore
 
 @Test func columnTrailSelectsTheWayDownToASelectedFolder() {
     let root = RemotePath(string: "/home/u")
@@ -41,13 +41,13 @@ import TransferCore
 
 @Test func editableExtensionsOpenLive() {
     for name in ["notes.txt", "app.swift", "main.rs", "page.tsx", "config.json", "clip.rip"] {
-        #expect(EditableFile.openKind(fileName: name) == .live)
+        #expect(EditableFile.openKind(fileName: name, extensions: TransferConfig.builtIn.extensionSet) == .live)
     }
 }
 
 @Test func documentsOpenForViewing() {
     for name in ["photo.jpg", "scan.png", "book.pdf", "movie.mp4", "archive.zip"] {
-        #expect(EditableFile.openKind(fileName: name) == .view)
+        #expect(EditableFile.openKind(fileName: name, extensions: TransferConfig.builtIn.extensionSet) == .view)
     }
 }
 
@@ -59,34 +59,47 @@ import TransferCore
 @Test func duplicateUsesCopySuffix() {
     let name = KeepBothName.duplicate(existing: ["notes.txt"], original: "notes.txt")
     #expect(name == "notes copy.txt")
+    #expect(KeepBothName.duplicate(existing: ["notes copy.txt", "notes copy 2.txt"], original: "notes.txt") == "notes copy 3.txt")
+    #expect(KeepBothName.duplicate(existing: [], original: ".env") == ".env copy")
+    #expect(KeepBothName.next(existing: [], original: "Makefile") == "Makefile 2")
 }
 
-@Test func matchingSizeAndTimeSkipsTheCopy() {
-    let source = RemoteItem(path: RemotePath(string: "/a"), kind: .file, size: 4, mtime: 10)
-    let destination = RemoteItem(path: RemotePath(string: "/b"), kind: .file, size: 4, mtime: 10)
-    let decision = CopyRules.fileDisposition(source: source, destination: destination, transferID: "1", liveSave: false)
-    #expect(decision == .skip)
+/// A temp added 47 bytes to its file's name, past the 255 a name may have when the name took more
+/// than 208 (R-T5). The name in it is cut to fit, never inside a character.
+@Test func aTempNameFitsTheNameLimit() {
+    let id = UUID().uuidString
+    #expect(CopyRules.tempName(for: "notes.txt", transferID: id) == ".notes.txt.transfer-\(id)")
+    for name in [String(repeating: "a", count: 255), String(repeating: "é", count: 127), String(repeating: "😀", count: 63)] {
+        let temp = CopyRules.tempName(for: name, transferID: id)
+        #expect(temp.utf8.count <= 255 && temp.utf8.count > 250)
+        #expect(temp.hasSuffix(".transfer-\(id)"))
+        #expect(name.hasPrefix(temp.dropFirst().dropLast(".transfer-\(id)".count)))
+    }
 }
 
-@Test func probeRequiresASingleVersionLine() {
-    #expect(ProbeResult(exitCode: 0, stdout: "performance-version 1\n").enabled)
-    #expect(!ProbeResult(exitCode: 2, stdout: "performance-version 0\n").enabled)
-    #expect(!ProbeResult(exitCode: 0, stdout: "one\ntwo\n").enabled)
+/// A folder has no extension: "v1.2" duplicated was "v1 copy.2", and kept both "v1 2.2" (R-C3).
+@Test func aFolderNameIsNotSplitAtItsLastDot() {
+    #expect(KeepBothName.duplicate(existing: ["v1.2"], original: "v1.2", isFolder: true) == "v1.2 copy")
+    #expect(KeepBothName.duplicate(existing: ["v1.2", "v1.2 copy"], original: "v1.2", isFolder: true) == "v1.2 copy 2")
+    #expect(KeepBothName.next(existing: ["site.d"], original: "site.d", isFolder: true) == "site.d 2")
+    #expect(KeepBothName.next(existing: ["site.d"], original: "site.d") == "site 2.d")
 }
 
-@Test func channelRolesAreOneDataRole() {
-    #expect(ChannelRole.allCases == [.browse, .interactive, .walker, .data])
-}
-
-@Test func sftpURLOmitsThePassword() {
-    let connection = SavedConnection(name: "Box", host: "example.com", user: "ada", port: "22")
-    let url = SftpURL.string(connection: connection, path: RemotePath(string: "/work/a b.txt"))
-    #expect(url == "sftp://ada@example.com:22/work/a%20b.txt")
+/// New Folder and a Live conflict's Keep Both named files with their own loops, outside Core.
+@Test func everyMadeUpNameIsTheFirstFreeOne() {
+    #expect(KeepBothName.untitledFolder(existing: []) == "untitled folder")
+    #expect(KeepBothName.untitledFolder(existing: ["untitled folder", "untitled folder 2"]) == "untitled folder 3")
+    // The extension stays last, so the sibling opens in the same editor as the file.
+    #expect(KeepBothName.fromThisMac(existing: ["note.txt"], original: "note.txt") == "note (from this Mac).txt")
+    #expect(KeepBothName.fromThisMac(existing: ["note (from this Mac).txt"], original: "note.txt") == "note (from this Mac 2).txt")
+    #expect(KeepBothName.fromThisMac(existing: [], original: "Makefile") == "Makefile (from this Mac)")
+    #expect(KeepBothName.firstFree(existing: ["a0", "a1"], from: 0) { "a\($0)" } == "a2")
 }
 
 @Test func retriesOnlyDroppedConnectionsAndTimeouts() {
     #expect(RetryPolicy.isRetryable(TransferError.connectionLost("closed")))
     #expect(RetryPolicy.isRetryable(TransferError.timeout("stat")))
+    #expect(RetryPolicy.isRetryable(TransferError.changedOnServer("grows.bin")))
     #expect(!RetryPolicy.isRetryable(TransferError.authenticationFailed("no")))
     #expect(!RetryPolicy.isRetryable(TransferError.permissionDenied("no")))
     #expect(!RetryPolicy.isRetryable(TransferError.hostKeyRejected))
@@ -104,31 +117,6 @@ import TransferCore
     #expect(CacheEviction.victims(entries, limit: 100) == ["old"])
     #expect(CacheEviction.victims(entries, limit: 50) == ["old", "mid"])
     #expect(CacheEviction.victims(entries, limit: 200).isEmpty)
-}
-
-@Test func knownHostsFilesComeFromSSHConfig() {
-    let output = """
-    user ada
-    userknownhostsfile /Users/ada/.ssh/known_hosts /Users/ada/.ssh/known_hosts2
-    globalknownhostsfile /etc/ssh/ssh_known_hosts
-    """
-    #expect(KnownHosts.files(sshConfigOutput: output) == [
-        "/Users/ada/.ssh/known_hosts", "/Users/ada/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts",
-    ])
-}
-
-@Test func hostKeySituationComparesTypeAndKey() {
-    let stored = KnownHosts.entries(keygenOutput: """
-    # Host box found: line 3
-    box ssh-ed25519 AAAAold
-    # Host box found: line 9
-    @cert-authority box ssh-rsa AAAArsa
-    """)
-    #expect(stored.count == 2)
-    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "AAAAold"), stored: stored) == .unchanged)
-    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "AAAAnew"), stored: stored) == .changed)
-    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ecdsa-sha2-nistp256", key: "AAAAec"), stored: stored) == .firstSeen)
-    #expect(KnownHosts.situation(offered: HostKeyLine(host: "box", keyType: "ssh-ed25519", key: "x"), stored: []) == .firstSeen)
 }
 
 @Test func socketNameIsShortAndStable() {
@@ -192,13 +180,13 @@ import TransferCore
 @Test func unitsScaleToThreeCharacters() {
     #expect(Units.bytes(0) == "  0 B")
     #expect(Units.bytes(959) == "959 B")
-    #expect(Units.bytes(1000) == "1.0kB")
-    #expect(Units.bytes(14336) == " 14kB")
-    #expect(Units.bytes(999_499) == "999kB")
-    #expect(Units.bytes(999_500) == "1.0MB")
-    #expect(Units.bytes(1_500_000_000) == "1.5GB")
-    #expect(Units.scale(0.0025, unit: "s") == "2.5ms")
-    #expect(Units.scale(0.000_000_4, unit: "s") == "400ns")
+    #expect(Units.bytes(1000) == "1.0 kB")
+    #expect(Units.bytes(14336) == " 14 kB")
+    #expect(Units.bytes(999_499) == "999 kB")
+    #expect(Units.bytes(999_500) == "1.0 MB")
+    #expect(Units.bytes(1_500_000_000) == "1.5 GB")
+    #expect(Units.scale(0.0025, unit: "s") == "2.5 ms")
+    #expect(Units.scale(0.000_000_4, unit: "s") == "400 ns")
     #expect(Units.scale(.infinity, unit: "B") == "??? B")
     #expect(Units.scale(1e16, unit: "B") == "??? B")
 }
@@ -207,7 +195,7 @@ import TransferCore
     var tally = ClipTally()
     tally.add(root: .file(size: 2100))
     tally.complete = true
-    #expect(ClipText.summary(tally, name: "notes.txt") == "“notes.txt” (2.1kB)")
+    #expect(ClipText.summary(tally, name: "notes.txt") == "“notes.txt” (2.1 kB)")
 }
 
 @Test func clipTextCountsFilesInsideFolders() {
@@ -218,7 +206,7 @@ import TransferCore
     for _ in 0..<28 { tally.add(inside: .file(size: 1000)) }
     tally.add(inside: .directory)
     tally.complete = true
-    #expect(ClipText.summary(tally, name: nil) == "3 files and 1 folder (31 files in all, 31kB)")
+    #expect(ClipText.summary(tally, name: nil) == "3 files and 1 folder (31 files in all, 31 kB)")
 }
 
 @Test func clipTextForFoldersAlone() {
@@ -239,28 +227,91 @@ import TransferCore
     #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv")) == nil)
 }
 
-@Test func pasteIntoTheSameFolderMakesACopy() {
-    let file = RemotePath(string: "/srv/notes.txt")
-    #expect(PasteRules.destinationName(for: file, into: RemotePath(string: "/srv"), existing: ["notes.txt"]) == "notes copy.txt")
-    #expect(PasteRules.destinationName(for: file, into: RemotePath(string: "/tmp"), existing: ["notes.txt"]) == "notes.txt")
+/// A `..` in the destination once hid that it was inside the folder being pasted (SFC-13).
+@Test func pasteRefusalSeesThroughDotSegments() {
+    let site = RemotePath(string: "/srv/site")
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/x/../site/sub")) != nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/./site")) != nil)
+    #expect(PasteRules.refusal(sources: [RemotePath(string: "/srv/a/../site")], into: RemotePath(string: "/srv/site/b")) != nil)
+    #expect(PasteRules.refusal(sources: [site], into: RemotePath(string: "/srv/site/../site2")) == nil)
 }
 
-@Test func treeCheckFindsWhatAMoveWouldLose() {
-    let source: [String: TreeEntry] = ["": .directory, "a.txt": .file(size: 4), "sub": .directory, "sub/b": .link]
-    #expect(TreeCheck.missing(source: source, destination: source).isEmpty)
+
+@Test func moveCheckFindsWhatAMoveWouldLose() {
+    let source: [TreeKey: TreeEntry] = ["": .directory, "a.txt": .file(size: 4, mtime: 9), "sub": .directory, "sub/b": .link]
+    #expect(MoveCheck.verdict(source: source, before: [:], after: source) == .remove)
     var partial = source
-    partial["a.txt"] = .file(size: 3)
+    partial["a.txt"] = .file(size: 3, mtime: 9)
     partial["sub/b"] = nil
     partial["extra"] = .file(size: 1)
-    #expect(TreeCheck.missing(source: source, destination: partial) == ["a.txt", "sub/b"])
+    #expect(MoveCheck.verdict(source: source, before: [:], after: partial) == .incomplete(["a.txt", "sub/b"]))
+    #expect(MoveCheck.verdict(source: [:], before: [:], after: [:]) == .incomplete([""]))
+}
+
+/// A FIFO, socket, or device walked as a plain empty file once let a move pass the check with
+/// an empty file at its name, and remove the original.
+@Test func moveCheckNeverCountsASpecialFileAsCopied() {
+    #expect(TreeEntry(RemoteItem(path: RemotePath(string: "/srv/fifo"), kind: .other, size: 0, mtime: 1)) == .other)
+    let source: [TreeKey: TreeEntry] = ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .other]
+    #expect(MoveCheck.verdict(source: source, before: [:], after: source) == .incomplete(["fifo"]))
+    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .file(size: 0)]) == .incomplete(["fifo"]))
+    #expect(MoveCheck.verdict(source: ["": .other], before: [:], after: ["": .other]) == .incomplete([""]))
+    var tally = ClipTally()
+    tally.add(root: .other)
+    tally.add(root: .directory)
+    tally.add(inside: .other)
+    #expect(tally.files == 1)
+    #expect(tally.allFiles == 2)
+    #expect(tally.bytes == 0)
 }
 
 /// A move whose collision was skipped once compared the source with the file already there, and
 /// removed the source when name and size matched.
-@Test func treeCheckTellsAFileAlreadyThereFromTheCopy() {
-    let source: [String: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
-    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4, mtime: 1_700_000_000)]).isEmpty)
-    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4, mtime: 1_600_000_000)]) == [""])
-    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 4)]).isEmpty)
-    #expect(TreeCheck.missing(source: source, destination: ["": .file(size: 5, mtime: 1_700_000_000)]) == [""])
+@Test func moveCheckTellsAFileAlreadyThereFromTheCopy() {
+    let source: [TreeKey: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
+    let copy: [TreeKey: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
+    #expect(MoveCheck.verdict(source: source, before: [:], after: copy) == .remove)
+    #expect(MoveCheck.verdict(source: source, before: copy, after: copy) == .alreadyThere([""]))
+    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4, mtime: 1_600_000_000)]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4)]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 5, mtime: 1_700_000_000)]) == .incomplete([""]))
+    // A folder that was already there may be merged into; a file inside it that was there may not.
+    let tree: [TreeKey: TreeEntry] = ["": .directory, "a": .file(size: 1, mtime: 2)]
+    #expect(MoveCheck.verdict(source: tree, before: ["": .directory], after: tree) == .remove)
+    #expect(MoveCheck.verdict(source: tree, before: tree, after: tree) == .alreadyThere(["a"]))
+}
+
+/// Quit asks whenever it could lose something, including when the Live count never arrived.
+@Test func quitAsksOnlyWhenSomethingCouldBeLost() {
+    #expect(QuitQuestion(unsynced: 0, running: 0) == nil)
+    let unknown = QuitQuestion(unsynced: nil, running: 0)
+    #expect(unknown?.message == "Transfer could not check its Live files")
+    let edits = QuitQuestion(unsynced: 2, running: 1)
+    #expect(edits?.message == "2 Live files have unsynced edits")
+    #expect(edits?.detail.hasSuffix("1 transfer not yet finished will stop; a move keeps each original until its copy is complete.") == true)
+    #expect(QuitQuestion(unsynced: 0, running: 3)?.message == "3 transfers have not finished")
+    #expect(QuitQuestion(unsynced: 0, running: 1)?.message == "A transfer has not finished")
+}
+
+/// On one server a drag moves, or copies with Option; from another server it only copies. A
+/// folder never goes into itself, and moving an item into its own folder does nothing.
+@Test func aDropMovesOnOneServerAndCopiesFromAnother() {
+    let here = ConnectionID()
+    let there = ConnectionID()
+    let folder = RemotePath(string: "/srv/dest")
+    let file = RemotePath(string: "/srv/src/a.txt")
+    let beside = RemotePath(string: "/srv/dest/b.txt")
+    let above = RemotePath(string: "/srv")
+    func drop(_ paths: [RemotePath], from source: ConnectionID, copy: Bool, move: Bool) -> [RemotePath]? {
+        PasteRules.drop(paths, from: source, onto: folder, on: here, canCopy: copy, canMove: move).map(\.paths)
+    }
+    #expect(PasteRules.drop([file], from: here, onto: folder, on: here, canCopy: true, canMove: true)?.moving == true)
+    #expect(PasteRules.drop([file], from: here, onto: folder, on: here, canCopy: true, canMove: false)?.moving == false)
+    #expect(drop([file, beside, above, folder], from: here, copy: true, move: true) == [file])
+    #expect(drop([file, beside, above], from: here, copy: true, move: false) == [file, beside])
+    #expect(drop([beside], from: here, copy: true, move: true) == nil)
+    #expect(drop([file], from: here, copy: false, move: false) == nil)
+    #expect(drop([file, above], from: there, copy: true, move: true) == [file, above])
+    #expect(PasteRules.drop([file], from: there, onto: folder, on: here, canCopy: true, canMove: true)?.moving == false)
+    #expect(drop([file], from: there, copy: false, move: true) == nil)
 }

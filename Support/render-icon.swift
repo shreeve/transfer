@@ -4,7 +4,8 @@
 // white page and a yellow badge survive at 16 pixels, where the pastel icon before it washed out.
 //
 // Usage: swift Support/render-icon.swift
-// Writes Support/AppIcon.png (1024 px), Support/AppIcon.iconset, and Support/AppIcon.icns.
+// Writes Support/AppIcon.icns, the only icon file the app bundle needs. The iconset it is made
+// from is drawn in a temporary folder.
 
 import AppKit
 
@@ -114,19 +115,20 @@ func png(_ px: Int) -> Data {
     return rep.representation(using: .png, properties: [:])!
 }
 
-let iconset = support.appendingPathComponent("AppIcon.iconset", isDirectory: true)
-try? FileManager.default.removeItem(at: iconset)
+let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+let iconset = scratch.appendingPathComponent("AppIcon.iconset", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: scratch) }
 try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
 for points in [16, 32, 128, 256, 512] {
     try png(points).write(to: iconset.appendingPathComponent("icon_\(points)x\(points).png"))
     try png(points * 2).write(to: iconset.appendingPathComponent("icon_\(points)x\(points)@2x.png"))
 }
-try png(1024).write(to: support.appendingPathComponent("AppIcon.png"))
 
+let icns = support.appendingPathComponent("AppIcon.icns")
 let iconutil = Process()
 iconutil.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
-iconutil.arguments = ["-c", "icns", iconset.path, "-o", support.appendingPathComponent("AppIcon.icns").path]
+iconutil.arguments = ["-c", "icns", iconset.path, "-o", icns.path]
 try iconutil.run()
 iconutil.waitUntilExit()
 guard iconutil.terminationStatus == 0 else { fatalError("iconutil failed") }
-print("wrote AppIcon.png, AppIcon.iconset, and AppIcon.icns in \(support.path)")
+print("wrote \(icns.path)")

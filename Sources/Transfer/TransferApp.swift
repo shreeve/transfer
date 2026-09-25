@@ -5,6 +5,8 @@ import TransferCore
 import TransferIO
 import TransferUI
 
+/// The scenes, menus, and delegate (library, Sparkle, `sftp://` links, the Quit guard). The only
+/// target that sees both UI and IO; windows reach the library only through `SessionProvider`.
 @main
 struct TransferApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
@@ -16,7 +18,11 @@ struct TransferApp: App {
             if let provider = delegate.provider {
                 BrowserWindow(provider: provider)
             } else {
-                ContentUnavailableView("Transfer could not open its library", systemImage: "externaldrive.badge.xmark")
+                ContentUnavailableView(
+                    "Transfer could not open its library",
+                    systemImage: "externaldrive.badge.xmark",
+                    description: Text(delegate.libraryError ?? "")
+                )
             }
         }
         .defaultSize(width: 960, height: 640)
@@ -25,7 +31,7 @@ struct TransferApp: App {
             let connected = model?.snapshot.connectionID != nil
             let plainKeys = model?.plainKeysAvailable == true
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesButton(updater: delegate.updater.updater)
+                CheckForUpdatesButton(state: delegate.updates)
             }
             CommandGroup(replacing: .newItem) {
                 Button("New Connection…") { model?.newConnection() }
@@ -55,12 +61,12 @@ struct TransferApp: App {
                     .disabled(!connected)
                 Button("Duplicate") { Task { await model?.duplicateSelection() } }
                     .keyboardShortcut("d")
-                    .disabled(primary?.kind != .file)
+                    .disabled(primary == nil)
                 Button("Rename") { model?.beginRename() }
                     .keyboardShortcut(.return, modifiers: [])
                     .disabled(primary == nil || !plainKeys)
                 Button("Forget Synced Live Files") { Task { await model?.forgetSyncedLive() } }
-                    .disabled(model?.liveFiles.contains { !$0.dirty && !$0.uploading && !$0.conflict } != true)
+                    .disabled(model?.liveFiles.contains(where: \.isSynced) != true)
                 Button("Discard Live File") { Task { await model?.discardSelectedLive() } }
                     .disabled(model.map { m in m.liveFiles.contains { m.snapshot.selection.contains($0.path) } } != true)
             }
@@ -190,13 +196,8 @@ struct BrowserWindow: View {
     }
 }
 
-/// "Check for Updates…" is enabled only while Sparkle can check.
 struct CheckForUpdatesButton: View {
-    @State private var state: UpdaterState
-
-    init(updater: SPUUpdater) {
-        _state = State(initialValue: UpdaterState(updater: updater))
-    }
+    let state: UpdaterState
 
     var body: some View {
         Button("Check for Updates…") { state.updater.checkForUpdates() }
@@ -204,6 +205,8 @@ struct CheckForUpdatesButton: View {
     }
 }
 
+/// Whether Sparkle can check now. One for the app, owned by the delegate: the menu's body runs
+/// on every focus change, and each run would otherwise start another observation.
 @MainActor
 @Observable
 final class UpdaterState {
@@ -223,39 +226,92 @@ final class UpdaterState {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let provider: TransferHub?
-    /// Sparkle reads SUFeedURL and SUPublicEDKey from Info.plist and checks on its own schedule.
-    /// Until a public key is in the plist the updater stays off, so a development build never
-    /// shows Sparkle's "not configured" alert at launch.
+    /// Why the library could not be opened, such as one written by a newer Transfer.
+    let libraryError: String?
+    /// Reads SUFeedURL and SUPublicEDKey from Info.plist and checks on its own schedule. Off until
+    /// the plist has a public key, so a development build never shows the "not configured" alert.
     let updater = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    let updates: UpdaterState
 
     override init() {
-        provider = try? TransferHub()
+        do {
+            provider = try TransferHub()
+            libraryError = nil
+        } catch {
+            provider = nil
+            libraryError = error.localizedDescription
+        }
+        updates = UpdaterState(updater: updater.updater)
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         WindowFrames.launchFinished()
+        if let libraryError {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Transfer could not open its library"
+            alert.informativeText = libraryError
+            alert.addButton(withTitle: "Quit")
+            alert.runModal()
+            NSApp.terminate(nil)
+            return
+        }
         let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String ?? ""
         if !key.isEmpty { updater.startUpdater() }
     }
 
     /// `sftp://` links, such as a Command-click on one a terminal shows.
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls {
-            if let link = SftpLink(url: url) { LinkInbox.deliver(link) }
-        }
+        urls.compactMap(SFTPURL.init(url:)).forEach(LinkInbox.deliver)
     }
 
+    /// Asks before quitting abandons unsynced Live edits or running transfers. The hub's actor may
+    /// be busy (say, hashing a large working copy), so the Live count gets a time limit off the
+    /// main thread, and a late count asks too. Every master disconnects before the reply.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let provider else { return .terminateNow }
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = CountBox()
-        Task.detached {
-            box.value = await provider.unsyncedLiveCount
-            semaphore.signal()
+        let running = TransferModel.unfinishedOperations
+        Task {
+            let unsynced = await Self.within(.seconds(3)) { await provider.unsyncedLiveCount }
+            if let question = QuitQuestion(unsynced: unsynced, running: running), !Self.ask(question) {
+                sender.reply(toApplicationShouldTerminate: false)
+                return
+            }
+            _ = await Self.within(.seconds(5)) { await provider.disconnectAll() }
+            sender.reply(toApplicationShouldTerminate: true)
         }
-        _ = semaphore.wait(timeout: .now() + 3)
-        return QuitGuard.mayQuit(unsynced: box.value) ? .terminateNow : .terminateCancel
+        return .terminateLater
+    }
+
+    /// Quit can come while Transfer is in the background (the Dock's menu, a logout), where the
+    /// alert would open behind the front app; the app comes forward first.
+    private static func ask(_ question: QuitQuestion) -> Bool {
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.messageText = question.message
+        alert.informativeText = question.detail
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Quit Anyway")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    /// `work`'s result, or nil once `limit` passes first. The work is not waited for after that.
+    private static func within<T: Sendable>(_ limit: Duration, _ work: @escaping @Sendable () async -> T) async -> T? {
+        await withCheckedContinuation { continuation in
+            let pending = Locked<CheckedContinuation<T?, Never>?>(continuation)
+            let finish: @Sendable (T?) -> Void = { value in
+                pending.withLock { waiting in
+                    waiting?.resume(returning: value)
+                    waiting = nil
+                }
+            }
+            Task { finish(await work()) }
+            Task {
+                try? await Task.sleep(for: limit)
+                finish(nil)
+            }
+        }
     }
 
     // Last in the responder chain: Copy and Paste for a window whose content holds no focus.
@@ -269,18 +325,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         default: true
         }
     }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        guard let provider else { return }
-        let semaphore = DispatchSemaphore(value: 0)
-        Task.detached {
-            await provider.disconnectAll()
-            semaphore.signal()
-        }
-        _ = semaphore.wait(timeout: .now() + 5)
-    }
-}
-
-private final class CountBox: @unchecked Sendable {
-    var value = 0
 }

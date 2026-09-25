@@ -6,7 +6,7 @@ import Foundation
 /// status, or a reply with no bytes, says the file ends there.
 public struct ReadPlan: Sendable {
     public let size: UInt64
-    public let chunk: UInt32
+    public static let chunk: UInt32 = 65_536
     /// Bytes written so far. The ranges never overlap, so this is also how much of the file is
     /// covered.
     public private(set) var received: UInt64 = 0
@@ -15,9 +15,8 @@ public struct ReadPlan: Sendable {
     private var ended = false
     private var furthest: UInt64 = 0
 
-    public init(size: UInt64, chunk: UInt32 = 65_536) {
+    public init(size: UInt64) {
         self.size = size
-        self.chunk = chunk
     }
 
     /// The next range to ask for: the rest of a short reply first, then fresh ranges until the
@@ -25,7 +24,7 @@ public struct ReadPlan: Sendable {
     public mutating func nextRequest() -> (offset: UInt64, length: UInt32)? {
         if !remainders.isEmpty { return remainders.removeFirst() }
         guard !ended, next < size else { return nil }
-        let length = UInt32(min(UInt64(chunk), size - next))
+        let length = UInt32(min(UInt64(Self.chunk), size - next))
         defer { next += UInt64(length) }
         return (next, length)
     }

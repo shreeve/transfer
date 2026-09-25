@@ -7,38 +7,64 @@
 #   ~/.config/transfer/host  (one line: the Mac's ssh alias for this machine)
 #   the address this ssh session arrived on
 # Transfer matches it to a saved server by alias, by `ssh -G` host name, or by address.
+#
+# Plain POSIX sh, so it runs the same under sh, dash, bash, zsh, and BusyBox, and needs no
+# python. (No variable is named `path`: zsh ties it to PATH.)
 set -e
 
-path=$(realpath -- "${1:-.}")
-host=${LC_TRANSFER_HOST:-}
-[ -n "$host" ] || host=$(head -n 1 "$HOME/.config/transfer/host" 2>/dev/null || true)
-[ -n "$host" ] || host=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $3}')
-if [ -z "$host" ]; then
-  echo "xfer: not in an ssh session; put this machine's name in ~/.config/transfer/host" >&2
-  exit 1
-fi
-case $host in *:*) host="[$host]" ;; esac
+fail() { printf 'xfer: %s\n' "$1" >&2; exit 1; }
 
-# Percent-encode everything but unreserved characters and slashes.
-encode() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"
+# The absolute, symlink-free path. BusyBox and older systems may lack realpath, or refuse `--`.
+resolve() {
+  [ -e "$1" ] || fail "$1: no such file or directory"
+  realpath -- "$1" 2>/dev/null && return
+  if [ -d "$1" ]; then
+    (CDPATH='' cd -P -- "$1" && pwd -P)
   else
-    printf '%s\n' "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/#/%23/g' -e 's/?/%3F/g'
+    parent=$(CDPATH='' cd -P -- "$(dirname -- "$1")" && pwd -P) || return
+    printf '%s/%s\n' "${parent%/}" "$(basename -- "$1")"
   fi
 }
 
-url="sftp://$(encode "$(id -un)")@$host$(encode "$path")"
-link=$(printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$host:$path")
+# Percent-encode every byte but the unreserved characters and those in $2, byte by byte, so UTF-8,
+# control characters, and newlines all come out as %XX: an OSC 8 URI must be printable ASCII.
+encode() {
+  printf '%s' "$1" | od -An -v -tx1 | LC_ALL=C awk -v keep="$2" '
+    BEGIN {
+      safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~" keep
+      for (b = 32; b < 127; b++) if (index(safe, c = sprintf("%c", b))) char[sprintf("%02x", b)] = c
+    }
+    { for (i = 1; i <= NF; i++) printf "%s", ($i in char) ? char[$i] : "%" toupper($i) }
+    END { print "" }'
+}
 
-# tmux before 3.4 drops OSC 8, so it goes through tmux's passthrough. Later tmux keeps links
-# itself when its terminal-features name hyperlinks, and passes through only when
-# allow-passthrough is on.
+target=$(resolve "${1:-.}")
+host=${LC_TRANSFER_HOST:-}
+[ -n "$host" ] || host=$(head -n 1 "$HOME/.config/transfer/host" 2>/dev/null || true)
+[ -n "$host" ] || host=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $3}')
+[ -n "$host" ] || fail "not in an ssh session; put this machine's name in ~/.config/transfer/host"
+
+# An IPv6 address goes in brackets, with a zone's % written %25 (RFC 6874).
+case $host in
+  \[*) authority=$host ;;
+  *:*) authority="[$(printf '%s' "$host" | sed 's/%/%25/g')]" ;;
+  *) authority=$(encode "$host") ;;
+esac
+url="sftp://$(encode "$(id -un)")@$authority$(encode "$target" /)"
+# The text shown is for people: control characters in a name would drive the terminal.
+shown=$(printf '%s:%s' "$host" "$target" | LC_ALL=C tr '\001-\037\177' '?')
+link=$(printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$shown")
+
+# tmux before 3.4 drops OSC 8, so the link goes through tmux's passthrough, which 3.3 allows only
+# with allow-passthrough on (its default is off). Later tmux keeps links itself when its
+# terminal-features name hyperlinks, and passes through only when allow-passthrough is on.
 if [ -n "${TMUX:-}" ]; then
   passthrough=$(tmux show -gv allow-passthrough 2>/dev/null || echo old)
   if [ "$passthrough" != off ]; then
     esc=$(printf '\033')
     link=$(printf '\033Ptmux;%s\033\\' "$(printf '%s' "$link" | sed "s/$esc/$esc$esc/g")")
+  elif tmux -V 2>/dev/null | awk '{ v = $2; sub(/^[^0-9]*/, "", v); split(v, n, "."); exit !(n[1] + 0 < 3 || (n[1] == 3 && n[2] + 0 < 4)) }'; then
+    echo "xfer: this tmux drops the link unless you run: tmux set -g allow-passthrough on" >&2
   fi
 fi
 printf '%s\n' "$link"

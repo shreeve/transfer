@@ -2,14 +2,12 @@ import AppKit
 import Observation
 import TransferCore
 
-/// The app's one clipboard, shared by every window and tab. It mirrors the general pasteboard:
-/// items copied in Transfer, or files copied in Finder. Each window shows it in its clipboard bar
-/// until it is pasted with a move, replaced, or cleared with Escape.
+/// One clipboard for every window and tab, mirroring the general pasteboard (Transfer items or
+/// Finder files). Each window's bar shows it until it is moved, replaced, or cleared with Escape.
 ///
-/// Finder pastes only real file URLs. It ignores a file promise on the general pasteboard, and a
-/// lazily provided URL does not help: the system reads every new pasteboard at once (Spotlight's
-/// clipboard history), not at paste time. So items copied here are downloaded to a staging
-/// folder right after the copy, and their URLs join the pasteboard when they are complete.
+/// Finder pastes only file URLs. It ignores file promises on the general pasteboard, and a lazy URL
+/// is read at once by the system (Spotlight's clipboard history), not at paste time. So copied
+/// items download to a staging folder at once, and their URLs join the pasteboard when complete.
 @MainActor
 @Observable
 public final class Clipboard {
@@ -49,14 +47,12 @@ public final class Clipboard {
     @ObservationIgnored private var seenChangeCount = -1
     @ObservationIgnored private var written: (payload: Data, text: String)?
     @ObservationIgnored private var work: Task<Void, Never>?
-    @ObservationIgnored private var poller: Timer?
     @ObservationIgnored private var observers: [any NSObjectProtocol] = []
     @ObservationIgnored private var escapeMonitor: Any?
 
     private init() {
-        // Leftovers from a run that did not quit cleanly.
-        try? FileManager.default.removeItem(at: Self.stagingRoot)
-        try? FileManager.default.removeItem(at: Self.cacheRoot.appendingPathComponent("Paste", isDirectory: true))
+        // Empties what an earlier run left.
+        _ = Self.stagingRoot
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { Clipboard.shared.poll() }
@@ -64,17 +60,16 @@ public final class Clipboard {
         observers.append(center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { Clipboard.shared.leave() }
         })
-        // The pasteboard posts no change notification; its change count is cheap to read.
-        let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
+        // The pasteboard posts no change notification; its change count is cheap to read, and the
+        // run loop holds the timer.
+        RunLoop.main.add(Timer(timeInterval: 0.5, repeats: true) { _ in
             MainActor.assumeIsolated {
                 if NSApp.isActive { Clipboard.shared.poll() }
             }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        poller = timer
-        // Escape reaches no single responder: a toolbar button or the window itself may hold the
-        // focus, and neither turns Escape into cancelOperation. So it is watched here, and left
-        // alone for text fields, sheets, and any window that is not a browser.
+        }, forMode: .common)
+        // No responder gets Escape as cancelOperation when a button or the window has focus, so it
+        // is watched here, except in text fields, sheets, and non-browser windows. An open rename
+        // bar goes first: Escape cancels it wherever focus is, and the clip stays.
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             MainActor.assumeIsolated { Clipboard.shared.takesEscape(event) } ? nil : event
         }
@@ -82,9 +77,14 @@ public final class Clipboard {
     }
 
     private func takesEscape(_ event: NSEvent) -> Bool {
-        guard event.keyCode == 53, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty, clip != nil,
+        guard event.keyCode == 53, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty,
               let window = event.window, window.isKeyWindow, window.attachedSheet == nil,
-              ChromeController.keyWindowController != nil, !(window.firstResponder is NSText) else { return false }
+              let controller = ChromeController.keyWindowController, !(window.firstResponder is NSText) else { return false }
+        if let model = controller.model, model.renaming {
+            model.renaming = false
+            return true
+        }
+        guard clip != nil else { return false }
         clear()
         return true
     }
@@ -92,10 +92,11 @@ public final class Clipboard {
     // MARK: Copy and clear
 
     /// Puts `items` on the pasteboard, counts what they hold, and makes them ready for Finder.
-    public func copy(_ items: [RemoteItem], session: any RemoteSession, place: String) {
+    /// `prompts` answers for the staging download, the copy's own operation.
+    public func copy(_ items: [RemoteItem], session: any RemoteSession, place: String, prompts: any PromptSink) {
         guard !items.isEmpty else { return }
         reset()
-        let payload = (try? JSONEncoder().encode(RemoteDragPayload(connection: session.connection.id.rawValue, paths: items.map(\.path.bytes)))) ?? Data()
+        let payload = RemoteDragPayload.data(for: items, session: session)
         let text = items.map(\.path.display).joined(separator: "\n")
         written = (payload, text)
         write(files: [])
@@ -110,33 +111,55 @@ public final class Clipboard {
             tally: tally,
             finder: .preparing(0)
         )
-        work = Task { [weak self] in
-            await self?.countRemote(items, session: session, id: id)
-            await self?.stageForFinder(items, session: session, id: id)
+        work = Task {
+            await OperationPrompts.$current.withValue(prompts) {
+                await countRemote(items, session: session, id: id)
+                await stageForFinder(items, session: session, id: id)
+            }
         }
     }
 
-    /// Escape and the bar's close button. Also after a move, whose sources are gone.
+    /// Escape and the bar's close button. Also after a move, whose sources are gone. Files copied
+    /// in Finder stay on the general pasteboard, which is the user's own; only the bar goes.
     public func clear() {
-        guard clip != nil else { return }
+        guard let clip else { return }
         reset()
         let pasteboard = NSPasteboard.general
+        guard case .remote = clip.source, pasteboard.changeCount == seenChangeCount else { return }
         pasteboard.clearContents()
         seenChangeCount = pasteboard.changeCount
     }
 
+    /// Clears the clip a finished move was made from, unless something else has been copied since.
+    public func clear(ifStill id: UUID) {
+        if clip?.id == id { clear() }
+    }
+
+    /// Finder pastes asynchronously and may still read a replaced or cleared clip's staged files,
+    /// so they go later. Their URLs have left the pasteboard, so no new paste can start.
     private func reset() {
         work?.cancel()
         work = nil
         written = nil
-        if let clip { try? FileManager.default.removeItem(at: Self.stagingRoot.appendingPathComponent(clip.id.uuidString)) }
+        if let clip, case .remote = clip.source {
+            let folder = Self.stagingFolder(clip.id)
+            Task.detached(priority: .utility) {
+                try? await Task.sleep(for: .seconds(600))
+                try? FileManager.default.removeItem(at: folder)
+            }
+        }
         clip = nil
     }
 
-    /// Quitting leaves no URLs behind that point into the staging folder it removes.
+    /// Quitting removes the staging folder, so the pasteboard keeps only the copied paths as
+    /// text, for a terminal, and no file URL into it.
     private func leave() {
-        if written != nil, NSPasteboard.general.changeCount == seenChangeCount { NSPasteboard.general.clearContents() }
         work?.cancel()
+        let pasteboard = NSPasteboard.general
+        if let written, pasteboard.changeCount == seenChangeCount {
+            pasteboard.clearContents()
+            pasteboard.setString(written.text, forType: .string)
+        }
         try? FileManager.default.removeItem(at: Self.stagingRoot)
     }
 
@@ -161,8 +184,7 @@ public final class Clipboard {
 
     // MARK: Watching the pasteboard
 
-    /// Another app, or Finder, changed the pasteboard: files from Finder become the clip, and
-    /// anything else clears it.
+    /// Another app changed the pasteboard: Finder files become the clip; anything else clears it.
     private func poll() {
         let pasteboard = NSPasteboard.general
         guard pasteboard.changeCount != seenChangeCount else { return }
@@ -170,60 +192,86 @@ public final class Clipboard {
         reset()
         // Remote paths written by another copy of Transfer are not ours to reach.
         guard pasteboard.data(forType: remoteDragType) == nil else { return }
-        let urls = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        let urls = pasteboard.fileURLs
         guard !urls.isEmpty else { return }
         let id = UUID()
         clip = Clip(id: id, source: .finder(urls), name: urls.count == 1 ? urls[0].lastPathComponent : nil, tally: ClipTally(), finder: .notNeeded)
-        let box = TallyBox()
-        work = Task { [weak self] in
-            await self?.publishing(box, to: id) {
-                await Task.detached {
+        let box = Locked(ClipTally())
+        work = Task {
+            await publishing(box, to: id) {
+                // Off the main thread, and stopped when the clip is: copying a whole disk in
+                // Finder must not leave a walk running after the next copy replaces it.
+                let walk = Task.detached {
+                    let manager = FileManager.default
                     for url in urls {
-                        guard !Task.isCancelled else { return }
-                        LocalTree.walk(url) { key, entry in
-                            if key.isEmpty { box.update { $0.add(root: entry) } } else { box.update { $0.add(inside: entry) } }
+                        guard let attributes = try? manager.attributesOfItem(atPath: url.path) else { continue }
+                        let root = TreeEntry(attributes)
+                        box.withLock { $0.add(root: root) }
+                        guard root == .directory, let enumerator = manager.enumerator(atPath: url.path) else { continue }
+                        while !Task.isCancelled, enumerator.nextObject() != nil {
+                            if let attributes = enumerator.fileAttributes { box.withLock { $0.add(inside: TreeEntry(attributes)) } }
                         }
                     }
-                }.value
+                }
+                await withTaskCancellationHandler { await walk.value } onCancel: { walk.cancel() }
             }
-            self?.update(id) { $0.tally.complete = true }
+            if !Task.isCancelled { update(id) { $0.tally.complete = true } }
         }
     }
 
     // MARK: Counting and staging
 
+    /// Counts what the copied folders hold, shown at most every 0.2 s. A folder that cannot be
+    /// walked leaves the count incomplete and Finder without a copy (the 1 GB limit and paste
+    /// progress need the whole count), as do names this Mac's disk would merge.
     private func countRemote(_ items: [RemoteItem], session: any RemoteSession, id: UUID) async {
-        let folders = items.filter { $0.kind == .directory }
-        guard !folders.isEmpty, let start = clip?.tally else { return }
-        let box = TallyBox(start)
-        await publishing(box, to: id) {
-            for folder in folders {
-                try? await session.walkTree(folder.path) { key, entry in
-                    if !key.isEmpty { box.update { $0.add(inside: entry) } }
+        guard var tally = clip?.tally else { return }
+        var clash = NameClash(ignoringCase: Self.diskIgnoresCase)
+        var shown = ContinuousClock.now
+        for item in items {
+            let root = TreeKey(bytes: item.path.nameBytes)
+            clash.add(root)
+            guard item.kind == .directory else { continue }
+            do {
+                for try await (key, entry) in session.walkTree(item.path) where !key.bytes.isEmpty {
+                    tally.add(inside: entry)
+                    clash.add(root.appending(key.bytes))
+                    if shown.duration(to: .now) >= .milliseconds(200) {
+                        update(id) { $0.tally = tally }
+                        shown = .now
+                    }
                 }
+            } catch {
+                if !Task.isCancelled {
+                    update(id) {
+                        $0.tally = tally
+                        $0.finder = .failed("could not count “\(item.name)”: \(error.localizedDescription)")
+                    }
+                }
+                return
             }
         }
-        update(id) { $0.tally.complete = true }
+        update(id) {
+            $0.tally = tally
+            $0.tally.complete = true
+            if let (first, second) = clash.found {
+                $0.finder = .failed("“\(first)” and “\(second)” differ only in case or accents, and this Mac's disk cannot hold both")
+            }
+        }
     }
 
     /// Downloads the clip into its own staging folder, then adds the file URLs to the pasteboard,
     /// unless something else has been copied in the meantime.
     private func stageForFinder(_ items: [RemoteItem], session: any RemoteSession, id: UUID) async {
-        guard let clip, clip.id == id, !Task.isCancelled else { return }
+        guard let clip, clip.id == id, case .preparing = clip.finder, clip.tally.complete, !Task.isCancelled else { return }
         guard clip.tally.bytes <= Self.finderLimit else {
             update(id) { $0.finder = .tooLarge }
             return
         }
-        let folder = Self.stagingRoot.appendingPathComponent(id.uuidString, isDirectory: true)
+        let folder = Self.stagingFolder(id)
         let total = max(clip.tally.bytes, 1)
-        let done = ByteBox()
-        let ticker = Task { [weak self] in
-            while !Task.isCancelled {
-                let fraction = min(Double(done.value) / Double(total), 0.99)
-                self?.update(id) { $0.finder = .preparing(fraction) }
-                try? await Task.sleep(for: .milliseconds(200))
-            }
-        }
+        let done = Locked<UInt64>(0)
+        let ticker = ticking { self.update(id) { $0.finder = .preparing(min(Double(done.value) / Double(total), 0.99)) } }
         defer { ticker.cancel() }
         var urls: [URL] = []
         do {
@@ -231,7 +279,7 @@ public final class Clipboard {
                 try Task.checkCancellation()
                 let url = folder.appendingPathComponent(item.name)
                 let base = done.value
-                try await session.download(item.path, to: url) { progress in done.set(base + progress.completed) }
+                try await session.download(item.path, to: url) { progress in done.value = base + progress.completed }
                 urls.append(url)
             }
         } catch {
@@ -245,18 +293,21 @@ public final class Clipboard {
     }
 
     /// Runs `body` while copying the box's tally into the clip every 0.2 s, and once at the end.
-    private func publishing(_ box: TallyBox, to id: UUID, _ body: () async -> Void) async {
-        let ticker = Task { [weak self] in
+    private func publishing(_ box: Locked<ClipTally>, to id: UUID, _ body: () async -> Void) async {
+        let ticker = ticking { self.update(id) { $0.tally = box.value } }
+        await body()
+        ticker.cancel()
+        update(id) { $0.tally = box.value }
+    }
+
+    /// Runs `tick` now and every 0.2 s until the task it returns is cancelled.
+    private func ticking(_ tick: @escaping @MainActor () -> Void) -> Task<Void, Never> {
+        Task {
             while !Task.isCancelled {
-                let tally = box.value
-                self?.update(id) { $0.tally = tally }
+                tick()
                 try? await Task.sleep(for: .milliseconds(200))
             }
         }
-        await body()
-        ticker.cancel()
-        let tally = box.value
-        update(id) { $0.tally = tally }
     }
 
     private func update(_ id: UUID, _ change: (inout Clip) -> Void) {
@@ -267,81 +318,36 @@ public final class Clipboard {
 
     // MARK: Folders
 
+    /// `~/Library/Caches/<bundle id>`, or `Caches` under the library root `TRANSFER_LIBRARY`
+    /// names, so a development build leaves the installed app's folders alone.
     nonisolated private static var cacheRoot: URL {
-        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        if let root = LibraryOverride.root { return root.appendingPathComponent("Caches", isDirectory: true) }
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Transfer", isDirectory: true)
     }
 
-    static var stagingRoot: URL { cacheRoot.appendingPathComponent("Clipboard", isDirectory: true) }
+    /// `Staging`, the clips' folder, emptied at launch. Only one copy of Transfer runs on a library
+    /// (the hub's lock on `transfer.lock`; a second copy is refused before any window, and so
+    /// before this, exists), and each library has its own cache root, so whatever is here was
+    /// left by an earlier run.
+    nonisolated static let stagingRoot: URL = {
+        let manager = FileManager.default
+        // What 0.1.7 and earlier left at the top level.
+        for old in ["Clipboard", "Paste"] { try? manager.removeItem(at: cacheRoot.appendingPathComponent(old, isDirectory: true)) }
+        let root = cacheRoot.appendingPathComponent("Staging", isDirectory: true)
+        try? manager.removeItem(at: root)
+        try? manager.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }()
 
-    /// A fresh folder for a paste between servers, which travels through this Mac.
-    nonisolated static func scratchFolder() -> URL {
-        cacheRoot.appendingPathComponent("Paste/\(UUID().uuidString)", isDirectory: true)
-    }
-}
-
-/// Walks a local file or folder the way `RemoteSession.walkTree` walks a remote one, so the
-/// two can be compared before a move removes the original.
-enum LocalTree {
-    static func walk(_ root: URL, visit: (String, TreeEntry) -> Void) {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey]
-        guard let rootEntry = entry(root, keys: keys) else { return }
-        visit("", rootEntry)
-        guard rootEntry == .directory,
-              let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: []) else { return }
-        let prefix = root.standardizedFileURL.path.count + 1
-        for case let url as URL in enumerator {
-            guard let found = entry(url, keys: keys) else { continue }
-            visit(String(url.standardizedFileURL.path.dropFirst(prefix)), found)
-        }
+    private static func stagingFolder(_ id: UUID) -> URL {
+        stagingRoot.appendingPathComponent("clip-\(id.uuidString)", isDirectory: true)
     }
 
-    static func entries(_ root: URL) -> [String: TreeEntry] {
-        var all: [String: TreeEntry] = [:]
-        walk(root) { all[$0] = $1 }
-        return all
+    /// Whether the disk that staging folders live on treats `README` and `readme` as one name, as
+    /// a Mac's disk does unless formatted case-sensitive. When it cannot be told, yes.
+    nonisolated static var diskIgnoresCase: Bool {
+        let values = try? stagingRoot.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+        return values?.volumeSupportsCaseSensitiveNames != true
     }
-
-    private static func entry(_ url: URL, keys: [URLResourceKey]) -> TreeEntry? {
-        guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
-        if values.isSymbolicLink == true { return .link }
-        if values.isDirectory == true { return .directory }
-        return .file(size: UInt64(values.fileSize ?? 0), mtime: values.contentModificationDate.map(SFTPTime.seconds))
-    }
-}
-
-/// A remote tree collected from `walkTree`'s callbacks.
-final class TreeBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var entries: [String: TreeEntry] = [:]
-
-    func add(_ key: String, _ entry: TreeEntry) {
-        lock.withLock { entries[key] = entry }
-    }
-
-    var all: [String: TreeEntry] { lock.withLock { entries } }
-
-    static func collect(_ path: RemotePath, on session: any RemoteSession) async throws -> [String: TreeEntry] {
-        let box = TreeBox()
-        try await session.walkTree(path) { box.add($0, $1) }
-        return box.all
-    }
-}
-
-private final class TallyBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var tally: ClipTally
-
-    init(_ start: ClipTally = ClipTally()) { tally = start }
-
-    func update(_ change: (inout ClipTally) -> Void) { lock.withLock { change(&tally) } }
-    var value: ClipTally { lock.withLock { tally } }
-}
-
-private final class ByteBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var bytes: UInt64 = 0
-
-    func set(_ value: UInt64) { lock.withLock { bytes = value } }
-    var value: UInt64 { lock.withLock { bytes } }
 }

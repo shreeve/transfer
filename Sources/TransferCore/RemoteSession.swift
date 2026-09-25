@@ -1,3 +1,7 @@
+// The seam between views and transport. TransferUI reaches servers only via SessionProvider and
+// RemoteSession (TransferIO: TransferHub, SSHConnection); prompts return via PromptSink, or
+// OperationPrompts for an operation's own. Also the errors, operations, events, and library root.
+
 import Foundation
 
 public enum TransferError: Error, Equatable, Sendable, LocalizedError {
@@ -9,9 +13,11 @@ public enum TransferError: Error, Equatable, Sendable, LocalizedError {
     case noSuchFile(String)
     case failed(String)
     case typeMismatch(String)
-    case performanceUnavailable
     case connectionLost(String)
     case timeout(String)
+    /// The server's file changed while it was read, so what arrived is not one version of it.
+    /// Retried, as a dropped connection is: the next attempt reads the file as it is then.
+    case changedOnServer(String)
     case liveUnsynced(Int)
 
     public var errorDescription: String? {
@@ -20,15 +26,21 @@ public enum TransferError: Error, Equatable, Sendable, LocalizedError {
         case .cancelled: "Cancelled"
         case .hostKeyRejected: "The host key was not trusted"
         case .authenticationFailed(let text): text.isEmpty ? "Login failed" : text
-        case .permissionDenied(let text): "Permission denied: \(text)"
-        case .noSuchFile(let text): "No such file: \(text)"
+        case .permissionDenied(let text): Self.labeled("Permission denied", text)
+        case .noSuchFile(let text): Self.labeled("No such file", text)
         case .failed(let text): text
         case .typeMismatch(let text): "A file and a folder share the name \(text)"
-        case .performanceUnavailable: "The fast copy engine is not available"
         case .connectionLost(let text): "Connection lost: \(text)"
         case .timeout(let text): "Timed out: \(text)"
+        case .changedOnServer(let name): "“\(name)” changed on the server while it downloaded"
         case .liveUnsynced(let count): "\(count) Live file\(count == 1 ? " has" : "s have") unsynced edits"
         }
+    }
+
+    /// `label: text`, or `text` alone when it already says it, as a server's own message does.
+    private static func labeled(_ label: String, _ text: String) -> String {
+        if text.isEmpty { return label }
+        return text.lowercased().hasPrefix(label.lowercased()) ? text : "\(label): \(text)"
     }
 }
 
@@ -53,7 +65,18 @@ public struct PromptReply: Sendable {
 public protocol PromptSink: Sendable {
     func answer(_ request: PromptRequest) async -> PromptReply
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision
-    func resolveCollision(fileName: String) async -> NameCollisionChoice
+    /// Nil when nobody can answer (the window closed): the operation then fails rather than guess.
+    func resolveCollision(fileName: String) async -> NameCollisionChoice?
+}
+
+/// Who answers one user operation's questions, such as what to do about a name already taken. A
+/// session serves every window on its server, so the sink given to `connect` answers only login
+/// prompts (passwords, host keys); an operation's prompts go to the window that started it. Each
+/// operation's body, retries included, runs in `OperationPrompts.$current.withValue(sink) { … }`,
+/// which child tasks inherit. With no sink bound, an operation meeting an existing file fails with
+/// a clear error: nothing is replaced or skipped unless someone said so.
+public enum OperationPrompts {
+    @TaskLocal public static var current: (any PromptSink)?
 }
 
 public struct TransferOperation: Identifiable, Hashable, Sendable {
@@ -101,6 +124,34 @@ public struct LiveFile: Hashable, Sendable, Identifiable {
         self.conflict = conflict
         self.uploading = uploading
     }
+
+    /// What the file is doing, the most pressing first.
+    public enum Status: Equatable, Sendable {
+        case conflict, uploading, paused, dirty, synced
+    }
+
+    public var status: Status {
+        if conflict { return .conflict }
+        if uploading { return .uploading }
+        if paused { return .paused }
+        return dirty ? .dirty : .synced
+    }
+
+    /// The working copy matches the server, so forgetting the mapping loses nothing. A paused
+    /// file with nothing unsynced counts.
+    public var isSynced: Bool { !dirty && !uploading && !conflict }
+}
+
+/// A library root in place of `~/Library/Application Support/Transfer`, from the `TRANSFER_LIBRARY`
+/// environment variable, for development builds and end-to-end tests. Under it go the SQLite
+/// library, the config, Live working copies, login scratch, and (in `Caches`) the preview cache and
+/// the clipboard's staging and scratch folders, so a build started with it never touches the
+/// installed app's library, caches, or Live files. Nil when unset or empty.
+public enum LibraryOverride {
+    public static var root: URL? {
+        guard let path = ProcessInfo.processInfo.environment["TRANSFER_LIBRARY"], !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
 }
 
 /// The library: saved servers and one session per saved server.
@@ -111,14 +162,19 @@ public protocol SessionProvider: Sendable {
     func removeConnection(_ id: ConnectionID) async throws
     func session(for id: ConnectionID) async throws -> any RemoteSession
     /// The saved server an `sftp://` link means, or nil when none does.
-    func connection(matching link: SftpLink) async -> SavedConnection?
+    func connection(matching link: SFTPURL) async -> SavedConnection?
     var unsyncedLiveCount: Int { get async }
-    func unsyncedLiveCount(for id: ConnectionID) async -> Int
     func disconnectAll() async
     /// The extensions that open Live, from the user's config file.
     func editableExtensions() async -> [String]
     /// Rewrites the config file. Open sessions pick the list up at once.
     func setEditableExtensions(_ extensions: [String]) async throws
+    /// Runs a paste or drop. Items on the destination's own server are copied there, or renamed
+    /// when moving; items on another server pass through a scratch folder on this Mac; files from
+    /// this Mac upload. Both servers must be logged in. A move removes an original, or puts a file
+    /// from this Mac in the Trash, only after checking that this move wrote a complete copy of it,
+    /// and throws `TransferKept` for any it kept. Call again with the same request to retry.
+    func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
 }
 
 /// One saved server. Views reach the server only through this protocol.
@@ -128,42 +184,45 @@ public protocol RemoteSession: Sendable {
     /// Logs in, or returns the start path at once when already logged in.
     func connect(prompts: any PromptSink) async throws -> RemotePath
     func disconnect() async
-    var performanceModeEnabled: Bool { get async }
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error>
     func stat(_ path: RemotePath) async throws -> RemoteItem
     func readlink(_ path: RemotePath) async throws -> String
+    /// What `path` finally names, through any chain of links, as the server resolves it: the item
+    /// at the server's REALPATH of `path`. A loop or a dangling link throws.
+    func resolve(_ path: RemotePath) async throws -> RemoteItem
     func mkdir(_ path: RemotePath) async throws
     func rename(_ source: RemotePath, to destination: RemotePath) async throws
-    func remove(_ path: RemotePath) async throws
+    /// Removes a file or a folder tree. While a Live file under `path` holds bytes the server
+    /// lacks, it refuses with `TransferError.liveUnsynced` and removes nothing, unless `force`:
+    /// the user was warned and chose to discard those edits. Even then a Live file is forgotten
+    /// only after the server's delete succeeded, so a failed delete keeps every edit.
+    func remove(_ path: RemotePath, force: Bool) async throws
     func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
-    func copyDirectory(from remote: RemotePath, to local: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
-    func copyDirectory(fromLocal local: URL, to remote: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func openKind(fileName: String) async -> OpenKind
     func prepareLiveFile(_ path: RemotePath) async throws -> URL
+    /// A cached copy of a file the user opened to view; no preview cancels its fetch.
     func prepareViewFile(_ path: RemotePath) async throws -> URL
+    /// Quick Look's copy: a text file as highlighted HTML.
     func preparePreview(_ path: RemotePath) async throws -> URL
+    /// The inspector's copy, also used to prefetch; a newer preview cancels its fetch. For a text
+    /// file larger than `EditableFile.previewHead`, only that much of it.
+    func prepareInspectorPreview(_ path: RemotePath) async throws -> URL
     func clearPreviewCache() async
     func discardLiveFile(_ path: RemotePath, force: Bool) async throws
     func setLivePaused(_ path: RemotePath, paused: Bool) async
     func liveFiles() async -> [LiveFile]
     func events() -> AsyncStream<SessionEvent>
-    func recents() async -> [RemotePath]
-    func remember(_ path: RemotePath) async
-    func pins() async -> [RemotePath]
-    func pin(_ path: RemotePath) async
-    func unpin(_ path: RemotePath) async
-    func duplicate(_ path: RemotePath) async throws
-    /// Copies a file, link, or folder tree to `destination` on this same server. Files are copied
-    /// on the server when it offers `copy-data`, else through the Mac. Folders merge into an
-    /// existing folder and file collisions are settled as uploads settle them.
+    func stars() async -> [RemotePath]
+    func star(_ path: RemotePath, on: Bool) async
+    /// Copies a file, link, or folder tree to `destination` on this server, on the server when it
+    /// offers `copy-data`, else via the Mac. Folders merge; file collisions settle as for uploads.
     func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
-    /// Walks `root` on the walker channel and reports every entry, the root first under the
+    /// Walks `root` on the walker channel and streams every entry, the root first under the
     /// empty key, the rest by their path relative to it.
-    func walkTree(_ root: RemotePath, visit: @escaping @Sendable (String, TreeEntry) -> Void) async throws
-    /// `.compare` opens the diff tool itself and returns nil.
+    func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, TreeEntry), Error>
+    /// `.compare` opens the diff tool itself.
     func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws
-    var unsyncedLiveCount: Int { get async }
     /// A shell command that joins the same SSH master and starts a login shell in `directory`.
     func terminalCommand(directory: RemotePath) async -> String?
 }
@@ -178,5 +237,15 @@ public enum SessionEvent: Sendable {
 }
 
 public extension RemoteSession {
-    func performanceFlag() async -> Bool { await performanceModeEnabled }
+    /// A removal that never discards unsynced Live edits.
+    func remove(_ path: RemotePath) async throws {
+        try await remove(path, force: false)
+    }
+
+    /// The whole tree `walkTree` streams, by key.
+    func tree(_ root: RemotePath) async throws -> [TreeKey: TreeEntry] {
+        var entries: [TreeKey: TreeEntry] = [:]
+        for try await (key, entry) in walkTree(root) { entries[key] = entry }
+        return entries
+    }
 }

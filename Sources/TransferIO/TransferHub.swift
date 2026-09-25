@@ -9,19 +9,37 @@ public actor TransferHub: SessionProvider {
     /// Every Live file, for every server. One per app: a connection that is replaced keeps its
     /// files, and one watcher covers them all.
     private let live: LiveSync
+    /// Held for the hub's life: one copy of Transfer per library. The launch sweeps, the temps,
+    /// and the ssh control sockets all assume no other process is using this library.
+    private let libraryLock: Int32
 
-    /// `root` defaults to `~/Library/Application Support/Transfer`.
+    /// `root` defaults to `TRANSFER_LIBRARY` (`LibraryOverride`) when that is set, else to
+    /// `~/Library/Application Support/Transfer`. Throws when another copy of Transfer has the
+    /// library open.
     public init(root: URL? = nil) throws {
+        let root = root ?? LibraryOverride.root ?? Store.standardRoot
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        libraryLock = try Self.lockLibrary(root)
         store = try Store(root: root)
         SSHConnection.removeLoginScratch(in: store.root)
         config = ConfigLoader.load(root: store.root)
         live = LiveSync(store: store)
-        for path in store.localTemps() {
-            if FileManager.default.fileExists(atPath: path) {
-                try? FileManager.default.removeItem(atPath: path)
-            }
-            store.forgetTemp(path)
+        for temp in store.localTemps() {
+            try? FileManager.default.removeItem(at: temp)
+            store.forgetTemp(local: temp)
         }
+    }
+
+    deinit { close(libraryLock) }
+
+    private static func lockLibrary(_ root: URL) throws -> Int32 {
+        let fd = open(root.appendingPathComponent("transfer.lock").path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw TransferError.failed("Transfer could not open its library at \(root.path)") }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            throw TransferError.failed("Another copy of Transfer is already open. Quit it, then open Transfer again.")
+        }
+        return fd
     }
 
     public func savedConnections() async throws -> [SavedConnection] {
@@ -30,62 +48,88 @@ public actor TransferHub: SessionProvider {
 
     public func save(_ connection: SavedConnection) async throws {
         store.save(connection)
-        if let existing = sessions[connection.id], !(await existing.isConnected) {
-            sessions[connection.id] = nil
-        }
+        // A session that is not logged in, perhaps mid-login with the old settings, is replaced
+        // and stopped, so no orphaned master finishes that login.
+        guard let existing = sessions[connection.id], !(await existing.isConnected), sessions[connection.id] === existing else { return }
+        makeSession(connection, replacing: existing)
     }
 
     public func removeConnection(_ id: ConnectionID) async throws {
-        let unsynced = await live.unsyncedCount(on: id)
-        if unsynced > 0 { throw TransferError.liveUnsynced(unsynced) }
-        await sessions[id]?.disconnect()
-        sessions[id] = nil
-        await live.close(id)
+        // Live checks, closes, and deletes the server's Live folder in one turn, so no edit can
+        // land between the check and the removal.
+        try await live.closeIfSynced(id)
+        // Out of the library first, so no caller makes a new session while this one disconnects.
         store.remove(id)
-        KeychainStore.delete(account: id.rawValue.uuidString)
-        let live = store.root.appendingPathComponent("Live/\(id.rawValue.uuidString)", isDirectory: true)
-        try? FileManager.default.removeItem(at: live)
+        KeychainStore.delete(id)
+        let session = sessions.removeValue(forKey: id)
+        await session?.disconnect()
     }
 
     public func session(for id: ConnectionID) async throws -> any RemoteSession {
+        try await sshSession(for: id)
+    }
+
+    public func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+        let destination = try await sshSession(for: request.connection)
+        var source: SSHConnection?
+        if case .server(let id, _) = request.sources, id != request.connection { source = try await sshSession(for: id) }
+        try await TransferEngine(request: request, destination: destination, progress: progress).run(from: source)
+    }
+
+    private func sshSession(for id: ConnectionID) async throws -> SSHConnection {
         guard let saved = store.connection(id) else { throw TransferError.noSuchFile("saved server") }
-        if let existing = sessions[id] {
-            if await existing.isConnected || existing.connection == saved { return existing }
-        }
-        let session = SSHConnection(connection: saved, store: store, editableExtensions: config.extensionSet, live: live)
-        sessions[id] = session
+        guard let existing = sessions[id] else { return makeSession(saved) }
+        if existing.connection == saved { return existing }
+        let connected = await existing.isConnected
+        // Another caller may have replaced it meanwhile; theirs is the one to share.
+        if let current = sessions[id], current !== existing { return current }
+        if connected { return existing }
+        return makeSession(saved, replacing: existing)
+    }
+
+    /// The new session's first login waits for `replacing` to be gone, so the old master's
+    /// teardown never reaches the new one on their shared socket path.
+    @discardableResult
+    private func makeSession(_ saved: SavedConnection, replacing old: SSHConnection? = nil) -> SSHConnection {
+        let session = SSHConnection(connection: saved, store: store, editableExtensions: config.extensionSet, live: live, replacing: old)
+        sessions[saved.id] = session
         return session
     }
 
-    public func connection(matching link: SftpLink) async -> SavedConnection? {
+    public func connection(matching link: SFTPURL) async -> SavedConnection? {
         let saved = store.connections()
         // An address in the link is compared with each server's resolved addresses; a name is not.
         let byAddress = SSHResolver.isAddress(link.host)
-        let candidates = await withTaskGroup(of: SftpLinkMatch.Candidate?.self) { group in
-            for connection in saved {
+        let candidates = await withTaskGroup(of: SFTPURL.Match.Candidate?.self) { group in
+            // Four `ssh -G` at a time, however many servers are saved.
+            var pending = saved[...]
+            func next() {
+                guard let connection = pending.popFirst() else { return }
                 group.addTask {
-                    guard let output = await SSHResolver.config(for: connection) else { return nil }
-                    let hostName = SSHConfigValues.parse(output)["hostname"] ?? connection.host
-                    let addresses = byAddress ? SSHResolver.addresses(of: hostName) : []
-                    return SftpLinkMatch.Candidate(connection: connection, sshConfigOutput: output, addresses: addresses)
+                    guard let output = await SSHResolver.config(for: connection),
+                          var candidate = SFTPURL.Match.Candidate(connection: connection, sshConfigOutput: output) else { return nil }
+                    if byAddress { candidate.addresses = await SSHResolver.addresses(of: candidate.hostName) }
+                    return candidate
                 }
             }
-            var found: [SavedConnection.ID: SftpLinkMatch.Candidate] = [:]
-            for await candidate in group { if let candidate { found[candidate.connection.id] = candidate } }
+            for _ in 0..<4 { next() }
+            var found: [SavedConnection.ID: SFTPURL.Match.Candidate] = [:]
+            for await candidate in group {
+                if let candidate { found[candidate.connection.id] = candidate }
+                next()
+            }
             // In library order, so the first saved server wins a tie.
             return saved.compactMap { found[$0.id] }
         }
-        return SftpLinkMatch.best(link, among: candidates)
+        return SFTPURL.Match.best(link, among: candidates)
     }
 
     public var unsyncedLiveCount: Int { get async { await live.unsyncedCount() } }
 
-    public func unsyncedLiveCount(for id: ConnectionID) async -> Int {
-        await live.unsyncedCount(on: id)
-    }
-
     public func disconnectAll() async {
-        for session in sessions.values { await session.disconnect() }
+        await withTaskGroup(of: Void.self) { group in
+            for session in sessions.values { group.addTask { await session.disconnect() } }
+        }
     }
 
     public func editableExtensions() async -> [String] {

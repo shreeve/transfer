@@ -3,7 +3,7 @@ import SwiftUI
 import TransferCore
 import UniformTypeIdentifiers
 
-/// The column view. It reads `BrowserModel` state through `TransferModel` and owns none of it.
+/// The column view. It reads `TransferModel` state and owns none of it.
 struct ColumnBrowser: NSViewRepresentable {
     var model: TransferModel
 
@@ -11,7 +11,6 @@ struct ColumnBrowser: NSViewRepresentable {
 
     func makeNSView(context: Context) -> ColumnStack {
         let browser = TiledBrowser()
-        browser.model = model
         browser.setCellClass(CenteredBrowserCell.self)
         browser.delegate = context.coordinator
         browser.target = context.coordinator
@@ -49,8 +48,14 @@ struct ColumnBrowser: NSViewRepresentable {
         weak var browser: NSBrowser?
         weak var stack: ColumnStack?
         private var root: RemotePath?
+        /// Each loaded column's rows by folder, the only listing browser callbacks read. `sync`
+        /// reloads a column exactly when its entry changes, so every row AppKit asks about is one
+        /// the column was loaded with, and a folder is sorted once per change, not once per row.
         private var shown: [RemotePath: [RemoteItem]] = [:]
         private var syncing = false
+        /// The model's selection as of the last `sync`, so one the model makes itself is shown.
+        private var syncedSelection: Set<RemotePath> = []
+        private let drag = RowDrag()
 
         init(model: TransferModel) { self.model = model }
 
@@ -59,28 +64,37 @@ struct ColumnBrowser: NSViewRepresentable {
             let newRoot = model.columnRoot ?? model.snapshot.path
             syncing = true
             defer { syncing = false }
+            var trail: [ColumnTrail.Column]?
             if root != newRoot {
+                // A new root rebuilds every column, each selected from the trail as after a
+                // reload; else a view switch, a link to a file, or Back showed nothing selected.
                 root = newRoot
                 showsUpEntry = newRoot.parent != nil
-                shown.removeAll()
+                shown = [newRoot: listing(newRoot)]
                 browser.loadColumnZero()
-                return
+                trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
             }
-            // Reloading a column makes it the last one and drops its selection, so a change to any
-            // column but the last (a move out of the parent folder, say) left the location's column
-            // gone and nothing selected while the model still stood in it. From the first reloaded
-            // column on, each column takes its selection back from the model's trail, which brings
-            // back the column after it.
+            // A selection the model made (a renamed item, a file Go to or a link reveals) is shown
+            // too; else it waited for the next reload, which often came first, with the old one.
+            // The browser's own clicks reach the model already shown here, and restoring them
+            // changes nothing.
+            if trail == nil, model.snapshot.selection != syncedSelection {
+                trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
+            }
+            syncedSelection = model.snapshot.selection
+            // Reloading a column makes it the last and drops its selection, so changing any but
+            // the last (say, a move out of the parent) left the location's column gone while the
+            // model still stood in it. From the first reloaded column on, each column retakes its
+            // selection from the model's trail, which brings back the column after it.
             //
-            // The last column is read again on every pass. Asking the browser about a column it no
-            // longer has throws an Objective-C exception inside SwiftUI's update; AppKit catches it,
-            // but the unwinding leaves the main thread's observation tracking dangling, and the next
-            // observable read crashes.
-            var trail: [ColumnTrail.Column]?
+            // `lastColumn` is read on every pass. Asking about a column the browser no longer has
+            // throws an Objective-C exception inside SwiftUI's update; AppKit catches it, but the
+            // unwinding leaves observation tracking dangling and the next observable read crashes.
+            var loaded: Set<RemotePath> = []
             var column = 0
             while column <= max(browser.lastColumn, 0) {
                 let path = self.path(forColumn: column) ?? newRoot
-                let current = children(path)
+                let current = listing(path)
                 if shown[path] != current {
                     shown[path] = current
                     browser.reloadColumn(column)
@@ -91,9 +105,12 @@ struct ColumnBrowser: NSViewRepresentable {
                         trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
                     }
                 }
+                loaded.insert(path)
                 if let trail { restoreSelection(browser, column: column, folder: path, items: current, trail: trail) }
                 column += 1
             }
+            // A folder whose column closed is read from the model afresh when it opens again.
+            shown = shown.filter { loaded.contains($0.key) }
         }
 
         /// Selects in `column` what the trail selects there, when the column still shows the
@@ -115,8 +132,10 @@ struct ColumnBrowser: NSViewRepresentable {
             }
         }
 
+        /// The folder `column` shows, or nil for a column the browser does not have. Column −1,
+        /// which AppKit proposes for the area beyond the columns, is no column.
         private func path(forColumn column: Int) -> RemotePath? {
-            guard let browser else { return nil }
+            guard let browser, column >= 0 else { return nil }
             if column == 0 { return root }
             guard column <= browser.lastColumn else { return nil }
             guard let parent = browser.parentForItems(inColumn: column) as? RemoteItem else { return nil }
@@ -129,9 +148,8 @@ struct ColumnBrowser: NSViewRepresentable {
             root ?? model.snapshot.path
         }
 
-        /// The `..` row at the top of the first column, shown whenever the folder has a parent.
-        /// `showsUpEntry` is a plain flag set during sync: AppKit asks for row heights inside its
-        /// layout pass, and touching observable model state there is not safe.
+        /// The first column's `..` row, if its folder has a parent. `showsUpEntry` is a plain flag
+        /// set in `sync`: row heights are asked mid-layout, where observable reads are unsafe.
         private let upEntry = UpEntry()
         private var showsUpEntry = false
 
@@ -139,9 +157,38 @@ struct ColumnBrowser: NSViewRepresentable {
             showsUpEntry && path == root
         }
 
+        /// What `child:ofItem:` answers for an index the folder does not have. AppKit asks about
+        /// row −1 while a drop is proposed between rows (measured); the answer is never drawn.
+        private static let noItem = RemoteItem(path: RemotePath(string: "/"), kind: .other)
+
+        /// A folder's rows as its column was loaded. The browser opens a clicked folder's column
+        /// before the model hears of the click, so a folder not shown yet is read once from the model.
+        private func entries(_ path: RemotePath) -> [RemoteItem] {
+            if let list = shown[path] { return list }
+            let list = listing(path)
+            shown[path] = list
+            return list
+        }
+
+        /// The rows of `column`, or nil for a column the browser lacks. Every index AppKit hands a
+        /// callback is checked here first: `item(atRow:inColumn:)` throws for column −1 and past
+        /// `lastColumn`, and forwards row −1 to `child:ofItem:`.
+        private func rows(ofColumn column: Int) -> (up: Bool, items: [RemoteItem])? {
+            guard let browser, column >= 0, column <= browser.lastColumn, let folder = path(forColumn: column) else { return nil }
+            return (hasUpEntry(folder), entries(folder))
+        }
+
+        /// The `..` entry, a `RemoteItem`, or nil for a row or column that is not there.
+        private func entry(row: Int, column: Int) -> Any? {
+            guard row >= 0, let (up, items) = rows(ofColumn: column) else { return nil }
+            let index = up ? row - 1 : row
+            if index < 0 { return upEntry }
+            return index < items.count ? items[index] : nil
+        }
+
         func browser(_ browser: NSBrowser, numberOfChildrenOfItem item: Any?) -> Int {
             let path = path(of: item)
-            return children(path).count + (hasUpEntry(path) ? 1 : 0)
+            return entries(path).count + (hasUpEntry(path) ? 1 : 0)
         }
 
         func browser(_ browser: NSBrowser, child index: Int, ofItem item: Any?) -> Any {
@@ -151,8 +198,8 @@ struct ColumnBrowser: NSViewRepresentable {
                 if index == 0 { return upEntry }
                 index -= 1
             }
-            let list = children(path)
-            return index < list.count ? list[index] : RemoteItem(path: RemotePath(string: "/"), kind: .other)
+            let list = entries(path)
+            return list.indices.contains(index) ? list[index] : Self.noItem
         }
 
         func browser(_ browser: NSBrowser, isLeafItem item: Any?) -> Bool {
@@ -167,12 +214,9 @@ struct ColumnBrowser: NSViewRepresentable {
 
         func browser(_ browser: NSBrowser, willDisplayCell cell: Any, atRow row: Int, column: Int) {
             guard let cell = cell as? NSBrowserCell else { return }
-            if browser.item(atRow: row, inColumn: column) is UpEntry {
-                cell.image = ItemIcon.upImage
-                return
-            }
-            guard let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return }
-            cell.image = ItemIcon.image(for: item)
+            let entry = entry(row: row, column: column)
+            cell.image = entry is UpEntry ? ItemIcon.upImage : (entry as? RemoteItem).map(ItemIcon.image(for:))
+            cell.setAccessibilityLabel(entry is UpEntry ? "Parent folder" : nil)
         }
 
         /// The `..` row is as tall as the list view's column header, so the rows beneath it sit
@@ -189,7 +233,8 @@ struct ColumnBrowser: NSViewRepresentable {
             return root ?? model.snapshot.path
         }
 
-        private func children(_ path: RemotePath) -> [RemoteItem] {
+        /// The model's listing in column order, read only by `sync` and for unshown folders.
+        private func listing(_ path: RemotePath) -> [RemoteItem] {
             if let cached = model.columnItems(path) { return cached }
             // Called from inside SwiftUI's update pass; the listing starts on the next turn.
             let model = model
@@ -211,44 +256,79 @@ struct ColumnBrowser: NSViewRepresentable {
         @objc func selectionChanged(_ sender: Any?) {
             guard !syncing, let browser else { return }
             let column = browser.selectedColumn
-            guard column >= 0 else { return }
+            guard let (up, list) = rows(ofColumn: column) else { return }
             let selected = browser.selectedRowIndexes(inColumn: column) ?? IndexSet()
-            if selected.contains(where: { browser.item(atRow: $0, inColumn: column) is UpEntry }) {
+            if up, selected.contains(0) {
                 let model = model
                 Task { await model.goParent() }
                 return
             }
-            let items = selected.compactMap { browser.item(atRow: $0, inColumn: column) as? RemoteItem }
+            let offset = up ? 1 : 0
+            let items = selected.compactMap { list.indices.contains($0 - offset) ? list[$0 - offset] : nil }
             let parent = path(forColumn: column) ?? model.snapshot.path
             model.selectInColumns(items, parent: parent)
         }
 
+        /// The `..` row goes to the parent folder when it is clicked, never when the keyboard
+        /// lands on it: arrowing up past the first row, or Shift-extending across it, leaves it out.
+        func browser(_ browser: NSBrowser, selectionIndexesForProposedSelection proposed: IndexSet, inColumn column: Int) -> IndexSet {
+            guard column == 0, showsUpEntry, proposed.contains(0), !Self.isClick(NSApp.currentEvent) else { return proposed }
+            let rows = proposed.subtracting(IndexSet(integer: 0))
+            return rows.isEmpty ? browser.selectedRowIndexes(inColumn: 0) ?? IndexSet() : rows
+        }
+
+        private static func isClick(_ event: NSEvent?) -> Bool {
+            switch event?.type {
+            case .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .otherMouseDown: true
+            default: false
+            }
+        }
+
         // MARK: Context menu
 
-        /// The right-clicked row joins the selection first, as a click would select it, so every
-        /// entry acts on what the menu was opened over. The `..` row and the empty area below the
-        /// rows get the folder's menu.
+        /// A right-clicked row joins the selection first, as a click would, so every entry acts on
+        /// what the menu was opened over. A column's empty area or `..` row makes its folder the
+        /// location with nothing selected, as a click there does, so New Folder, Upload, Paste,
+        /// and Copy Remote URL act on that folder, not on the deepest column.
         func menuNeedsUpdate(_ menu: NSMenu) {
             menu.removeAllItems()
             guard let browser else { return }
             let column = browser.clickedColumn
             let row = browser.clickedRow
-            var clicked: RemoteItem?
-            if column >= 0, column <= browser.lastColumn, row >= 0, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem {
-                clicked = item
-                if !model.snapshot.selection.contains(item.path) {
+            let clicked = entry(row: row, column: column) as? RemoteItem
+            if let clicked {
+                if !model.snapshot.selection.contains(clicked.path) {
                     if browser.lastColumn > column { browser.lastColumn = column }
                     browser.selectRowIndexes(IndexSet(integer: row), inColumn: column)
-                    if item.kind == .directory { browser.addColumn() }
+                    if clicked.kind == .directory { browser.addColumn() }
                     selectionChanged(nil)
                 }
+            } else {
+                showFolder(ofColumn: column, in: browser)
             }
             ItemMenu.fill(menu, item: clicked, model: model)
         }
 
+        /// Makes `column`'s folder the location, as a click on its empty area does: nothing
+        /// selected in it, no column after it, and the folder selected in the column before.
+        private func showFolder(ofColumn column: Int, in browser: NSBrowser) {
+            guard let folder = path(forColumn: column) else { return }
+            if browser.lastColumn > column { browser.lastColumn = column }
+            if browser.selectedRowIndexes(inColumn: column)?.isEmpty == false {
+                browser.selectRowIndexes(IndexSet(), inColumn: column)
+            }
+            if column > 0, let opened = browser.parentForItems(inColumn: column) as? RemoteItem, let parent = path(forColumn: column - 1) {
+                model.selectInColumns([opened], parent: parent)
+            } else {
+                model.selectInColumns([], parent: folder)
+            }
+        }
+
         @objc func doubleClicked(_ sender: Any?) {
-            guard let browser, browser.selectedColumn >= 0,
-                  let item = browser.item(atRow: browser.selectedRow(inColumn: browser.selectedColumn), inColumn: browser.selectedColumn) as? RemoteItem
+            guard let browser else { return }
+            let column = browser.selectedColumn
+            guard column >= 0, column <= browser.lastColumn,
+                  let item = entry(row: browser.selectedRow(inColumn: column), column: column) as? RemoteItem
             else { return }
             let model = model
             Task { await model.open(item) }
@@ -261,8 +341,8 @@ struct ColumnBrowser: NSViewRepresentable {
         }
 
         func browser(_ browser: NSBrowser, pasteboardWriterForRow row: Int, column: Int) -> (any NSPasteboardWriting)? {
-            guard let session = model.session, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem else { return nil }
-            return RemoteItemPromise.provider(for: item, among: model.dragItems(including: item), session: session)
+            guard let item = entry(row: row, column: column) as? RemoteItem else { return nil }
+            return drag.writer(for: item, model: model)
         }
 
         // MARK: Drop in
@@ -277,33 +357,29 @@ struct ColumnBrowser: NSViewRepresentable {
             // The browser's own empty area, outside every column, is no target for its own drag:
             // answering it with an operation makes NSBrowser cancel a drag that crosses it on the
             // way out to Finder. Files arriving from elsewhere still drop there, into this folder.
-            if column.pointee < 0, RemoteDragPayload.read(from: info.draggingPasteboard) != nil { return [] }
-            guard let connection = model.snapshot.connectionID else { return [] }
+            if column.pointee < 0, info.draggingPasteboard.types?.contains(remoteDragType) == true { return [] }
             // A folder row is the target only for a drop on it; between rows means the column's folder.
-            if let target = browser.item(atRow: row.pointee, inColumn: column.pointee) as? RemoteItem, target.kind == .directory {
-                dropOperation.pointee = .on
-            } else {
-                row.pointee = -1
-                dropOperation.pointee = .on
-            }
-            guard let folder = dropFolder(browser, row: row.pointee, column: column.pointee) else { return [] }
-            return dropAction(from: info.draggingPasteboard, onto: folder, connection: connection)?.operation ?? []
+            if (entry(row: row.pointee, column: column.pointee) as? RemoteItem)?.kind != .directory { row.pointee = -1 }
+            dropOperation.pointee = .on
+            guard let folder = dropFolder(row: row.pointee, column: column.pointee) else { return [] }
+            return dropAction(for: info, onto: folder, model: model)?.operation ?? []
         }
 
         func browser(_ browser: NSBrowser, acceptDrop info: any NSDraggingInfo, atRow row: Int, column: Int, dropOperation: NSBrowser.DropOperation) -> Bool {
-            guard let connection = model.snapshot.connectionID,
-                  let folder = dropFolder(browser, row: row, column: column),
-                  let action = dropAction(from: info.draggingPasteboard, onto: folder, connection: connection) else { return false }
+            guard let folder = dropFolder(row: row, column: column),
+                  let action = dropAction(for: info, onto: folder, model: model) else { return false }
             let model = model
             Task { await model.perform(action) }
             return true
         }
 
-        private func dropFolder(_ browser: NSBrowser, row: Int, column: Int) -> RemotePath? {
-            if row >= 0, let item = browser.item(atRow: row, inColumn: column) as? RemoteItem, item.kind == .directory {
+        /// A folder row, else the column's folder. Beyond every column it is the location, the
+        /// folder list and icon views drop into too.
+        private func dropFolder(row: Int, column: Int) -> RemotePath? {
+            if let item = entry(row: row, column: column) as? RemoteItem, item.kind == .directory {
                 return item.path
             }
-            return column >= 0 ? path(forColumn: column) : root
+            return column >= 0 ? path(forColumn: column) : model.snapshot.path
         }
     }
 }
@@ -311,22 +387,19 @@ struct ColumnBrowser: NSViewRepresentable {
 /// The `..` row's item in the column view.
 final class UpEntry: NSObject {}
 
-/// Places the browser so its right edge sits on this view's right edge and its width is never
-/// less than its columns, so the browser itself never scrolls sideways. When the columns are wider
-/// than this view, the stack begins left of it, under the floating sidebar, which the split view
-/// draws on top. This view's bounds are the visible region, the content pane's safe area, so each
-/// frame of the inspector or sidebar animation arrives as a new width and the whole stack moves
-/// as one piece: still while the columns fit, then abutting the inspector once they do not.
+/// Keeps the browser's right edge on this view's and its width at least its columns', so the
+/// browser never scrolls sideways itself. Wider columns start left of this view, under the floating
+/// sidebar, which the split view draws on top. The bounds are the visible region (the content
+/// pane's safe area), so each frame of an inspector or sidebar animation is a new width and the
+/// stack moves as one: still while the columns fit, then abutting the inspector once they do not.
 ///
-/// Columns left of the visible region are reached by panning the whole stack to the right, with
-/// Shift and a mouse wheel or a sideways swipe (`ColumnPan`), as far as the first column's left
-/// edge. A column that appears or resizes slides the stack back to rest.
+/// Shift with a wheel, or a sideways swipe, pans the stack right (`ColumnPan`) as far as the first
+/// column's left edge. A column that appears or resizes slides the stack back to rest.
 final class ColumnStack: NSView {
     let browser: TiledBrowser
     private var lastWidth: CGFloat = 0
     private var lastColumns: CGFloat = 0
-    /// How far right of its resting place the stack sits: 0 keeps the last column on this view's
-    /// right edge.
+    /// How far right of rest the stack sits; 0 keeps the last column on this view's right edge.
     private var pan: CGFloat = 0
 
     init(browser: TiledBrowser) {
@@ -341,9 +414,8 @@ final class ColumnStack: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    /// The width of every loaded column, measured from the browser's own tiling so a column the
-    /// user has resized counts at its real width. A column the browser has not tiled yet counts
-    /// at the default width, and `measured` is false so the caller asks again after tiling.
+    /// Loaded columns' width from the browser's own tiling, so resized columns count at real width.
+    /// Untiled columns count at the default width and `measured` is false, so the caller re-asks.
     private var columnsWidth: (width: CGFloat, measured: Bool) {
         let last = browser.lastColumn
         guard last >= 0 else { return (0, true) }
@@ -358,9 +430,8 @@ final class ColumnStack: NSView {
         let (columns, measured) = columnsWidth
         if !measured { DispatchQueue.main.async { [weak self] in self?.needsLayout = true } }
         let width = max(columns, visible)
-        // A column that appears or resizes while the pane is at rest slides the stack, as Finder
-        // does. While the pane itself is animating, each frame is placed directly and the split
-        // view's timing rules.
+        // A column appearing or resizing slides the stack, as in Finder, when the pane is at rest.
+        // While the pane animates, each frame is placed directly and the split view's timing rules.
         let slide = visible == lastWidth && columns != lastColumns && lastColumns > 0 && window != nil
         if columns != lastColumns { pan = 0 }
         pan = min(pan, width - visible)
@@ -395,10 +466,9 @@ final class ColumnStack: NSView {
     }
 }
 
-/// Sideways scrolling over the column view: Shift with a mouse wheel, or a swipe on a trackpad or
-/// Magic Mouse whose sideways motion outweighs its vertical. Each column is its own vertical
-/// scroll view and the browser never scrolls sideways, so nothing else would take these. One
-/// monitor for the app, as `OpenShortcut` is; vertical scrolling goes on to the columns.
+/// Sideways scrolling over the column view: Shift and a wheel, or a trackpad or Magic Mouse swipe
+/// more sideways than vertical. Columns scroll only vertically and the browser never sideways, so
+/// nothing else takes these. One monitor for the app, as `ContentKeys`; vertical passes through.
 @MainActor
 enum ColumnPan {
     private static var monitor: Any?
@@ -415,8 +485,7 @@ enum ColumnPan {
     private static func takes(_ event: NSEvent) -> Bool {
         var sideways = event.scrollingDeltaX
         let vertical = event.scrollingDeltaY
-        // macOS turns Shift and a wheel into a sideways scroll itself; should it not, the wheel's
-        // vertical motion is the sideways one.
+        // macOS turns Shift and a wheel sideways itself; if it does not, vertical motion is used.
         if sideways == 0, event.modifierFlags.contains(.shift) { sideways = vertical }
         else if abs(sideways) <= abs(vertical) { return false }
         guard sideways != 0, let stack = stack(under: event) else { return false }
@@ -433,23 +502,12 @@ enum ColumnPan {
     }
 }
 
-/// The column browser: fixed-width columns. Space opens Quick Look, as in Finder.
+/// The column browser: fixed-width columns. Space reaches Quick Look through `ContentKeys`.
 final class TiledBrowser: NSBrowser {
-    /// Columns start at this width and never reflow to fit the pane. `ColumnStack` moves the whole
-    /// set instead. Re-tiling to fit made every column visibly resize during the inspector toggle,
-    /// which read as an overlay rather than a slide.
+    /// Columns never reflow to fit the pane; `ColumnStack` moves the whole set instead. Re-tiling
+    /// made every column resize during the inspector toggle, reading as an overlay, not a slide.
     static let columnWidth: CGFloat = 260
-    weak var model: TransferModel?
-
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
-            model?.togglePreview()
-            return
-        }
-        super.keyDown(with: event)
-    }
 }
-
 
 /// Icons at 16 points, cached by kind and extension: every row of every view asks for one.
 @MainActor
@@ -465,20 +523,22 @@ enum ItemIcon {
     }()
 
     static func image(for item: RemoteItem) -> NSImage {
-        let key: String
-        switch item.kind {
-        case .directory: key = "/dir"
-        case .symlink: key = "/link"
-        case .other: key = "/other"
-        case .file: key = (item.name as NSString).pathExtension.lowercased()
+        var (key, type): (String, UTType) = switch item.kind {
+        case .directory: ("/dir", .folder)
+        case .symlink: ("/link", .symbolicLink)
+        case .other: ("/other", .item)
+        case .file: ((item.name as NSString).pathExtension.lowercased(), .data)
         }
         if let cached = cache[key] { return cached }
-        let type: UTType
-        switch item.kind {
-        case .directory: type = .folder
-        case .symlink: type = .symbolicLink
-        case .other: type = .item
-        case .file: type = UTType(filenameExtension: key) ?? .data
+        if item.kind == .file {
+            // Extensions come from the server. One the system does not know (`app.log.1`, …
+            // `.100000`) gets the generic icon under one key, so they cannot grow the cache.
+            if let known = UTType(filenameExtension: key), !known.isDynamic {
+                type = known
+            } else {
+                key = "/data"
+                if let cached = cache[key] { return cached }
+            }
         }
         let icon = NSWorkspace.shared.icon(for: type)
         icon.size = NSSize(width: 16, height: 16)
@@ -504,9 +564,8 @@ final class CenteredBrowserCell: NSBrowserCell {
     static let gap: CGFloat = 5
     static let chevronInset: CGFloat = 8
 
-    /// The `..` row's content draws 5 points high so its arrow and text land where list view's
-    /// header puts the same arrow and "Name": the column view's rows start 5 points lower than
-    /// the list's header does.
+    /// Column rows start 5 points below list view's header; lifting the `..` row as much puts its
+    /// arrow and text where that header draws the same arrow and "Name".
     static let upRowLift: CGFloat = 5
 
     override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {

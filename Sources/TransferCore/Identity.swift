@@ -1,6 +1,9 @@
+// The identities everything else is keyed by: connections, Live files, remote paths (bytes: a
+// server's names need not be UTF-8), listed items, SFTP times and fingerprints, saved servers.
+
 import Foundation
 
-public struct ConnectionID: Hashable, Sendable, Codable, RawRepresentable {
+public struct ConnectionID: Hashable, Sendable, RawRepresentable {
     public var rawValue: UUID
     public init(rawValue: UUID) { self.rawValue = rawValue }
     public init() { self.rawValue = UUID() }
@@ -12,21 +15,25 @@ public struct ConnectionID: Hashable, Sendable, Codable, RawRepresentable {
     }
 }
 
-public struct LiveFileID: Hashable, Sendable, Codable, RawRepresentable {
+public struct LiveFileID: Hashable, Sendable, RawRepresentable {
     public var rawValue: UUID
     public init(rawValue: UUID) { self.rawValue = rawValue }
     public init() { self.rawValue = UUID() }
 }
 
-public struct RemotePath: Hashable, Sendable, Codable {
-    public var bytes: [UInt8]
+/// A server path as bytes: names need not be UTF-8, and the bytes go back on the wire. Trailing
+/// slashes are dropped: `/srv/site/` is `/srv/site`, named `site`, and appending never makes `//`.
+public struct RemotePath: Hashable, Sendable {
+    public private(set) var bytes: [UInt8]
 
     public init(bytes: [UInt8]) {
+        var bytes = bytes
+        while bytes.count > 1, bytes.last == 0x2F { bytes.removeLast() }
         self.bytes = bytes
     }
 
     public init(string: String) {
-        self.bytes = Array(string.utf8)
+        self.init(bytes: Array(string.utf8))
     }
 
     public var display: String {
@@ -35,46 +42,101 @@ public struct RemotePath: Hashable, Sendable, Codable {
 
     public var isRoot: Bool { bytes == [0x2F] }
 
+    /// `name` as the last component. Leading slashes in `name` are ignored, and an empty path
+    /// stays relative: appending to it is `name` alone, never `/name` at the server's root.
     public func appending(name: [UInt8]) -> RemotePath {
-        if bytes == [0x2F] {
-            return RemotePath(bytes: [0x2F] + name)
-        }
-        return RemotePath(bytes: bytes + [0x2F] + name)
+        let name = name.drop { $0 == 0x2F }
+        return RemotePath(bytes: isRoot || bytes.isEmpty ? bytes + name : bytes + [0x2F] + name)
     }
 
+    public func appending(_ name: String) -> RemotePath {
+        appending(name: Array(name.utf8))
+    }
+
+    /// Nil for the root and for a relative path of one component.
     public var parent: RemotePath? {
-        guard bytes.count > 1 else { return nil }
-        let slash = bytes.lastIndex(of: 0x2F) ?? 0
-        if slash == 0 { return RemotePath(bytes: [0x2F]) }
-        return RemotePath(bytes: Array(bytes[..<slash]))
+        guard !isRoot, let slash = bytes.lastIndex(of: 0x2F) else { return nil }
+        return RemotePath(bytes: slash == 0 ? [0x2F] : Array(bytes[..<slash]))
     }
 
     /// The last path component, decoded for display.
-    public var name: String { String(decoding: nameBytes, as: UTF8.self) }
+    public var name: String { String(decoding: nameSlice, as: UTF8.self) }
 
-    /// True when this path is `ancestor` or lies under it.
+    public var nameBytes: [UInt8] { Array(nameSlice) }
+
+    /// `nameBytes` without a copy.
+    var nameSlice: ArraySlice<UInt8> {
+        if isRoot { return [] }
+        guard let slash = bytes.lastIndex(of: 0x2F) else { return bytes[...] }
+        return bytes[(slash + 1)...]
+    }
+
+    /// True when this path is `ancestor` or lies under it. A lexical test: `..` is a name here,
+    /// so compare `normalized` paths when either side may hold one.
     public func isInside(_ ancestor: RemotePath) -> Bool {
         if bytes == ancestor.bytes { return true }
         let head = ancestor.isRoot ? ancestor.bytes : ancestor.bytes + [0x2F]
-        return bytes.count > head.count && Array(bytes[..<head.count]) == head
+        return bytes.count > head.count && bytes.starts(with: head)
     }
 
-    public var nameBytes: [UInt8] {
-        guard let slash = bytes.lastIndex(of: 0x2F), slash + 1 < bytes.count else {
-            return bytes == [0x2F] ? [] : bytes
+    /// The path with `prefix` swapped for `replacement` when this path is `prefix` or lies under
+    /// it, as where a moved folder's contents land; nil otherwise.
+    public func replacing(prefix: RemotePath, with replacement: RemotePath) -> RemotePath? {
+        guard isInside(prefix) else { return nil }
+        return self == prefix ? replacement : replacement.appending(name: Array(bytes[(prefix.isRoot ? 1 : prefix.bytes.count + 1)...]))
+    }
+
+    /// The path with empty and `.` components dropped and each `..` removing the one before it, up
+    /// to the root. Lexical only: a symlinked folder's `..` is wherever the server says.
+    public var normalized: RemotePath {
+        let absolute = bytes.first == 0x2F
+        var kept: [ArraySlice<UInt8>] = []
+        for part in bytes.split(separator: 0x2F) {
+            switch part {
+            case [0x2E]: continue
+            case [0x2E, 0x2E] where kept.last.map({ $0 != [0x2E, 0x2E] }) ?? absolute:
+                if !kept.isEmpty { kept.removeLast() }
+            default: kept.append(part)
+            }
         }
-        return Array(bytes[(slash + 1)...])
+        let joined = Array(kept.joined(separator: [0x2F]))
+        if absolute { return RemotePath(bytes: [0x2F] + joined) }
+        return RemotePath(bytes: joined.isEmpty ? [0x2E] : joined)
+    }
+
+    /// Whether `name` names one entry: not empty, `.`, or `..`, and with no `/` or NUL, which
+    /// would reach somewhere else.
+    public static func isSingleName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
+    }
+
+    /// Where Go to Remote Folder goes for `text`: `/…` is absolute, `~` and `~/…` start at `home`,
+    /// the server's start folder (the saved server's folder, else the login's home), and anything
+    /// else is relative to `current`. `.` and `..` are taken lexically, as `normalized` does. Nil
+    /// when `text` is blank.
+    public static func typed(_ text: String, from current: RemotePath, home: RemotePath) -> RemotePath? {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        let path: RemotePath
+        if text.hasPrefix("/") {
+            path = RemotePath(string: text)
+        } else if text == "~" || text.hasPrefix("~/") {
+            path = home.appending(String(text.dropFirst()))
+        } else {
+            path = current.appending(text)
+        }
+        return path.normalized
     }
 }
 
-public enum ItemKind: String, Hashable, Sendable, Codable {
+public enum ItemKind: String, Hashable, Sendable {
     case file
     case directory
     case symlink
     case other
 }
 
-public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
+public struct RemoteItem: Hashable, Sendable, Identifiable {
     public var path: RemotePath
     public var kind: ItemKind
     public var size: UInt64?
@@ -82,7 +144,6 @@ public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
     public var mode: UInt32?
     public var owner: String?
     public var group: String?
-    public var linkTarget: String?
 
     public var id: RemotePath { path }
 
@@ -93,8 +154,7 @@ public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
         mtime: UInt32? = nil,
         mode: UInt32? = nil,
         owner: String? = nil,
-        group: String? = nil,
-        linkTarget: String? = nil
+        group: String? = nil
     ) {
         self.path = path
         self.kind = kind
@@ -103,12 +163,10 @@ public struct RemoteItem: Hashable, Sendable, Codable, Identifiable {
         self.mode = mode
         self.owner = owner
         self.group = group
-        self.linkTarget = linkTarget
     }
 
-    public var name: String { String(decoding: path.nameBytes, as: UTF8.self) }
+    public var name: String { path.name }
     public var isHidden: Bool { name.hasPrefix(".") && name != "." && name != ".." }
-    public var isDotEntry: Bool { name == "." || name == ".." }
 }
 
 /// SFTP v3 keeps times as unsigned 32-bit seconds since 1970.
@@ -122,26 +180,24 @@ public enum SFTPTime {
     }
 }
 
-public struct Fingerprint: Hashable, Sendable, Codable {
-    public var kind: ItemKind
+/// A file as SFTP describes it: size and whole-second mtime.
+public struct Fingerprint: Hashable, Sendable {
     public var size: UInt64
     public var mtime: UInt32
 
-    public init(kind: ItemKind, size: UInt64, mtime: UInt32) {
-        self.kind = kind
+    public init(size: UInt64, mtime: UInt32) {
         self.size = size
         self.mtime = mtime
     }
 
     public init?(item: RemoteItem) {
         guard item.kind == .file, let size = item.size, let mtime = item.mtime else { return nil }
-        self.kind = item.kind
         self.size = size
         self.mtime = mtime
     }
 }
 
-public struct SavedConnection: Hashable, Sendable, Codable, Identifiable {
+public struct SavedConnection: Hashable, Sendable, Identifiable {
     public var id: ConnectionID
     public var name: String
     public var host: String

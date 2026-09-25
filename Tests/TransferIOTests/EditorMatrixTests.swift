@@ -4,75 +4,13 @@ import Testing
 import TransferCore
 @testable import TransferIO
 
-/// Live sync against the ways real editors save, with the real FSEvents watcher. Runs only
-/// against a local sshd (`Scripts/local-sshd.sh`), like `ServerTests`. Each scenario prints one
-/// `MATRIX` line: uploads counted two ways, from `.succeeded` shelf events and from renames onto
-/// the server file (inode changes), plus every distinct server content seen along the way.
-@Suite(.serialized)
+/// Live sync against the ways real editors save, with the real FSEvents watcher and the local
+/// sshd (`ServerHarness`). Each scenario checks uploads counted two ways, from `.succeeded` shelf
+/// events and from renames onto the server file (inode changes), and every distinct content the
+/// server held along the way. A tool that fails prints one `MATRIX` line. Waits are on the Live
+/// worker going idle, not on fixed sleeps, except where the timing is the scenario.
+@Suite(.serialized, .enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct EditorMatrix {
-    private static var port: String? { ProcessInfo.processInfo.environment["TRANSFER_TEST_PORT"] }
-    private static var identity: String? { ProcessInfo.processInfo.environment["TRANSFER_TEST_IDENTITY"] }
-
-    private struct Harness {
-        let session: SSHConnection
-        let root: URL
-        let remote: URL
-        let staging: URL
-        let prompts: TestPrompts
-        let events: MatrixEvents
-        let logger: Task<Void, Never>
-
-        var remotePath: RemotePath { RemotePath(string: remote.path) }
-
-        func cleanUp() async {
-            logger.cancel()
-            await session.disconnect()
-            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
-        }
-    }
-
-    private final class TestPrompts: PromptSink, @unchecked Sendable {
-        func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-        func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
-        func resolveCollision(fileName: String) async -> NameCollisionChoice { .replace }
-    }
-
-    private func harness(_ name: String) throws -> Harness? {
-        guard let port = Self.port, let identity = Self.identity else { return nil }
-        let base = TestCaches.fresh(name)
-        let root = base.appendingPathComponent("library", isDirectory: true)
-        let remote = base.appendingPathComponent("remote", isDirectory: true)
-        let staging = base.appendingPathComponent("staging", isDirectory: true)
-        let store: Store
-        do {
-            for folder in [root, remote, staging] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
-            store = try Store(root: root)
-        } catch {
-            try? FileManager.default.removeItem(at: base)
-            throw error
-        }
-        let saved = SavedConnection(name: name, host: "127.0.0.1", user: NSUserName(), port: port, identityFile: identity, remotePath: remote.path)
-        let session = SSHConnection(connection: saved, store: store, editableExtensions: TransferConfig.builtIn.extensionSet)
-        let events = MatrixEvents()
-        let stream = session.events()
-        let logger = Task { for await event in stream { events.record(event) } }
-        return Harness(session: session, root: root, remote: remote, staging: staging, prompts: TestPrompts(), events: events, logger: logger)
-    }
-
-    /// Runs `body` with a connected harness and always awaits its cleanup, when it throws too. Does
-    /// nothing without a server.
-    private func withHarness(_ name: String, _ body: (Harness) async throws -> Void) async throws {
-        guard let h = try harness(name) else { return }
-        do {
-            _ = try await h.session.connect(prompts: h.prompts)
-            try await body(h)
-        } catch {
-            await h.cleanUp()
-            throw error
-        }
-        await h.cleanUp()
-    }
-
     private struct LiveCase {
         let local: URL
         let remoteFile: URL
@@ -80,7 +18,7 @@ struct EditorMatrix {
         let watch: ServerWatch
     }
 
-    private func open(_ h: Harness, _ name: String, _ contents: Data) async throws -> LiveCase {
+    private func open(_ h: ServerHarness, _ name: String, _ contents: Data) async throws -> LiveCase {
         let remoteFile = h.remote.appendingPathComponent(name)
         try contents.write(to: remoteFile)
         // An older server time, as a real file has; the working copy gets it too.
@@ -91,26 +29,27 @@ struct EditorMatrix {
         return LiveCase(local: local, remoteFile: remoteFile, path: path, watch: ServerWatch(remoteFile))
     }
 
-    private func waitUntil(_ seconds: Double = 8, _ condition: () async -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+    /// Waits out what the test just did: twice, one FSEvents delivery slot (0.3 s latency), then
+    /// until the Live worker has nothing queued, due, or running. An event caused by the first
+    /// round's work, such as an upload's snapshot being read, is handled by the second.
+    private func quiesce(_ h: ServerHarness) async {
+        for _ in 0..<2 {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            _ = await waitUntil { await h.session.live.workCount(on: h.session.connection.id) == 0 }
         }
-        return await condition()
     }
 
-    /// Waits for the server to hold `expected` and the file to be clean, then a further 1.5 s so a
-    /// late second upload is counted too. Returns the upload count from shelf events.
+    /// Waits for the server to hold `expected` and the file to be clean, then for everything
+    /// pending to run, so a late second upload is counted too. Returns the upload count from shelf events.
     @discardableResult
-    private func expectSynced(_ label: String, _ h: Harness, _ c: LiveCase, _ expected: Data, allowed: Set<String> = [],
+    private func expectSynced(_ label: String, _ h: ServerHarness, _ c: LiveCase, _ expected: Data, allowed: Set<String> = [],
                               maxUploads: Int? = 1, sourceLocation: SourceLocation = #_sourceLocation) async -> Int {
         let landed = await waitUntil {
             guard (try? Data(contentsOf: c.remoteFile)) == expected else { return false }
             guard let file = await h.session.liveFiles().first(where: { $0.path == c.path }) else { return false }
             return !file.dirty && !file.uploading && !file.conflict
         }
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        await quiesce(h)
         c.watch.stop()
         let file = await h.session.liveFiles().first(where: { $0.path == c.path })
         let uploads = h.events.succeeded(c.path)
@@ -129,7 +68,7 @@ struct EditorMatrix {
         return uploads
     }
 
-    private func noStrays(_ label: String, _ h: Harness, allowed: Set<String>, sourceLocation: SourceLocation = #_sourceLocation) {
+    private func noStrays(_ label: String, _ h: ServerHarness, allowed: Set<String>, sourceLocation: SourceLocation = #_sourceLocation) {
         let names = Set((try? FileManager.default.contentsOfDirectory(atPath: h.remote.path)) ?? [])
         let strays = names.subtracting(allowed)
         #expect(strays.isEmpty, "\(label): stray files on the server: \(strays.sorted())", sourceLocation: sourceLocation)
@@ -168,7 +107,7 @@ struct EditorMatrix {
 
     @Test(arguments: ["default", "yes", "no", "auto"])
     func vimWrites(_ backupcopy: String) async throws {
-        try await withHarness("vim") { h in
+        try await withHarness("vim", connected: true) { h in
             let c = try await open(h, "note.txt", vimText)
             var args = ["-Nu", "NONE", "-n", "-es"]
             if backupcopy != "default" { args += ["-c", "set backupcopy=\(backupcopy)"] }
@@ -183,7 +122,7 @@ struct EditorMatrix {
     // MARK: 2. vim with a swap file
 
     @Test func vimWithItsOwnSwapFile() async throws {
-        try await withHarness("vimswap") { h in
+        try await withHarness("vimswap", connected: true) { h in
             let c = try await open(h, "note.txt", vimText)
             // No -n: vim makes .note.txt.swp itself, writes, and removes it.
             try run("/usr/bin/vim", ["-Nu", "NONE", "-es", "-c", "set updatecount=1", "-c", "%s/one/two/", "-c", "w", "-c", "q", c.local.path])
@@ -193,17 +132,17 @@ struct EditorMatrix {
     }
 
     @Test func vimWithALongLivedSwapFile() async throws {
-        try await withHarness("vimswap2") { h in
+        try await withHarness("vimswap2", connected: true) { h in
             let c = try await open(h, "note.txt", vimText)
             let swap = c.local.deletingLastPathComponent().appendingPathComponent(".note.txt.swp")
             try Data(repeating: 0x55, count: 4096).write(to: swap)
-            try await Task.sleep(nanoseconds: 800_000_000)
+            await quiesce(h)
             // Swap churn before the write, as vim updates it while typing.
             for index in 0..<4 {
                 try Data(repeating: UInt8(index), count: 4096 * (index + 1)).write(to: swap)
                 try await Task.sleep(nanoseconds: 150_000_000)
             }
-            try await Task.sleep(nanoseconds: 1_000_000_000)
+            await quiesce(h)
             #expect(h.events.succeeded(c.path) == 0, "swap churn alone uploaded the file")
             try run("/usr/bin/vim", ["-Nu", "NONE", "-n", "-es", "-c", "%s/one/two/", "-c", "wq", c.local.path])
             try Data(repeating: 9, count: 100).write(to: swap)
@@ -216,7 +155,7 @@ struct EditorMatrix {
     // MARK: 3. VS Code: truncate and write in place
 
     @Test func inPlaceSmallWrite() async throws {
-        try await withHarness("vscode") { h in
+        try await withHarness("vscode", connected: true) { h in
             let c = try await open(h, "app.js", Data("let a = 1\n".utf8))
             let final = Data("let a = 2\nlet b = 3\n".utf8)
             try python("import sys\nopen(sys.argv[1],'w').write(sys.argv[2])", [c.local.path, String(decoding: final, as: UTF8.self)])
@@ -250,7 +189,7 @@ struct EditorMatrix {
     }
 
     @Test func inPlaceLargeChunkedWrite() async throws {
-        try await withHarness("big") { h in
+        try await withHarness("big", connected: true) { h in
             let c = try await open(h, "big.txt", bigData(4_000_000, seed: 1))
             let final = bigData(5_000_000, seed: 2)
             let source = h.staging.appendingPathComponent("final.bin")
@@ -262,28 +201,25 @@ struct EditorMatrix {
     }
 
     /// A writer that stalls longer than the settle time mid-file may have its partial bytes
-    /// uploaded, by design; the final bytes must still land.
+    /// uploaded, by design: only whole chunks, never a torn one. The final bytes must still land.
     @Test func inPlaceLargeWriteWithAStall() async throws {
-        try await withHarness("stall") { h in
+        try await withHarness("stall", connected: true) { h in
             let c = try await open(h, "big.txt", bigData(4_000_000, seed: 3))
             let final = bigData(5_000_000, seed: 4)
             let source = h.staging.appendingPathComponent("final.bin")
             try final.write(to: source)
             try python(Self.chunkedWriter, [c.local.path, source.path, "10", "0.1", "4", "1.2"])
-            let landed = await waitUntil {
-                guard (try? Data(contentsOf: c.remoteFile)) == final else { return false }
-                return await h.session.liveFiles().first?.dirty == false
-            }
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            c.watch.stop()
-            #expect(landed)
+            let step = final.count / 10
+            let chunks = Set((1..<10).map { Self.digest(final.prefix($0 * step)) })
+            await expectSynced("3 in-place 5MB with a stall", h, c, final, allowed: chunks, maxUploads: nil)
+            noStrays("3 in-place 5MB with a stall", h, allowed: ["big.txt"])
         }
     }
 
     // MARK: 4. Temp and rename in the same folder
 
     @Test func atomicTempAndRename() async throws {
-        try await withHarness("atomic") { h in
+        try await withHarness("atomic", connected: true) { h in
             let c = try await open(h, "main.go", Data("package main\n".utf8))
             let final = Data("package main\n\nfunc main() {}\n".utf8)
             try python("""
@@ -303,7 +239,7 @@ struct EditorMatrix {
     // MARK: 5. NSDocument / TextEdit
 
     @Test func replaceItemAtFromItemReplacementDirectory() async throws {
-        try await withHarness("nsdoc") { h in
+        try await withHarness("nsdoc", connected: true) { h in
             let c = try await open(h, "doc.txt", Data("draft\n".utf8))
             let final = Data("final draft, saved by NSDocument\n".utf8)
             let scratch = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: c.local, create: true)
@@ -316,7 +252,7 @@ struct EditorMatrix {
     }
 
     @Test func coordinatedAtomicWrite() async throws {
-        try await withHarness("coord") { h in
+        try await withHarness("coord", connected: true) { h in
             let c = try await open(h, "doc.txt", Data("draft\n".utf8))
             let final = Data("coordinated\n".utf8)
             var coordinatorError: NSError?
@@ -331,7 +267,7 @@ struct EditorMatrix {
     }
 
     @Test func coordinatedInPlaceWrite() async throws {
-        try await withHarness("coord2") { h in
+        try await withHarness("coord2", connected: true) { h in
             let c = try await open(h, "doc.txt", Data("draft\n".utf8))
             let final = Data("coordinated in place\n".utf8)
             var coordinatorError: NSError?
@@ -348,7 +284,7 @@ struct EditorMatrix {
 
     @Test(arguments: [false, true])
     func rapidSaves(_ sameSize: Bool) async throws {
-        try await withHarness("rapid") { h in
+        try await withHarness("rapid", connected: true) { h in
             let c = try await open(h, "rapid.txt", Data("start!\n".utf8))
             var allowed: Set<String> = []
             for index in 1...5 {
@@ -365,7 +301,7 @@ struct EditorMatrix {
 
     /// Saves spaced just past the settle time, so each may start an upload that the next one overtakes.
     @Test func savesSpacedAroundTheSettleTime() async throws {
-        try await withHarness("rapid2") { h in
+        try await withHarness("rapid2", connected: true) { h in
             let c = try await open(h, "rapid.txt", Data("start!\n".utf8))
             var allowed: Set<String> = []
             for index in 1...5 {
@@ -383,15 +319,19 @@ struct EditorMatrix {
     // MARK: 7. Metadata only
 
     @Test func touchChmodAndXattrUploadNothing() async throws {
-        try await withHarness("meta") { h in
+        try await withHarness("meta", connected: true) { h in
             let c = try await open(h, "meta.txt", Data("unchanged\n".utf8))
-            try await Task.sleep(nanoseconds: 500_000_000)
+            await quiesce(h)
             try run("/usr/bin/touch", [c.local.path])
-            try await Task.sleep(nanoseconds: 1_200_000_000)
+            await quiesce(h)
+            // A pass saw the touch: it recorded the new time and uploaded nothing.
+            let touched = LiveSync.stamp(c.local)?.mtime.timeIntervalSinceReferenceDate
+            let rows = await h.session.store.liveFiles()
+            #expect(rows.first?.syncedMtime == touched, "no pass restamped the touched copy")
             try run("/bin/chmod", ["644", c.local.path])
-            try await Task.sleep(nanoseconds: 1_200_000_000)
+            await quiesce(h)
             try run("/usr/bin/xattr", ["-w", "com.test", "x", c.local.path])
-            try await Task.sleep(nanoseconds: 2_000_000_000)
+            await quiesce(h)
             c.watch.stop()
             let file = await h.session.liveFiles().first
             #expect(h.events.succeeded(c.path) == 0)
@@ -405,9 +345,9 @@ struct EditorMatrix {
 
     @Test(arguments: [200, 300, 800])
     func deleteThenRecreate(_ gapMilliseconds: Int) async throws {
-        try await withHarness("unlink") { h in
+        try await withHarness("unlink", connected: true) { h in
             let c = try await open(h, "gone.txt", Data("before\n".utf8))
-            try await Task.sleep(nanoseconds: 500_000_000)
+            await quiesce(h)
             let final = Data("after the unlink, gap \(gapMilliseconds)\n".utf8)
             try FileManager.default.removeItem(at: c.local)
             try await Task.sleep(nanoseconds: UInt64(gapMilliseconds) * 1_000_000)
@@ -421,7 +361,7 @@ struct EditorMatrix {
     /// later: inside the one-second grace for a missing copy.
     @Test(arguments: [450, 550])
     func deleteWhileAPassIsPending(_ deleteAfter: Int) async throws {
-        try await withHarness("pend") { h in
+        try await withHarness("pend", connected: true) { h in
             let c = try await open(h, "gone.txt", Data("before\n".utf8))
             try await Task.sleep(nanoseconds: 1_500_000_000)
             try run("/usr/bin/touch", [c.local.path])
@@ -439,7 +379,7 @@ struct EditorMatrix {
     /// slot; the unlink lands just before the pass, so its own event is delivered ~300 ms later.
     @Test(arguments: [620, 635, 650])
     func unlinkBehindSwapChurn(_ unlinkAt: Int) async throws {
-        try await withHarness("churn") { h in
+        try await withHarness("churn", connected: true) { h in
             let c = try await open(h, "gone.txt", Data("before\n".utf8))
             let swap = c.local.deletingLastPathComponent().appendingPathComponent(".gone.txt.swp")
             try await Task.sleep(nanoseconds: 1_500_000_000)
@@ -461,7 +401,7 @@ struct EditorMatrix {
     // MARK: 9. The server changed behind the app's back
 
     @Test func saveAfterServerChangeIsAConflict() async throws {
-        try await withHarness("conflict") { h in
+        try await withHarness("conflict", connected: true) { h in
             let c = try await open(h, "note.txt", Data("first\n".utf8))
             let remoteEdit = Data("remote-edit\n".utf8)
             try remoteEdit.write(to: c.remoteFile)
@@ -486,7 +426,7 @@ struct EditorMatrix {
     // MARK: 10. Two Live files at once
 
     @Test func twoFilesSavedTogether() async throws {
-        try await withHarness("two") { h in
+        try await withHarness("two", connected: true) { h in
             let a = try await open(h, "a.txt", Data("a0\n".utf8))
             let b = try await open(h, "b.txt", Data("b0\n".utf8))
             let finalA = Data("a1, saved first\n".utf8)
@@ -557,21 +497,4 @@ private final class ServerWatch: @unchecked Sendable {
     func stop() { lock.withLock { running = false } }
     var renames: Int { lock.withLock { renameCount } }
     var digests: Set<String> { lock.withLock { Set(seen) } }
-}
-
-private final class MatrixEvents: @unchecked Sendable {
-    private let lock = NSLock()
-    private var events: [SessionEvent] = []
-
-    func record(_ event: SessionEvent) { lock.withLock { events.append(event) } }
-
-    func succeeded(_ path: RemotePath) -> Int {
-        lock.withLock {
-            events.filter { if case .operation(let op) = $0 { op.livePath == path && op.state == .succeeded } else { false } }.count
-        }
-    }
-
-    func conflicts(_ path: RemotePath) -> Int {
-        lock.withLock { events.filter { if case .conflict(let p, _) = $0 { p == path } else { false } }.count }
-    }
 }

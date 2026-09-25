@@ -1,45 +1,53 @@
 # Agent rules
 
-Read `HANDOFF.md` before changing the window or the SSH session. Read `PLAN.md` for product behavior. When the window chrome in `HANDOFF.md` disagrees with the opening lines of `PLAN.md`, follow `HANDOFF.md`.
+Transfer is a native Mac SFTP browser that feels like a small utility Apple shipped next to Finder: browse a server, preview files, open editable files Live so every completed save uploads, and copy, drag and paste between servers and the Finder. It rides the Mac's own `/usr/bin/ssh`, so `~/.ssh/config`, the agent and `ProxyJump` just work, and it shares one login per server across windows. It targets macOS 27 on Apple silicon only. It never loses or silently overwrites a user's data, local or remote; every rule below serves that or the native feel.
+
+`docs/SPEC.md` is what the product does. `HANDOFF.md` is how the code does it, with the Traps: read it before changing the window, the SSH session, Live files, or transfers.
 
 ## Shape
 
 - `TransferCore`: values and decisions. No SwiftUI, AppKit, `Process`, or `FileManager`.
-- `TransferIO`: `/usr/bin/ssh`, SFTP packets, SQLite, Keychain. No SwiftUI or AppKit.
-- `TransferUI`: views and AppKit adapters. No `TransferIO`.
-- `Transfer`: `@main` only. The only target that imports both UI and IO.
+- `TransferIO`: `/usr/bin/ssh`, SFTP, SQLite, Keychain, Live files, the transfer engine. No SwiftUI or AppKit.
+- `TransferUI`: views and AppKit adapters. No `TransferIO`. It writes and removes no file except the clipboard's staging folder; everything else goes through `RemoteSession` or `SessionProvider`.
+- `Transfer`: `@main`, the only target that imports both UI and IO.
 
-Views talk to a `RemoteSession`. `SSHConnection` is the implementation. Do not put a socket, a process, or a file write in a view.
+A rule with a decision in it belongs in Core, with a test.
 
-## Do not reopen these
+## Rules
 
-- The transport is `/usr/bin/ssh`. No libssh, no custom SSH stack, no HTTP/3, no tunnel, no compression. Passengers are `ssh -S sock -s -- <host> sftp`.
-- Do not embed rsync. The fast copy, when it exists, replaces `Tools/performance-version` and leaves the browser alone. `PerformanceDirectoryCopy.available()` returns false on purpose.
-- The window frame is AppKit (`WindowChrome.swift`): `NSSplitViewController`, `NSToolbar`, content pane spanning the window, sidebar and inspector as safe-area insets, columns pinned to `safeAreaLayoutGuide`, collapse behavior `.useConstraints`, title-bar separator forced to `.none`. Do not move that frame back to SwiftUI.
-- Hide `NSScrollPocket` views over the content. Leave the sidebar’s pocket. Draw the toolbar line with `hoverLine`, and read the pointer on each refresh.
-- Host each SwiftUI column once. Do not assign `rootView` on every update.
-- `NSBrowser` must be at least as wide as its columns (`ColumnStack`). Do not try to scroll it from outside.
-- In column view, `validateDrop` returns no operation for column −1 when the pasteboard has `remoteDragType`. Any other answer cancels the browser’s own drag.
-- `NSFilePromiseProvider` is not an `NSItemProvider`. Drags start in the AppKit views (`PromiseText`, `IconItemView`, `ListTable`, `TiledBrowser`).
-- Finder pastes only file URLs. Copied items are staged in the caches folder and their URLs added when complete. Do not put a file promise or a lazy URL on the general pasteboard for Finder.
-- A move removes a source only after `TreeCheck` finds its copy complete. Finder originals go to the Trash.
-- Copy and Paste reach the window through the responder chain, with the app delegate as the fallback (`KeyWindowEdit`). Escape for the clipboard is one key monitor in `Clipboard`. Do not add per-view Escape handlers.
-- Live files belong to `LiveSync`. Only its per-server worker changes a Live file's sync state; anything else (a conflict choice, discard, a rename or delete under a Live path) is a command on that worker. What a pass does is `LiveDecision` in TransferCore; change the rules there, with a test. Never write the working copy behind an open editor, and never rename it: a remote rename changes only the record's path. A Live open rides the interactive lane as `.open`, which a preview never drops.
-- Never let an Objective-C exception escape an `updateNSView` or a layout pass. AppKit catches it, and the Observation crash that follows lands somewhere else. Check `NSBrowser` column indices against `lastColumn` on every use.
-- Socket names use `ConnectionID.socketName` (12 hex digits). SSH option paths that contain spaces go through `-S`, `-i`, or a quoted `-o` value.
-- Every `ssh` command line puts `--` before the destination. A user or host from an `sftp://` link comes from another app, and without `--` one starting with `-` is an ssh option such as `-oProxyCommand`.
-- `SSH_FXP_SYMLINK` on OpenSSH is target, then link.
+- The transport is `/usr/bin/ssh`: no libssh, no SSH stack of our own, no tunnel, no compression, and no rsync. Passengers are `ssh -S sock -s -- <host> sftp`. A faster copy, if one comes, must not change the browser.
+- Every `ssh` command line puts `--` before the destination: a user or host from an `sftp://` link comes from another app, and one starting with `-` would be an option such as `-oProxyCommand`. Processes start with an argument vector, never through a shell; the one command typed into a shell, Open in Terminal's, quotes every field and is refused when any holds a control character.
+- A server is untrusted. Every name it sends that reaches the Mac's disk goes through `LocalPlacement` (`child`, `occupant`, `makeFolder`, `makeLink`): one path component, read with `lstat`, never followed through a local link, never removed without the user's answer.
+- A name collision is asked through the operation's own prompt, `OperationPrompts.current`, never the login's sheet. With nobody to ask, the operation fails; it never guesses Skip or Replace. A rename the user asks for never replaces anything.
+- Moves and pastes run only through `SessionProvider.transfer` (`TransferEngine` in TransferIO, tested in `MoveServerTests`); TransferUI only queues a `TransferRequest`. A move removes an original only when `MoveCheck` finds that item's own copy complete, and on a server removes only what that check verified (a Finder original goes to the Trash whole).
+- Live files belong to `LiveSync`. Only its per-server worker changes a Live file's sync state; anything else (a conflict choice, discard, a rename or delete under a Live path) is a command on that worker. What a pass does is `LiveDecision` in TransferCore: change the rules there, with a test. Never write the working copy behind an open editor, and never rename it. A Live open rides the interactive lane as `.open`, which a preview never drops.
+- Every AppKit callback that takes a row or column (`NSBrowser`, `NSTableView`, a menu's `clickedRow`, a drop's −1) checks it against the listing that view was loaded with before using it. An Objective-C exception must never escape an `updateNSView` or a layout pass: AppKit catches it, and the Observation crash that follows lands somewhere else.
+- Keys the content pane handles go through one local key monitor each: Command-Down and Space in `ContentKeys`, Escape in `Clipboard`. Copy and Paste reach the window through the responder chain, with the app delegate as the fallback (`KeyWindowEdit`). Do not add per-view key handlers.
+- Drags start in the AppKit views (`IconItemView`, `ListTable`, `TiledBrowser`) with `NSFilePromiseProvider`. A drop honors remote paths only from a drag this process started (`dropAction(for:onto:model:)`).
+- Finder pastes only file URLs: copied items are staged and their URLs added when complete. No file promise or lazy URL on the general pasteboard.
+- `transfer.sqlite` and `config.json` change only with an automatic forward migration (a step in `Store.migrate`, `Store.schemaVersion` raised) and a `StoreTests` case that opens a 0.1.7 library.
+- The Traps in `HANDOFF.md` were measured on macOS 27 and stay unless something proven better replaces them: the `-s` argument order, OpenSSH's SYMLINK order, the 104-byte socket path (`ConnectionID.socketName`), `-o` quoting, FSEvents timing, `.useConstraints`, `NSScrollPocket`, safe-area pinning, `NSBrowser` width and `validateDrop` for column −1, hosting each column once, frame autosave names, and `handlesExternalEvents`.
+- Fix a bug with a test in the lowest layer that can host it (Core, then IO without a server, then the server suites). Never weaken a test to make it pass.
 
 ## Check
 
 ```bash
-swift test
+swift build          # no warnings
+swift test           # the server suites report skipped
 ```
 
-Server tests, only when the behavior under test needs a real `sshd`:
+Server tests need the local, unprivileged `sshd` (never a real server). Pass a free port when other sessions run tests too, and build in your own `--scratch-path`:
 
 ```bash
-eval "$(Scripts/local-sshd.sh)" && swift test; kill $TRANSFER_TEST_SSHD
+eval "$(Scripts/local-sshd.sh 2222)" && TRANSFER_REQUIRE_SERVER=1 swift test; kill $TRANSFER_TEST_SSHD
 ```
 
-Package with `Scripts/package-app.sh`. To watch sidebar and inspector animation, launch with `TRANSFER_ANIMATION_SCALE=6`.
+`TRANSFER_REQUIRE_SERVER=1` makes a missing server fail every server test instead of skipping it. Run the server suites after any change to IO behavior.
+
+`Scripts/package-app.sh` builds `Transfer.app` and prints its path. Launch a development build only with its own library:
+
+```bash
+open --env TRANSFER_LIBRARY=/tmp/transfer-dev "$(Scripts/package-app.sh)"
+```
+
+Without `TRANSFER_LIBRARY` it opens the real library in `~/Library/Application Support/Transfer`: while the installed app is open it is refused (one copy per library), and otherwise it sweeps the library's login scratch and temps and starts Live sync on the user's own records. `TRANSFER_ANIMATION_SCALE=6` stretches the sidebar and inspector animations for watching them.

@@ -3,71 +3,10 @@ import Testing
 import TransferCore
 @testable import TransferIO
 
-/// These run only against a local sshd. Start one with `Scripts/local-sshd.sh` and export the
-/// variables it prints: TRANSFER_TEST_PORT and TRANSFER_TEST_IDENTITY.
+/// The real SSH master, SFTP channels, copies, and Live sync against the local sshd
+/// (`ServerHarness`).
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct ServerTests {
-    private static var port: String? { ProcessInfo.processInfo.environment["TRANSFER_TEST_PORT"] }
-    private static var identity: String? { ProcessInfo.processInfo.environment["TRANSFER_TEST_IDENTITY"] }
-
-    private struct Harness {
-        let session: SSHConnection
-        let root: URL
-        let remote: URL
-        let prompts: TestPrompts
-
-        var remotePath: RemotePath { RemotePath(string: remote.path) }
-
-        func cleanUp() async {
-            await session.disconnect()
-            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
-        }
-    }
-
-    private final class TestPrompts: PromptSink, @unchecked Sendable {
-        var hostDecision: HostKeyDecision = .trustOnce
-        var collision: NameCollisionChoice = .replace
-        var collisions = 0
-
-        func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-        func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { hostDecision }
-        func resolveCollision(fileName: String) async -> NameCollisionChoice {
-            collisions += 1
-            return collision
-        }
-    }
-
-    private func harness(_ name: String) throws -> Harness? {
-        guard let port = Self.port, let identity = Self.identity else { return nil }
-        // Short on purpose: the control socket lives under this root and socket paths are capped at 104 bytes.
-        let base = TestCaches.fresh(name)
-        let root = base.appendingPathComponent("library", isDirectory: true)
-        let remote = base.appendingPathComponent("remote", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: remote, withIntermediateDirectories: true)
-            let store = try Store(root: root)
-            let saved = SavedConnection(name: name, host: "127.0.0.1", user: NSUserName(), port: port, identityFile: identity, remotePath: remote.path)
-            let session = SSHConnection(connection: saved, store: store, editableExtensions: TransferConfig.builtIn.extensionSet)
-            return Harness(session: session, root: root, remote: remote, prompts: TestPrompts())
-        } catch {
-            try? FileManager.default.removeItem(at: base)
-            throw error
-        }
-    }
-
-    /// Runs `body` with a fresh harness and always awaits its cleanup, when it throws too. Does
-    /// nothing without a server.
-    private func withHarness(_ name: String, _ body: (Harness) async throws -> Void) async throws {
-        guard let h = try harness(name) else { return }
-        do {
-            try await body(h)
-        } catch {
-            await h.cleanUp()
-            throw error
-        }
-        await h.cleanUp()
-    }
-
     private func randomData(_ count: Int) -> Data {
         var data = Data(count: count)
         data.withUnsafeMutableBytes { buffer in
@@ -76,21 +15,11 @@ struct ServerTests {
         return data
     }
 
-    private func waitUntil(_ seconds: Double = 8, _ condition: () async -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-        return await condition()
-    }
-
     @Test func loginListsAndMovesBytes() async throws {
         try await withHarness("bytes") { h in
             let start = try await h.session.connect(prompts: h.prompts)
             #expect(start.display == h.remote.resolvingSymlinksInPath().path)
             #expect(await h.session.isConnected)
-            #expect(await h.session.performanceModeEnabled == false)
 
             let many = h.remote.appendingPathComponent("many")
             try FileManager.default.createDirectory(at: many, withIntermediateDirectories: true)
@@ -109,9 +38,9 @@ struct ServerTests {
             try payload.write(to: local)
             let uploaded = h.remotePath.appending(name: Array("up.bin".utf8))
             var last = TransferProgress(completed: 0)
-            let box = ProgressBox()
-            try await h.session.upload(local, to: uploaded) { box.last = $0 }
-            last = box.last
+            let box = Locked(TransferProgress(completed: 0))
+            try await h.session.upload(local, to: uploaded) { box.value = $0 }
+            last = box.value
             #expect(last.completed == UInt64(payload.count))
             #expect(try Data(contentsOf: h.remote.appendingPathComponent("up.bin")) == payload)
             let leftovers = try FileManager.default.contentsOfDirectory(atPath: h.remote.path).filter { $0.contains(".transfer-") }
@@ -137,6 +66,18 @@ struct ServerTests {
             #expect(h.prompts.collisions == 1)
             #expect(try Data(contentsOf: down) == payload)
 
+            // With nobody to ask, a collision fails the operation and leaves the file alone; the
+            // login's prompts are never asked.
+            let other = randomData(100)
+            try other.write(to: down)
+            await OperationPrompts.$current.withValue(nil) {
+                await #expect(throws: TransferError.self) { try await h.session.download(uploaded, to: down) { _ in } }
+                await #expect(throws: TransferError.self) { try await h.session.upload(down, to: uploaded) { _ in } }
+            }
+            #expect(h.prompts.collisions == 1)
+            #expect(try Data(contentsOf: down) == other)
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("up.bin")) == payload)
+
             let command = await h.session.terminalCommand(directory: h.remotePath)
             #expect(command?.hasPrefix("/usr/bin/ssh -S ") == true)
             #expect(command?.contains("Compression=no") == true)
@@ -159,6 +100,8 @@ struct ServerTests {
 
             let first = try await h.session.prepareViewFile(remote)
             #expect(try String(contentsOf: first, encoding: .utf8) == "first")
+            #expect(first.path.hasPrefix(h.root.appendingPathComponent("Caches/Preview").path + "/"), "the cache is the test library's own")
+            #expect(first.lastPathComponent == "note.txt", "an app opening the copy, and Quick Look's Open With, show the file's own name")
             let identity = try first.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
 
             let again = try await h.session.prepareViewFile(remote)
@@ -173,6 +116,75 @@ struct ServerTests {
         }
     }
 
+    /// The inspector downloaded a whole text file, up to 8 MB, to show its first 64 KB (UIM-20).
+    /// It now fetches only that head, reused while the file's size and time are unchanged.
+    @Test func aTextPreviewFetchesOnlyTheHead() async throws {
+        try await withHarness("head", connected: true) { h in
+            let head = EditableFile.previewHead
+            let big = h.remote.appendingPathComponent("big.txt")
+            func put(_ fill: String, at time: TimeInterval) throws {
+                try Data(String(repeating: fill, count: 3 << 20).utf8).write(to: big)
+                try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: time)], ofItemAtPath: big.path)
+            }
+            try put("a", at: 1_700_000_000)
+            let remote = h.remotePath.appending(name: Array("big.txt".utf8))
+            func identity(_ url: URL) throws -> NSObject? {
+                try url.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier as? NSObject
+            }
+
+            let first = try await h.session.prepareInspectorPreview(remote)
+            #expect(try Data(contentsOf: first) == Data(String(repeating: "a", count: head).utf8))
+            let again = try await h.session.prepareInspectorPreview(remote)
+            #expect(again == first)
+            #expect(try identity(again) == identity(first), "an unchanged file's head is not fetched twice")
+
+            try put("b", at: 1_700_000_060)
+            let changed = try await h.session.prepareInspectorPreview(remote)
+            #expect(try Data(contentsOf: changed) == Data(String(repeating: "b", count: head).utf8))
+
+            // Viewing still fetches the whole file, and a file that is not text is previewed whole.
+            let whole = try await h.session.prepareViewFile(remote)
+            #expect(try Data(contentsOf: whole).count == 3 << 20)
+            try Data(count: 100_000).write(to: h.remote.appendingPathComponent("blob.bin"))
+            let blob = try await h.session.prepareInspectorPreview(h.remotePath.appending(name: Array("blob.bin".utf8)))
+            #expect(try Data(contentsOf: blob).count == 100_000)
+        }
+    }
+
+    /// Links were followed one hop, so a chain such as /usr/bin/java → /etc/alternatives/java →
+    /// the JDK's binary would not open (UIM-19). The server's REALPATH follows the whole chain;
+    /// a loop or a dangling link fails with an error rather than hanging.
+    @Test func linkChainsResolveToTheirEnd() async throws {
+        try await withHarness("chain", connected: true) { h in
+            let fm = FileManager.default
+            try fm.createDirectory(at: h.remote.appendingPathComponent("jdk/bin"), withIntermediateDirectories: true)
+            try Data("java".utf8).write(to: h.remote.appendingPathComponent("jdk/bin/java"))
+            try fm.createDirectory(at: h.remote.appendingPathComponent("alternatives"), withIntermediateDirectories: true)
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("alternatives/java").path, withDestinationPath: "../jdk/bin/java")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("java").path, withDestinationPath: "alternatives/java")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("home").path, withDestinationPath: "alternatives/../jdk")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("here").path, withDestinationPath: "home")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("loop-a").path, withDestinationPath: "loop-b")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("loop-b").path, withDestinationPath: "loop-a")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("gone").path, withDestinationPath: "nowhere")
+            func path(_ name: String) -> RemotePath { h.remotePath.appending(name: Array(name.utf8)) }
+
+            let java = try await h.session.resolve(path("java"))
+            #expect(java.kind == .file)
+            #expect(java.size == 4)
+            #expect(java.path == RemotePath(string: h.remote.appendingPathComponent("jdk/bin/java").path))
+            let folder = try await h.session.resolve(path("here"))
+            #expect(folder.kind == .directory)
+            #expect(folder.path == path("jdk"))
+            #expect(try await h.session.resolve(path("jdk")).path == path("jdk"))
+            for name in ["loop-a", "gone"] {
+                let error = await #expect(throws: TransferError.self) { try await h.session.resolve(path(name)) }
+                #expect(error?.localizedDescription.contains(path(name).display) == true)
+            }
+            #expect(try await h.session.resolve(path("java")).kind == .file, "the channel still works")
+        }
+    }
+
     @Test func directoryCopyRoundTripsWithSymlinks() async throws {
         try await withHarness("tree") { h in
             _ = try await h.session.connect(prompts: h.prompts)
@@ -184,11 +196,11 @@ struct ServerTests {
             try FileManager.default.createSymbolicLink(atPath: tree.appendingPathComponent("link").path, withDestinationPath: "one.txt")
 
             let up = h.remotePath.appending(name: Array("tree-up".utf8))
-            let box = ProgressBox()
-            try await h.session.copyDirectory(fromLocal: tree, to: up) { box.last = $0 }
-            #expect(box.last.itemsCompleted == 4)
+            let box = Locked(TransferProgress(completed: 0))
+            try await h.session.upload(tree, to: up) { box.value = $0 }
+            #expect(box.value.itemsCompleted == 4)
             // Uploading the same tree again merges into it; the link already there is kept.
-            try await h.session.copyDirectory(fromLocal: tree, to: up) { _ in }
+            try await h.session.upload(tree, to: up) { _ in }
             #expect(h.prompts.collisions == 0)
             let upURL = h.remote.appendingPathComponent("tree-up")
             #expect(try Data(contentsOf: upURL.appendingPathComponent("a/b/deep.txt")) == Data("deep".utf8))
@@ -196,14 +208,14 @@ struct ServerTests {
             #expect(try Data(contentsOf: upURL.appendingPathComponent("a/big.bin")) == Data(contentsOf: tree.appendingPathComponent("a/big.bin")))
 
             let down = h.root.appendingPathComponent("tree-down", isDirectory: true)
-            try await h.session.copyDirectory(from: up, to: down) { _ in }
+            try await h.session.download(up, to: down) { _ in }
             #expect(try Data(contentsOf: down.appendingPathComponent("one.txt")) == Data("one".utf8))
             #expect(try Data(contentsOf: down.appendingPathComponent("a/big.bin")) == Data(contentsOf: tree.appendingPathComponent("a/big.bin")))
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: down.appendingPathComponent("link").path) == "one.txt")
             #expect(h.prompts.collisions == 0)
 
             // A second download skips every matching file and asks about nothing.
-            try await h.session.copyDirectory(from: up, to: down) { _ in }
+            try await h.session.download(up, to: down) { _ in }
             #expect(h.prompts.collisions == 0)
 
             try await h.session.remove(up)
@@ -224,22 +236,20 @@ struct ServerTests {
             try FileManager.default.createSymbolicLink(atPath: tree.appendingPathComponent("link").path, withDestinationPath: "one.txt")
             let site = h.remotePath.appending(name: Array("site".utf8))
 
-            let entries = TreeBox()
-            try await h.session.walkTree(site) { key, entry in entries.add(key, entry) }
-            #expect(entries.all == ["": .directory, "one.txt": .file(size: 3), "a": .directory, "a/big.bin": .file(size: UInt64(big.count)),
+            let entries = try await sizes(h.session.tree(site))
+            #expect(entries == ["": .directory, "one.txt": .file(size: 3), "a": .directory, "a/big.bin": .file(size: UInt64(big.count)),
                                     "a/b": .directory, "a/b/deep.txt": .file(size: 4), "link": .link])
 
             // The Mac's own sftp-server offers copy-data, so this copy never leaves the server.
             let copy = h.remotePath.appending(name: Array("site copy".utf8))
-            let box = ProgressBox()
-            try await h.session.copy(site, to: copy) { box.last = $0 }
-            #expect(box.last.itemsCompleted == 4)
+            let box = Locked(TransferProgress(completed: 0))
+            try await h.session.copy(site, to: copy) { box.value = $0 }
+            #expect(box.value.itemsCompleted == 4)
             let copyURL = h.remote.appendingPathComponent("site copy")
             #expect(try Data(contentsOf: copyURL.appendingPathComponent("a/big.bin")) == big)
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: copyURL.appendingPathComponent("link").path) == "one.txt")
-            let copied = TreeBox()
-            try await h.session.walkTree(copy) { key, entry in copied.add(key, entry) }
-            #expect(TreeCheck.missing(source: entries.all, destination: copied.all).isEmpty)
+            let copied = try await h.session.tree(copy)
+            #expect(try await MoveCheck.verdict(source: h.session.tree(site), before: [:], after: copied) == .remove)
             let sourceTime = try FileManager.default.attributesOfItem(atPath: tree.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
             let copyTime = try FileManager.default.attributesOfItem(atPath: copyURL.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
             #expect(sourceTime.map { Int($0.timeIntervalSince1970) } == copyTime.map { Int($0.timeIntervalSince1970) })
@@ -273,10 +283,6 @@ struct ServerTests {
             try Data("first".utf8).write(to: remoteFile)
             let path = h.remotePath.appending(name: Array("note.txt".utf8))
 
-            let events = EventLog()
-            let stream = h.session.events()
-            let logger = Task { for await event in stream { events.record(event) } }
-
             let local = try await h.session.prepareLiveFile(path)
             #expect(try Data(contentsOf: local) == Data("first".utf8))
             #expect(local.path.contains("/Live/"))
@@ -299,10 +305,10 @@ struct ServerTests {
             try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)], ofItemAtPath: remoteFile.path)
             try Data("third".utf8).write(to: local)
             // The event reaches the log through its own task, a moment after the flag is set.
-            let conflicted = await waitUntil { await h.session.liveFiles().first?.conflict == true && events.conflicts.contains(path) }
+            let conflicted = await waitUntil { await h.session.liveFiles().first?.conflict == true && h.events.conflicts(path) > 0 }
             #expect(conflicted)
             #expect(try Data(contentsOf: remoteFile) == Data("remote-edit".utf8))
-            #expect(events.conflicts.contains(path))
+            #expect(h.events.conflicts(path) > 0)
             #expect(FileManager.default.fileExists(atPath: local.deletingLastPathComponent().appendingPathComponent("note.txt (server)").path))
 
             try await h.session.resolveLive(path, choice: .keepLocal)
@@ -329,7 +335,6 @@ struct ServerTests {
             try await h.session.discardLiveFile(renamed, force: false)
             #expect(await h.session.liveFiles().isEmpty)
             #expect(!FileManager.default.fileExists(atPath: local.deletingLastPathComponent().path))
-            logger.cancel()
             await h.session.disconnect()
         }
     }
@@ -397,20 +402,19 @@ struct ServerTests {
             // Edited while Transfer was closed.
             try Data("v2-offline".utf8).write(to: local)
 
-            let store = try Store(root: h.root)
-            let again = SSHConnection(connection: h.session.connection, store: store, editableExtensions: TransferConfig.builtIn.extensionSet)
-            _ = try await again.connect(prompts: h.prompts)
-            #expect(await again.liveFiles().map(\.path) == [path])
-            let uploaded = await waitUntil { (try? Data(contentsOf: remoteFile)) == Data("v2-offline".utf8) }
-            #expect(uploaded)
-            await again.disconnect()
+            try await h.withSecondSession { again in
+                _ = try await again.connect(prompts: h.prompts)
+                #expect(await again.liveFiles().map(\.path) == [path])
+                let uploaded = await waitUntil { (try? Data(contentsOf: remoteFile)) == Data("v2-offline".utf8) }
+                #expect(uploaded)
+            }
         }
     }
 
     @Test func rejectedHostKeyNeverLogsIn() async throws {
-        try await withHarness("hostkey") { h in
+        try await withHarness("hostkey", knownHost: false) { h in
             h.prompts.hostDecision = .cancel
-            await #expect(throws: TransferError.hostKeyRejected) {
+            await #expect(throws: TransferError.cancelled) {
                 _ = try await h.session.connect(prompts: h.prompts)
             }
             #expect(await h.session.isConnected == false)
@@ -418,41 +422,9 @@ struct ServerTests {
     }
 }
 
-private final class ProgressBox: @unchecked Sendable {
-    var last = TransferProgress(completed: 0)
-}
-
-private final class EventLog: @unchecked Sendable {
-    private let lock = NSLock()
-    private var events: [SessionEvent] = []
-
-    func record(_ event: SessionEvent) {
-        lock.lock()
-        events.append(event)
-        lock.unlock()
-    }
-
-    var conflicts: [RemotePath] {
-        lock.lock()
-        defer { lock.unlock() }
-        return events.compactMap { if case .conflict(let path, _) = $0 { path } else { nil } }
-    }
-}
-
-private final class TreeBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var entries: [String: TreeEntry] = [:]
-
-    /// Files are kept by size alone; the times are the server's.
-    func add(_ key: String, _ entry: TreeEntry) {
-        lock.lock()
-        if case .file(let size, _) = entry { entries[key] = .file(size: size) } else { entries[key] = entry }
-        lock.unlock()
-    }
-
-    var all: [String: TreeEntry] {
-        lock.lock()
-        defer { lock.unlock() }
-        return entries
+/// A walked tree with files kept by size alone; the times are the server's.
+private func sizes(_ tree: [TreeKey: TreeEntry]) -> [TreeKey: TreeEntry] {
+    tree.mapValues { entry in
+        if case .file(let size, _) = entry { .file(size: size) } else { entry }
     }
 }

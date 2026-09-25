@@ -1,6 +1,10 @@
+/// The library database, `transfer.sqlite` under the library root: saved servers, stars, Live
+/// records, and temps of copies in flight. Its schema version is `PRAGMA user_version`; opening
+/// migrates it one transaction per step and refuses a newer Transfer's library rather than guess.
+
 import Foundation
+import os
 import SQLite3
-import Security
 import TransferCore
 
 struct LiveRow: Sendable {
@@ -27,19 +31,98 @@ struct LiveRow: Sendable {
 final class Store: @unchecked Sendable {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "transfer.store")
+    private static let log = Logger(subsystem: "com.github.shreeve.transfer", category: "library")
     let root: URL
+    /// Rebuildable caches (previews): `~/Library/Caches/Transfer` for the default library, else
+    /// `Caches` under the custom root, so a test or dev build never reads or evicts the user's.
+    let cacheRoot: URL
 
-    /// `root` defaults to `~/Library/Application Support/Transfer`.
-    init(root customRoot: URL? = nil) throws {
-        let base = customRoot ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    /// `~/Library/Application Support/Transfer`, the library when no other root is given.
+    static var standardRoot: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Transfer", isDirectory: true)
+    }
+
+    /// `root` defaults to `standardRoot`.
+    init(root customRoot: URL? = nil) throws {
+        let standard = Self.standardRoot
+        let base = customRoot ?? standard
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
         self.root = base
+        cacheRoot = base.standardizedFileURL == standard.standardizedFileURL
+            ? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Transfer", isDirectory: true)
+            : base.appendingPathComponent("Caches", isDirectory: true)
         let path = base.appendingPathComponent("transfer.sqlite").path
-        if sqlite3_open(path, &db) != SQLITE_OK {
-            throw TransferError.failed("Could not open the library")
+        do {
+            guard sqlite3_open(path, &db) == SQLITE_OK else { throw TransferError.failed("Could not open the library") }
+            try open()
+        } catch {
+            sqlite3_close(db)
+            db = nil
+            throw error
         }
+    }
+
+    deinit {
+        sqlite3_close(db)
+    }
+
+    // MARK: Schema
+
+    /// The newest schema this build knows; `migrate(from:)` has a step for each one before it.
+    static let schemaVersion = 3
+
+    private func open() throws {
+        // Two copies of this Transfer never share a library (the hub's lock), but an older
+        // Transfer, which takes no lock, may have it open; a write waits for its lock instead
+        // of failing at once.
+        sqlite3_busy_timeout(db, 5_000)
+        while try transaction(migrateOneStep) {}
+        // WAL makes a commit one log append, not a rollback journal's create, write, fsync, and
+        // unlink, and lets the other process read during a write. The mode persists in the file but
+        // cannot change during another process's transaction; this launch then keeps the old mode
+        // and the next retries. FULL fsyncs the log each commit, so a power loss never rolls back a
+        // written Live record; NORMAL would halve the cost (0.035 ms a temps pair) but lose that.
+        report("switch the library to WAL") { try execute("PRAGMA journal_mode = WAL") }
+        try execute("PRAGMA synchronous = FULL")
+    }
+
+    /// Runs inside a write transaction, so the version it reads is not stale: another process may
+    /// have migrated while this one waited for the lock. False once the library is current.
+    private func migrateOneStep() throws -> Bool {
+        let version = try userVersion()
+        guard version <= Self.schemaVersion else {
+            throw TransferError.failed("This library was written by a newer version of Transfer (schema \(version); this version knows \(Self.schemaVersion)). Update Transfer to open it.")
+        }
+        guard version < Self.schemaVersion else { return false }
+        try migrate(from: version)
+        try execute("PRAGMA user_version = \(version + 1)")
+        return true
+    }
+
+    /// Brings the library from `version` to `version + 1`.
+    private func migrate(from version: Int) throws {
+        switch version {
+        case 0:
+            try adoptReleasedSchema()
+        case 1:
+            // Recents were written and never read.
+            try execute("DROP TABLE IF EXISTS recents")
+        case 2:
+            // Paths became exact bytes (`StoredPath`): text when they are UTF-8, a blob when not.
+            // Every path an older Transfer stored is UTF-8 text, so no row changes; a blob would
+            // not match the text an older Transfer compares with, and its Unstar would fail.
+            break
+        default:
+            preconditionFailure("No migration from library schema \(version)")
+        }
+    }
+
+    /// Version 1 is the schema of Transfer 0.1.0 through 0.1.7, which kept no version: every launch
+    /// created missing tables and tried to add each column a later build had introduced. Any
+    /// library at version 0, from those releases or the builds before them, becomes exactly that.
+    private func adoptReleasedSchema() throws {
         try execute("""
         CREATE TABLE IF NOT EXISTS connections (
           id TEXT PRIMARY KEY, name TEXT, host TEXT, user TEXT, port TEXT,
@@ -58,103 +141,115 @@ final class Store: @unchecked Sendable {
         );
         CREATE TABLE IF NOT EXISTS temps (path TEXT PRIMARY KEY);
         """)
-        // Columns added after the first schema. SQLite has no ADD COLUMN IF NOT EXISTS.
-        _ = sqlite3_exec(db, "ALTER TABLE live_files ADD COLUMN dirty INTEGER DEFAULT 0", nil, nil, nil)
-        _ = sqlite3_exec(db, "ALTER TABLE temps ADD COLUMN connection_id TEXT", nil, nil, nil)
-        for column in ["paused INTEGER DEFAULT 0", "conflict TEXT", "conflict_size INTEGER", "conflict_mtime INTEGER",
-                       "synced_size INTEGER", "synced_mtime REAL", "synced_digest TEXT"] {
-            _ = sqlite3_exec(db, "ALTER TABLE live_files ADD COLUMN \(column)", nil, nil, nil)
+        let added = [
+            ("live_files", "dirty INTEGER DEFAULT 0"), ("temps", "connection_id TEXT"),
+            ("live_files", "paused INTEGER DEFAULT 0"), ("live_files", "conflict TEXT"),
+            ("live_files", "conflict_size INTEGER"), ("live_files", "conflict_mtime INTEGER"),
+            ("live_files", "synced_size INTEGER"), ("live_files", "synced_mtime REAL"),
+            ("live_files", "synced_digest TEXT"),
+        ]
+        for (table, column) in added {
+            var present = false
+            try run("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", [table, String(column.prefix { $0 != " " })]) { _ in present = true }
+            if !present { try execute("ALTER TABLE \(table) ADD COLUMN \(column)") }
         }
     }
 
     // MARK: Connections
 
     func connections() -> [SavedConnection] {
-        queue.sync { queryConnections() }
+        queue.sync {
+            var values: [SavedConnection] = []
+            report("read saved servers") {
+                try run("SELECT id, name, host, user, port, identity, remote_path FROM connections ORDER BY name") { row in
+                    values.append(SavedConnection(
+                        id: ConnectionID(rawValue: UUID(uuidString: row.text(0)) ?? UUID()),
+                        name: row.text(1),
+                        host: row.text(2),
+                        user: row.text(3),
+                        port: row.text(4),
+                        identityFile: row.text(5),
+                        remotePath: row.text(6)
+                    ))
+                }
+            }
+            return values
+        }
     }
 
     func connection(_ id: ConnectionID) -> SavedConnection? {
-        queue.sync { queryConnections().first { $0.id == id } }
+        connections().first { $0.id == id }
     }
 
     func save(_ connection: SavedConnection) {
-        queue.sync {
-            bind(
-                "INSERT OR REPLACE INTO connections (id, name, host, user, port, identity, remote_path) VALUES (?,?,?,?,?,?,?)",
-                connection.id.rawValue.uuidString,
-                connection.name,
-                connection.host,
-                connection.user,
-                connection.port,
-                connection.identityFile,
-                connection.remotePath
-            )
-        }
+        write(
+            "INSERT OR REPLACE INTO connections (id, name, host, user, port, identity, remote_path) VALUES (?,?,?,?,?,?,?)",
+            connection.id.rawValue.uuidString, connection.name, connection.host, connection.user,
+            connection.port, connection.identityFile, connection.remotePath
+        )
     }
 
+    /// Everything the library holds for a server, in one transaction.
     func remove(_ id: ConnectionID) {
         queue.sync {
             let key = id.rawValue.uuidString
-            bind("DELETE FROM connections WHERE id = ?", key)
-            bind("DELETE FROM recents WHERE connection_id = ?", key)
-            bind("DELETE FROM pins WHERE connection_id = ?", key)
-            bind("DELETE FROM live_files WHERE connection_id = ?", key)
-            bind("DELETE FROM temps WHERE connection_id = ?", key)
-        }
-    }
-
-    // MARK: Recents and pins
-
-    func recents(connection: ConnectionID) -> [String] {
-        queue.sync {
-            strings("SELECT path FROM recents WHERE connection_id = ? ORDER BY used_at DESC LIMIT 10", connection.rawValue.uuidString)
-        }
-    }
-
-    func remember(connection: ConnectionID, path: String) {
-        queue.sync {
-            bind(
-                "INSERT OR REPLACE INTO recents (connection_id, path, used_at) VALUES (?,?,?)",
-                connection.rawValue.uuidString,
-                path,
-                String(Date().timeIntervalSince1970)
-            )
-        }
-    }
-
-    func pins(connection: ConnectionID) -> [String] {
-        queue.sync { strings("SELECT path FROM pins WHERE connection_id = ? ORDER BY path", connection.rawValue.uuidString) }
-    }
-
-    func pin(connection: ConnectionID, path: String, on: Bool) {
-        queue.sync {
-            if on {
-                bind("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, path)
-            } else {
-                bind("DELETE FROM pins WHERE connection_id = ? AND path = ?", connection.rawValue.uuidString, path)
+            report("remove a saved server") {
+                try transaction {
+                    try run("DELETE FROM connections WHERE id = ?", [key])
+                    for table in ["pins", "live_files", "temps"] {
+                        try run("DELETE FROM \(table) WHERE connection_id = ?", [key])
+                    }
+                }
             }
+        }
+    }
+
+    // MARK: Stars
+
+    // Paths are stored as `StoredPath` and matched and read cast to blobs, so a path is the same
+    // whichever storage class a row has, and the rows an older Transfer writes and matches as
+    // text are the same paths.
+
+    /// Starred paths live in the `pins` table, named before the sidebar called them Starred.
+    func stars(connection: ConnectionID) -> [RemotePath] {
+        paths("SELECT DISTINCT CAST(path AS BLOB) FROM pins WHERE connection_id = ? ORDER BY 1", connection.rawValue.uuidString)
+            .map(RemotePath.init(bytes:))
+    }
+
+    func star(connection: ConnectionID, path: RemotePath, on: Bool) {
+        if on {
+            write("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, StoredPath(path.bytes))
+        } else {
+            write("DELETE FROM pins WHERE connection_id = ? AND CAST(path AS BLOB) = ?", connection.rawValue.uuidString, path.bytes)
         }
     }
 
     // MARK: Temps
 
-    /// `connection` is nil for a temp on the local disk.
-    func rememberTemp(_ path: String, connection: ConnectionID?) {
-        queue.sync {
-            bind("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", path, connection?.rawValue.uuidString ?? "")
-        }
+    func rememberTemp(_ path: RemotePath, connection: ConnectionID) {
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(path.bytes), connection.rawValue.uuidString)
     }
 
-    func forgetTemp(_ path: String) {
-        queue.sync { bind("DELETE FROM temps WHERE path = ?", path) }
+    func rememberTemp(local url: URL) {
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(Array(url.path.utf8)), "")
     }
 
-    func localTemps() -> [String] {
-        queue.sync { strings("SELECT path FROM temps WHERE connection_id IS NULL OR connection_id = ''", nil) }
+    func forgetTemp(_ path: RemotePath) {
+        write("DELETE FROM temps WHERE CAST(path AS BLOB) = ?", path.bytes)
     }
 
-    func remoteTemps(connection: ConnectionID) -> [String] {
-        queue.sync { strings("SELECT path FROM temps WHERE connection_id = ?", connection.rawValue.uuidString) }
+    func forgetTemp(local url: URL) {
+        write("DELETE FROM temps WHERE CAST(path AS BLOB) = ?", Array(url.path.utf8))
+    }
+
+    func localTemps() -> [URL] {
+        paths("SELECT DISTINCT CAST(path AS BLOB) FROM temps WHERE connection_id IS NULL OR connection_id = '' ORDER BY 1")
+            .map { URL(fileURLWithPath: String(decoding: $0, as: UTF8.self)) }
+    }
+
+    func remoteTemps(connection: ConnectionID) -> [RemotePath] {
+        paths("SELECT DISTINCT CAST(path AS BLOB) FROM temps WHERE connection_id = ? ORDER BY 1", connection.rawValue.uuidString)
+            .map(RemotePath.init(bytes:))
     }
 
     // MARK: Live files
@@ -164,181 +259,191 @@ final class Store: @unchecked Sendable {
     /// Every Live row, or one connection's.
     func liveFiles(connection: ConnectionID? = nil) -> [LiveRow] {
         queue.sync {
-            var statement: OpaquePointer?
-            defer { sqlite3_finalize(statement) }
-            let sql = "SELECT \(Self.liveColumns) FROM live_files" + (connection == nil ? "" : " WHERE connection_id = ?")
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
-            if let connection { bindText(statement, 1, connection.rawValue.uuidString) }
             var rows: [LiveRow] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                guard let id = UUID(uuidString: text(statement, 0)), let owner = UUID(uuidString: text(statement, 1)) else { continue }
-                func int(_ column: Int32) -> Int64? {
-                    sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : sqlite3_column_int64(statement, column)
+            let sql = "SELECT \(Self.liveColumns) FROM live_files" + (connection == nil ? "" : " WHERE connection_id = ?")
+            report("read Live files") {
+                try run(sql, connection.map { [$0.rawValue.uuidString] } ?? []) { row in
+                    guard let id = UUID(uuidString: row.text(0)), let owner = UUID(uuidString: row.text(1)) else { return }
+                    rows.append(LiveRow(
+                        id: LiveFileID(rawValue: id),
+                        connection: ConnectionID(rawValue: owner),
+                        path: RemotePath(bytes: row.bytes(2)),
+                        baseSize: row.int(3).map { UInt64(bitPattern: $0) },
+                        baseMtime: row.int(4).map { UInt32(truncatingIfNeeded: $0) },
+                        localPath: row.text(5),
+                        dirty: (row.int(6) ?? 0) != 0,
+                        paused: (row.int(7) ?? 0) != 0,
+                        conflict: row.string(8),
+                        conflictSize: row.int(9).map { UInt64(bitPattern: $0) },
+                        conflictMtime: row.int(10).map { UInt32(truncatingIfNeeded: $0) },
+                        syncedSize: row.int(11).map { UInt64(bitPattern: $0) },
+                        syncedMtime: row.double(12),
+                        syncedDigest: row.string(13)
+                    ))
                 }
-                func string(_ column: Int32) -> String? {
-                    sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : text(statement, column)
-                }
-                rows.append(LiveRow(
-                    id: LiveFileID(rawValue: id),
-                    connection: ConnectionID(rawValue: owner),
-                    path: RemotePath(bytes: Array(text(statement, 2).utf8)),
-                    baseSize: int(3).map { UInt64(bitPattern: $0) },
-                    baseMtime: int(4).map { UInt32(truncatingIfNeeded: $0) },
-                    localPath: text(statement, 5),
-                    dirty: sqlite3_column_int(statement, 6) != 0,
-                    paused: sqlite3_column_int(statement, 7) != 0,
-                    conflict: string(8),
-                    conflictSize: int(9).map { UInt64(bitPattern: $0) },
-                    conflictMtime: int(10).map { UInt32(truncatingIfNeeded: $0) },
-                    syncedSize: int(11).map { UInt64(bitPattern: $0) },
-                    syncedMtime: sqlite3_column_type(statement, 12) == SQLITE_NULL ? nil : sqlite3_column_double(statement, 12),
-                    syncedDigest: string(13)
-                ))
             }
             return rows
         }
     }
 
     func saveLive(_ row: LiveRow) {
-        queue.sync {
-            var statement: OpaquePointer?
-            defer { sqlite3_finalize(statement) }
-            let sql = "INSERT OR REPLACE INTO live_files (\(Self.liveColumns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
-            func int(_ column: Int32, _ value: Int64?) {
-                if let value { sqlite3_bind_int64(statement, column, value) } else { sqlite3_bind_null(statement, column) }
-            }
-            func string(_ column: Int32, _ value: String?) {
-                if let value { bindText(statement, column, value) } else { sqlite3_bind_null(statement, column) }
-            }
-            bindText(statement, 1, row.id.rawValue.uuidString)
-            bindText(statement, 2, row.connection.rawValue.uuidString)
-            bindText(statement, 3, row.path.display)
-            int(4, row.baseSize.map { Int64(bitPattern: $0) })
-            int(5, row.baseMtime.map { Int64($0) })
-            bindText(statement, 6, row.localPath)
-            sqlite3_bind_int(statement, 7, row.dirty ? 1 : 0)
-            sqlite3_bind_int(statement, 8, row.paused ? 1 : 0)
-            string(9, row.conflict)
-            int(10, row.conflictSize.map { Int64(bitPattern: $0) })
-            int(11, row.conflictMtime.map { Int64($0) })
-            int(12, row.syncedSize.map { Int64(bitPattern: $0) })
-            if let mtime = row.syncedMtime { sqlite3_bind_double(statement, 13, mtime) } else { sqlite3_bind_null(statement, 13) }
-            string(14, row.syncedDigest)
-            sqlite3_step(statement)
-        }
+        write(
+            "INSERT OR REPLACE INTO live_files (\(Self.liveColumns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            row.id.rawValue.uuidString, row.connection.rawValue.uuidString, StoredPath(row.path.bytes),
+            row.baseSize.map { Int64(bitPattern: $0) }, row.baseMtime.map { Int64($0) }, row.localPath,
+            Int64(row.dirty ? 1 : 0), Int64(row.paused ? 1 : 0), row.conflict,
+            row.conflictSize.map { Int64(bitPattern: $0) }, row.conflictMtime.map { Int64($0) },
+            row.syncedSize.map { Int64(bitPattern: $0) }, row.syncedMtime, row.syncedDigest
+        )
     }
 
     func deleteLive(_ id: LiveFileID) {
-        queue.sync { bind("DELETE FROM live_files WHERE id = ?", id.rawValue.uuidString) }
-    }
-
-    func dirtyLiveCount(connection: ConnectionID? = nil) -> Int {
-        queue.sync {
-            var statement: OpaquePointer?
-            defer { sqlite3_finalize(statement) }
-            let sql = connection == nil
-                ? "SELECT COUNT(*) FROM live_files WHERE dirty = 1"
-                : "SELECT COUNT(*) FROM live_files WHERE dirty = 1 AND connection_id = ?"
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return 0 }
-            if let connection { bindText(statement, 1, connection.rawValue.uuidString) }
-            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
-            return Int(sqlite3_column_int(statement, 0))
-        }
+        write("DELETE FROM live_files WHERE id = ?", id.rawValue.uuidString)
     }
 
     // MARK: Plumbing
 
-    private func queryConnections() -> [SavedConnection] {
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(db, "SELECT id, name, host, user, port, identity, remote_path FROM connections ORDER BY name", -1, &statement, nil) == SQLITE_OK else {
-            return []
+    private func paths(_ sql: String, _ value: String? = nil) -> [[UInt8]] {
+        queue.sync {
+            var values: [[UInt8]] = []
+            report("read the library") { try run(sql, value.map { [$0] } ?? []) { values.append($0.bytes(0)) } }
+            return values
         }
-        var values: [SavedConnection] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let id = text(statement, 0)
-            values.append(SavedConnection(
-                id: ConnectionID(rawValue: UUID(uuidString: id) ?? UUID()),
-                name: text(statement, 1),
-                host: text(statement, 2),
-                user: text(statement, 3),
-                port: text(statement, 4),
-                identityFile: text(statement, 5),
-                remotePath: text(statement, 6)
-            ))
+    }
+
+    /// The public API cannot throw, so a failed statement is logged with SQLite's reason.
+    private func write(_ sql: String, _ values: (any SQLValue)?...) {
+        queue.sync { report("write the library") { try run(sql, values) } }
+    }
+
+    private func report(_ action: String, _ body: () throws -> Void) {
+        do { try body() } catch { Self.log.error("Could not \(action, privacy: .public): \(error.localizedDescription, privacy: .public)") }
+    }
+
+    /// The one way a statement runs: prepare, bind `values` in order, step to the end calling
+    /// `row` for each result row, finalize. Any result other than a row or done throws.
+    private func run(_ sql: String, _ values: [(any SQLValue)?] = [], row: (Row) -> Void = { _ in }) throws {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try check(sqlite3_prepare_v2(db, sql, -1, &statement, nil))
+        for (index, value) in values.enumerated() {
+            let position = Int32(index + 1)
+            try check(value.map { $0.bind(statement, position) } ?? sqlite3_bind_null(statement, position))
         }
-        return values
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { return }
+            guard result == SQLITE_ROW else { return try check(result) }
+            row(Row(statement: statement))
+        }
     }
 
-    private func strings(_ sql: String, _ a: String?) -> [String] {
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
-        if let a { bindText(statement, 1, a) }
-        var values: [String] = []
-        while sqlite3_step(statement) == SQLITE_ROW { values.append(text(statement, 0)) }
-        return values
-    }
-
-    private func bind(_ sql: String, _ values: String...) {
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
-        for (index, value) in values.enumerated() { bindText(statement, Int32(index + 1), value) }
-        sqlite3_step(statement)
-    }
-
-    private func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String) {
-        sqlite3_bind_text(statement, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-    }
-
-    private func text(_ statement: OpaquePointer?, _ index: Int32) -> String {
-        guard let pointer = sqlite3_column_text(statement, index) else { return "" }
-        return String(cString: pointer)
-    }
-
+    /// Runs one or more statements that bind nothing and return no rows.
     private func execute(_ sql: String) throws {
-        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
-            throw TransferError.failed("Could not prepare the library")
+        try check(sqlite3_exec(db, sql, nil, nil, nil))
+    }
+
+    private func transaction<T>(_ body: () throws -> T) throws -> T {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let value = try body()
+            try execute("COMMIT")
+            return value
+        } catch {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            throw error
+        }
+    }
+
+    private func userVersion() throws -> Int {
+        var version = 0
+        try run("PRAGMA user_version") { version = Int($0.int(0) ?? 0) }
+        return version
+    }
+
+    private func check(_ result: Int32) throws {
+        guard result != SQLITE_OK else { return }
+        throw TransferError.failed("Library: \(String(cString: sqlite3_errmsg(db)))")
+    }
+}
+
+/// A value `Store.run` can bind to a statement parameter; `nil` binds NULL.
+private protocol SQLValue {
+    func bind(_ statement: OpaquePointer?, _ index: Int32) -> Int32
+}
+
+extension String: SQLValue {
+    fileprivate func bind(_ statement: OpaquePointer?, _ index: Int32) -> Int32 {
+        sqlite3_bind_text(statement, index, self, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+    }
+}
+
+extension Int64: SQLValue {
+    fileprivate func bind(_ statement: OpaquePointer?, _ index: Int32) -> Int32 {
+        sqlite3_bind_int64(statement, index, self)
+    }
+}
+
+extension Double: SQLValue {
+    fileprivate func bind(_ statement: OpaquePointer?, _ index: Int32) -> Int32 {
+        sqlite3_bind_double(statement, index, self)
+    }
+}
+
+extension [UInt8]: SQLValue {
+    /// A blob, byte for byte. An empty one is bound as a zero-length blob, not NULL.
+    fileprivate func bind(_ statement: OpaquePointer?, _ index: Int32) -> Int32 {
+        withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return sqlite3_bind_zeroblob(statement, index, 0) }
+            return sqlite3_bind_blob(statement, index, base, Int32(bytes.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         }
     }
 }
 
-enum KeychainStore {
-    private static let service = "Transfer"
+/// A path as the library stores it: UTF-8 text, as every Transfer before the byte-exact paths
+/// wrote it and still matches it (`path = ?`, bound as text), or a blob of the exact bytes when
+/// they are not UTF-8 or hold a NUL, which text would cut short.
+private struct StoredPath: SQLValue {
+    let bytes: [UInt8]
 
-    static func load(account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let text = String(data: data, encoding: .utf8) else { return nil }
-        return text
+    init(_ bytes: [UInt8]) {
+        self.bytes = bytes
     }
 
-    static func save(account: String, secret: String) {
-        delete(account: account)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecValueData as String: Data(secret.utf8),
-        ]
-        SecItemAdd(query as CFDictionary, nil)
+    fileprivate func bind(_ statement: OpaquePointer?, _ index: Int32) -> Int32 {
+        guard !bytes.contains(0), let text = String(validating: bytes, as: UTF8.self) else { return bytes.bind(statement, index) }
+        return text.bind(statement, index)
+    }
+}
+
+/// One result row, valid only inside the `row` callback.
+private struct Row {
+    let statement: OpaquePointer?
+
+    func isNull(_ column: Int32) -> Bool {
+        sqlite3_column_type(statement, column) == SQLITE_NULL
     }
 
-    static func delete(account: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(query as CFDictionary)
+    /// The column's bytes: a blob's as stored, a text's in UTF-8.
+    func bytes(_ column: Int32) -> [UInt8] {
+        guard let base = sqlite3_column_blob(statement, column) else { return [] }
+        return Array(UnsafeRawBufferPointer(start: base, count: Int(sqlite3_column_bytes(statement, column))))
+    }
+
+    /// "" for NULL.
+    func text(_ column: Int32) -> String {
+        String(decoding: bytes(column), as: UTF8.self)
+    }
+
+    func string(_ column: Int32) -> String? {
+        isNull(column) ? nil : text(column)
+    }
+
+    func int(_ column: Int32) -> Int64? {
+        isNull(column) ? nil : sqlite3_column_int64(statement, column)
+    }
+
+    func double(_ column: Int32) -> Double? {
+        isNull(column) ? nil : sqlite3_column_double(statement, column)
     }
 }

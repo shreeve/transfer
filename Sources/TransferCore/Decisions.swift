@@ -1,7 +1,10 @@
+// Small pure rules, tested in Tests/TransferCoreTests: Live or view, made-up names, listing order,
+// the column trail, units, retries, cache eviction, known-hosts lines, what Quit asks.
+
 import Foundation
 import UniformTypeIdentifiers
 
-public enum OpenKind: String, Sendable, Codable {
+public enum OpenKind: String, Sendable {
     case live
     case view
 }
@@ -24,159 +27,103 @@ public struct TransferConfig: Codable, Equatable, Sendable {
 }
 
 public enum EditableFile {
-    public static let extensions = TransferConfig.builtIn.extensionSet
+    /// How much of a text file the inspector shows, and so all of it that is fetched.
+    public static let previewHead = 64 << 10
 
-    public static func openKind(fileName: String, extensions: Set<String> = EditableFile.extensions) -> OpenKind {
+    public static func openKind(fileName: String, extensions: Set<String>) -> OpenKind {
         let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
         if extensions.contains(ext) { return .live }
-        if let type = UTType(filenameExtension: ext) {
-            if type.conforms(to: .plainText) || type.conforms(to: .sourceCode) {
-                return .live
-            }
-        }
+        if let type = UTType(filenameExtension: ext), type.conforms(to: .plainText) || type.conforms(to: .sourceCode) { return .live }
         return .view
     }
 }
 
-public enum NameCollisionChoice: String, Sendable, Codable {
+public enum NameCollisionChoice: String, Sendable {
     case skip
     case keepBoth
     case replace
 }
 
-public enum LiveConflictChoice: String, Sendable, Codable {
+public enum LiveConflictChoice: String, Sendable {
     case compare
     case keepLocal
     case keepRemote
     case keepBoth
 }
 
+/// Every name the app makes up so as not to take an existing one.
 public enum KeepBothName {
-    public static func next(existing: Set<String>, original: String) -> String {
-        let split = splitExtension(original)
-        var n = 2
-        while true {
-            let candidate = "\(split.base) \(n)\(split.ext)"
-            if !existing.contains(candidate) { return candidate }
-            n += 1
-        }
+    /// The first of `candidate(first)`, `candidate(first + 1)`, … that `existing` lacks.
+    public static func firstFree(existing: Set<String>, from first: Int = 1, _ candidate: (Int) -> String) -> String {
+        var n = first
+        while existing.contains(candidate(n)) { n += 1 }
+        return candidate(n)
     }
 
-    public static func duplicate(existing: Set<String>, original: String) -> String {
-        let split = splitExtension(original)
-        let first = "\(split.base) copy\(split.ext)"
-        if !existing.contains(first) { return first }
-        var n = 2
-        while true {
-            let candidate = "\(split.base) copy \(n)\(split.ext)"
-            if !existing.contains(candidate) { return candidate }
-            n += 1
-        }
+    /// Keep Both: "report 2.pdf", "report 3.pdf", …; a folder's whole name is kept: "v1.2 2".
+    public static func next(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
+        let split = splitExtension(original, isFolder: isFolder)
+        return firstFree(existing: existing, from: 2) { "\(split.base) \($0)\(split.ext)" }
     }
 
-    private static func splitExtension(_ name: String) -> (base: String, ext: String) {
-        guard let dot = name.lastIndex(of: "."), dot != name.startIndex else {
+    /// Duplicate: "notes copy.txt", "notes copy 2.txt", …; a folder's whole name is kept: "v1.2 copy".
+    public static func duplicate(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
+        let split = splitExtension(original, isFolder: isFolder)
+        return firstFree(existing: existing) { $0 == 1 ? "\(split.base) copy\(split.ext)" : "\(split.base) copy \($0)\(split.ext)" }
+    }
+
+    /// New Folder: "untitled folder", "untitled folder 2", …
+    public static func untitledFolder(existing: Set<String>) -> String {
+        firstFree(existing: existing) { $0 == 1 ? "untitled folder" : "untitled folder \($0)" }
+    }
+
+    /// Keep Both for a Live conflict, the Mac's copy beside the server's: "notes (from this
+    /// Mac).txt", "notes (from this Mac 2).txt", …; the extension stays last, so the copy opens in
+    /// the same editor.
+    public static func fromThisMac(existing: Set<String>, original: String) -> String {
+        let split = splitExtension(original)
+        return firstFree(existing: existing) { $0 == 1 ? "\(split.base) (from this Mac)\(split.ext)" : "\(split.base) (from this Mac \($0))\(split.ext)" }
+    }
+
+    /// A folder has no extension, as in Finder: its name is all base.
+    private static func splitExtension(_ name: String, isFolder: Bool = false) -> (base: String, ext: String) {
+        guard !isFolder, let dot = name.lastIndex(of: "."), dot != name.startIndex else {
             return (name, "")
         }
         return (String(name[..<dot]), String(name[dot...]))
     }
 }
 
-public enum CopyDisposition: Equatable, Sendable {
-    case skip
-    case collide
-    case typeMismatch
-    case write(tempName: String)
-}
-
 public enum CopyRules {
-    public static func fileDisposition(
-        source: RemoteItem,
-        destination: RemoteItem?,
-        transferID: String,
-        liveSave: Bool
-    ) -> CopyDisposition {
-        let temp = tempName(for: source.name, transferID: transferID)
-        guard let destination else { return .write(tempName: temp) }
-        if source.kind != destination.kind { return .typeMismatch }
-        if source.kind != .file { return .typeMismatch }
-        if !liveSave,
-           let left = Fingerprint(item: source),
-           let right = Fingerprint(item: destination),
-           left.size == right.size,
-           left.mtime == right.mtime {
-            return .skip
-        }
-        return .collide
-    }
-
+    /// The hidden temp beside `basename`: ".notes.txt.transfer-<id>". The name in it is cut, never
+    /// inside a character, so the temp fits the 255 bytes a file name may take even when
+    /// `basename` nearly does.
     public static func tempName(for basename: String, transferID: String) -> String {
-        ".\(basename).transfer-\(transferID)"
+        LiveDecision.siblingName(of: basename, prefix: ".", suffix: ".transfer-\(transferID)")
     }
 }
 
-public struct ProbeResult: Equatable, Sendable {
-    public var enabled: Bool
-    public var versionLine: String?
-
-    public init(exitCode: Int32, stdout: String) {
-        let trimmed = stdout.hasSuffix("\n") ? String(stdout.dropLast()) : stdout
-        let oneLine = !trimmed.isEmpty && !trimmed.contains("\n")
-        if exitCode == 0 && oneLine {
-            enabled = true
-            versionLine = trimmed
-        } else {
-            enabled = false
-            versionLine = nil
-        }
-    }
-}
-
-public enum SftpURL {
-    public static func string(connection: SavedConnection, path: RemotePath) -> String {
-        var host = connection.host
-        if !connection.port.isEmpty { host += ":\(connection.port)" }
-        let user = connection.user.trimmingCharacters(in: .whitespaces)
-        let authority = user.isEmpty ? host : "\(percent(user))@\(host)"
-        let encoded = path.display.split(separator: "/", omittingEmptySubsequences: false).map {
-            percent(String($0))
-        }.joined(separator: "/")
-        let suffix = encoded.hasPrefix("/") ? encoded : "/" + encoded
-        return "sftp://\(authority)\(suffix)"
-    }
-
-    private static func percent(_ value: String) -> String {
-        var allowed = CharacterSet.urlPathAllowed
-        allowed.remove(charactersIn: "/@:?#[]")
-        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-    }
-}
-
-public enum OperationState: String, Hashable, Sendable, Codable {
+public enum OperationState: String, Hashable, Sendable {
     case queued
     case active
     case paused
     case succeeded
     case failed
-    case canceled
 }
 
 public struct TransferProgress: Hashable, Sendable {
     public var completed: UInt64
     public var total: UInt64?
     public var itemsCompleted: Int
-    public var itemsTotal: Int?
 
-    public init(completed: UInt64, total: UInt64? = nil, itemsCompleted: Int = 0, itemsTotal: Int? = nil) {
+    public init(completed: UInt64, total: UInt64? = nil, itemsCompleted: Int = 0) {
         self.completed = completed
         self.total = total
         self.itemsCompleted = itemsCompleted
-        self.itemsTotal = itemsTotal
     }
 }
 
-public enum HostKeySituation: String, Sendable, Codable {
-    case unchanged
+public enum HostKeySituation: String, Sendable {
     case firstSeen
     case changed
 }
@@ -202,7 +149,7 @@ public enum HostKeyDecision: Sendable {
     case replace
 }
 
-public enum ViewMode: String, Hashable, Sendable, Codable, CaseIterable {
+public enum ViewMode: String, Hashable, Sendable, CaseIterable {
     case icon
     case list
     case columns
@@ -223,8 +170,6 @@ public struct SortConfiguration: Hashable, Sendable, Codable {
         self.foldersFirst = foldersFirst
     }
 
-    private enum CodingKeys: String, CodingKey { case column, ascending, caseInsensitive, foldersFirst }
-
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         column = try container.decodeIfPresent(String.self, forKey: .column) ?? "name"
@@ -236,107 +181,172 @@ public struct SortConfiguration: Hashable, Sendable, Codable {
 
 public struct BrowserSnapshot: Hashable, Sendable {
     public var connectionID: ConnectionID?
-    public var path: RemotePath
-    public var selection: Set<RemotePath>
-    public var viewMode: ViewMode
-    public var sort: SortConfiguration
-    public var showsHidden: Bool
+    public var path = RemotePath(bytes: [0x2F])
+    public var selection: Set<RemotePath> = []
+    public var viewMode = ViewMode.list
+    public var sort = SortConfiguration()
+    public var showsHidden = false
 
-    public init(
-        connectionID: ConnectionID? = nil,
-        path: RemotePath = RemotePath(bytes: [0x2F]),
-        selection: Set<RemotePath> = [],
-        viewMode: ViewMode = .list,
-        sort: SortConfiguration = SortConfiguration(),
-        showsHidden: Bool = false
-    ) {
-        self.connectionID = connectionID
-        self.path = path
-        self.selection = selection
-        self.viewMode = viewMode
-        self.sort = sort
-        self.showsHidden = showsHidden
-    }
+    public init() {}
 }
 
-/// What the column view shows for a location: one column per folder from the root down to the
-/// location, each with its selection. Every column above the location selects the next folder on
-/// the way down; the location's own column selects the items of `selection` it holds. A selected
-/// folder that is itself the location is therefore selected in its parent's column, and its own
-/// column shows with nothing selected, as it does after a click.
+/// What the column view shows for a location: a column per folder from the root down, each with its
+/// selection. Each column above the location selects the next folder down; the location's own
+/// column selects the items of `selection` it holds. So a selected folder that is the location is
+/// selected in its parent's column, and its own column has nothing selected, as after a click.
 public enum ColumnTrail {
     public struct Column: Hashable, Sendable {
         public var folder: RemotePath
         public var selected: Set<RemotePath>
-
-        public init(folder: RemotePath, selected: Set<RemotePath>) {
-            self.folder = folder
-            self.selected = selected
-        }
     }
 
     public static func columns(root: RemotePath, path: RemotePath, selection: Set<RemotePath>) -> [Column] {
-        var folders = [path]
-        if path.isInside(root) {
-            while let last = folders.last, last != root, let parent = last.parent { folders.append(parent) }
-            folders.reverse()
-        } else {
-            folders = [root]
+        var folders = [path.isInside(root) ? path : root]
+        while let last = folders.last, last != root, let parent = last.parent { folders.append(parent) }
+        folders.reverse()
+        return folders.enumerated().map { index, folder in
+            Column(folder: folder, selected: index + 1 < folders.count ? [folders[index + 1]] : selection.filter { $0.parent == folder })
         }
-        var columns: [Column] = []
-        for (index, folder) in folders.enumerated() {
-            let selected: Set<RemotePath> = index + 1 < folders.count
-                ? [folders[index + 1]]
-                : selection.filter { $0.parent == folder }
-            columns.append(Column(folder: folder, selected: selected))
-        }
-        return columns
     }
 }
 
+/// The order of a folder's items. Each item's sort key is computed once, not per comparison: a
+/// listing is sorted again on each publish while a big folder streams in.
 public enum ListingSort {
-    /// With `foldersFirst`, directories come first in every column and direction. Within each
-    /// group the chosen column applies, with raw-byte name order breaking ties.
+    /// With `foldersFirst`, directories come first in every column and direction. Then the column
+    /// applies; ties go to name order, ascending in every direction. Names compare case-folded
+    /// first when `caseInsensitive`, then by raw bytes. A missing size or time counts as 0.
     public static func apply(_ items: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
-        items.sorted { lhs, rhs in
-            if sort.foldersFirst, (lhs.kind == .directory) != (rhs.kind == .directory) {
-                return lhs.kind == .directory
+        let order = Order(sort)
+        return order.sorted(items) { index, _ in items[index] }
+    }
+
+    /// `page`, newly listed, merged into `sorted`, already in `apply`'s order for the same `sort`.
+    /// The result equals `apply(sorted + page, sort:)` for the cost of sorting the page and copying
+    /// the listing, so a streaming folder's publishes stop costing a full sort each.
+    public static func merge(_ page: [RemoteItem], into sorted: [RemoteItem], sort: SortConfiguration) -> [RemoteItem] {
+        guard !sorted.isEmpty else { return apply(page, sort: sort) }
+        let order = Order(sort)
+        var merged: [RemoteItem] = []
+        merged.reserveCapacity(sorted.count + page.count)
+        var start = sorted.startIndex
+        for (index, key) in order.sorted(page, { ($0, $1) }) {
+            // The first listed item that sorts after the new one. Galloping from the last
+            // insertion point computes the keys of only a few listed items per new one.
+            let after = { (listed: Int) in order.precedes(key, order.key(sorted[listed])) }
+            var low = start
+            var high = start
+            var step = 1
+            while high < sorted.endIndex, !after(high) {
+                low = high + 1
+                high = low + step
+                step *= 2
             }
-            let order: ComparisonResult
+            high = min(high, sorted.endIndex)
+            while low < high {
+                let middle = (low + high) / 2
+                if after(middle) { high = middle } else { low = middle + 1 }
+            }
+            merged += sorted[start..<low]
+            merged.append(page[index])
+            start = low
+        }
+        merged += sorted[start...]
+        return merged
+    }
+
+    private struct Key {
+        var folder: Bool
+        var value: UInt64
+        /// The lowercased name's UTF-8, when names fold. Byte order is the order of
+        /// `compare(_:options: .literal)`, which the sort used before.
+        var folded: ArraySlice<UInt8>
+        var name: ArraySlice<UInt8>
+    }
+
+    private struct Order {
+        enum Column { case name, size, mtime, kind }
+        let column: Column
+        let ascending: Bool
+        let foldersFirst: Bool
+        let caseInsensitive: Bool
+
+        init(_ sort: SortConfiguration) {
             switch sort.column {
-            case "size":
-                order = (lhs.size ?? 0) < (rhs.size ?? 0) ? .orderedAscending : (lhs.size == rhs.size ? .orderedSame : .orderedDescending)
-            case "mtime":
-                order = (lhs.mtime ?? 0) < (rhs.mtime ?? 0) ? .orderedAscending : (lhs.mtime == rhs.mtime ? .orderedSame : .orderedDescending)
-            case "kind":
-                order = lhs.kind.rawValue.compare(rhs.kind.rawValue, options: .literal)
-            default:
-                order = compareNames(lhs, rhs, caseInsensitive: sort.caseInsensitive)
+            case "size": column = .size
+            case "mtime": column = .mtime
+            case "kind": column = .kind
+            default: column = .name
             }
-            if order == .orderedSame {
-                return compareNames(lhs, rhs, caseInsensitive: sort.caseInsensitive) == .orderedAscending
+            ascending = sort.ascending
+            foldersFirst = sort.foldersFirst
+            caseInsensitive = sort.caseInsensitive
+        }
+
+        /// `items` in order, as `each(index, key)`. The keys stay put while their indices are
+        /// sorted, and Swift's sort is stable, so items that tie on every key keep their order.
+        func sorted<T>(_ items: [RemoteItem], _ each: (Int, Key) -> T) -> [T] {
+            let keys = items.map(key)
+            return keys.withUnsafeBufferPointer { keys in
+                keys.indices.sorted { precedes(keys[$0], keys[$1]) }.map { each($0, keys[$0]) }
             }
-            return sort.ascending ? order == .orderedAscending : order == .orderedDescending
         }
-    }
 
-    private static func compareNames(_ lhs: RemoteItem, _ rhs: RemoteItem, caseInsensitive: Bool) -> ComparisonResult {
-        if caseInsensitive {
-            let folded = lhs.name.lowercased().compare(rhs.name.lowercased(), options: .literal)
-            if folded != .orderedSame { return folded }
+        func key(_ item: RemoteItem) -> Key {
+            let name = item.path.nameSlice
+            let value: UInt64 = switch column {
+            case .size: item.size ?? 0
+            case .mtime: UInt64(item.mtime ?? 0)
+            case .kind: Self.kindRank(item.kind)
+            case .name: 0
+            }
+            return Key(folder: item.kind == .directory, value: value, folded: caseInsensitive ? Self.fold(name) : [], name: name)
         }
-        return compareBytes(lhs.path.nameBytes, rhs.path.nameBytes)
-    }
 
-    private static func compareBytes(_ left: [UInt8], _ right: [UInt8]) -> ComparisonResult {
-        let count = min(left.count, right.count)
-        for index in 0..<count {
-            if left[index] < right[index] { return .orderedAscending }
-            if left[index] > right[index] { return .orderedDescending }
+        /// What `String.lowercased()` makes of the name, as UTF-8. ASCII, the usual case, folds
+        /// byte by byte, and a name with no capitals is its own fold.
+        private static func fold(_ name: ArraySlice<UInt8>) -> ArraySlice<UInt8> {
+            var capitals = false
+            for byte in name {
+                if byte >= 0x80 { return Array(String(decoding: name, as: UTF8.self).lowercased().utf8)[...] }
+                if byte &- 0x41 < 26 { capitals = true }
+            }
+            return capitals ? ArraySlice(name.map { $0 &- 0x41 < 26 ? $0 | 0x20 : $0 }) : name
         }
-        if left.count < right.count { return .orderedAscending }
-        if left.count > right.count { return .orderedDescending }
-        return .orderedSame
+
+        /// The kinds in the order of their raw values, as the kind column sorted them before.
+        private static func kindRank(_ kind: ItemKind) -> UInt64 {
+            switch kind {
+            case .directory: 0
+            case .file: 1
+            case .other: 2
+            case .symlink: 3
+            }
+        }
+
+        func precedes(_ lhs: Key, _ rhs: Key) -> Bool {
+            if foldersFirst, lhs.folder != rhs.folder { return lhs.folder }
+            if column != .name, lhs.value != rhs.value { return (lhs.value < rhs.value) == ascending }
+            let names = compareNames(lhs, rhs)
+            return column == .name && !ascending ? names > 0 : names < 0
+        }
+
+        private func compareNames(_ lhs: Key, _ rhs: Key) -> Int {
+            if caseInsensitive {
+                let folded = Self.compare(lhs.folded, rhs.folded)
+                if folded != 0 { return folded }
+            }
+            return Self.compare(lhs.name, rhs.name)
+        }
+
+        private static func compare(_ left: ArraySlice<UInt8>, _ right: ArraySlice<UInt8>) -> Int {
+            let count = min(left.count, right.count)
+            let order = left.withUnsafeBufferPointer { l in
+                right.withUnsafeBufferPointer { r in count == 0 ? 0 : memcmp(l.baseAddress!, r.baseAddress!, count) }
+            }
+            if order != 0 { return order < 0 ? -1 : 1 }
+            return left.count == right.count ? 0 : (left.count < right.count ? -1 : 1)
+        }
     }
 }
 
@@ -385,12 +395,12 @@ public enum SyntaxPreview {
     }
 }
 
-/// Values with units in three characters and an SI prefix: `959 B`, `1.2kB`, ` 14kB`, `2.5ms`.
-/// Sizes, rates, and times read the same way everywhere.
+/// Values in three characters, a space, and the unit with its SI prefix: `959 B`, `1.2 kB`,
+/// ` 14 kB`, `2.5 ms`. Sizes, rates, and times read the same way everywhere.
 public enum Units {
     public static func scale(_ value: Double, unit: String) -> String {
         if value > 0, value.isFinite {
-            let span = ["T", "G", "M", "k", " ", "m", "µ", "n", "p"]
+            let span = ["T", "G", "M", "k", "", "m", "µ", "n", "p"]
             var value = value
             var slot = 4
             while value < 0.995, slot < 8 {
@@ -404,7 +414,7 @@ public enum Units {
             if value < 999.5 {
                 let tenth = (value * 10).rounded() / 10
                 let digits = tenth >= 10 ? String(Int(value.rounded())) : String(format: "%.1f", tenth)
-                return String(repeating: " ", count: max(0, 3 - digits.count)) + digits + span[slot] + unit
+                return String(repeating: " ", count: max(0, 3 - digits.count)) + digits + " " + span[slot] + unit
             }
         }
         return value == 0 ? "  0 \(unit)" : "??? \(unit)"
@@ -419,10 +429,9 @@ public enum RetryPolicy {
     public static let delays: [Double] = [1, 2, 4]
 
     public static func isRetryable(_ error: Error) -> Bool {
-        guard let error = error as? TransferError else { return false }
-        switch error {
-        case .connectionLost, .timeout: return true
-        default: return false
+        switch error as? TransferError {
+        case .connectionLost?, .timeout?, .changedOnServer?: true
+        default: false
         }
     }
 
@@ -484,35 +493,25 @@ public struct HostKeyLine: Hashable, Sendable {
     public var text: String { "\(host) \(keyType) \(key)" }
 }
 
-public enum KnownHosts {
-    /// The known-hosts files `ssh -G` reports, user files first.
-    public static func files(sshConfigOutput: String) -> [String] {
-        var user: [String] = []
-        var global: [String] = []
-        for line in sshConfigOutput.split(separator: "\n") {
-            let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-            guard parts.count > 1 else { continue }
-            switch parts[0].lowercased() {
-            case "userknownhostsfile": user += parts.dropFirst()
-            case "globalknownhostsfile": global += parts.dropFirst()
-            default: continue
-            }
-        }
-        return user + global
-    }
+/// What Quit asks, or nil when quitting loses nothing. `unsynced` is nil when the Live count did
+/// not arrive in time: then it asks, since unsynced edits cannot be ruled out.
+public struct QuitQuestion: Equatable, Sendable {
+    public var message: String
+    public var detail: String
 
-    /// The entries `ssh-keygen -F` printed.
-    public static func entries(keygenOutput: String) -> [HostKeyLine] {
-        keygenOutput.split(separator: "\n").compactMap { HostKeyLine(line: String($0)) }
-    }
-
-    public static func situation(offered: HostKeyLine, stored: [HostKeyLine]) -> HostKeySituation {
-        if stored.contains(where: { $0.keyType == offered.keyType && $0.key == offered.key }) {
-            return .unchanged
+    public init?(unsynced: Int?, running: Int) {
+        let stops = running > 0 ? "\(ClipText.count(running, "transfer")) not yet finished will stop; a move keeps each original until its copy is complete." : nil
+        switch unsynced {
+        case nil:
+            message = "Transfer could not check its Live files"
+            detail = ["Some may have edits that have not reached the server. Quitting now leaves any such edits on this Mac until the next launch.", stops].compactMap(\.self).joined(separator: " ")
+        case let count? where count > 0:
+            message = TransferError.liveUnsynced(count).localizedDescription
+            detail = ["Uploads run only while Transfer is open. Quitting now leaves those edits on this Mac until the next launch.", stops].compactMap(\.self).joined(separator: " ")
+        default:
+            guard let stops else { return nil }
+            message = running == 1 ? "A transfer has not finished" : "\(running) transfers have not finished"
+            detail = stops
         }
-        if stored.contains(where: { $0.keyType == offered.keyType }) {
-            return .changed
-        }
-        return .firstSeen
     }
 }
