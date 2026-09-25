@@ -304,6 +304,7 @@ struct TransferServerTests {
 
             let page = try await h.session.preparePreview(path)
             #expect(try String(contentsOf: page, encoding: .utf8).contains("first"))
+            #expect(page.lastPathComponent == "note.txt.html")
             let identity = try page.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
             let again = try await h.session.preparePreview(path)
             #expect(again == page)

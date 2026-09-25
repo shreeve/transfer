@@ -647,7 +647,7 @@ extension SSHConnection {
         }
         // Only the head of a text file is shown, so only the head is fetched. The copy is named for
         // the file's size and time, so an unchanged file reuses it.
-        let file = try previewURL(path, ext: (item.name as NSString).pathExtension, version: "head \(print.size):\(print.mtime)")
+        let file = try previewURL(path, name: item.name, version: "head \(print.size):\(print.mtime)")
         if FileManager.default.fileExists(atPath: file.path) { return file }
         try await fetchHead(path, limit: head, to: file)
         trimPreviewCache()
@@ -664,8 +664,7 @@ extension SSHConnection {
     /// The whole file in the preview cache, fetched on the lane as `kind`.
     private func cachedCopy(_ item: RemoteItem, lane kind: InteractiveLane.Kind) async throws -> URL {
         let path = item.path
-        let ext = (item.name as NSString).pathExtension
-        let file = try previewURL(path, ext: ext.isEmpty ? "bin" : ext)
+        let file = try previewURL(path, name: item.name)
         // The copy carries the remote size and mtime; the same pair means the same bytes.
         if let print = Fingerprint(item: item), (try? LocalPlacement.occupant(file)) == .file(print) { return file }
         try await lane.submit(kind) {
@@ -680,9 +679,9 @@ extension SSHConnection {
         if EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live {
             // The page is named for the file's size and time too, so an unchanged file reuses it.
             let print = Fingerprint(item: item)
-            let file = try previewURL(path, ext: "html", version: print.map { "\($0.size):\($0.mtime)" } ?? "")
+            let file = try previewURL(path, name: item.name, suffix: ".html", version: print.map { "\($0.size):\($0.mtime)" } ?? "")
             if print != nil, FileManager.default.fileExists(atPath: file.path) { return file }
-            let part = try previewURL(path, ext: "part")
+            let part = try previewURL(path, name: item.name, suffix: ".part")
             let limit: UInt64 = 512 * 1024
             try await fetchHead(path, limit: min(item.size ?? limit, limit), to: part)
             defer { try? FileManager.default.removeItem(at: part) }
@@ -706,9 +705,11 @@ extension SSHConnection {
         store.cacheRoot.appendingPathComponent("Preview", isDirectory: true)
     }
 
-    /// The cache file for `path` on this server. Named for the server too, since two servers
-    /// can hold different files at one path.
-    private func previewURL(_ path: RemotePath, ext: String, version: String = "") throws -> URL {
+    /// The cache file for `path` on this server: the remote file's own name (plus `suffix`, cut to
+    /// fit), in a folder named for the server, the path, and `version`, since two servers can hold
+    /// different files at one path. The name is what Quick Look's Open With and an app viewing the
+    /// copy show and open, where a digest meant nothing.
+    private func previewURL(_ path: RemotePath, name: String, suffix: String = "", version: String = "") throws -> URL {
         var cache = previewCacheDirectory
         try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         var values = URLResourceValues()
@@ -716,18 +717,30 @@ extension SSHConnection {
         try? cache.setResourceValues(values)
         let key = Data(connection.id.rawValue.uuidString.utf8) + Data(path.bytes) + Data([0]) + Data(version.utf8)
         let digest = SHA256.hash(data: key).map { String(format: "%02x", $0) }.joined()
-        return cache.appendingPathComponent("\(digest).\(ext)")
+        let folder = cache.appendingPathComponent(digest, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let fits = suffix.isEmpty && name.utf8.count <= 255
+        return folder.appendingPathComponent(fits ? name : LiveDecision.siblingName(of: name, suffix: suffix))
     }
 
+    /// Evicts whole entries, each a file's folder (or a digest-named file from before names were
+    /// kept), by the last use of what it holds, in one walk of the cache.
     private func trimPreviewCache() {
-        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentAccessDateKey, .contentModificationDateKey]
-        guard let files = try? FileManager.default.contentsOfDirectory(at: previewCacheDirectory, includingPropertiesForKeys: Array(keys)) else { return }
-        let entries = files.compactMap { url -> CacheEntry? in
-            guard let values = try? url.resourceValues(forKeys: keys) else { return nil }
+        let root = previewCacheDirectory.path
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentAccessDateKey, .contentModificationDateKey]
+        guard let walker = FileManager.default.enumerator(at: previewCacheDirectory, includingPropertiesForKeys: Array(keys)) else { return }
+        var entries: [String: CacheEntry] = [:]
+        for case let url as URL in walker {
+            guard let values = try? url.resourceValues(forKeys: keys) else { continue }
             let used = values.contentAccessDate ?? values.contentModificationDate ?? .distantPast
-            return CacheEntry(id: url.path, size: UInt64(values.fileSize ?? 0), lastUsed: used)
+            let parent = url.deletingLastPathComponent().path
+            let id = values.isDirectory == true || parent == root ? url.path : parent
+            var entry = entries[id] ?? CacheEntry(id: id, size: 0, lastUsed: .distantPast)
+            if values.isDirectory != true { entry.size += UInt64(values.fileSize ?? 0) }
+            entry.lastUsed = max(entry.lastUsed, used)
+            entries[id] = entry
         }
-        for victim in CacheEviction.victims(entries, limit: CacheEviction.previewLimit) {
+        for victim in CacheEviction.victims(Array(entries.values), limit: CacheEviction.previewLimit) {
             try? FileManager.default.removeItem(atPath: victim)
         }
     }

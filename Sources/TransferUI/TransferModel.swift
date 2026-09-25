@@ -948,7 +948,7 @@ public final class TransferModel {
                 let target = try await Self.resolveLink(item, session: session)
                 let url = try await session.preparePreview(target.path)
                 if Task.isCancelled { return }
-                PreviewPanel.shared.show(url, generation: generation)
+                PreviewPanel.shared.show(url, title: target.name, generation: generation)
             } catch {
                 self?.report(error)
             }
@@ -2113,7 +2113,7 @@ enum TerminalLauncher {
 @MainActor
 final class PreviewPanel: NSObject, @MainActor QLPreviewPanelDataSource, @MainActor QLPreviewPanelDelegate {
     static let shared = PreviewPanel()
-    private var url: URL?
+    private var item: Item?
     private(set) var generation = 0
 
     private enum Key {
@@ -2124,10 +2124,21 @@ final class PreviewPanel: NSObject, @MainActor QLPreviewPanelDataSource, @MainAc
 
     var isVisible: Bool { QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible }
 
-    /// Shows `url`, unless the panel was closed since `generation` was read.
-    func show(_ url: URL, generation: Int) {
+    /// The cached copy under the remote file's name: a text file's copy is a highlighted page.
+    private final class Item: NSObject, QLPreviewItem {
+        let previewItemURL: URL!
+        let previewItemTitle: String!
+
+        init(url: URL, title: String) {
+            previewItemURL = url
+            previewItemTitle = title
+        }
+    }
+
+    /// Shows `url` titled `title`, unless the panel was closed since `generation` was read.
+    func show(_ url: URL, title: String, generation: Int) {
         guard generation == self.generation, let panel = QLPreviewPanel.shared() else { return }
-        self.url = url
+        item = Item(url: url, title: title)
         panel.dataSource = self
         panel.delegate = self
         if panel.isVisible {
@@ -2144,11 +2155,11 @@ final class PreviewPanel: NSObject, @MainActor QLPreviewPanelDataSource, @MainAc
     }
 
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        url == nil ? 0 : 1
+        item == nil ? 0 : 1
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
-        (url ?? URL(fileURLWithPath: "/")) as NSURL
+        item ?? URL(fileURLWithPath: "/") as NSURL
     }
 
     /// Space and Escape put the panel away; the arrow keys go to the browser behind it, so the
