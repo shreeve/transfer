@@ -51,6 +51,17 @@ import Testing
     }
 }
 
+/// Gatekeeper refuses to open a quarantined `.command` or `.tool` in any app, so a Live copy of one
+/// could not be edited (E2E): only those Live copies go unquarantined; a `.sh` stays quarantined.
+@Test func onlyTerminalScriptLiveCopiesGoUnquarantined() {
+    for name in ["run.command", "RUN.COMMAND", "build.tool", "a.sh.command"] {
+        #expect(!EditableFile.quarantinesLiveCopy(fileName: name), "\(name)")
+    }
+    for name in ["run.sh", "run.zsh", "tool.py", "notes.txt", "Makefile", "command", "run.command.txt", "run.", "App.app"] {
+        #expect(EditableFile.quarantinesLiveCopy(fileName: name), "\(name)")
+    }
+}
+
 /// Only what follows the last dot is the extension (COR-1), and a trailing dot leaves none. A name
 /// with no dot matches the list by its whole name, so a user's "makefile" entry opens Makefile
 /// Live (FR-2); the built-in list holds no such name, and an empty entry matches nothing.

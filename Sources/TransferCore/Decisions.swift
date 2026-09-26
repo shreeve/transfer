@@ -40,6 +40,15 @@ public enum EditableFile {
         if let type = UTType(filenameExtension: ext), type.conforms(to: .plainText) || type.conforms(to: .sourceCode) { return .live }
         return .view
     }
+
+    /// Whether a Live working copy is quarantined, as every other download is. A Terminal script
+    /// (`.command`, `.tool`) is not: Gatekeeper refuses to open a quarantined one in any app, an
+    /// editor too, so it could never be edited Live. The copy is 0600, so nothing runs it.
+    public static func quarantinesLiveCopy(fileName: String) -> Bool {
+        guard let dot = fileName.lastIndex(of: "."), let script = UTType("com.apple.terminal.shell-script"),
+              let type = UTType(filenameExtension: String(fileName[fileName.index(after: dot)...])) else { return true }
+        return !type.conforms(to: script)
+    }
 }
 
 public enum NameCollisionChoice: String, Sendable {

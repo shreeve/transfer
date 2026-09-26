@@ -294,6 +294,23 @@ struct TransferServerTests {
         }
     }
 
+    /// Gatekeeper refuses to open a quarantined `.command` in any app, an editor too, so it could not
+    /// be edited Live (E2E): a Live Terminal script lands unquarantined, and 0600 so nothing runs it.
+    /// Any other Live copy, a `.sh` included, stays quarantined.
+    @Test func liveTerminalScriptsLandUnquarantinedAndPrivate() async throws {
+        try await withHarness("livecmd", connected: true) { h in
+            for name in ["run.command", "run.sh"] {
+                let file = h.remote.appendingPathComponent(name)
+                try Data("echo hi\n".utf8).write(to: file)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+                let live = try await h.session.prepareLiveFile(h.remotePath.appending(name))
+                #expect(quarantined(live) == (name == "run.sh"), "\(name)")
+                #expect(try FileManager.default.attributesOfItem(atPath: live.path)[.posixPermissions] as? Int == 0o600, "\(name)")
+                try await h.session.discardLiveFile(h.remotePath.appending(name), force: true)
+            }
+        }
+    }
+
     /// A View or preview copy took the server's write bits, so an editor saved into it, never
     /// uploaded, and the next fetch renamed over the edits (COR-1): they are read-only now (D3).
     /// A download took group and other write bits from the server regardless of the umask (SEC2-08).

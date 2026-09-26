@@ -1003,8 +1003,8 @@ extension SSHConnection: LiveServer {
     }
 
     func liveFetch(_ item: RemoteItem, to local: URL, interactive: Bool) async throws {
-        guard interactive else { return try await fetch(item.path, info: item, to: local) { _ in } }
-        try await lane.submit(.open) { try await self.fetch(item.path, info: item, to: local, interactive: true) { _ in } }
+        guard interactive else { return try await fetch(item.path, info: item, to: local, live: true) { _ in } }
+        try await lane.submit(.open) { try await self.fetch(item.path, info: item, to: local, live: true, interactive: true) { _ in } }
     }
 
     func liveSave(_ snapshot: URL, to path: RemotePath, expecting: ServerExpectation, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> Fingerprint {

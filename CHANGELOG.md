@@ -22,7 +22,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 
 ### Security
 
-- A `.command` or script opened Live no longer runs in Terminal without Gatekeeper's check: Live copies are quarantined like every other download, and a file whose default app would run it opens in the text editor (see Behavior changes).
+- A `.command` or script opened Live no longer runs in Terminal without Gatekeeper's check: Live copies are quarantined like every other download, and a file whose default app would run it opens in the text editor (see Behavior changes). A Live `.command` or `.tool`, which Gatekeeper lets no app open while quarantined, is instead written without the execute bit.
 - A saved password answers only the prompt ssh itself writes for that server, so a `ProxyJump` host can no longer get it by asking for it by name.
 - A password typed into a login sheet that was withdrawn, and its Save in Keychain, no longer fill in the next login sheet, which could be another server's.
 - A server that lists wrong or missing sizes can no longer fill the disk: copying for the Finder stops staging at 1 GB actually received, and the inspector previews a file only up to 8 MB whatever its listing said. A huge listed size no longer crashes a copy or a drag to the Finder.
@@ -64,7 +64,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 
 ### Behavior changes
 
-- Every download is quarantined, Live working copies included, so macOS checks an app or script from a server before it first runs.
+- Every download is quarantined, Live working copies included, so macOS checks an app or script from a server before it first runs. A Live `.command` or `.tool` is the exception, as macOS would let no editor open it; it is written private and not executable instead.
 - A file whose default app would run it (Terminal, iTerm2, Ghostty, Python Launcher, or Jar Launcher) opens in the default text editor instead, whether opened Live or to view. Choosing such an app when Transfer asks which app opens a type no longer makes it the Mac's default for that type.
 - Copies opened to view or preview are read-only, so an editor says the file is locked instead of saving edits that never upload and are later overwritten.
 - A move on one server onto a name the destination already holds asks Replace, Keep Both, or Skip, instead of failing.

@@ -89,14 +89,17 @@ extension SSHConnection {
     /// without `replacing` the rename refuses a name that something took since it was looked up.
     /// The file takes the server's permissions under this process's umask, as `sftp get` does,
     /// without setuid, setgid, or sticky, which an untrusted server must not grant; `readOnly`
-    /// drops the write bits too. Every download is quarantined as a browser's is, a Live working
-    /// copy too: the app a Live file opens in may run it (D2).
+    /// drops the write bits too, and a `live` working copy is private (0600) as it lands. Every
+    /// download is quarantined as a browser's is, a Live working copy too, as the app it opens in may
+    /// run it (D2), except a Live Terminal script, which Gatekeeper lets no editor open
+    /// (`EditableFile.quarantinesLiveCopy`); being 0600, it runs nowhere.
     func fetch(
         _ path: RemotePath,
         info: RemoteItem,
         to destination: URL,
         replacing: Bool = true,
         readOnly: Bool = false,
+        live: Bool = false,
         interactive: Bool = false,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
@@ -107,8 +110,9 @@ extension SSHConnection {
             try await receive(path, info: info, into: temp, interactive: interactive, progress: progress)
             // Marked first: a file without write bits takes no extended attribute. The channel
             // created it with 0o666 under the umask, which no mode listed keeps.
-            LocalPlacement.quarantine(temp)
-            var attributes: [FileAttributeKey: Any] = [.posixPermissions: Int((info.mode ?? 0o666) & (readOnly ? 0o555 : 0o777) & ~Self.fileMask)]
+            if !live || EditableFile.quarantinesLiveCopy(fileName: path.name) { LocalPlacement.quarantine(temp) }
+            let mode = live ? 0o600 : (info.mode ?? 0o666) & (readOnly ? 0o555 : 0o777) & ~Self.fileMask
+            var attributes: [FileAttributeKey: Any] = [.posixPermissions: Int(mode)]
             if let mtime = info.mtime { attributes[.modificationDate] = Date(timeIntervalSince1970: TimeInterval(mtime)) }
             try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path)
             // One rename replaces the destination, so a watched Live copy is never briefly missing.
