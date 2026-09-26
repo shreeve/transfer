@@ -80,7 +80,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 ### For maintainers
 
 - A `TransferUITests` target drives the real window model against fake sessions and a fake library; `swift test` runs it without a server.
-- With the local sshd, the full test run takes about 13 s instead of about 75: `EditorMatrix`, `MoveServerTests`, and `ThroughputServerTests` run their cases in parallel.
+- With the local sshd, the full test run takes about 18 s instead of about 75: `EditorMatrix`, `MoveServerTests`, and `ThroughputServerTests` run their cases in parallel.
 - A file a replace set aside is recorded in the `temps` table under the owner `<uuid> aside`, which 0.1.7 and 0.2.0 never select; records 0.2.0 wrote are still read. There is no schema change.
 
 ## 0.2.0 — 2026-09-24
