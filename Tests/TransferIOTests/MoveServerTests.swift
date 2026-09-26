@@ -6,8 +6,8 @@ import TransferCore
 /// Pastes and drops through `TransferEngine` against the local sshd, above all the moves, which
 /// delete: an original goes only once this move is proven to have written a complete copy of it.
 /// A second saved server for the same sshd stands in for an alias, an address, or a second host
-/// on a shared disk. Serialized for the same reason as `TransferServerTests`.
-@Suite(.serialized, .enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
+/// on a shared disk.
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct MoveServerTests {
     /// Move Item Here into the folder the items came from, copied through a second saved server
     /// for the same host, found each item "already there" and deleted the only copy (CLIP-01).

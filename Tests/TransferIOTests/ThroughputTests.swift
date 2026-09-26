@@ -320,7 +320,7 @@ import TransferCore
 
 /// The same against the local sshd: small files share data channels and a large one never does,
 /// a large file moves over several channels at once, and a part that fails leaves no temp.
-@Suite(.serialized, .enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct ThroughputServerTests {
     /// Small jobs share a channel, up to sixteen on one; a whole-channel job shares with nobody;
     /// and there are never more than seven data channels.
