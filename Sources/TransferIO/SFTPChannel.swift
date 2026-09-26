@@ -148,7 +148,7 @@ actor SFTPChannel {
                         } onCancel: {
                             next.cancel()
                         }
-                        guard let page, !page.isEmpty else {
+                        guard let page else {
                             finished = true
                             continue
                         }
@@ -506,17 +506,19 @@ actor SFTPChannel {
         }
     }
 
-    /// One page of `parent`'s entries, nil at the end. A name the server sends is used as a path
-    /// component, so anything that is not exactly one is dropped: `.` and `..`, an empty name, and
-    /// a name with a slash or NUL, which a hostile server could send to reach outside the folder.
+    /// One page of `parent`'s entries, nil at the end: EOF, or a page of no names. A name the
+    /// server sends is used as a path component, so anything that is not exactly one is dropped:
+    /// `.` and `..`, an empty name, and a name with a slash or NUL, which a hostile server could
+    /// send to reach outside the folder. A page of only such names is empty, not the end.
     private func readDirectory(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem]? {
-        let message: SFTPMessage
+        let names: [(filename: Data, attrs: SFTPAttrs)]
         do {
-            message = try await call(SFTPCode.readdir) { $0.appendBlob(handle) }
+            names = try self.names(in: await call(SFTPCode.readdir) { $0.appendBlob(handle) })
         } catch is EndOfFile {
             return nil
         }
-        return try names(in: message).compactMap { name in
+        guard !names.isEmpty else { return nil }
+        return names.compactMap { name in
             guard Self.isSingleComponent(name.filename) else { return nil }
             return item(path: parent.appending(name: Array(name.filename)), attrs: name.attrs)
         }
