@@ -79,11 +79,19 @@ Transfer updates itself, however it was installed. Choose **Transfer → Check f
 
 Remove it the way you installed it. Each of these removes only the app: your saved servers, Live files, and settings stay, so a later install picks up where you left off.
 
-| Installed with | Uninstall |
-| --- | --- |
-| Homebrew | `brew uninstall --cask transfer-sftp` |
-| Installer | `curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh \| bash -s -- --uninstall` |
-| Download | Drag `Transfer.app` from Applications to the Trash |
+**Homebrew**
+
+```bash
+brew uninstall --cask transfer-sftp
+```
+
+**Installer**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash -s -- --uninstall
+```
+
+**Download.** Drag `Transfer.app` from Applications to the Trash.
 
 `brew uninstall --zap --cask transfer-sftp` also deletes your data: saved servers, Live file working copies, caches, and preferences, but not passwords in the Keychain. Check first that no Live file has unsynced edits. [Where your data lives](#where-your-data-lives) lists everything, for removing it by hand.
 
