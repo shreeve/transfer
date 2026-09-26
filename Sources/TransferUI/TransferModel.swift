@@ -2031,7 +2031,7 @@ final class OperationPrompt: PromptSink {
 }
 
 enum TerminalLauncher {
-    private static let apps: [(name: String, bundle: String)] = [
+    static let apps: [(name: String, bundle: String)] = [
         ("Terminal", "com.apple.Terminal"),
         ("iTerm2", "com.googlecode.iterm2"),
         ("Ghostty", "com.mitchellh.ghostty"),
