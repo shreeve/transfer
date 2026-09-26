@@ -45,6 +45,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - Right-clicking a folder that is not selected in column view opens its menu, instead of failing and leaving the view out of step. The right-click menu's Quick Look and Rename act on the item clicked, and Open Live works on a link to a file.
 - Escape in the search field gives the keyboard back to the files, and Command-F with the search item in the toolbar's overflow no longer turns off Return and Space.
 - Finder's Stop always stops a drag's download.
+- Choosing Keep Local again after its upload's reply was lost clears the conflict, instead of raising it again over your own bytes.
 - Retry on a Live conflict's row keeps the conflict on the shelf, and two refused Live discards each ask in turn.
 - An Extensions edit made just before closing Settings is saved.
 - View → Clear Preview Cache works in a window with no server open.

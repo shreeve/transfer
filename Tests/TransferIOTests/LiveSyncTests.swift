@@ -923,6 +923,23 @@ struct LiveSyncTests {
         }
     }
 
+    /// Keep Local whose reply was lost left the working copy on the server, so trying it again met
+    /// a server file that no longer matched the conflict and raised it again, over our own bytes
+    /// (FR-16). The second try adopts that upload and clears the conflict, sending nothing again.
+    @Test func keepLocalWhoseReplyWasLostIsAdoptedWhenChosenAgain() async throws {
+        try await withLive("keep-lost") { h in
+            let (local, _) = try await conflicted(h, server: "theirs", local: "mine")
+            await h.fake.landNextSaveThenFail()
+            await #expect(throws: (any Error).self) { try await h.live.resolve(note, on: h.connection, choice: .keepLocal) }
+            #expect(await h.fake.contents(note) == "mine")
+            try await h.live.resolve(note, on: h.connection, choice: .keepLocal)
+            #expect(await h.fake.saves == 1)
+            #expect(await h.file().map { !$0.dirty && !$0.conflict } == true)
+            #expect(read(local) == "mine")
+            #expect(!FileManager.default.fileExists(atPath: serverCopy(local).path))
+        }
+    }
+
     // MARK: Refreshing beside an editor (LIVE-06)
 
     /// An NSDocument editor holding the copy is told before a refresh replaces it. One that saves
