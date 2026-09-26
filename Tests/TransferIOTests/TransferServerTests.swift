@@ -369,7 +369,7 @@ struct TransferServerTests {
             let destination = h.remotePath.appending(name: Array("moved".utf8))
             try await h.session.copy(source, to: destination) { _ in }
             let copied = try await h.session.tree(destination)
-            #expect(MoveCheck.verdict(source: original, before: [:], after: copied) == .incomplete(["pipe"]))
+            #expect(MoveCheck.verdict(source: original, after: copied, written: Set(copied.keys)) == .incomplete(["pipe"]))
 
             // Removal empties folders of many entries, several levels deep, special files too.
             for index in 0..<250 { try Data("\(index)".utf8).write(to: site.appendingPathComponent("deep/er/g\(index)")) }

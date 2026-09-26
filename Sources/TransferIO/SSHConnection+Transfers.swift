@@ -19,7 +19,7 @@ extension SSHConnection {
     /// Removes a moved original: only what the move verified of it, `verified` by key as it was
     /// then. A file changed or added since stays, with the folders holding it, and so does all of
     /// it when a Live file under it was saved since `mark` (`LiveSync.saveMark`, read before the
-    /// walk): the copy lacks those bytes. Returns whether all of it went.
+    /// copy): the copy may lack those bytes. Returns whether all of it went.
     func removeMoved(_ path: RemotePath, verified: [TreeKey: TreeEntry], savedSince mark: UInt64) async throws -> Bool {
         defer { if let parent = path.parent { pipe.emit(.directoryChanged(parent)) } }
         do {
@@ -160,7 +160,7 @@ extension SSHConnection {
             try await withInteractive { link in try await link.upload(source, to: temp, stamp: stamp, progress: progress) }
             let link = try await metadataLink()
             let written = Fingerprint(item: try await link.lstat(temp))
-            let found = try await existing(placed, on: link)
+            let found = try await link.lookup(placed)
             let now = found.flatMap(Fingerprint.init(item:))
             // "Absent" means nothing at all there: a folder or a link is not absent.
             let matches = switch expecting {
@@ -234,10 +234,15 @@ extension SSHConnection {
         parts.finish()
     }
 
-    /// `SFTPChannel.lookup` on `link`, else on the metadata channel.
-    func existing(_ path: RemotePath, on link: SFTPChannel? = nil) async throws -> RemoteItem? {
-        if let link { return try await link.lookup(path) }
-        return try await metadataLink().lookup(path)
+    /// `SFTPChannel.lookup` on the metadata channel.
+    func existing(_ path: RemotePath) async throws -> RemoteItem? {
+        try await metadataLink().lookup(path)
+    }
+
+    /// Whether any of `folders` holds `name`.
+    func holds(_ name: String, inAny folders: Set<RemotePath>) async throws -> Bool {
+        for folder in folders where try await existing(folder.appending(name)) != nil { return true }
+        return false
     }
 
     // MARK: Directory copy

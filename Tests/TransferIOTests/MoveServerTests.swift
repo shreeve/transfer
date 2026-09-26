@@ -62,6 +62,35 @@ struct MoveServerTests {
         }
     }
 
+    /// A lookalike that reached the destination during the copy, after the move's snapshot of it,
+    /// was answered Skip and then passed for the move's copy: the original was removed and only
+    /// the lookalike was left (XFR-01). Only what the move wrote counts now.
+    @Test func aLookalikeArrivingDuringTheCopyNeverPassesForIt() async throws {
+        try await withHarness("late", connected: true) { h in
+            try await withAlias(h) { alias in
+                let from = try h.folder("from", files: ["report.txt": "AAAA"])
+                try h.setTime("from/report.txt", 1_700_000_000)
+                let to = try h.folder("to")
+                let planted = Locked(false)
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("report.txt")]), into: to, on: h.session.connection.id, moving: true)
+                // During the download, someone else writes a file of the same size and time.
+                let engine = TransferEngine(request: request, destination: h.session) { _ in
+                    guard !planted.withLock({ defer { $0 = true }; return $0 }) else { return }
+                    try? h.write("to/report.txt", "BBBB")
+                    try? h.setTime("to/report.txt", 1_700_000_000)
+                }
+                let skip = Choosing(.skip)
+                await #expect(throws: TransferKept([.init("report.txt", .alreadyThere)], moving: true, place: "on the other server")) {
+                    try await OperationPrompts.$current.withValue(skip) { try await engine.run(from: alias) }
+                }
+                #expect(planted.value)
+                #expect(skip.asked == 1)
+                #expect(try h.read("from/report.txt") == "AAAA")
+                #expect(try h.read("to/report.txt") == "BBBB")
+            }
+        }
+    }
+
     /// With Keep Both the copy lands as "name 2", and the move checked the old name, kept the
     /// original, and said the copy was not complete (CLIP-15).
     @Test func keepBothIsFollowedToWhereTheCopyLanded() async throws {
@@ -303,6 +332,124 @@ struct MoveServerTests {
             #expect(try h.read("dir/note.txt") == "FIRST")
             #expect(try Data(contentsOf: local) == Data("FIRST".utf8))
             #expect(await h.session.liveFiles().count == 1)
+        }
+    }
+
+    /// The save mark was read after the copy, so a Live save that landed while the item was being
+    /// copied, keeping its size and whole-second time, was in neither the copy nor the mark: the
+    /// original holding it was removed, and the edit was nowhere (XFR-04, LIV2-01).
+    @Test func aLiveSaveDuringTheCopyKeepsTheOriginal() async throws {
+        try await withHarness("lcopy", connected: true) { h in
+            try await withAlias(h) { alias in
+                let dir = try h.folder("from", files: ["dir/note.txt": "first"])
+                try h.setTime("from/dir/note.txt", 1_700_000_000)
+                let local = try await h.session.prepareLiveFile(dir.appending("dir").appending("note.txt"))
+                let saved = Locked(false)
+                let request = TransferRequest(.server(h.session.connection.id, [dir.appending("dir")]), into: try h.folder("to"), on: alias.connection.id, moving: true)
+                // The download's first progress holds the copy until the save is on the server.
+                let engine = TransferEngine(request: request, destination: alias) { _ in
+                    guard !saved.withLock({ defer { $0 = true }; return $0 }) else { return }
+                    let landed = DispatchSemaphore(value: 0)
+                    Task {
+                        let next = h.staging.appendingPathComponent("note.txt")
+                        try? Data("FIRST".utf8).write(to: next)
+                        try? FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000.5)], ofItemAtPath: next.path)
+                        _ = rename(next.path, local.path)
+                        _ = await waitUntil { (try? h.read("from/dir/note.txt")) == "FIRST" }
+                        _ = await waitUntil { await h.session.liveFiles().first?.dirty == false }
+                        landed.signal()
+                    }
+                    _ = landed.wait(timeout: .now() + 10)
+                }
+                await #expect(throws: TransferKept([.init("dir", .changed)], moving: true, place: "on the other server")) {
+                    try await engine.run(from: h.session)
+                }
+                #expect(saved.value)
+                #expect(try h.read("from/dir/note.txt") == "FIRST")
+                #expect(try Data(contentsOf: local) == Data("FIRST".utf8))
+                #expect(await h.session.liveFiles().count == 1)
+            }
+        }
+    }
+
+    /// A move on one server is one rename per item, which never replaces, and a folder is never
+    /// moved into itself (TD2-04).
+    @Test func aMoveOnOneServerRenamesAndNeverReplaces() async throws {
+        try await withHarness("rename", connected: true) { h in
+            let from = try h.folder("from", files: ["a.txt": "a", "dir/c.txt": "c"])
+            let to = try h.folder("to")
+            let id = h.session.connection.id
+            try await run(TransferRequest(.server(id, [from.appending("a.txt"), from.appending("dir")]), into: to, on: id, moving: true), on: h.session)
+            #expect(try h.names("from").isEmpty)
+            #expect(try h.read("to/a.txt") == "a")
+            #expect(try h.read("to/dir/c.txt") == "c")
+            #expect(h.prompts.collisions == 0)
+
+            let into = to.appending("dir")
+            await #expect(throws: TransferError.self) { try await run(TransferRequest(.server(id, [into]), into: into, on: id, moving: true), on: h.session) }
+            await #expect(throws: TransferError.self) { try await run(TransferRequest(.server(id, [to]), into: into, on: id, moving: true), on: h.session) }
+            #expect(try h.names("to") == ["a.txt", "dir"])
+            #expect(try h.names("to/dir") == ["c.txt"])
+        }
+    }
+
+    /// A move on one server onto a name the folder held failed red with "already exists" instead
+    /// of asking (UIB-02). It now asks, as every other route does: Skip keeps both, Keep Both and
+    /// Replace move it, and a folder merges; the original goes only once its copy is verified.
+    @Test func aMoveOnOneServerOntoATakenNameAsks() async throws {
+        try await withHarness("taken", connected: true) { h in
+            let id = h.session.connection.id
+            let from = try h.folder("from", files: ["a.txt": "new", "dir/x.txt": "x"])
+            let to = try h.folder("to", files: ["a.txt": "old", "dir/y.txt": "y"])
+            let file = TransferRequest(.server(id, [from.appending("a.txt")]), into: to, on: id, moving: true)
+
+            let skip = Choosing(.skip)
+            await #expect(throws: TransferKept([.init("a.txt", .alreadyThere)], moving: true, place: "on the server")) {
+                try await OperationPrompts.$current.withValue(skip) { try await run(file, on: h.session) }
+            }
+            #expect(skip.asked == 1)
+            #expect(try h.read("from/a.txt") == "new")
+            #expect(try h.read("to/a.txt") == "old")
+
+            let keepBoth = Choosing(.keepBoth)
+            try await OperationPrompts.$current.withValue(keepBoth) { try await run(TransferRequest(file.sources, into: to, on: id, moving: true), on: h.session) }
+            #expect(keepBoth.asked == 1)
+            #expect(try h.read("to/a.txt") == "old")
+            #expect(try h.read("to/a 2.txt") == "new")
+            #expect(try h.names("from") == ["dir"])
+
+            try await run(TransferRequest(.server(id, [from.appending("dir")]), into: to, on: id, moving: true), on: h.session)
+            #expect(try h.names("to/dir") == ["x.txt", "y.txt"])
+            #expect(try h.names("from").isEmpty)
+
+            try h.write("from/b.txt", "new b")
+            try h.write("to/b.txt", "old b")
+            let replace = Choosing(.replace)
+            try await OperationPrompts.$current.withValue(replace) {
+                try await run(TransferRequest(.server(id, [from.appending("b.txt")]), into: to, on: id, moving: true), on: h.session)
+            }
+            #expect(try h.read("to/b.txt") == "new b")
+            #expect(try h.names("from").isEmpty)
+            #expect(h.prompts.collisions == 0)
+        }
+    }
+
+    /// Two paths on one server can be one folder: moving an item into a link to its own folder
+    /// would copy it onto itself and remove the only copy. The probe folder refuses it.
+    @Test func aMoveOnOneServerIntoALinkToItsOwnFolderRemovesNothing() async throws {
+        try await withHarness("onelink", connected: true) { h in
+            let site = try h.folder("site", files: ["a.txt": "a"])
+            try FileManager.default.createSymbolicLink(atPath: h.remote.appendingPathComponent("alias").path, withDestinationPath: "site")
+            let id = h.session.connection.id
+            let replace = Choosing(.replace)
+            await #expect(throws: TransferError.self) {
+                try await OperationPrompts.$current.withValue(replace) {
+                    try await run(TransferRequest(.server(id, [site.appending("a.txt")]), into: h.remotePath.appending("alias"), on: id, moving: true), on: h.session)
+                }
+            }
+            #expect(replace.asked == 0)
+            #expect(try h.names("site") == ["a.txt"])
+            #expect(try h.read("site/a.txt") == "a")
         }
     }
 

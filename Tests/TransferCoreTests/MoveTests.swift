@@ -2,13 +2,20 @@ import Foundation
 import Testing
 @testable import TransferCore
 
-/// A lookalike the user replaced is the move's own copy; one the user skipped never is (D9).
+/// A lookalike the user replaced is the move's own copy; one the user skipped never is (D9). A
+/// lookalike that reached the destination during the copy, after a snapshot of it, passed for the
+/// copy when skipped, and the original was removed (XFR-01): only what the move wrote counts (D6).
 @Test func moveCheckCountsOnlyWhatTheMoveWrote() {
     let file: [TreeKey: TreeEntry] = ["": .file(size: 4, mtime: 9)]
-    #expect(MoveCheck.verdict(source: file, before: file, after: file) == .alreadyThere([""]))
-    #expect(MoveCheck.verdict(source: file, before: file, after: file, written: [""]) == .remove)
+    #expect(MoveCheck.verdict(source: file, after: file, written: []) == .alreadyThere([""]))
+    #expect(MoveCheck.verdict(source: file, after: file, written: [""]) == .remove)
     // Replaced, but the copy is not the original's.
-    #expect(MoveCheck.verdict(source: file, before: file, after: ["": .file(size: 4, mtime: 8)], written: [""]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: file, after: ["": .file(size: 4, mtime: 8)], written: [""]) == .incomplete([""]))
+    // A folder merged into counts without being written; what it holds does not.
+    let tree: [TreeKey: TreeEntry] = ["": .directory, "a": .link, "b": .file(size: 1, mtime: 1)]
+    #expect(MoveCheck.verdict(source: tree, after: tree, written: ["b"]) == .alreadyThere(["a"]))
+    #expect(MoveCheck.verdict(source: tree, after: tree, written: ["a", "b"]) == .remove)
+    #expect(MoveCheck.verdict(source: tree, after: ["": .file(size: 1, mtime: 1)], written: ["", "a", "b"]) == .incomplete(["", "a", "b"]))
 }
 
 /// A server name in two Unicode forms, or two names that are not UTF-8, once made one String key,
@@ -20,7 +27,7 @@ import Testing
     #expect(TreeKey(bytes: [0x61, 0xFF]) != TreeKey(bytes: [0x61, 0xFE]))
     let source: [TreeKey: TreeEntry] = ["": .directory, composed: .file(size: 1, mtime: 1), decomposed: .file(size: 1, mtime: 1)]
     let copy: [TreeKey: TreeEntry] = ["": .directory, composed: .file(size: 1, mtime: 1)]
-    #expect(MoveCheck.verdict(source: source, before: [:], after: copy) == .incomplete([decomposed]))
+    #expect(MoveCheck.verdict(source: source, after: copy, written: Set(copy.keys)) == .incomplete([decomposed]))
     #expect(TreeKey("a/b").components == [Array("a".utf8), Array("b".utf8)])
     #expect(TreeKey("").appending(Array("a".utf8)).appending(Array("b".utf8)) == "a/b")
 }
@@ -28,8 +35,8 @@ import Testing
 /// A source whose server gives no time proves nothing, even where the sizes match.
 @Test func moveCheckNeedsTheSourceTimeToo() {
     let source: [TreeKey: TreeEntry] = ["": .file(size: 4)]
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4, mtime: 9)]) == .incomplete([""]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4)]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .file(size: 4, mtime: 9)], written: [""]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .file(size: 4)], written: [""]) == .incomplete([""]))
 }
 
 @Test func nameClashFindsNamesThisMacCannotHoldApart() {

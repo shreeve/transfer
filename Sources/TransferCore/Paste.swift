@@ -153,34 +153,28 @@ public enum PasteRules {
 public enum MoveCheck {
     public enum Verdict: Equatable, Sendable {
         case remove
-        /// Files or links, by key, that the destination held before the move began and the move
-        /// did not replace. Their copy cannot be told from what was there: a lookalike the user
-        /// chose to skip, or the original itself reached through a second saved server.
+        /// Files or links, by key, that the destination holds and this move did not write: a
+        /// lookalike the user chose to skip, one that arrived during the copy, or the original
+        /// itself reached through a second saved server. None can be told from a copy.
         case alreadyThere([TreeKey])
         /// Entries, by key, that the copy lacks or holds differently.
         case incomplete([TreeKey])
     }
 
     /// `source` is the original's tree walked after the copy, so anything added meanwhile is
-    /// missing from the copy and keeps it. `before` is the destination before the move reached it
-    /// (empty if none), `after` the destination now, `written` the keys the move itself wrote over
-    /// what was there when the user chose Replace. A folder already there may be merged into; a
-    /// file or link already there counts only when replaced. A file counts only with an equal size
-    /// and a known, equal time: every copy keeps the time; an unknown one proves nothing.
-    public static func verdict(
-        source: [TreeKey: TreeEntry],
-        before: [TreeKey: TreeEntry],
-        after: [TreeKey: TreeEntry],
-        written: Set<TreeKey> = []
-    ) -> Verdict {
+    /// missing from the copy and keeps it. `after` is the destination now, and `written` the keys
+    /// this move itself wrote there (D6). A folder there may be one the copy merged into; a file
+    /// or link counts only when this move wrote it, with an equal size and a known, equal time:
+    /// every copy keeps the time; an unknown one proves nothing.
+    public static func verdict(source: [TreeKey: TreeEntry], after: [TreeKey: TreeEntry], written: Set<TreeKey>) -> Verdict {
         guard !source.isEmpty else { return .incomplete([""]) }
         var there: [TreeKey] = []
         var missing: [TreeKey] = []
         for (key, entry) in source {
-            if let old = before[key], !(entry == .directory && old == .directory), !written.contains(key) {
+            if entry == .directory, after[key] == .directory { continue }
+            if written.contains(key), let copy = after[key], proven(entry, copy) { continue }
+            if entry != .directory, entry != .other, after[key] != nil, !written.contains(key) {
                 there.append(key)
-            } else if let copy = after[key], proven(entry, copy) {
-                continue
             } else {
                 missing.append(key)
             }
@@ -255,9 +249,9 @@ package struct TransferMemo: Sendable {
     package var done: Set<Int> = []
     /// Where each source goes, once chosen, by index.
     package var targets: [Int: RemotePath] = [:]
-    /// Each destination's tree just before that source's copy first reached it, by index: what
-    /// an earlier item wrote there is in it, and counts as already there.
-    package var before: [Int: [TreeKey: TreeEntry]] = [:]
+    /// The Live save count before the first attempt copied anything: a save since may be missing
+    /// from a copy, and keeps its original.
+    package var liveMark: UInt64?
     /// Whether the two ends of a move were proven to be different folders.
     package var checked = false
     /// The files, links, and folders each source's copy wrote on the destination, by index. Only
