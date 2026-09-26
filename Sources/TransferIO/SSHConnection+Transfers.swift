@@ -85,30 +85,31 @@ extension SSHConnection {
         try tally.check()
     }
 
-    /// Temp-and-rename onto the local disk. No collision check, but without `replacing` the
-    /// rename refuses a name that something took since it was looked up. The file takes the
-    /// server's permissions without setuid, setgid, or sticky, which an untrusted server must not
-    /// grant. `quarantine` marks it for Gatekeeper, as a browser marks its downloads; a Live
-    /// working copy is not marked, since it only ever opens in an editor.
+    /// Temp-and-rename into `destination`'s folder, which the caller made. No collision check, but
+    /// without `replacing` the rename refuses a name that something took since it was looked up.
+    /// The file takes the server's permissions under this process's umask, as `sftp get` does,
+    /// without setuid, setgid, or sticky, which an untrusted server must not grant; `readOnly`
+    /// drops the write bits too. Every download is quarantined as a browser's is, a Live working
+    /// copy too: the app a Live file opens in may run it (D2).
     func fetch(
         _ path: RemotePath,
         info: RemoteItem,
         to destination: URL,
         replacing: Bool = true,
-        quarantine: Bool = false,
+        readOnly: Bool = false,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let folder = destination.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let temp = folder.appendingPathComponent(CopyRules.tempName(for: destination.lastPathComponent, transferID: UUID().uuidString))
         store.rememberTemp(local: temp)
         do {
             try await receive(path, info: info, into: temp, progress: progress)
-            var attributes: [FileAttributeKey: Any] = [:]
-            if let mode = info.mode { attributes[.posixPermissions] = Int(mode & 0o777) }
+            // Marked first: a file without write bits takes no extended attribute. The channel
+            // created it with 0o666 under the umask, which no mode listed keeps.
+            LocalPlacement.quarantine(temp)
+            var attributes: [FileAttributeKey: Any] = [.posixPermissions: Int((info.mode ?? 0o666) & (readOnly ? 0o555 : 0o777) & ~Self.fileMask)]
             if let mtime = info.mtime { attributes[.modificationDate] = Date(timeIntervalSince1970: TimeInterval(mtime)) }
-            if !attributes.isEmpty { try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path) }
-            if quarantine { LocalPlacement.quarantine(temp) }
+            try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path)
             // One rename replaces the destination, so a watched Live copy is never briefly missing.
             let placed = replacing ? Darwin.rename(temp.path, destination.path) : renamex_np(temp.path, destination.path, UInt32(RENAME_EXCL))
             guard placed == 0 else {
@@ -121,6 +122,14 @@ extension SSHConnection {
             throw error
         }
     }
+
+    /// This process's umask. Read once: reading it means setting it, which races with any file
+    /// another thread creates meanwhile.
+    private static let fileMask: UInt32 = {
+        let mask = umask(0o022)
+        umask(mask)
+        return UInt32(mask)
+    }()
 
     public func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         try await upload(source, to: destination, tally: CopyTally(progress))
@@ -290,7 +299,7 @@ extension SSHConnection {
             if tally.addingJob() { _ = try await group.next() }
             group.addTask {
                 do {
-                    try await self.fetch(item.path, info: item, to: placed.url, replacing: placed.found != nil, quarantine: true, progress: tally.file())
+                    try await self.fetch(item.path, info: item, to: placed.url, replacing: placed.found != nil, progress: tally.file())
                     tally.finished()
                 } catch {
                     try tally.failed(name, error)
@@ -662,7 +671,7 @@ extension SSHConnection {
     /// The first `limit` bytes of `path`, on the preview lane.
     private func fetchHead(_ path: RemotePath, limit: UInt64, to file: URL) async throws {
         try await lane.submit(.preview) {
-            try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: limit), to: file, quarantine: true) { _ in }
+            try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: limit), to: file, readOnly: true) { _ in }
         }
     }
 
@@ -673,7 +682,7 @@ extension SSHConnection {
         // The copy carries the remote size and mtime; the same pair means the same bytes.
         if let print = Fingerprint(item: item), (try? LocalPlacement.occupant(file)) == .file(print) { return file }
         try await lane.submit(kind) {
-            try await self.fetch(path, info: item, to: file, quarantine: true) { _ in }
+            try await self.fetch(path, info: item, to: file, readOnly: true) { _ in }
         }
         trimPreviewCache()
         return file
@@ -725,7 +734,7 @@ extension SSHConnection {
         let folder = cache.appendingPathComponent(digest, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let fits = suffix.isEmpty && name.utf8.count <= 255
-        return folder.appendingPathComponent(fits ? name : LiveDecision.siblingName(of: name, suffix: suffix))
+        return try LocalPlacement.child(folder, name: fits ? name : LiveDecision.siblingName(of: name, suffix: suffix))
     }
 
     /// Evicts whole entries, each a file's folder (or a digest-named file from before names were

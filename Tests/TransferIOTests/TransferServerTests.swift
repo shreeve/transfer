@@ -286,10 +286,40 @@ struct TransferServerTests {
             #expect(quarantined(local))
             #expect(quarantined(local.appendingPathComponent("tool")))
 
-            // A Live working copy opens only in an editor and is not marked.
+            // A Live working copy was not marked, but it opens in the type's default app, and
+            // Terminal runs a `.command` it opens (SEC2-01, UIV-01): every download is marked (D2).
             let live = try await h.session.prepareLiveFile(h.remotePath.appending(name: Array("note.txt".utf8)))
-            #expect(!quarantined(live))
+            #expect(quarantined(live))
             try await h.session.discardLiveFile(h.remotePath.appending(name: Array("note.txt".utf8)), force: true)
+        }
+    }
+
+    /// A View or preview copy took the server's write bits, so an editor saved into it, never
+    /// uploaded, and the next fetch renamed over the edits (COR-1): they are read-only now (D3).
+    /// A download took group and other write bits from the server regardless of the umask (SEC2-08).
+    @Test func viewCopiesAreReadOnlyAndDownloadsHonorTheUmask() async throws {
+        try await withHarness("mode", connected: true) { h in
+            for name in ["README", "open.sh"] {
+                let file = h.remote.appendingPathComponent(name)
+                try Data("text".utf8).write(to: file)
+                try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: file.path)
+            }
+            let mask = umask(0o022)
+            umask(mask)
+            func mode(_ url: URL) throws -> Int? { try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int }
+
+            let view = try await h.session.prepareViewFile(h.remotePath.appending("README"))
+            #expect(try mode(view) == 0o555 & ~Int(mask))
+            #expect(quarantined(view))
+            let preview = try await h.session.prepareInspectorPreview(h.remotePath.appending("open.sh"))
+            #expect(try mode(preview) == 0o555 & ~Int(mask))
+            // A changed file still replaces the read-only copy.
+            try Data("later".utf8).write(to: h.remote.appendingPathComponent("README"))
+            #expect(try String(contentsOf: try await h.session.prepareViewFile(h.remotePath.appending("README")), encoding: .utf8) == "later")
+
+            let local = h.staging.appendingPathComponent("open.sh")
+            try await h.session.download(h.remotePath.appending("open.sh"), to: local) { _ in }
+            #expect(try mode(local) == 0o777 & ~Int(mask))
         }
     }
 
