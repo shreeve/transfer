@@ -17,7 +17,7 @@ It is a browser window, not a second Finder and not a mounted disk: standard App
 | Space | Quick Look. Never Live. |
 | Drag to the Finder, or File → Download Copy… | A detached copy on the Mac. The remote file stays. |
 
-A folder opens in the browser. File → Open Live (Option-Command-O) opens any file Live. An editable file is one whose extension is in `editableExtensions` in the user's `config.json` (Settings → Extensions), or whose type conforms to `public.plain-text` or `public.source-code`. The extension is what follows the last dot, so a name with no dot (`README`, `Makefile`) has none and opens View. Contents are never sniffed.
+A folder opens in the browser. File → Open Live (Option-Command-O) opens any file Live. An editable file is one whose extension is in `editableExtensions` in the user's `config.json` (Settings → Extensions), or whose type conforms to `public.plain-text` or `public.source-code`. The extension is what follows the last dot; a name with no dot (`README`, `Makefile`) matches the list by its whole name, and none is on the built-in list, so it opens View unless the user adds it. Contents are never sniffed.
 
 ### Not built
 

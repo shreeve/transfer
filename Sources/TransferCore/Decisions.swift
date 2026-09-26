@@ -30,10 +30,12 @@ public enum EditableFile {
     /// How much of a text file the inspector shows, and so all of it that is fetched.
     public static let previewHead = 64 << 10
 
-    /// The extension is what follows the last dot: "README" and "notes." have none, so they open
-    /// View whatever the list holds; ".env"'s is "env".
+    /// The extension is what follows the last dot: ".env"'s is "env", and "notes." has none. A
+    /// name with no dot, such as "Makefile", matches the list by its whole name.
     public static func openKind(fileName: String, extensions: Set<String>) -> OpenKind {
-        guard let dot = fileName.lastIndex(of: "."), case let ext = fileName[fileName.index(after: dot)...].lowercased(), !ext.isEmpty else { return .view }
+        guard let dot = fileName.lastIndex(of: ".") else { return extensions.contains(fileName.lowercased()) ? .live : .view }
+        let ext = fileName[fileName.index(after: dot)...].lowercased()
+        guard !ext.isEmpty else { return .view }
         if extensions.contains(ext) { return .live }
         if let type = UTType(filenameExtension: ext), type.conforms(to: .plainText) || type.conforms(to: .sourceCode) { return .live }
         return .view

@@ -65,7 +65,6 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - A file whose default app would run it (Terminal, iTerm2, Ghostty, or Python Launcher) opens in the default text editor instead, whether opened Live or to view.
 - Copies opened to view or preview are read-only, so an editor says the file is locked instead of saving edits that never upload and are later overwritten.
 - A move on one server onto a name the destination already holds asks Replace, Keep Both, or Skip, instead of failing.
-- A name with no dot, such as `README` or `Makefile`, has no extension: it opens with View even when the Extensions list holds its whole name. Open Live still opens it Live.
 - Saved servers are listed in Finder's order.
 - In icon view, Shift-click adds or removes an item, and clicking one of several selected items selects just that one, as in Finder. In list and icon view, once a folder has listed, the selection keeps only the items shown, so a filter never leaves items selected out of sight.
 - The inspector shows the time in the Mac's own format, for example 24-hour.

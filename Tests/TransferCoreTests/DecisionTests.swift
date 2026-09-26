@@ -51,15 +51,17 @@ import Testing
     }
 }
 
-/// A name with no dot was taken whole as its extension, so a list holding "makefile" opened
-/// Makefile Live by accident (COR-1). Only what follows the last dot is the extension.
+/// Only what follows the last dot is the extension (COR-1), and a trailing dot leaves none. A name
+/// with no dot matches the list by its whole name, so a user's "makefile" entry opens Makefile
+/// Live (FR-2); the built-in list holds no such name, and an empty entry matches nothing.
 @Test func anExtensionIsWhatFollowsTheLastDot() {
     func kind(_ name: String, _ extensions: Set<String>) -> OpenKind { EditableFile.openKind(fileName: name, extensions: extensions) }
     for name in ["README", "Makefile", "LICENSE", "notes.", "..", ".bashrc", "a.tar.gz"] {
         #expect(kind(name, TransferConfig.builtIn.extensionSet) == .view, "\(name)")
     }
-    #expect(kind("README", ["readme"]) == .view)
-    #expect(kind("Makefile", ["makefile"]) == .view)
+    #expect(kind("README", ["readme"]) == .live)
+    #expect(kind("Makefile", ["makefile"]) == .live)
+    #expect(kind("Makefile", ["make"]) == .view)
     #expect(kind("notes.", ["notes"]) == .view)
     #expect(kind("Notes", [""]) == .view)
     #expect(kind(".env", ["env"]) == .live)
