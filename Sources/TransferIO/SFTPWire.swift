@@ -5,47 +5,19 @@ import TransferCore
 /// every length against the bytes it has. The server's bytes are untrusted; `SFTPChannel` speaks
 /// the protocol with these pieces.
 enum SFTPCode {
-    static let initialize: UInt8 = 1
-    static let version: UInt8 = 2
-    static let open: UInt8 = 3
-    static let close: UInt8 = 4
-    static let read: UInt8 = 5
-    static let write: UInt8 = 6
-    static let lstat: UInt8 = 7
-    static let fstat: UInt8 = 8
-    static let setstat: UInt8 = 9
-    static let fsetstat: UInt8 = 10
-    static let opendir: UInt8 = 11
-    static let readdir: UInt8 = 12
-    static let remove: UInt8 = 13
-    static let mkdir: UInt8 = 14
-    static let rmdir: UInt8 = 15
-    static let realpath: UInt8 = 16
-    static let rename: UInt8 = 18
-    static let readlink: UInt8 = 19
-    static let symlink: UInt8 = 20
-    static let status: UInt8 = 101
-    static let handle: UInt8 = 102
-    static let data: UInt8 = 103
-    static let name: UInt8 = 104
-    static let attrs: UInt8 = 105
-    static let extended: UInt8 = 200
-
-    static let ok: UInt32 = 0
-    static let eof: UInt32 = 1
-    static let noSuchFile: UInt32 = 2
-    static let permission: UInt32 = 3
-    static let failure: UInt32 = 4
-
-    static let attrSize: UInt32 = 0x1
-    static let attrUID: UInt32 = 0x2
-    static let attrPerms: UInt32 = 0x4
-    static let attrTime: UInt32 = 0x8
-
-    static let fxRead: UInt32 = 0x1
-    static let fxWrite: UInt32 = 0x2
-    static let fxCreat: UInt32 = 0x8
-    static let fxTrunc: UInt32 = 0x10
+    // Requests, and VERSION.
+    static let initialize: UInt8 = 1, version: UInt8 = 2, open: UInt8 = 3, close: UInt8 = 4, read: UInt8 = 5
+    static let write: UInt8 = 6, lstat: UInt8 = 7, fstat: UInt8 = 8, setstat: UInt8 = 9, fsetstat: UInt8 = 10
+    static let opendir: UInt8 = 11, readdir: UInt8 = 12, remove: UInt8 = 13, mkdir: UInt8 = 14, rmdir: UInt8 = 15
+    static let realpath: UInt8 = 16, rename: UInt8 = 18, readlink: UInt8 = 19, symlink: UInt8 = 20, extended: UInt8 = 200
+    // Replies.
+    static let status: UInt8 = 101, handle: UInt8 = 102, data: UInt8 = 103, name: UInt8 = 104, attrs: UInt8 = 105
+    // STATUS codes.
+    static let ok: UInt32 = 0, eof: UInt32 = 1, noSuchFile: UInt32 = 2, permission: UInt32 = 3, failure: UInt32 = 4
+    // ATTRS flags, and OPEN's.
+    static let attrSize: UInt32 = 0x1, attrUID: UInt32 = 0x2, attrPerms: UInt32 = 0x4, attrTime: UInt32 = 0x8
+    static let attrExtended: UInt32 = 0x8000_0000
+    static let fxRead: UInt32 = 0x1, fxWrite: UInt32 = 0x2, fxCreat: UInt32 = 0x8, fxTrunc: UInt32 = 0x10
 }
 
 struct SFTPAttrs: Equatable {
@@ -72,29 +44,8 @@ struct SFTPAttrs: Equatable {
     }
 
     func encoded() -> Data {
-        var flags: UInt32 = 0
-        var body = Data()
-        if let size {
-            flags |= SFTPCode.attrSize
-            body.appendU64(size)
-        }
-        if let uid, let gid {
-            flags |= SFTPCode.attrUID
-            body.appendU32(uid)
-            body.appendU32(gid)
-        }
-        if let permissions {
-            flags |= SFTPCode.attrPerms
-            body.appendU32(permissions)
-        }
-        if let atime, let mtime {
-            flags |= SFTPCode.attrTime
-            body.appendU32(atime)
-            body.appendU32(mtime)
-        }
         var out = Data()
-        out.appendU32(flags)
-        out.append(body)
+        out.appendAttrs(self)
         return out
     }
 }
@@ -219,16 +170,13 @@ struct ByteReader {
         self.index = 0
     }
 
-    mutating func u32() throws -> UInt32 {
-        guard index + 4 <= data.count else { throw TransferError.failed("Short SFTP packet") }
-        defer { index += 4 }
-        return data.withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: index, as: UInt32.self)) }
-    }
+    mutating func u32() throws -> UInt32 { try integer() }
+    mutating func u64() throws -> UInt64 { try integer() }
 
-    mutating func u64() throws -> UInt64 {
-        guard index + 8 <= data.count else { throw TransferError.failed("Short SFTP packet") }
-        defer { index += 8 }
-        return data.withUnsafeBytes { UInt64(bigEndian: $0.loadUnaligned(fromByteOffset: index, as: UInt64.self)) }
+    private mutating func integer<T: FixedWidthInteger>() throws -> T {
+        guard index + MemoryLayout<T>.size <= data.count else { throw TransferError.failed("Short SFTP packet") }
+        defer { index += MemoryLayout<T>.size }
+        return data.withUnsafeBytes { T(bigEndian: $0.loadUnaligned(fromByteOffset: index, as: T.self)) }
     }
 
     mutating func blob() throws -> Data {
@@ -256,7 +204,7 @@ struct ByteReader {
             value.atime = try u32()
             value.mtime = try u32()
         }
-        if flags & 0x8000_0000 != 0 {
+        if flags & SFTPCode.attrExtended != 0 {
             let count = Int(try u32())
             for _ in 0..<count {
                 _ = try blob()
@@ -300,6 +248,18 @@ extension Data {
     mutating func openFields(_ path: RemotePath, flags: UInt32) {
         appendPath(path)
         appendU32(flags)
-        append(SFTPAttrs().encoded())
+        appendAttrs(SFTPAttrs())
+    }
+
+    /// ATTRS: a flags word naming the fields that follow, in the draft's order. The owner and the
+    /// times go only as pairs.
+    mutating func appendAttrs(_ attrs: SFTPAttrs) {
+        let owner = attrs.uid.flatMap { uid in attrs.gid.map { [uid, $0] } } ?? []
+        let permissions = attrs.permissions.map { [$0] } ?? []
+        let times = attrs.atime.flatMap { atime in attrs.mtime.map { [atime, $0] } } ?? []
+        appendU32((attrs.size == nil ? 0 : SFTPCode.attrSize) | (owner.isEmpty ? 0 : SFTPCode.attrUID)
+            | (permissions.isEmpty ? 0 : SFTPCode.attrPerms) | (times.isEmpty ? 0 : SFTPCode.attrTime))
+        if let size = attrs.size { appendU64(size) }
+        for word in owner + permissions + times { appendU32(word) }
     }
 }

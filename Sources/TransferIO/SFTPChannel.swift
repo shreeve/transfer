@@ -36,7 +36,6 @@ actor SFTPChannel {
     /// A server silent this long while requests wait has hung: the channel closes and its requests
     /// fail with a timeout, which a transfer retries on a new channel.
     private let stallLimit: Duration
-    /// How long the server has to answer INIT.
     private let handshakeLimit: Duration
     private var lastHeard = ContinuousClock.now
     private var handshakeStarted: ContinuousClock.Instant?
@@ -120,9 +119,8 @@ actor SFTPChannel {
         Fingerprint(item: try item(path: RemotePath(string: "/"), message: await call(SFTPCode.fstat) { $0.appendBlob(handle) }))
     }
 
-    /// Keeps several READDIR requests in flight. OpenSSH answers each with at most a hundred names,
-    /// so a large folder does not pay a round trip per page. A listing its reader abandons stops at
-    /// once and still closes its handle on the server.
+    /// Keeps several READDIR requests in flight, as OpenSSH answers each with at most a hundred
+    /// names. A listing its reader abandons stops at once and still closes its handle.
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -136,9 +134,8 @@ actor SFTPChannel {
                     var finished = false
                     var pages = 0
                     while !finished || !inFlight.isEmpty {
-                        // Four pages at first, so a small folder asks for at most three pages
-                        // past its end; sixteen once four have come, so a large one pays about
-                        // one round trip per 1,600 names.
+                        // Four pages at first, so a small folder asks for at most three past
+                        // its end; sixteen once four have come, a round trip per 1,600 names.
                         while !finished, inFlight.count < (pages < 4 ? 4 : 16) {
                             inFlight.append(Task { try await self.readDirectory(handle, parent: path) })
                         }
@@ -168,7 +165,7 @@ actor SFTPChannel {
     func mkdir(_ path: RemotePath) async throws {
         _ = try await call(SFTPCode.mkdir) {
             $0.appendPath(path)
-            $0.append(SFTPAttrs().encoded())
+            $0.appendAttrs(SFTPAttrs())
         }
     }
 
@@ -214,11 +211,10 @@ actor SFTPChannel {
         let forget: @Sendable (_ aside: RemotePath, _ placed: RemotePath) -> Void
     }
 
-    /// Puts `temp` in place of `placed`. With `posix-rename@openssh.com` the swap is atomic and a
-    /// failure leaves `placed` untouched. Without it, SFTP v3 rename will not replace a file, so
+    /// Puts `temp` in place of `placed`: atomically with `posix-rename@openssh.com`. Without it,
     /// `placed` steps aside under a hidden name first, recorded in `log`, and comes back if `temp`
-    /// cannot take its place: a failure never leaves the server with neither the old file nor the
-    /// new one. A folder is never replaced, as posix-rename would refuse it.
+    /// cannot take its place, so a failure never leaves the server with neither file. A folder is
+    /// never replaced, as posix-rename would refuse it.
     func replace(_ temp: RemotePath, onto placed: RemotePath, log: AsideLog? = nil) async throws {
         if extensions.contains("posix-rename@openssh.com") {
             try await posixRename(temp, to: placed)
@@ -284,9 +280,9 @@ actor SFTPChannel {
     }
 
     /// Copies a file on the server with OpenSSH's `copy-data` extension, which callers check for
-    /// first. Two round trips: both OPENs, then `copy-data`, `stamp` on the new file's handle, and
-    /// both CLOSEs, which the server carries out in order. The written file's CLOSE is awaited,
-    /// since it can report a failed last write; a `stamp` that did not take is not an error.
+    /// first. Two round trips: both OPENs, then `copy-data`, `stamp`, and both CLOSEs, which the
+    /// server carries out in order. The written file's CLOSE is awaited, since it can report a
+    /// failed last write; a `stamp` that did not take is not an error.
     func copyData(_ source: RemotePath, to destination: RemotePath, stamp: SFTPAttrs? = nil) async throws {
         try Task.checkCancellation()
         let opens = try [
@@ -345,7 +341,7 @@ actor SFTPChannel {
     func setstat(_ path: RemotePath, _ stamp: SFTPAttrs) async throws {
         _ = try await call(SFTPCode.setstat) {
             $0.appendPath(path)
-            $0.append(stamp.encoded())
+            $0.appendAttrs(stamp)
         }
     }
 
@@ -353,7 +349,7 @@ actor SFTPChannel {
     private func setstatRequest(handle: Data, _ stamp: SFTPAttrs) throws -> UInt32 {
         try send(SFTPCode.fsetstat) {
             $0.appendBlob(handle)
-            $0.append(stamp.encoded())
+            $0.appendAttrs(stamp)
         }
     }
 
@@ -365,12 +361,10 @@ actor SFTPChannel {
         try parts.finish()
     }
 
-    /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight, until nothing is
-    /// left to ask for. With `matching`, the file opened must still be the one listed: the plan
-    /// stops at the listed size, so a file that grew would arrive cut short and look complete.
-    /// The channel that owns the download throws when it is not, checking with its first READs
-    /// and before writing a byte; one `helping` leaves it alone, so a file replaced meanwhile is
-    /// never read in pieces from two versions.
+    /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight. With `matching`,
+    /// the file opened must still be the one listed, as the plan stops at the listed size: the
+    /// owning channel throws when it is not, checking with its first READs and before writing a
+    /// byte; one `helping` leaves it alone, so a file is never read in pieces of two versions.
     func receive(_ path: RemotePath, into parts: DownloadParts, matching print: Fingerprint? = nil, helping: Bool = false) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxRead)
         defer { closeSoon([handle]) }
@@ -440,9 +434,9 @@ actor SFTPChannel {
     }
 
     /// Writes what `parts` hands out to `handle`, keeping 2 MB in flight, then closes it, awaiting
-    /// the close: a server may report a failed last write only there. `stamp` and the close go out
-    /// right behind the last write, costing no round trip; the server carries out a file's
-    /// requests in order, so no write lands after the stamp. A stamp that did not take is no error.
+    /// the close, where a server may report a failed last write. `stamp` and the close go right
+    /// behind the last write; the server carries out a file's requests in order, so no write lands
+    /// after the stamp. A stamp that did not take is no error.
     func send(_ parts: UploadParts, to handle: Data, stamp: SFTPAttrs? = nil) async throws {
         var writes: [(id: UInt32, count: UInt64)] = []
         var finishing: [UInt32] = []
