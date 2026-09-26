@@ -10,6 +10,14 @@ struct OpenerTests {
         #expect(FileOpener.editor(replacing: runner, plainText: "com.apple.Terminal") == "com.apple.TextEdit")
     }
 
+    /// FR-11: a runner picked in the chooser is not made the type's default.
+    @Test func onlyARunnerRunsWhatItOpens() {
+        #expect(FileOpener.runs("com.apple.Terminal"))
+        #expect(FileOpener.runs("com.apple.JavaLauncher"))
+        #expect(!FileOpener.runs("com.apple.TextEdit"))
+        #expect(!FileOpener.runs(nil))
+    }
+
     @Test func anyOtherDefaultAppIsKept() {
         #expect(FileOpener.editor(replacing: "com.apple.dt.Xcode", plainText: "com.apple.TextEdit") == nil)
         #expect(FileOpener.editor(replacing: "com.apple.Preview", plainText: nil) == nil)

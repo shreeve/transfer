@@ -61,7 +61,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 ### Behavior changes
 
 - Every download is quarantined, Live working copies included, so macOS checks an app or script from a server before it first runs.
-- A file whose default app would run it (Terminal, iTerm2, Ghostty, Python Launcher, or Jar Launcher) opens in the default text editor instead, whether opened Live or to view.
+- A file whose default app would run it (Terminal, iTerm2, Ghostty, Python Launcher, or Jar Launcher) opens in the default text editor instead, whether opened Live or to view. Choosing such an app when Transfer asks which app opens a type no longer makes it the Mac's default for that type.
 - Copies opened to view or preview are read-only, so an editor says the file is locked instead of saving edits that never upload and are later overwritten.
 - A move on one server onto a name the destination already holds asks Replace, Keep Both, or Skip, instead of failing.
 - A name with no dot, such as `README` or `Makefile`, has no extension: it opens with View even when the Extensions list holds its whole name. Open Live still opens it Live.
