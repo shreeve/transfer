@@ -114,6 +114,21 @@ struct SessionUnitTests {
         #expect(result.stdout == "out\n")
         #expect(result.stderr == "err\n")
     }
+
+    /// A login's question asked from a cancelled task gets the safe answer without asking any
+    /// window still waiting (FR-6).
+    @Test func aCancelledLoginAsksNobody() async {
+        let prompts = LoginPrompts()
+        let window = TestPrompts(.trustOnce)
+        prompts.join(UUID(), window)
+        let event = HostKeyEvent(situation: .firstSeen, keyType: "ssh-ed25519", fingerprint: "SHA256:x", line: "box ssh-ed25519 AAAA")
+        let asked = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await prompts.decideHostKey(event)
+        }
+        #expect(await asked.value == .cancel)
+        #expect(window.hostKeyEvents.isEmpty)
+    }
 }
 
 /// Login, host keys, and channels against the local sshd (`ServerHarness`).

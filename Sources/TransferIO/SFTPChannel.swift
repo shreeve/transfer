@@ -125,6 +125,7 @@ actor SFTPChannel {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    try Task.checkCancellation()
                     let handle = try await handles(opening: [send(SFTPCode.opendir) { $0.appendPath(path) }])[0]
                     var inFlight: [Task<[RemoteItem]?, Error>] = []
                     defer {

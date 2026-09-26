@@ -601,10 +601,12 @@ public actor SSHConnection: RemoteSession {
         }
     }
 
-    /// The channel `dispatch` hands this caller, or nil when it counted an open for this caller to make.
+    /// The channel `dispatch` hands this caller, or nil when it counted an open for this caller to
+    /// make. A teardown since then reset that count, so the caller does not open one.
     private func nextReleased(_ share: Int) async throws -> SFTPChannel? {
         let id = UUID()
-        return try await withTaskCancellationHandler {
+        let queued = generation
+        let link: SFTPChannel? = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 if Task.isCancelled {
                     continuation.resume(throwing: TransferError.cancelled)
@@ -615,6 +617,8 @@ public actor SSHConnection: RemoteSession {
         } onCancel: {
             Task { await self.leaveQueue(id) }
         }
+        guard link != nil || queued == generation else { throw TransferError.connectionLost("The SSH connection closed") }
+        return link
     }
 
     private func leaveQueue(_ id: UUID) {
@@ -1067,7 +1071,7 @@ final class LoginPrompts: PromptSink {
     }
 
     private func ask<Answer>(safe: Answer, isSafe: (Answer) -> Bool, _ question: (any PromptSink) async -> Answer) async -> Answer {
-        while let caller = callers.value.last {
+        while !Task.isCancelled, let caller = callers.value.last {
             let answer = await question(caller.sink)
             if !isSafe(answer) || callers.value.contains(where: { $0.id == caller.id }) { return answer }
         }
