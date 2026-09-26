@@ -97,13 +97,14 @@ extension SSHConnection {
         to destination: URL,
         replacing: Bool = true,
         readOnly: Bool = false,
+        interactive: Bool = false,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let folder = destination.deletingLastPathComponent()
         let temp = folder.appendingPathComponent(CopyRules.tempName(for: destination.lastPathComponent, transferID: UUID().uuidString))
         store.rememberTemp(local: temp)
         do {
-            try await receive(path, info: info, into: temp, progress: progress)
+            try await receive(path, info: info, into: temp, interactive: interactive, progress: progress)
             // Marked first: a file without write bits takes no extended attribute. The channel
             // created it with 0o666 under the umask, which no mode listed keeps.
             LocalPlacement.quarantine(temp)
@@ -192,22 +193,29 @@ extension SSHConnection {
 
     /// Reads the server's file into `file` over one data channel, which a small file shares with
     /// others, and a large one also over the channels free now. Every channel checks that the file
-    /// it opened is still the one `info` lists, whose size says where to stop.
-    private func receive(_ path: RemotePath, info: RemoteItem, into file: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    /// it opened is still the one `info` lists, whose size says where to stop. An `interactive`
+    /// file, one the user waits on, starts on the interactive channel: the data pool serves its
+    /// waiters in order, behind every job of a folder copy (SES2-02).
+    private func receive(_ path: RemotePath, info: RemoteItem, into file: URL, interactive: Bool, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let print = Fingerprint(item: info)
         guard let size = info.size, size >= Self.stripeSize, let print else {
             // The channel creates the file, off this actor, once the job holds the channel.
-            return try await withData(DataShare(size: info.size)) { link in
+            return try await withChannel(interactive: interactive, DataShare(size: info.size)) { link in
                 try await link.download(path, to: file, size: info.size, matching: print, progress: progress)
             }
         }
-        try await withData(.whole) { link in
+        try await withChannel(interactive: interactive, .whole) { link in
             let parts = try DownloadParts(file, size: size, progress: progress)
             try await striped({ try await link.receive(path, into: parts, matching: print) }) {
                 try await $0.receive(path, into: parts, matching: print, helping: true)
             }
             try parts.finish()
         }
+    }
+
+    private func withChannel<T>(interactive: Bool, _ share: DataShare, _ body: (SFTPChannel) async throws -> T) async throws -> T {
+        if interactive { return try await withInteractive(body) }
+        return try await withData(share, body)
     }
 
     /// Runs `first`, and `helper` on each of up to three more data channels free now, each taking
@@ -671,7 +679,7 @@ extension SSHConnection {
     /// The first `limit` bytes of `path`, on the preview lane.
     private func fetchHead(_ path: RemotePath, limit: UInt64, to file: URL) async throws {
         try await lane.submit(.preview) {
-            try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: limit), to: file, readOnly: true) { _ in }
+            try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: limit), to: file, readOnly: true, interactive: true) { _ in }
         }
     }
 
@@ -682,7 +690,7 @@ extension SSHConnection {
         // The copy carries the remote size and mtime; the same pair means the same bytes.
         if let print = Fingerprint(item: item), (try? LocalPlacement.occupant(file)) == .file(print) { return file }
         try await lane.submit(kind) {
-            try await self.fetch(path, info: item, to: file, readOnly: true) { _ in }
+            try await self.fetch(path, info: item, to: file, readOnly: true, interactive: true) { _ in }
         }
         trimPreviewCache()
         return file

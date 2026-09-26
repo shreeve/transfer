@@ -317,6 +317,42 @@ struct ThroughputServerTests {
         }
     }
 
+    /// A Live open, a view, and a preview downloaded over the data pool, whose waiters are served
+    /// in order, so the file the user waited on queued behind every job of a folder copy while the
+    /// interactive channel sat idle (SES2-02). Each now starts on the interactive channel.
+    @Test func aFileTheUserWaitsOnNeverQueuesBehindTheDataPool() async throws {
+        try await withHarness("lanejob", connected: true) { h in
+            try Data("hello".utf8).write(to: h.remote.appendingPathComponent("open.txt"))
+            let path = h.remotePath.appending("open.txt")
+            let item = try await h.session.stat(path)
+            let release = Locked(false)
+            let held = Locked(0)
+            let holders = Task {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for _ in 0..<(SSHConnection.dataChannels + 3) {
+                        group.addTask {
+                            try await h.session.withData { _ in
+                                held.withLock { $0 += 1 }
+                                while !release.value { try await Task.sleep(for: .milliseconds(20)) }
+                            }
+                        }
+                    }
+                    try await group.waitForAll()
+                }
+            }
+            // Let go after a while in any case, so a lane job stuck behind the pool fails, not hangs.
+            Task { try? await Task.sleep(for: .seconds(3)); release.value = true }
+            #expect(await waitUntil { held.value == SSHConnection.dataChannels })
+            let started = ContinuousClock.now
+            try await h.session.liveFetch(item, to: h.staging.appendingPathComponent("open.txt"), interactive: true)
+            _ = try await h.session.prepareViewFile(path)
+            _ = try await h.session.prepareInspectorPreview(path)
+            #expect(ContinuousClock.now - started < .seconds(2))
+            release.value = true
+            try await holders.value
+        }
+    }
+
     /// Folder copies of many small files in every direction, where files share channels, land
     /// every byte, on a fresh connection whose channels all open during the copy.
     @Test func manySmallFilesCopyWhole() async throws {
