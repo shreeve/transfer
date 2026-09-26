@@ -169,13 +169,15 @@ struct DetailColumn: View {
                 detail: event.situation == .changed
                     ? "The server now presents a different key. Someone could be intercepting the connection."
                     : "Check this fingerprint against one you got from the server's owner.",
-                width: 460,
+                width: 520,
                 onCancel: { model.prompts.finish(.hostKey(.cancel)) }
             ) {
                 LabeledContent("Server", value: hostKeyServer(server, event))
                 LabeledContent("Key type", value: event.keyType)
+                // A SHA-256 fingerprint is always 43 characters of base64: one line at this size.
                 LabeledContent("SHA256", value: event.fingerprint)
-                    .font(.body.monospaced())
+                    .font(.callout.monospaced())
+                    .lineLimit(1)
                     .textSelection(.enabled)
             } actions: {
                 if event.situation == .firstSeen {
