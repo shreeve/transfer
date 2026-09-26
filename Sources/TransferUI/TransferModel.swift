@@ -46,6 +46,8 @@ final class ServerContext {
     var listener: Task<Void, Never>?
     /// The listing running for each folder, at most one per folder.
     var jobs: [RemotePath: ListingJob] = [:]
+    /// Events that came during the login, handled once it lands.
+    var early: [SessionEvent] = []
 
     init(connection: SavedConnection, session: any RemoteSession, generation: Int) {
         self.connection = connection
@@ -265,9 +267,7 @@ public final class TransferModel {
         observers.removeAll()
         // A connect still logging in lands nowhere.
         connectGeneration &+= 1
-        loginPrompt?.retire()
-        loginPrompt = nil
-        loginTask?.cancel()
+        stopLogin()
         context?.close()
         sidebarReload?.cancel()
         previewTask?.cancel()
@@ -277,10 +277,7 @@ public final class TransferModel {
 
     /// As `close`, for a model released without it.
     isolated deinit {
-        for observer in observers { NotificationCenter.default.removeObserver(observer) }
-        context?.close()
-        sidebarReload?.cancel()
-        prompts.cancelAll()
+        close()
     }
 
     /// Reads the global preferences at launch and whenever they change. Hidden files and the sort
@@ -429,8 +426,7 @@ public final class TransferModel {
         if let current = loginPrompt, current.serverID == connection.id {
             login = current
         } else {
-            loginPrompt?.retire()
-            loginTask?.cancel()
+            stopLogin()
             login = prompts.login(connection)
             loginPrompt = login
         }
@@ -452,8 +448,9 @@ public final class TransferModel {
             pending = fresh
             // Listening before the login catches the notices the login itself raises.
             listen(fresh)
-            // Its own task, so `abandonConnect` can end the wait even when the caller's task goes on.
-            let attempt = Task { try await session.connect(prompts: login) }
+            // Its own task, so `abandonConnect` can end the wait even when the caller's task goes
+            // on; a second connect to the same server waits on the same one.
+            let attempt = loginTask ?? Task { try await session.connect(prompts: login) }
             loginTask = attempt
             let start = try await withTaskCancellationHandler { try await attempt.value } onCancel: { attempt.cancel() }
             var path = start
@@ -470,7 +467,7 @@ public final class TransferModel {
             install(fresh, path: path, selection: selection)
             await refresh()
             scheduleSidebarReload()
-            if let missing { status = "No such file or folder: \(missing.display)" }
+            if let missing, isCurrent(fresh) { status = "No such file or folder: \(missing.display)" }
         } catch {
             // A login the user cancelled, at a password or a host key, fails quietly.
             guard generation == connectGeneration, !login.declined else { return }
@@ -484,6 +481,11 @@ public final class TransferModel {
     private func abandonConnect() {
         connectGeneration &+= 1
         connectingTo = nil
+        stopLogin()
+    }
+
+    /// Takes back the login's sheets and stops waiting for it.
+    private func stopLogin() {
         loginPrompt?.retire()
         loginPrompt = nil
         loginTask?.cancel()
@@ -492,8 +494,12 @@ public final class TransferModel {
 
     /// Makes `fresh` the window's server in one step: its session, listener, location, and
     /// empty caches. The old server's listener and listings stop; its queued transfers go on.
+    /// The login is over, so the title names the server while its first listing arrives.
     private func install(_ fresh: ServerContext, path: RemotePath, selection: Set<RemotePath>) {
         leaveServer(keepingRowsOf: fresh.connection.id)
+        connectingTo = nil
+        loginPrompt = nil
+        loginTask = nil
         context = fresh
         snapshot.connectionID = fresh.connection.id
         snapshot.path = path
@@ -502,6 +508,8 @@ public final class TransferModel {
         loadPreferences(for: fresh.connection.id)
         refreshItems()
         syncSidebarSelection()
+        for event in fresh.early { handle(event, from: fresh) }
+        fresh.early = []
     }
 
     /// Leaves the window showing no server.
@@ -1680,7 +1688,13 @@ public final class TransferModel {
     }
 
     public func openTerminal() async {
-        guard let session, let command = await session.terminalCommand(directory: snapshot.path) else { return }
+        guard let session else { return }
+        guard let command = await session.terminalCommand(directory: snapshot.path) else {
+            status = await session.isConnected
+                ? "Open in Terminal refused: this folder's path or the server's settings hold a control character."
+                : TransferError.notConnected.localizedDescription
+            return
+        }
         if let problem = await TerminalLauncher.open(command: command) { status = problem }
     }
 
@@ -1738,8 +1752,10 @@ public final class TransferModel {
 
     private func handle(_ event: SessionEvent, from source: ServerContext) {
         guard isCurrent(source) else {
-            // Before its login lands, a server's notices still matter to the window that asked.
-            if case .notice(let text) = event, source.generation == connectGeneration { status = text }
+            // Before its login lands, a server's notices still matter to the window that asked, and
+            // the rest, such as a Live conflict found as Live sync resumes, wait for it to land.
+            guard source.generation == connectGeneration else { return }
+            if case .notice(let text) = event { status = text } else { source.early.append(event) }
             return
         }
         switch event {

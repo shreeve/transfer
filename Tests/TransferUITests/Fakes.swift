@@ -8,8 +8,10 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     let connection: SavedConnection
     let home: RemotePath
     let folders: Locked<[RemotePath: [RemoteItem]]>
-    /// A login that waits until cancelled, as one at a password sheet does.
-    let hangs: Locked<Bool>
+    /// How long a login takes: a long one waits until cancelled, as one at a password sheet does.
+    let loginTime: Locked<Duration?>
+    /// How long a listing takes before its items arrive.
+    let listTime = Locked<Duration?>(nil)
     let connects = Locked(0)
     let loggedIn = Locked(false)
     let calls = Locked<[String]>([])
@@ -24,7 +26,7 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
         self.connection = connection
         self.home = RemotePath(string: home)
         self.folders = Locked(folders)
-        self.hangs = Locked(hangs)
+        loginTime = Locked(hangs ? .seconds(60) : nil)
         (eventStream, send) = AsyncStream.makeStream()
     }
 
@@ -34,7 +36,7 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
 
     func connect(prompts: any PromptSink) async throws -> RemotePath {
         connects.withLock { $0 += 1 }
-        if hangs.value { try await Task.sleep(for: .seconds(60)) }
+        if let time = loginTime.value { try await Task.sleep(for: time) }
         loggedIn.value = true
         return home
     }
@@ -43,9 +45,13 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
 
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         let items = folders.value[path] ?? []
+        let time = listTime.value
         return AsyncThrowingStream { continuation in
-            for item in items { continuation.yield(item) }
-            continuation.finish()
+            Task {
+                if let time { try? await Task.sleep(for: time) }
+                for item in items { continuation.yield(item) }
+                continuation.finish()
+            }
         }
     }
 
