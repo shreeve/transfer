@@ -20,10 +20,12 @@ struct RemotePathTests {
 
     /// Go to Remote Folder joined anything not starting with `/` onto the location as one name, so
     /// `~` and `~/x` looked for a folder named `~`, and `..` stayed in the path (UIM-32).
-    /// Rename and every local placement take a name only when it names one entry.
+    /// Rename and every local placement take a name only when it names one entry; a slash with a
+    /// combining mark after it was one Character, not "/", and passed.
     @Test func aSingleNameCannotReachAnotherEntry() {
         for name in ["notes.txt", ".hidden", "...", "a b", "café"] { #expect(RemotePath.isSingleName(name)) }
-        for name in ["", ".", "..", "a/b", "/", "../x", "a\0b"] { #expect(!RemotePath.isSingleName(name)) }
+        for name in ["", ".", "..", "a/b", "/", "../x", "a\0b", "a/\u{301}b"] { #expect(!RemotePath.isSingleName(name)) }
+        #expect(RemotePath.isSingleName(bytes: Data("x".utf8)) && !RemotePath.isSingleName(bytes: Data([0x61, 0x2F, 0xCC, 0x81])))
     }
 
     @Test func aTypedFolderIsAbsoluteHomeOrRelative() {

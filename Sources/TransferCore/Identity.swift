@@ -104,10 +104,13 @@ public struct RemotePath: Hashable, Sendable {
         return RemotePath(bytes: joined.isEmpty ? [0x2E] : joined)
     }
 
-    /// Whether `name` names one entry: not empty, `.`, or `..`, and with no `/` or NUL, which
-    /// would reach somewhere else.
-    public static func isSingleName(_ name: String) -> Bool {
-        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
+    /// Whether `name` names one entry: not empty, `.`, or `..`, and with no `/` or NUL byte,
+    /// which would reach somewhere else. Bytes, not characters: "/" followed by a combining mark
+    /// is one Character that is not "/".
+    public static func isSingleName(_ name: String) -> Bool { isSingleName(bytes: name.utf8) }
+
+    public static func isSingleName(bytes name: some Collection<UInt8>) -> Bool {
+        !name.isEmpty && !name.elementsEqual([0x2E]) && !name.elementsEqual([0x2E, 0x2E]) && !name.contains(0x2F) && !name.contains(0)
     }
 
     /// Where Go to Remote Folder goes for `text`: `/…` is absolute, `~` and `~/…` start at `home`,

@@ -517,14 +517,9 @@ actor SFTPChannel {
         }
         guard !names.isEmpty else { return nil }
         return names.compactMap { name in
-            guard Self.isSingleComponent(name.filename) else { return nil }
+            guard RemotePath.isSingleName(bytes: name.filename) else { return nil }
             return item(path: parent.appending(name: Array(name.filename)), attrs: name.attrs)
         }
-    }
-
-    static func isSingleComponent(_ name: Data) -> Bool {
-        !name.isEmpty && name != Data([0x2E]) && name != Data([0x2E, 0x2E])
-            && !name.contains(0x2F) && !name.contains(0)
     }
 
     private func openFile(_ path: RemotePath, flags: UInt32) async throws -> Data {
