@@ -62,6 +62,13 @@ public enum KeepBothName {
         return candidate(n)
     }
 
+    /// The hidden temp beside `basename`: ".notes.txt.transfer-<id>". The name in it is cut, never
+    /// inside a character, so the temp fits the 255 bytes a file name may take even when
+    /// `basename` nearly does.
+    public static func temp(for basename: String, id: String = UUID().uuidString) -> String {
+        LiveDecision.siblingName(of: basename, prefix: ".", suffix: ".transfer-\(id)")
+    }
+
     /// Keep Both: "report 2.pdf", "report 3.pdf", …; a folder's whole name is kept: "v1.2 2".
     public static func next(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
         let split = splitExtension(original, isFolder: isFolder)
@@ -93,15 +100,6 @@ public enum KeepBothName {
             return (name, "")
         }
         return (String(name[..<dot]), String(name[dot...]))
-    }
-}
-
-public enum CopyRules {
-    /// The hidden temp beside `basename`: ".notes.txt.transfer-<id>". The name in it is cut, never
-    /// inside a character, so the temp fits the 255 bytes a file name may take even when
-    /// `basename` nearly does.
-    public static func tempName(for basename: String, transferID: String) -> String {
-        LiveDecision.siblingName(of: basename, prefix: ".", suffix: ".transfer-\(transferID)")
     }
 }
 

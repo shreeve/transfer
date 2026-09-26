@@ -37,8 +37,8 @@ struct HubTests {
         defer { try? FileManager.default.removeItem(at: base) }
         let root = base.appendingPathComponent("library", isDirectory: true)
         let store = try Store(root: root)
-        let temp = base.appendingPathComponent(CopyRules.tempName(for: "a.txt", transferID: UUID().uuidString))
-        let folder = base.appendingPathComponent(CopyRules.tempName(for: "b", transferID: UUID().uuidString), isDirectory: true)
+        let temp = base.appendingPathComponent(KeepBothName.temp(for: "a.txt"))
+        let folder = base.appendingPathComponent(KeepBothName.temp(for: "b"), isDirectory: true)
         let document = base.appendingPathComponent("notes.txt")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         for file in [temp, folder.appendingPathComponent("inside"), document] { try Data("x".utf8).write(to: file) }

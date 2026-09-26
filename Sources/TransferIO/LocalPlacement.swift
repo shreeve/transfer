@@ -140,7 +140,7 @@ enum LocalPlacement {
             guard symlink(target, url.path) == 0 else { throw posixError(url).error }
             return
         }
-        let temp = url.deletingLastPathComponent().appendingPathComponent(CopyRules.tempName(for: url.lastPathComponent, transferID: UUID().uuidString))
+        let temp = url.deletingLastPathComponent().appendingPathComponent(KeepBothName.temp(for: url.lastPathComponent))
         guard symlink(target, temp.path) == 0 else { throw posixError(url).error }
         guard rename(temp.path, url.path) == 0 else {
             let failure = posixError(url)

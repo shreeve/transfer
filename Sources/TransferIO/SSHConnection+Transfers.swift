@@ -101,7 +101,7 @@ extension SSHConnection {
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let folder = destination.deletingLastPathComponent()
-        let temp = folder.appendingPathComponent(CopyRules.tempName(for: destination.lastPathComponent, transferID: UUID().uuidString))
+        let temp = folder.appendingPathComponent(KeepBothName.temp(for: destination.lastPathComponent))
         store.rememberTemp(local: temp)
         do {
             try await receive(path, info: info, into: temp, interactive: interactive, progress: progress)
@@ -576,7 +576,7 @@ extension SSHConnection {
     /// run cannot. `body` writes the temp and renames it into place.
     private func withRemoteTemp<T>(for placed: RemotePath, _ body: (RemotePath) async throws -> T) async throws -> T {
         let parent = placed.parent ?? RemotePath(string: "/")
-        let temp = parent.appending(name: Array(CopyRules.tempName(for: placed.name, transferID: UUID().uuidString).utf8))
+        let temp = parent.appending(name: Array(KeepBothName.temp(for: placed.name).utf8))
         store.rememberTemp(temp, connection: connection.id)
         do {
             let result = try await body(temp)

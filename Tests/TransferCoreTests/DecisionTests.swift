@@ -85,9 +85,9 @@ import Testing
 /// than 208 (R-T5). The name in it is cut to fit, never inside a character.
 @Test func aTempNameFitsTheNameLimit() {
     let id = UUID().uuidString
-    #expect(CopyRules.tempName(for: "notes.txt", transferID: id) == ".notes.txt.transfer-\(id)")
+    #expect(KeepBothName.temp(for: "notes.txt", id: id) == ".notes.txt.transfer-\(id)")
     for name in [String(repeating: "a", count: 255), String(repeating: "é", count: 127), String(repeating: "😀", count: 63)] {
-        let temp = CopyRules.tempName(for: name, transferID: id)
+        let temp = KeepBothName.temp(for: name, id: id)
         #expect(temp.utf8.count <= 255 && temp.utf8.count > 250)
         #expect(temp.hasSuffix(".transfer-\(id)"))
         #expect(name.hasPrefix(temp.dropFirst().dropLast(".transfer-\(id)".count)))

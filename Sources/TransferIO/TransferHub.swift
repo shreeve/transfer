@@ -32,7 +32,7 @@ public actor TransferHub: SessionProvider {
         }
     }
 
-    /// `CopyRules.tempName`'s shape, `.<name>.transfer-<UUID>`, as every Transfer has named them.
+    /// `KeepBothName.temp`'s shape, `.<name>.transfer-<UUID>`, as every Transfer has named them.
     static func isTempName(_ name: String) -> Bool {
         guard name.hasPrefix("."), let marker = name.range(of: ".transfer-", options: .backwards) else { return false }
         return UUID(uuidString: String(name[marker.upperBound...])) != nil
