@@ -12,7 +12,7 @@ enum Subprocess {
 
     /// Runs `launch` to its end, killing it on `timeout` (throws `.timeout`) or task cancellation
     /// (throws `.cancelled`). Its output is read as it arrives, and once it exits the runner waits
-    /// at most a second more for the pipes to close: a child it left running, such as an askpass
+    /// at most a second more for both pipes to close: a child it left running, such as an askpass
     /// helper still polling for a reply, may hold them open for minutes.
     static func run(_ launch: String, _ arguments: [String], environment: [String: String]? = nil, timeout: Duration) async throws -> Result {
         let process = Process()
@@ -46,8 +46,9 @@ enum Subprocess {
             stopped.withLock { $0.cancelled = true }
             if process.isRunning { process.terminate() }
         }
-        await output.waitForEnd()
-        await errors.waitForEnd()
+        let deadline = ContinuousClock.now + .seconds(1)
+        await output.waitForEnd(until: deadline)
+        await errors.waitForEnd(until: deadline)
         if stopped.value.cancelled { throw TransferError.cancelled }
         if stopped.value.timedOut { throw TransferError.timeout(name) }
         return Result(status: process.terminationStatus, stdout: output.text, stderr: errors.text)
@@ -79,9 +80,10 @@ final class OutputTail: Sendable {
 
     var text: String { String(decoding: data.value, as: UTF8.self) }
 
-    /// Waits, at most a second, for everything the process wrote before it exited.
-    func waitForEnd() async {
-        for _ in 0..<50 where !ended.value {
+    /// Waits until `deadline`, a second from now unless given, for everything the process wrote
+    /// before it exited.
+    func waitForEnd(until deadline: ContinuousClock.Instant = .now + .seconds(1)) async {
+        while !ended.value, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
     }
