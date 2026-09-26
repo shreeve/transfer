@@ -177,3 +177,19 @@ func waitUntil(_ seconds: Double = 8, _ condition: () async -> Bool) async -> Bo
     }
     return await condition()
 }
+
+func socketPath(_ h: ServerHarness) -> String {
+    h.root.appendingPathComponent("ssh/\(h.session.connection.id.socketName)").path
+}
+
+/// The ssh processes on this harness's control socket whose command line contains `marker`.
+func processes(_ h: ServerHarness, _ marker: String) async throws -> [(pid: pid_t, command: String)] {
+    let socket = socketPath(h)
+    let listed = try await Subprocess.run("/bin/ps", ["-axwwo", "pid=,command="], timeout: .seconds(5))
+    return listed.stdout.split(separator: "\n").compactMap { line in
+        let text = line.trimmingCharacters(in: .whitespaces)
+        guard text.contains(socket), text.contains("/usr/bin/ssh"), marker.isEmpty || text.contains(marker),
+              let space = text.firstIndex(of: " "), let pid = pid_t(text[..<space]) else { return nil }
+        return (pid, String(text[space...]))
+    }
+}

@@ -432,13 +432,13 @@ struct ThroughputServerTests {
             try data.write(to: local)
             let when = Date(timeIntervalSince1970: 1_600_000_000)
             try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: local.path)
-            let before = try await passengers(h).count
+            let before = try await processes(h, " sftp").count
             let remote = h.remotePath.appending(name: Array("big.bin".utf8))
             try await h.session.upload(local, to: remote) { _ in }
             #expect(try Data(contentsOf: h.remote.appendingPathComponent("big.bin")) == data)
             let attributes = try FileManager.default.attributesOfItem(atPath: h.remote.appendingPathComponent("big.bin").path)
             #expect(attributes[.modificationDate] as? Date == when)
-            #expect(try await passengers(h).count >= before + 2)
+            #expect(try await processes(h, " sftp").count >= before + 2)
             let down = h.staging.appendingPathComponent("down.bin")
             try await h.session.download(remote, to: down) { _ in }
             #expect(try Data(contentsOf: down) == data)
@@ -478,12 +478,12 @@ struct ThroughputServerTests {
             try Data(count: size).write(to: local)
             try Data(count: size).write(to: h.remote.appendingPathComponent("there.bin"))
             // Four data channels, open and idle, so a transfer's parts start on all of them at once.
-            let reserved = Set(try await passengers(h).map(\.pid))
+            let reserved = Set(try await processes(h, " sftp").map(\.pid))
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for _ in 0..<4 { group.addTask { try await h.session.withData { _ in try await Task.sleep(for: .milliseconds(300)) } } }
                 try await group.waitForAll()
             }
-            let data = try await passengers(h).map(\.pid).filter { !reserved.contains($0) }
+            let data = try await processes(h, " sftp").map(\.pid).filter { !reserved.contains($0) }
             #expect(data.count == 4)
             let down = h.staging.appendingPathComponent("down")
             try FileManager.default.createDirectory(at: down, withIntermediateDirectories: true)
@@ -496,7 +496,7 @@ struct ThroughputServerTests {
                 for _ in 0..<4 { group.addTask { try await h.session.withData { _ in try await Task.sleep(for: .milliseconds(300)) } } }
                 try await group.waitForAll()
             }
-            let alive = try await passengers(h).map(\.pid).filter { !reserved.contains($0) }
+            let alive = try await processes(h, " sftp").map(\.pid).filter { !reserved.contains($0) }
             #expect(alive.count == 4)
             await #expect(throws: TransferError.self) {
                 try await h.session.upload(local, to: h.remotePath.appending(name: Array("up.bin".utf8)), progress: killingOne(alive))
@@ -510,16 +510,4 @@ struct ThroughputServerTests {
 private func killingOne(_ pids: [pid_t]) -> @Sendable (TransferProgress) -> Void {
     let victims = Locked(pids)
     return { _ in if let pid = victims.withLock({ $0.popLast() }) { kill(pid, SIGKILL) } }
-}
-
-/// The session's SFTP passengers: its reserved channels and its data channels.
-private func passengers(_ h: ServerHarness) async throws -> [(pid: pid_t, command: String)] {
-    let socket = h.root.appendingPathComponent("ssh/\(h.session.connection.id.socketName)").path
-    let listed = try await Subprocess.run("/bin/ps", ["-axwwo", "pid=,command="], timeout: .seconds(5))
-    return listed.stdout.split(separator: "\n").compactMap { line in
-        let text = line.trimmingCharacters(in: .whitespaces)
-        guard text.contains(socket), text.contains("/usr/bin/ssh"), text.contains(" sftp"),
-              let space = text.firstIndex(of: " "), let pid = pid_t(text[..<space]) else { return nil }
-        return (pid, String(text[space...]))
-    }
 }
