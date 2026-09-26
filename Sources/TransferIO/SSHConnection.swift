@@ -69,7 +69,7 @@ public actor SSHConnection: RemoteSession {
             self = (size ?? .max) <= 256 << 10 ? .small : .whole
         }
     }
-    /// How long a login may take, prompts included, before it gives up.
+    /// How long a master may take to log in, password prompts included, before it gives up.
     static let loginTimeout: Duration = .seconds(300)
 
     /// `live` is the hub's one `LiveSync`, shared by every connection. `replacing` is the session
@@ -183,8 +183,9 @@ public actor SSHConnection: RemoteSession {
         }
         // The temps an earlier run could not remove; each is forgotten only once it is gone.
         for temp in store.remoteTemps(connection: connection.id) { await discardRemoteTemp(temp) }
+        // A master that died meanwhile has already told Live; a shelf row retries this.
+        guard isConnected, let startPath else { throw TransferError.connectionLost("The SSH connection closed") }
         await live.connected(connection.id, server: self)
-        guard let startPath else { throw TransferError.notConnected }
         return startPath
     }
 
@@ -201,7 +202,7 @@ public actor SSHConnection: RemoteSession {
         }
         let ask = try prepareAskpass()
         held.scratch.append(ask)
-        let deadline = ContinuousClock.now + Self.loginTimeout
+        var deadline = ContinuousClock.now + Self.loginTimeout
         let poller = Task { await self.servePrompts(prompts, directory: ask) }
         defer { poller.cancel() }
         var hostKeyArguments: [String] = []
@@ -228,6 +229,8 @@ public actor SSHConnection: RemoteSession {
             if failure == .revoked || askedAboutHostKey { throw TransferError.hostKeyRejected }
             askedAboutHostKey = true
             hostKeyArguments = try await trustHostKey(failure, prompts: prompts, ask: ask, holding: &held)
+            // The question may have waited on the user for any time; the retry gets its own limit.
+            deadline = ContinuousClock.now + Self.loginTimeout
         }
         let browse = try await openLink()
         held.reserved[.browse] = browse
