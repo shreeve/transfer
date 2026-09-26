@@ -431,23 +431,11 @@ public enum RetryPolicy {
     }
 }
 
-public struct CacheEntry: Hashable, Sendable {
-    public var id: String
-    public var size: UInt64
-    public var lastUsed: Date
-
-    public init(id: String, size: UInt64, lastUsed: Date) {
-        self.id = id
-        self.size = size
-        self.lastUsed = lastUsed
-    }
-}
-
 public enum CacheEviction {
     public static let previewLimit: UInt64 = 1_073_741_824
 
     /// Oldest entries first, until the rest fit under `limit`.
-    public static func victims(_ entries: [CacheEntry], limit: UInt64) -> [String] {
+    public static func victims(_ entries: [(id: String, size: UInt64, lastUsed: Date)], limit: UInt64) -> [String] {
         var total = entries.reduce(UInt64(0)) { $0 + $1.size }
         guard total > limit else { return [] }
         var removed: [String] = []

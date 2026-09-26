@@ -775,13 +775,13 @@ extension SSHConnection {
         let root = store.previewCache.path
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentAccessDateKey, .contentModificationDateKey]
         guard let walker = FileManager.default.enumerator(at: store.previewCache, includingPropertiesForKeys: Array(keys)) else { return }
-        var entries: [String: CacheEntry] = [:]
+        var entries: [String: (id: String, size: UInt64, lastUsed: Date)] = [:]
         for case let url as URL in walker {
             guard let values = try? url.resourceValues(forKeys: keys) else { continue }
             let used = values.contentAccessDate ?? values.contentModificationDate ?? .distantPast
             let parent = url.deletingLastPathComponent().path
             let id = values.isDirectory == true || parent == root ? url.path : parent
-            var entry = entries[id] ?? CacheEntry(id: id, size: 0, lastUsed: .distantPast)
+            var entry = entries[id] ?? (id, 0, .distantPast)
             if values.isDirectory != true { entry.size += UInt64(values.fileSize ?? 0) }
             entry.lastUsed = max(entry.lastUsed, used)
             entries[id] = entry

@@ -136,10 +136,10 @@ import Testing
 }
 
 @Test func cacheEvictionDropsTheOldestFirst() {
-    let entries = [
-        CacheEntry(id: "new", size: 40, lastUsed: Date(timeIntervalSince1970: 300)),
-        CacheEntry(id: "old", size: 40, lastUsed: Date(timeIntervalSince1970: 100)),
-        CacheEntry(id: "mid", size: 40, lastUsed: Date(timeIntervalSince1970: 200)),
+    let entries: [(id: String, size: UInt64, lastUsed: Date)] = [
+        ("new", 40, Date(timeIntervalSince1970: 300)),
+        ("old", 40, Date(timeIntervalSince1970: 100)),
+        ("mid", 40, Date(timeIntervalSince1970: 200)),
     ]
     #expect(CacheEviction.victims(entries, limit: 100) == ["old"])
     #expect(CacheEviction.victims(entries, limit: 50) == ["old", "mid"])
