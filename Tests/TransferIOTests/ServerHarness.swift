@@ -168,12 +168,12 @@ final class EventRecorder: Sendable {
     }
 }
 
-/// Polls `condition` every 50 ms until it holds or `seconds` pass.
+/// Polls `condition` every 20 ms until it holds or `seconds` pass.
 func waitUntil(_ seconds: Double = 8, _ condition: () async -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(seconds)
     while Date() < deadline {
         if await condition() { return true }
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        try? await Task.sleep(nanoseconds: 20_000_000)
     }
     return await condition()
 }

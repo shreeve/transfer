@@ -20,9 +20,9 @@ import TransferCore
                 cancelled.value = Task.isCancelled
             }
         }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         let preview = Task { try await lane.submit(.preview) {} }
-        #expect(await eventually { await lane.waiting == 1 })
+        #expect(await waitUntil { await lane.waiting == 1 })
         await gate.open()
         try await save.value
         try await preview.value
@@ -42,9 +42,9 @@ import TransferCore
                 order.withLock { $0.append("open") }
             }
         }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         let preview = Task { try await lane.submit(.preview) { order.withLock { $0.append("preview") } } }
-        #expect(await eventually { await lane.waiting == 1 })
+        #expect(await waitUntil { await lane.waiting == 1 })
         await gate.open()
         try await open.value
         try await preview.value
@@ -63,9 +63,9 @@ import TransferCore
                 order.withLock { $0.append(Task.isCancelled ? "preview cancelled" : "preview") }
             }
         }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         let save = Task { try await lane.submit(.save) { order.withLock { $0.append("save") } } }
-        #expect(await eventually { await lane.waiting == 1 })
+        #expect(await waitUntil { await lane.waiting == 1 })
         await gate.open()
         try await preview.value
         try await save.value
@@ -78,12 +78,12 @@ import TransferCore
         let gate = Gate()
         let order = Locked<[String]>([])
         let blocker = Task { try await lane.submit(.save) { await gate.wait() } }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         var jobs: [Task<Void, Error>] = []
         for (kind, name) in [(InteractiveLane.Kind.preview, "preview"), (.save, "save"), (.open, "open")] {
             let count = jobs.count
             jobs.append(Task { try await lane.submit(kind) { order.withLock { $0.append(name) } } })
-            #expect(await eventually { await lane.waiting == count + 1 })
+            #expect(await waitUntil { await lane.waiting == count + 1 })
         }
         await gate.open()
         try await blocker.value
@@ -96,9 +96,9 @@ import TransferCore
         let lane = InteractiveLane()
         let gate = Gate()
         let blocker = Task { try await lane.submit(.save) { await gate.wait() } }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         let older = Task { try await lane.submit(.preview) {} }
-        #expect(await eventually { await lane.waiting == 1 })
+        #expect(await waitUntil { await lane.waiting == 1 })
         let newer = Task { try await lane.submit(.preview) {} }
         await #expect(throws: TransferError.cancelled) { try await older.value }
         #expect(await lane.waiting == 1)
@@ -113,7 +113,7 @@ import TransferCore
         let older = Task {
             try await lane.submit(.preview) { try await Task.sleep(for: .seconds(30)) }
         }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         let newer = Task { try await lane.submit(.preview) {} }
         await #expect(throws: CancellationError.self) { try await older.value }
         try await newer.value
@@ -132,11 +132,11 @@ import TransferCore
                 order.withLock { $0.append(Task.isCancelled ? "view cancelled" : "view") }
             }
         }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         let waiting = Task { try await lane.submit(.view) { order.withLock { $0.append("second view") } } }
-        #expect(await eventually { await lane.waiting == 1 })
+        #expect(await waitUntil { await lane.waiting == 1 })
         let prefetch = Task { try await lane.submit(.preview) { order.withLock { $0.append("prefetch") } } }
-        #expect(await eventually { await lane.waiting == 2 })
+        #expect(await waitUntil { await lane.waiting == 2 })
         let preview = Task { try await lane.submit(.preview) { order.withLock { $0.append("preview") } } }
         await #expect(throws: TransferError.cancelled) { try await prefetch.value }
         await gate.open()
@@ -152,9 +152,9 @@ import TransferCore
         let gate = Gate()
         let ran = Locked(false)
         let blocker = Task { try await lane.submit(.save) { await gate.wait() } }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         let open = Task { try await lane.submit(.open) { ran.value = true } }
-        #expect(await eventually { await lane.waiting == 1 })
+        #expect(await waitUntil { await lane.waiting == 1 })
         open.cancel()
         await #expect(throws: TransferError.cancelled) { try await open.value }
         #expect(await lane.waiting == 0)
@@ -169,10 +169,10 @@ import TransferCore
         let save = Task {
             try await lane.submit(.save) { try await Task.sleep(for: .seconds(30)) }
         }
-        #expect(await eventually { await lane.isRunning })
+        #expect(await waitUntil { await lane.isRunning })
         save.cancel()
         await #expect(throws: CancellationError.self) { try await save.value }
-        #expect(await eventually { await !lane.isRunning })
+        #expect(await waitUntil { await !lane.isRunning })
     }
 }
 

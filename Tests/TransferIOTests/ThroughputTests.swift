@@ -113,7 +113,7 @@ import TransferCore
         let parts = try DownloadParts(file, size: UInt64(content.count)) { _ in }
         try await server.channel.receive(Self.path, into: parts, matching: Fingerprint(size: 200_000, mtime: 8), helping: true)
         #expect(server.sent(SFTPCode.read).isEmpty)
-        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 1 })
         #expect(parts.nextRequest()?.offset == 0)
         await server.stop()
     }
@@ -160,7 +160,7 @@ import TransferCore
         #expect(server.sent(SFTPCode.fstat).count == 1)
         // The server answers in order, so once it has the CLOSE every READ reply is out, and none
         // is written into a pipe `stop` has closed.
-        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 1 })
         await server.stop()
     }
 
@@ -200,7 +200,7 @@ import TransferCore
         } else {
             await #expect(throws: TransferError.changedOnServer("file")) { try await download() }
         }
-        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 1 })
         await server.stop()
     }
 

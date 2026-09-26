@@ -50,10 +50,10 @@ import TransferCore
         let reader = Task {
             for try await _ in await server.channel.list(RemotePath(string: "/srv")) {}
         }
-        #expect(await eventually { !server.sent(SFTPCode.readdir).isEmpty })
+        #expect(await waitUntil { !server.sent(SFTPCode.readdir).isEmpty })
         reader.cancel()
         _ = try? await reader.value
-        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 1 })
         #expect(server.sent(SFTPCode.close).first?.paths == ["h"])
         await server.stop()
     }
@@ -73,7 +73,7 @@ import TransferCore
     @Test func aListingLeftEarlyClosesItsHandle() async throws {
         let server = try await ScriptedServer(answer: ScriptedServer.listing([[Array("a".utf8), Array("b".utf8)]]))
         for try await _ in await server.channel.list(RemotePath(string: "/srv")) { break }
-        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 1 })
         await server.stop()
     }
 
@@ -91,12 +91,12 @@ import TransferCore
                 try await server.channel.download(path, to: file, size: 10) { _ in }
             }
         }
-        #expect(await eventually { !server.sent(type).isEmpty })
+        #expect(await waitUntil { !server.sent(type).isEmpty })
         reader.cancel()
         try await Task.sleep(for: .milliseconds(50))
         server.send(ScriptedServer.handle(server.sent(type)[0].id, "late"))
         _ = try? await reader.value
-        #expect(await eventually { server.sent(SFTPCode.close).map(\.paths) == [["late"]] })
+        #expect(await waitUntil { server.sent(SFTPCode.close).map(\.paths) == [["late"]] })
         #expect(server.sent(SFTPCode.readdir).isEmpty && server.sent(SFTPCode.read).isEmpty)
         await server.stop()
     }
@@ -153,7 +153,7 @@ import TransferCore
             Task { try await server.channel.upload(file, to: RemotePath(string: "/srv/up")) { _ in } },
             Task { try await server.channel.download(RemotePath(string: "/srv/down"), to: file.appendingPathExtension("down"), size: 1 << 20) { _ in } },
         ]
-        #expect(await eventually { server.sent(SFTPCode.write).count == 16 && server.sent(SFTPCode.read).count == 16 })
+        #expect(await waitUntil { server.sent(SFTPCode.write).count == 16 && server.sent(SFTPCode.read).count == 16 })
         let started = ContinuousClock.now
         for transfer in transfers {
             transfer.cancel()
@@ -188,14 +188,14 @@ import TransferCore
                 try await server.channel.upload(file, to: temp) { _ in }
             }
         }
-        #expect(await eventually { server.sent(SFTPCode.open).contains { $0.paths.first == temp.display } })
+        #expect(await waitUntil { server.sent(SFTPCode.open).contains { $0.paths.first == temp.display } })
         write.cancel()
         try await Task.sleep(for: .milliseconds(200))
         #expect(!finished.value)
         server.send(ScriptedServer.handle(server.sent(SFTPCode.open).last!.id, "temp"))
         await #expect(throws: (any Error).self) { try await write.value }
         #expect(server.sent(SFTPCode.write).isEmpty && server.sent(SFTPCode.extended).isEmpty)
-        #expect(await eventually { server.sent(SFTPCode.close).map(\.paths) == (copying ? [["source"], ["temp"]] : [["temp"]]) })
+        #expect(await waitUntil { server.sent(SFTPCode.close).map(\.paths) == (copying ? [["source"], ["temp"]] : [["temp"]]) })
         await server.stop()
     }
 
@@ -329,7 +329,7 @@ import TransferCore
     @Test func aCancelledReplaceWithoutPosixRenameStillPutsTheOldFileBack() async throws {
         let server = try await Self.stepping(ScriptedServer.file, onto: nil)
         let replace = Task { try await server.channel.replace(Self.temp, onto: Self.placed) }
-        #expect(await eventually { server.sent(SFTPCode.rename).count == 2 })
+        #expect(await waitUntil { server.sent(SFTPCode.rename).count == 2 })
         replace.cancel()
         try await Task.sleep(for: .milliseconds(50))
         server.send(ScriptedServer.status(server.sent(SFTPCode.rename)[1].id, SFTPCode.failure))
@@ -359,7 +359,7 @@ import TransferCore
         let dropped = Locked<[String]>([])
         let hung = try await Self.stepping(ScriptedServer.file, onto: nil)
         let replace = Task { try await hung.channel.replace(Self.temp, onto: Self.placed, log: logging(dropped)) }
-        #expect(await eventually { hung.sent(SFTPCode.rename).count == 2 })
+        #expect(await waitUntil { hung.sent(SFTPCode.rename).count == 2 })
         hung.hangUp()
         await #expect(throws: (any Error).self) { try await replace.value }
         #expect(dropped.value == ["remember /srv/a"])

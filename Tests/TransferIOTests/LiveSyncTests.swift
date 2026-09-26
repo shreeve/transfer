@@ -43,15 +43,6 @@ struct LiveSyncTests {
         try? FileManager.default.removeItem(at: h.base)
     }
 
-    private func waitUntil(_ seconds: Double = 5, _ condition: () async -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 25_000_000)
-        }
-        return await condition()
-    }
-
     private func pause(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000_000) }
 
     /// Waits for the worker to have nothing queued, due, or running, so a check that something

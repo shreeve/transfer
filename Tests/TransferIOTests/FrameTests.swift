@@ -133,7 +133,7 @@ import TransferCore
         for banner in ["Welcome to the build host\r\n", "hi\n"] {
             let server = try await ScriptedServer(extensions: nil)
             let handshake = Task { try await server.channel.handshake() }
-            #expect(await eventually { !server.sent(SFTPCode.initialize).isEmpty })
+            #expect(await waitUntil { !server.sent(SFTPCode.initialize).isEmpty })
             server.send(Data(banner.utf8) + ScriptedServer.version([]))
             let error = await #expect(throws: TransferError.self) { try await handshake.value }
             let text = banner.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -145,7 +145,7 @@ import TransferCore
     @Test func aFirstPacketThatIsNotVersionFailsTheHandshake() async throws {
         let server = try await ScriptedServer(extensions: nil)
         let handshake = Task { try await server.channel.handshake() }
-        #expect(await eventually { !server.sent(SFTPCode.initialize).isEmpty })
+        #expect(await waitUntil { !server.sent(SFTPCode.initialize).isEmpty })
         server.send(ScriptedServer.ok(0))
         await #expect(throws: TransferError.failed("The server did not answer in SFTP")) { try await handshake.value }
         await server.stop()
@@ -165,7 +165,7 @@ import TransferCore
     @Test func cancellingAHandshakeClosesTheChannel() async throws {
         let server = try await ScriptedServer(extensions: nil)
         let handshake = Task { try await server.channel.handshake() }
-        #expect(await eventually { !server.sent(SFTPCode.initialize).isEmpty })
+        #expect(await waitUntil { !server.sent(SFTPCode.initialize).isEmpty })
         handshake.cancel()
         await #expect(throws: TransferError.cancelled) { try await handshake.value }
         #expect(await !server.channel.isOpen)
@@ -177,7 +177,7 @@ import TransferCore
     @Test func aCallInFlightFailsWithTheReasonTheChannelClosed() async throws {
         let server = try await ScriptedServer()
         let call = Task { try await server.channel.lstat(Self.path) }
-        #expect(await eventually { !server.sent(SFTPCode.lstat).isEmpty })
+        #expect(await waitUntil { !server.sent(SFTPCode.lstat).isEmpty })
         await server.channel.closeLink(reason: .connectionLost("The SSH connection closed"))
         let error = await #expect(throws: TransferError.connectionLost("The SSH connection closed")) { try await call.value }
         #expect(error.map(RetryPolicy.isRetryable) == true)
@@ -205,11 +205,11 @@ import TransferCore
             }
         }
         let copy = Task { try await server.channel.copyData(Self.path, to: RemotePath(string: "/srv/b")) }
-        #expect(await eventually { !server.sent(SFTPCode.extended).isEmpty })
+        #expect(await waitUntil { !server.sent(SFTPCode.extended).isEmpty })
         try await Task.sleep(for: .seconds(1))
         server.send(ScriptedServer.ok(server.sent(SFTPCode.extended)[0].id))
         try await copy.value
-        #expect(await eventually { server.sent(SFTPCode.close).count == 2 })
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 2 })
         await server.stop()
     }
 

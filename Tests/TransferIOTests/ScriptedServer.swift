@@ -191,12 +191,3 @@ final class ScriptedServer: @unchecked Sendable {
         return attrs
     }
 }
-
-/// Polls `condition` until it holds or five seconds pass.
-func eventually(_ condition: () async -> Bool) async -> Bool {
-    for _ in 0..<500 {
-        if await condition() { return true }
-        try? await Task.sleep(nanoseconds: 10_000_000)
-    }
-    return await condition()
-}
