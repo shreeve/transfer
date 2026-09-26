@@ -24,6 +24,11 @@ public actor SSHConnection: RemoteSession {
     /// The latest release of a master and its channels. The next login waits for it, so an old
     /// master never exits, unlinking the socket, after a new one has bound it.
     private var releasing: Task<Void, Never>?
+    /// Set once the hub has replaced this session or removed its server. A window may still hold
+    /// it, but it never logs in again: its login would take the socket path of the replacement
+    /// and end that one's master.
+    private let retired = Locked(false)
+    static let retiredError = TransferError.failed("This server's settings changed or it was removed. Choose it again to connect.")
     /// Bumped by every login and teardown, so a channel that finishes opening afterwards is closed.
     private var generation = 0
     private var reserved: [ChannelRole: SFTPChannel] = [:]
@@ -69,7 +74,8 @@ public actor SSHConnection: RemoteSession {
 
     /// `live` is the hub's one `LiveSync`, shared by every connection. `replacing` is the session
     /// for this server that this one takes over from, as when its settings changed: it disconnects
-    /// now, and this one's first login waits for that, since both use one socket path.
+    /// now and never logs in again, and this one's first login waits for that, since both use one
+    /// socket path.
     init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync, sshConfigFile: String? = nil,
          replacing previous: SSHConnection? = nil) {
         self.connection = connection
@@ -78,6 +84,7 @@ public actor SSHConnection: RemoteSession {
         self.live = live
         self.sshConfigFile = sshConfigFile
         socketPath = store.root.appendingPathComponent("ssh/\(connection.id.socketName)").path
+        previous?.retired.value = true
         releasing = previous.map { old in Task { await old.disconnect() } }
     }
 
@@ -108,6 +115,7 @@ public actor SSHConnection: RemoteSession {
             _ = await stopping.task.result
             if login?.task == stopping.task { login = nil }
         }
+        if retired.value { throw Self.retiredError }
         let current: Login
         if let login {
             current = login
@@ -139,6 +147,12 @@ public actor SSHConnection: RemoteSession {
             _ = await login.task.result
         }
         await tearDown(reason: .cancelled)
+    }
+
+    /// Disconnects for good: the hub removed this session's server.
+    func retire() async {
+        retired.value = true
+        await disconnect()
     }
 
     /// What one login has started, released together when it fails or the session ends.

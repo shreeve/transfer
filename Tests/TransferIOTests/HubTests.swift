@@ -84,7 +84,8 @@ struct HubTests {
         #expect(ConfigLoader.load(root: root).editableExtensions == ["txt", "md", "swift"])
     }
 
-    /// Every window gets the one session for a server until the saved server changes.
+    /// Every window gets the one session for a server until the saved server changes; a save that
+    /// changes nothing keeps it. The session replaced never logs in again.
     @Test func sessionsAreSharedUntilTheServerChanges() async throws {
         let base = TestCaches.fresh("hubshare")
         defer { try? FileManager.default.removeItem(at: base) }
@@ -92,6 +93,7 @@ struct HubTests {
         var saved = SavedConnection(name: "box", host: "box.invalid", user: "u", port: "", identityFile: "", remotePath: "")
         try await hub.save(saved)
         let first = try #require(try await hub.session(for: saved.id) as? SSHConnection)
+        try await hub.save(saved)
         let again = try #require(try await hub.session(for: saved.id) as? SSHConnection)
         #expect(first === again)
         saved.host = "other.invalid"
@@ -99,6 +101,7 @@ struct HubTests {
         let replaced = try #require(try await hub.session(for: saved.id) as? SSHConnection)
         #expect(replaced !== first)
         #expect(replaced.connection.host == "other.invalid")
+        await #expect(throws: SSHConnection.retiredError) { _ = try await first.connect(prompts: TestPrompts()) }
     }
 
     /// A config.json that no longer decodes is copied aside before the defaults take over, since

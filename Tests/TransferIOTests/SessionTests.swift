@@ -254,6 +254,11 @@ struct SessionServerTests {
                                             live: h.live, sshConfigFile: h.configFile.path, replacing: h.session)
             _ = try await replacement.connect(prompts: RecordingPrompts(.cancel))
             #expect(await h.session.isConnected == false)
+            // The old session, which a window may still hold, never logs in again: that login
+            // would take the socket and end the replacement's master.
+            await #expect(throws: SSHConnection.retiredError) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            #expect(!RetryPolicy.isRetryable(SSHConnection.retiredError))
+            #expect(await replacement.isConnected)
             await h.session.disconnect()
             try await killPassengers(h)
             _ = try await replacement.stat(h.remotePath)

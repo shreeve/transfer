@@ -50,7 +50,8 @@ public actor TransferHub: SessionProvider {
         store.save(connection)
         // A session that is not logged in, perhaps mid-login with the old settings, is replaced
         // and stopped, so no orphaned master finishes that login.
-        guard let existing = sessions[connection.id], !(await existing.isConnected), sessions[connection.id] === existing else { return }
+        guard let existing = sessions[connection.id], existing.connection != connection, !(await existing.isConnected),
+              sessions[connection.id] === existing else { return }
         makeSession(connection, replacing: existing)
     }
 
@@ -61,8 +62,7 @@ public actor TransferHub: SessionProvider {
         // Out of the library first, so no caller makes a new session while this one disconnects.
         store.remove(id)
         KeychainStore.delete(id)
-        let session = sessions.removeValue(forKey: id)
-        await session?.disconnect()
+        await sessions.removeValue(forKey: id)?.retire()
     }
 
     public func session(for id: ConnectionID) async throws -> any RemoteSession {
