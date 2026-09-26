@@ -56,7 +56,19 @@ final class Store: @unchecked Sendable {
         let path = base.appendingPathComponent("transfer.sqlite").path
         do {
             guard sqlite3_open(path, &db) == SQLITE_OK else { throw TransferError.failed("Could not open the library") }
-            try open()
+            // Two copies of this Transfer never share a library (the hub's lock), but an older
+            // Transfer, which takes no lock, may have it open; a write waits for its lock instead
+            // of failing at once.
+            sqlite3_busy_timeout(db, 5_000)
+            while try transaction(migrateOneStep) {}
+            // WAL makes a commit one log append, not a rollback journal's create, write, fsync,
+            // and unlink, and lets the other process read during a write. The mode persists in the
+            // file but cannot change during another process's transaction; this launch then keeps
+            // the old mode and the next retries. FULL fsyncs the log each commit, so a power loss
+            // never rolls back a written Live record; NORMAL would halve the cost (0.035 ms a temps
+            // pair) but lose that.
+            report("switch the library to WAL") { try execute("PRAGMA journal_mode = WAL") }
+            try execute("PRAGMA synchronous = FULL")
         } catch {
             sqlite3_close(db)
             db = nil
@@ -73,28 +85,15 @@ final class Store: @unchecked Sendable {
     /// The newest schema this build knows; `migrate(from:)` has a step for each one before it.
     static let schemaVersion = 3
 
-    private func open() throws {
-        // Two copies of this Transfer never share a library (the hub's lock), but an older
-        // Transfer, which takes no lock, may have it open; a write waits for its lock instead
-        // of failing at once.
-        sqlite3_busy_timeout(db, 5_000)
-        while try transaction(migrateOneStep) {}
-        // WAL makes a commit one log append, not a rollback journal's create, write, fsync, and
-        // unlink, and lets the other process read during a write. The mode persists in the file but
-        // cannot change during another process's transaction; this launch then keeps the old mode
-        // and the next retries. FULL fsyncs the log each commit, so a power loss never rolls back a
-        // written Live record; NORMAL would halve the cost (0.035 ms a temps pair) but lose that.
-        report("switch the library to WAL") { try execute("PRAGMA journal_mode = WAL") }
-        try execute("PRAGMA synchronous = FULL")
-    }
-
     /// Runs inside a write transaction, so the version it reads is not stale: another process may
     /// have migrated while this one waited for the lock. False once the library is current.
     private func migrateOneStep() throws -> Bool {
-        let version = try userVersion()
+        var version = 0
+        try run("PRAGMA user_version") { version = Int($0.int(0) ?? 0) }
         guard version <= Self.schemaVersion else {
             throw TransferError.failed("This library was written by a newer version of Transfer (schema \(version); this version knows \(Self.schemaVersion)). Update Transfer to open it.")
         }
+        guard version >= 0 else { throw TransferError.failed("transfer.sqlite is not a Transfer library (schema \(version)).") }
         guard version < Self.schemaVersion else { return false }
         try migrate(from: version)
         try execute("PRAGMA user_version = \(version + 1)")
@@ -161,9 +160,11 @@ final class Store: @unchecked Sendable {
         queue.sync {
             var values: [SavedConnection] = []
             report("read saved servers") {
-                try run("SELECT id, name, host, user, port, identity, remote_path FROM connections ORDER BY name") { row in
+                try run("SELECT id, name, host, user, port, identity, remote_path FROM connections") { row in
+                    // A row without an id could never be edited or removed.
+                    guard let id = UUID(uuidString: row.text(0)) else { return }
                     values.append(SavedConnection(
-                        id: ConnectionID(rawValue: UUID(uuidString: row.text(0)) ?? UUID()),
+                        id: ConnectionID(rawValue: id),
                         name: row.text(1),
                         host: row.text(2),
                         user: row.text(3),
@@ -173,7 +174,7 @@ final class Store: @unchecked Sendable {
                     ))
                 }
             }
-            return values
+            return values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         }
     }
 
@@ -218,7 +219,7 @@ final class Store: @unchecked Sendable {
 
     func star(connection: ConnectionID, path: RemotePath, on: Bool) {
         if on {
-            write("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, StoredPath(path.bytes))
+            write("INSERT OR REPLACE INTO pins (connection_id, path) VALUES (?,?)", connection.rawValue.uuidString, StoredPath(bytes: path.bytes))
         } else {
             write("DELETE FROM pins WHERE connection_id = ? AND CAST(path AS BLOB) = ?", connection.rawValue.uuidString, path.bytes)
         }
@@ -230,11 +231,11 @@ final class Store: @unchecked Sendable {
     /// kept under an owner key no older Transfer reads: 0.1.7 reads a record up to its NUL, and
     /// would remove the aside, the old file's only copy, as a temp.
     func rememberTemp(_ path: RemotePath, connection: ConnectionID, aside: Bool = false) {
-        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(path.bytes), connection.rawValue.uuidString + (aside ? " aside" : ""))
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(bytes: path.bytes), connection.rawValue.uuidString + (aside ? " aside" : ""))
     }
 
     func rememberTemp(local url: URL) {
-        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(Array(url.path.utf8)), "")
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(bytes: Array(url.path.utf8)), "")
     }
 
     func forgetTemp(_ path: RemotePath) {
@@ -293,7 +294,7 @@ final class Store: @unchecked Sendable {
     func saveLive(_ row: LiveRow) {
         write(
             "INSERT OR REPLACE INTO live_files (\(Self.liveColumns)) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            row.id.rawValue.uuidString, row.connection.rawValue.uuidString, StoredPath(row.path.bytes),
+            row.id.rawValue.uuidString, row.connection.rawValue.uuidString, StoredPath(bytes: row.path.bytes),
             row.baseSize.map { Int64(bitPattern: $0) }, row.baseMtime.map { Int64($0) }, row.localPath,
             Int64(row.dirty ? 1 : 0), Int64(row.paused ? 1 : 0), row.conflict,
             row.conflictSize.map { Int64(bitPattern: $0) }, row.conflictMtime.map { Int64($0) },
@@ -359,12 +360,6 @@ final class Store: @unchecked Sendable {
         }
     }
 
-    private func userVersion() throws -> Int {
-        var version = 0
-        try run("PRAGMA user_version") { version = Int($0.int(0) ?? 0) }
-        return version
-    }
-
     private func check(_ result: Int32) throws {
         guard result != SQLITE_OK else { return }
         throw TransferError.failed("Library: \(String(cString: sqlite3_errmsg(db)))")
@@ -409,10 +404,6 @@ extension [UInt8]: SQLValue {
 /// they are not UTF-8 or hold a NUL, which text would cut short.
 private struct StoredPath: SQLValue {
     let bytes: [UInt8]
-
-    init(_ bytes: [UInt8]) {
-        self.bytes = bytes
-    }
 
     fileprivate func bind(_ statement: OpaquePointer?, _ index: Int32) -> Int32 {
         guard !bytes.contains(0), let text = String(validating: bytes, as: UTF8.self) else { return bytes.bind(statement, index) }

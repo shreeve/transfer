@@ -269,19 +269,19 @@ struct StoreTests {
         #expect(read.map(\.path.bytes) == [bytes])
     }
 
-    /// A library from a newer Transfer is refused, with a reason, and left as it was.
-    @Test func aNewerLibraryIsRefusedAndUntouched() throws {
+    /// A library from a newer Transfer is refused, with a reason, and left as it was; so is one
+    /// with a negative version, which no Transfer wrote and which crashed at launch (WIR-04).
+    @Test(arguments: [Store.schemaVersion + 1, -1]) func aNewerOrForeignLibraryIsRefusedAndUntouched(version: Int) throws {
         let root = TestCaches.fresh("store")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let future = Store.schemaVersion + 1
-        try Raw(root).run("CREATE TABLE future (x); PRAGMA user_version = \(future)")
+        try Raw(root).run("CREATE TABLE future (x); PRAGMA user_version = \(version)")
 
         let error = #expect(throws: TransferError.self) { try Store(root: root) }
-        #expect(error?.localizedDescription.contains("newer version of Transfer") == true)
+        #expect(error?.localizedDescription.contains(version < 0 ? "not a Transfer library" : "newer version of Transfer") == true)
 
         let raw = try Raw(root)
-        #expect(raw.value("PRAGMA user_version") == "\(future)")
+        #expect(raw.value("PRAGMA user_version") == "\(version)")
         #expect(raw.value("PRAGMA journal_mode") == "delete")
         #expect(raw.value("SELECT count(*) FROM sqlite_master WHERE name = 'future'") == "1")
     }
@@ -299,6 +299,19 @@ struct StoreTests {
 
         #expect(stars(store, Self.alpha) == ["/waited"])
         #expect(stars(store, Self.beta) == ["/held"])
+    }
+
+    /// Saved servers read in Finder's order, not byte order ("Zeta" before "alpha"), and a row
+    /// whose id is not a UUID, which could never be edited or removed, is left out (WIR-11, WIR-12).
+    @Test func savedServersReadInFinderOrderWithoutRowsLackingAnID() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try Store(root: root)
+        for name in ["Zeta", "server 10", "éclair", "alpha", "server 9"] {
+            store.save(SavedConnection(id: ConnectionID(rawValue: UUID()), name: name, host: "h"))
+        }
+        try Raw(root).run("INSERT INTO connections (id, name) VALUES ('not-a-uuid', 'Ghost')")
+        #expect(store.connections().map(\.name) == ["alpha", "éclair", "server 9", "server 10", "Zeta"])
     }
 
     /// Removing a server drops its rows from every table and nobody else's.
