@@ -3,20 +3,23 @@ import TransferCore
 
 /// A download against a server that answers READs from a file of `length` bytes, at most `cap`
 /// bytes a reply, keeping up to `window` requests in flight and answering the oldest first, as
-/// the download loop does. Returns the plan and the bytes it covered.
-private func download(size: UInt64, length: UInt64, cap: UInt32, window: Int = 32) -> (ReadPlan, [Bool]) {
+/// the download loop does. With a seed, it answers them in random order, each reply capped
+/// anywhere up to `cap`. Returns the plan and the bytes it covered.
+private func download(size: UInt64, length: UInt64, cap: UInt32, window: Int = 32, seed: UInt64? = nil) -> (ReadPlan, [Bool]) {
+    var random = seed.map(SeededRandom.init)
     var plan = ReadPlan(size: size)
     var covered = [Bool](repeating: false, count: Int(max(size, length)))
     var inFlight: [(offset: UInt64, length: UInt32)] = []
     while true {
         while inFlight.count < window, let request = plan.nextRequest() { inFlight.append(request) }
         guard !inFlight.isEmpty else { break }
-        let read = inFlight.removeFirst()
+        let read = inFlight.remove(at: (random?.next()).map { Int($0 % UInt64(inFlight.count)) } ?? 0)
         guard read.offset < length else {
             plan.endOfFile()
             continue
         }
-        let count = UInt32(min(UInt64(min(read.length, cap)), length - read.offset))
+        let most = (random?.next()).map { UInt32(1 + $0 % UInt64(cap)) } ?? cap
+        let count = UInt32(min(UInt64(min(read.length, most)), length - read.offset))
         for i in 0..<Int(count) { covered[Int(read.offset) + i] = true }
         plan.record(offset: read.offset, length: read.length, count: count)
     }
@@ -58,4 +61,18 @@ private func download(size: UInt64, length: UInt64, cap: UInt32, window: Int = 3
     #expect(plan.nextRequest() == nil)
     #expect(plan.isComplete)
     #expect(plan.received == 0)
+}
+
+/// Replies in any order, at any size, from files shorter or longer than listed: the whole file
+/// arrives, each byte once.
+@Test func aDownloadIsWholeWhateverOrderTheRepliesComeIn() {
+    var random = SeededRandom(state: 5)
+    for seed: UInt64 in 0..<100 {
+        let size = random.next() % 150_000
+        let length = random.next() % 3 == 0 ? random.next() % 150_000 : size
+        let (plan, covered) = download(size: size, length: length, cap: UInt32(1_024 + random.next() % 70_000), window: 1 + Int(random.next() % 40), seed: seed)
+        #expect(plan.received == UInt64(covered.count(where: \.self)), "a byte written twice")
+        #expect(plan.isComplete, "size \(size), length \(length)")
+        #expect(covered.prefix(Int(min(size, length))).allSatisfy { $0 })
+    }
 }

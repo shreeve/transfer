@@ -131,6 +131,34 @@ struct RemotePathTests {
         #expect(latin1.replacing(prefix: RemotePath(string: "/srv/a"), with: RemotePath(string: "/dst"))?.bytes == Array("/dst/".utf8) + [0xE9])
     }
 
+    /// Seeded random paths of slashes, dots, and bytes that are not UTF-8.
+    @Test func pathRulesHoldForAnyBytes() {
+        var random = SeededRandom(state: 1)
+        let pieces: [[UInt8]] = [[0x2F], [0x2F], [0x2E], [0x2E, 0x2E], Array("a".utf8), Array("b".utf8), [0xE9], [0xFF], [0x20], [0x00]]
+        func path(absolute: Bool = true) -> RemotePath {
+            var bytes: [UInt8] = absolute ? [0x2F] : []
+            for _ in 0..<random.next() % 8 { bytes += pieces[Int(random.next() % UInt64(pieces.count))] }
+            return RemotePath(bytes: bytes)
+        }
+        for _ in 0..<20_000 {
+            let absolute = random.next() % 4 != 0
+            let raw = path(absolute: absolute)
+            let normal = raw.normalized
+            #expect(normal.normalized == normal, "\(raw.bytes)")
+            guard absolute else { continue }
+            #expect(normal.bytes.first == 0x2F && !normal.bytes.split(separator: 0x2F).contains { $0 == [0x2E] || $0 == [0x2E, 0x2E] }, "\(raw.bytes)")
+            if let parent = normal.parent {
+                #expect(normal.isInside(parent))
+                #expect(parent.appending(name: normal.nameBytes) == normal, "\(normal.bytes)")
+            }
+            let prefix = path().normalized
+            guard normal.isInside(prefix) else { continue }
+            let destination = path().normalized
+            #expect(normal.replacing(prefix: prefix, with: prefix) == normal)
+            #expect(normal.replacing(prefix: prefix, with: destination)?.replacing(prefix: destination, with: prefix) == normal, "\(normal.bytes) \(prefix.bytes) \(destination.bytes)")
+        }
+    }
+
     @Test func anItemsNameIsItsPathsName() {
         let item = RemoteItem(path: RemotePath(string: "/srv/.env/"), kind: .file)
         #expect(item.name == ".env")

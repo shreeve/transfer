@@ -113,7 +113,17 @@ import Testing
     #expect(KeepBothName.firstFree(existing: ["a0", "a1"], from: 0) { "a\($0)" } == "a2")
 }
 
-@Test func retriesOnlyDroppedConnectionsAndTimeouts() {
+/// A server's own message already says what went wrong; the label is not said twice, as
+/// "Permission denied: Permission denied" was.
+@Test func aServersMessageIsNotLabeledTwice() {
+    #expect(TransferError.permissionDenied("Permission denied").localizedDescription == "Permission denied")
+    #expect(TransferError.permissionDenied("").localizedDescription == "Permission denied")
+    #expect(TransferError.permissionDenied("notes.txt: Operation not permitted").localizedDescription == "Permission denied: notes.txt: Operation not permitted")
+    #expect(TransferError.noSuchFile("No such file").localizedDescription == "No such file")
+    #expect(TransferError.noSuchFile("/srv/gone").localizedDescription == "No such file: /srv/gone")
+}
+
+@Test func retriesOnlyDroppedConnectionsTimeoutsAndFilesThatChanged() {
     #expect(RetryPolicy.isRetryable(TransferError.connectionLost("closed")))
     #expect(RetryPolicy.isRetryable(TransferError.timeout("stat")))
     #expect(RetryPolicy.isRetryable(TransferError.changedOnServer("grows.bin")))
@@ -134,6 +144,18 @@ import Testing
     #expect(CacheEviction.victims(entries, limit: 100) == ["old"])
     #expect(CacheEviction.victims(entries, limit: 50) == ["old", "mid"])
     #expect(CacheEviction.victims(entries, limit: 200).isEmpty)
+}
+
+/// The line a host-key probe reads back: hosts, key type, and key. A marker is skipped; a
+/// comment or a short line is no key.
+@Test func aKnownHostsLineReadsHostsTypeAndKey() {
+    let line = HostKeyLine(line: "  [box.example]:2200,10.0.0.9 ssh-ed25519  AAAAC3Nz comment ")
+    #expect(line == HostKeyLine(host: "[box.example]:2200,10.0.0.9", keyType: "ssh-ed25519", key: "AAAAC3Nz"))
+    #expect(line?.text == "[box.example]:2200,10.0.0.9 ssh-ed25519 AAAAC3Nz")
+    #expect(HostKeyLine(line: "@revoked box ssh-rsa AAAA")?.host == "box")
+    #expect(HostKeyLine(line: "# box ssh-rsa AAAA") == nil)
+    #expect(HostKeyLine(line: "box ssh-rsa") == nil)
+    #expect(HostKeyLine(line: " ") == nil)
 }
 
 @Test func socketNameIsShortAndStable() {
