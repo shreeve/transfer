@@ -31,7 +31,8 @@ struct TransferApp: App {
             let connected = model?.snapshot.connectionID != nil
             let plainKeys = model?.plainKeysAvailable == true
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesButton(state: delegate.updates)
+                Button("Check for Updates…") { delegate.updates.updater.checkForUpdates() }
+                    .disabled(!delegate.updates.canCheck)
             }
             CommandGroup(replacing: .newItem) {
                 Button("New Connection…") { model?.newConnection() }
@@ -195,15 +196,6 @@ struct BrowserWindow: View {
             // An open window takes each `sftp://` link, so SwiftUI opens a window for one only
             // when none is open. The app delegate decides where the link goes.
             .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
-    }
-}
-
-struct CheckForUpdatesButton: View {
-    let state: UpdaterState
-
-    var body: some View {
-        Button("Check for Updates…") { state.updater.checkForUpdates() }
-            .disabled(!state.canCheck)
     }
 }
 
