@@ -397,33 +397,21 @@ public enum SyntaxPreview {
     }
 }
 
-/// Values in three characters, a space, and the unit with its SI prefix: `959 B`, `1.2 kB`,
-/// ` 14 kB`, `2.5 ms`. Sizes, rates, and times read the same way everywhere.
+/// Sizes in three characters, a space, and the unit with its SI prefix: `959 B`, `1.2 kB`,
+/// ` 14 kB`, the same everywhere.
 public enum Units {
-    public static func scale(_ value: Double, unit: String) -> String {
-        if value > 0, value.isFinite {
-            let span = ["T", "G", "M", "k", "", "m", "µ", "n", "p"]
-            var value = value
-            var slot = 4
-            while value < 0.995, slot < 8 {
-                value *= 1000
-                slot += 1
-            }
-            while value >= 999.5, slot > 0 {
-                value /= 1000
-                slot -= 1
-            }
+    public static func bytes(_ size: UInt64) -> String {
+        guard size > 0 else { return "  0 B" }
+        var value = Double(size)
+        for prefix in ["", "k", "M", "G", "T"] {
             if value < 999.5 {
                 let tenth = (value * 10).rounded() / 10
                 let digits = tenth >= 10 ? String(Int(value.rounded())) : String(format: "%.1f", tenth)
-                return String(repeating: " ", count: max(0, 3 - digits.count)) + digits + " " + span[slot] + unit
+                return String(repeating: " ", count: 3 - digits.count) + digits + " " + prefix + "B"
             }
+            value /= 1000
         }
-        return value == 0 ? "  0 \(unit)" : "??? \(unit)"
-    }
-
-    public static func bytes(_ size: UInt64) -> String {
-        scale(Double(size), unit: "B")
+        return "??? B"
     }
 }
 

@@ -204,10 +204,30 @@ import Testing
     #expect(Units.bytes(999_499) == "999 kB")
     #expect(Units.bytes(999_500) == "1.0 MB")
     #expect(Units.bytes(1_500_000_000) == "1.5 GB")
-    #expect(Units.scale(0.0025, unit: "s") == "2.5 ms")
-    #expect(Units.scale(0.000_000_4, unit: "s") == "400 ns")
-    #expect(Units.scale(.infinity, unit: "B") == "??? B")
-    #expect(Units.scale(1e16, unit: "B") == "??? B")
+    #expect(Units.bytes(5) == "5.0 B")
+    #expect(Units.bytes(999_499_999_999_999) == "999 TB")
+    #expect(Units.bytes(10_000_000_000_000_000) == "??? B")
+    #expect(Units.bytes(.max) == "??? B")
+}
+
+@Test func everySizeReadsAsThreeCharactersWithinSixPercent() {
+    var random = SeededRandom(state: 3)
+    let scales: [Substring: Double] = ["B": 1, "kB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12]
+    for _ in 0..<20_000 {
+        let size = random.next() >> (random.next() % 64)
+        let text = Units.bytes(size)
+        guard !text.hasPrefix("???") else {
+            #expect(Double(size) >= 999.5e12, "\(size)")
+            continue
+        }
+        let parts = text.split(separator: " ")
+        #expect(text.prefix(3).count == 3 && text.dropFirst(3).first == " ", "\(size) \(text)")
+        guard let number = Double(parts[0]), let scale = scales[parts[1]] else {
+            Issue.record("\(size) reads \(text)")
+            continue
+        }
+        #expect(abs(number * scale - Double(size)) <= 0.06 * max(1, Double(size)), "\(size) \(text)")
+    }
 }
 
 @Test func clipTextNamesASingleItem() {
