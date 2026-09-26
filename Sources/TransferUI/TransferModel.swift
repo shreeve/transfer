@@ -190,6 +190,8 @@ public final class TransferModel {
     public var renameText = ""
     /// What the rename bar renames, fixed when it opens.
     @ObservationIgnored private var renameTarget: RemotePath?
+    /// How much of `renameText`, in UTF-16, the rename bar selects when it opens.
+    @ObservationIgnored private(set) var renameStem = 0
     public var sidebarSelection: SidebarItem?
     public var inspectorLinkTarget: String?
     /// Whether Terminal, iTerm2, or Ghostty is installed, learned in `start`.
@@ -1413,7 +1415,17 @@ public final class TransferModel {
         guard let item = item ?? primaryItem else { return }
         renameTarget = item.path
         renameText = item.name
+        renameStem = Self.renameStem(of: item.name, folder: item.kind == .directory)
         renaming = true
+    }
+
+    /// As Finder: a file's name up to its last dot, or the whole name of a folder, of a name with
+    /// no extension, or of a dotfile such as `.env`. In UTF-16, as the field editor counts.
+    nonisolated static func renameStem(of name: String, folder: Bool) -> Int {
+        guard !folder, let dot = name.lastIndex(of: "."), dot != name.startIndex, name.index(after: dot) != name.endIndex else {
+            return name.utf16.count
+        }
+        return name[..<dot].utf16.count
     }
 
     public func renameSelection(to name: String) async {

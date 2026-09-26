@@ -62,6 +62,20 @@ struct ViewTests {
         #expect(titles(.file).contains("Quick Look"))
     }
 
+    /// The rename bar selected the whole name; Finder selects a file's name up to its extension (E2E P4).
+    @Test func renameSelectsTheNameBeforeTheExtension() {
+        func stem(_ name: String, folder: Bool = false) -> String {
+            String(String(name.utf16.prefix(TransferModel.renameStem(of: name, folder: folder)))!)
+        }
+        #expect(stem("notes.txt") == "notes")
+        #expect(stem("a.tar.gz") == "a.tar")
+        #expect(stem("Résumé 📄.pdf") == "Résumé 📄")
+        #expect(stem("Photos.v2", folder: true) == "Photos.v2")
+        #expect(stem(".env") == ".env")
+        #expect(stem("Makefile") == "Makefile")
+        #expect(stem("notes.") == "notes.")
+    }
+
     /// FR-9: going back to a filter that still holds text keeps Space and Return with it.
     @Test func refocusingTheFilterKeepsThePlainKeysWithIt() async throws {
         _ = NSApplication.shared

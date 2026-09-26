@@ -727,6 +727,7 @@ private func closeButton(help: LocalizedStringKey, label: LocalizedStringKey, ac
 private struct RenameBar: View {
     @Bindable var model: TransferModel
     @FocusState private var focused: Bool
+    @State private var stemSelected = false
 
     var body: some View {
         HStack {
@@ -748,7 +749,17 @@ private struct RenameBar: View {
             DispatchQueue.main.async { focused = true }
         }
         // Command-F takes the keyboard from this field to the search field, which edits text too.
-        .onChange(of: focused) { model.textEditing = focused || NSApp.keyWindow?.firstResponder is NSText }
+        .onChange(of: focused) {
+            model.textEditing = focused || NSApp.keyWindow?.firstResponder is NSText
+            // The field selects all of the name as it takes focus; Finder leaves the extension out.
+            guard focused, !stemSelected else { return }
+            stemSelected = true
+            let (name, stem) = (model.renameText, model.renameStem)
+            DispatchQueue.main.async {
+                guard let editor = NSApp.keyWindow?.firstResponder as? NSTextView, editor.string == name else { return }
+                editor.setSelectedRange(NSRange(location: 0, length: stem))
+            }
+        }
         .onDisappear {
             model.textEditing = false
             // Escape or Return leaves the keyboard with the window itself; it goes back to the
