@@ -493,6 +493,23 @@ struct MoveServerTests {
         }
     }
 
+    /// A folder from this Mac pasted into a folder inside itself, on a server that reaches this
+    /// Mac's disk (a NAS mounted in Finder, or here the local sshd), copied its own output about a
+    /// hundred levels deep before failing (XFR-02). It is refused, and a copy elsewhere goes ahead.
+    @Test func aFolderFromThisMacIsNeverCopiedIntoItself() async throws {
+        try await withHarness("macself", connected: true) { h in
+            _ = try h.folder("site", files: ["a.txt": "a", "sub/b.txt": "b"])
+            let site = h.remote.appendingPathComponent("site")
+            let id = h.session.connection.id
+            await #expect(throws: TransferError.failed("“site” cannot be pasted into itself.")) {
+                try await run(TransferRequest(.mac([site]), into: h.remotePath.appending("site").appending("sub"), on: id, moving: false), on: h.session)
+            }
+            #expect(try h.names("site/sub") == ["b.txt"])
+            try await run(TransferRequest(.mac([site]), into: try h.folder("elsewhere"), on: id, moving: false), on: h.session)
+            #expect(try h.read("elsewhere/site/sub/b.txt") == "b")
+        }
+    }
+
     /// The folder-into-itself refusal compared names only, so a paste through a link that points
     /// inside the folder copied it into its own output until the disk filled (CLIP-08).
     @Test func aFolderIsNeverCopiedIntoItselfThroughALink() async throws {

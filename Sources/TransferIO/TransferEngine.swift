@@ -127,11 +127,21 @@ struct TransferEngine {
 
     /// Uploads; a move then puts each original in the Trash.
     private func fromMac(_ urls: [URL]) async throws {
-        if request.moving {
-            let parents = Set(urls.map { $0.deletingLastPathComponent() })
+        let parents = Set(urls.map { $0.deletingLastPathComponent() })
+        // A server may reach this Mac's disk, where a folder pasted into itself would walk into its
+        // own output (XFR-02): the probe is looked for under each folder along the destination's
+        // path, from its last component back.
+        let folders = urls.filter { (try? LocalPlacement.occupant($0)) == .folder }
+        let tail = request.folder.normalized.display.split(separator: "/").map(String.init)
+        if request.moving || !folders.isEmpty {
             try await proveApart { name in
-                try parents.contains { try LocalPlacement.occupant($0.appendingPathComponent(name)) != nil }
-                    ? Self.ontoItself("the folder on this Mac the items are in") : nil
+                if request.moving, try parents.contains(where: { try LocalPlacement.occupant($0.appendingPathComponent(name)) != nil }) {
+                    return Self.ontoItself("the folder on this Mac the items are in")
+                }
+                let inside = folders.first { folder in
+                    (0...tail.count).contains { (try? LocalPlacement.occupant(tail.suffix($0).reduce(folder) { $0.appendingPathComponent($1) }.appendingPathComponent(name))) != nil }
+                }
+                return inside.map { "“\($0.lastPathComponent)” cannot be pasted into itself." }
             }
         }
         try await each(urls, place: "on this Mac", name: \.lastPathComponent) { index, url in
