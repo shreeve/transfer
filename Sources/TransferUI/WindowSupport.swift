@@ -13,7 +13,7 @@ public extension FocusedValues {
 @MainActor
 enum FileOpener {
     /// Apps that run the file they open rather than show it.
-    nonisolated static let runners = Set(TerminalLauncher.apps.map(\.bundle) + ["org.python.PythonLauncher"])
+    nonisolated static let runners = Set(TerminalLauncher.apps.map(\.bundle) + ["org.python.PythonLauncher", "com.apple.JavaLauncher"])
 
     /// The app, by bundle identifier, that opens a server's file in place of `defaultApp`, or nil
     /// to keep it. The user opens a file to read or edit it, so one whose default app would run
