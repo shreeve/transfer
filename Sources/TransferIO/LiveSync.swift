@@ -116,33 +116,38 @@ actor LiveSync {
         self.watches = watches
         root = store.root.appendingPathComponent("Live", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        (entries, notices) = Self.load(store.liveFiles(), store: store)
+        (entries, notices) = Self.load(store.liveFiles(), store: store, root: root)
     }
 
     /// Records from their rows, reading only stamps; whether a copy holds edits is worked out when
-    /// asked. A gone copy takes its record, and its folder unless edits were known (the user hears
-    /// of those). A copy idle for a day expires unless it holds edits; its last activity is the
-    /// later of its and its folder's mtime, as a download gives the file the server's older time.
-    private static func load(_ rows: [LiveRow], store: Store) -> ([LiveFileID: Entry], [ConnectionID: [String]]) {
+    /// asked. Only a row's file name is read back: its copy is always in its own folder under
+    /// `root`, so a moved library keeps its copies and a row naming another place never reaches
+    /// outside the Live folder. A gone copy takes its record, and its folder unless edits were
+    /// known (the user hears of those). A copy idle for a day expires unless it holds edits; its
+    /// last activity is the later of its and its folder's mtime, as a download gives the file the
+    /// server's older time.
+    private static func load(_ rows: [LiveRow], store: Store, root: URL) -> ([LiveFileID: Entry], [ConnectionID: [String]]) {
         var loaded: [LiveFileID: Entry] = [:]
         var gone: [ConnectionID: [String]] = [:]
         for row in rows {
-            var entry = entry(from: row, local: URL(fileURLWithPath: row.localPath))
-            guard let stamp = stamp(entry.local) else {
+            let folder = folder(root, row.connection, row.id)
+            let local = try? LocalPlacement.child(folder, name: URL(fileURLWithPath: row.localPath).lastPathComponent)
+            var entry = entry(from: row, local: local ?? folder)
+            guard local != nil, let stamp = stamp(entry.local) else {
                 if LiveDecision.isUnsynced(entry.state, nil) {
                     gone[row.connection, default: []].append("The Live copy of \(row.path.display) is gone; its edits were not uploaded")
                 } else {
-                    try? FileManager.default.removeItem(at: entry.folder)
+                    try? FileManager.default.removeItem(at: folder)
                 }
                 store.deleteLive(row.id)
                 continue
             }
             entry.observed = stamp
-            let folderTime = (try? FileManager.default.attributesOfItem(atPath: entry.folder.path)[.modificationDate] as? Date) ?? .distantPast
+            let folderTime = (try? FileManager.default.attributesOfItem(atPath: folder.path)[.modificationDate] as? Date) ?? .distantPast
             if Date().timeIntervalSince(max(stamp.mtime, folderTime)) > expiry,
                !LiveDecision.isUnsynced(entry.state, localChange(entry.state, entry.local, stamp)) {
                 store.deleteLive(row.id)
-                try? FileManager.default.removeItem(at: entry.folder)
+                try? FileManager.default.removeItem(at: folder)
                 continue
             }
             loaded[row.id] = entry
@@ -150,15 +155,15 @@ actor LiveSync {
         return (loaded, gone)
     }
 
+    /// A Live file's own folder, `<root>/<connection>/<id>`, which holds its working copy.
+    private static func folder(_ root: URL, _ connection: ConnectionID, _ id: LiveFileID) -> URL {
+        root.appendingPathComponent("\(connection.rawValue.uuidString)/\(id.rawValue.uuidString)", isDirectory: true)
+    }
+
     // MARK: Connections
 
     /// A connection logged in: its files are looked at again, and passes waiting for the server run.
     func connected(_ connection: ConnectionID, server: any LiveServer) {
-        if !entries.values.contains(where: { $0.connection == connection }) {
-            let (loaded, gone) = Self.load(store.liveFiles(connection: connection), store: store)
-            entries.merge(loaded) { current, _ in current }
-            notices.merge(gone) { current, _ in current }
-        }
         servers[connection] = ServerRef(server)
         ready.insert(connection)
         startWatching()
@@ -654,7 +659,7 @@ actor LiveSync {
             if LiveDecision.isUnsynced(entry.state, nil) { forget(id) } else { drop(entry) }
         }
         let id = LiveFileID()
-        let folder = root.appendingPathComponent("\(connection.rawValue.uuidString)/\(id.rawValue.uuidString)", isDirectory: true)
+        let folder = Self.folder(root, connection, id)
         let file = try LocalPlacement.child(folder, name: item.name)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)

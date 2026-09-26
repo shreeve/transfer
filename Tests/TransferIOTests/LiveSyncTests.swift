@@ -1013,6 +1013,62 @@ struct LiveSyncTests {
         }
     }
 
+    // MARK: Round 2 (LIV2)
+
+    /// A row's stored absolute path was trusted: a clean row whose copy was gone had that path's
+    /// parent folder removed recursively at launch, wherever it was (LIV2-02).
+    @Test func aRowNamingAnotherPlaceNeverReachesOutsideTheLiveFolder() async throws {
+        let h = try Self.harness("outside")
+        defer { try? FileManager.default.removeItem(at: h.base) }
+        let victim = h.base.appendingPathComponent("Documents", isDirectory: true)
+        try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+        try Data("precious".utf8).write(to: victim.appendingPathComponent("thesis.txt"))
+        await h.live.closeAll()
+        for name in ["gone.txt", ".."] {
+            h.store.saveLive(LiveRow(id: LiveFileID(), connection: h.connection, path: note, baseSize: 1, baseMtime: 1,
+                                     localPath: victim.appendingPathComponent(name).path, dirty: false))
+        }
+        let again = LiveSync(store: h.store, watches: false)
+        #expect(read(victim.appendingPathComponent("thesis.txt")) == "precious")
+        #expect(await again.files(on: h.connection).isEmpty)
+        #expect(h.store.liveFiles().isEmpty)
+        await again.closeAll()
+    }
+
+    /// A library that moved (a renamed home folder, a restored copy) kept rows with the old
+    /// absolute paths, so an unsynced copy that moved with it read as gone and was forgotten (LIV2-03).
+    @Test func aMovedLibraryKeepsItsUnsyncedCopies() async throws {
+        let base = TestCaches.fresh("livesync-moved")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        let connection = ConnectionID()
+        let copy: String
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let store = try Store(root: root)
+            let h = Harness(base: base, store: store, live: LiveSync(store: store, watches: false), fake: FakeServer(), connection: connection)
+            await h.live.connected(connection, server: h.fake)
+            let (local, _) = try await openLive(h, note, "first")
+            await h.live.setPaused(note, on: connection, paused: true)
+            try Data("unsynced edit".utf8).write(to: local)
+            await h.live.closeAll()
+            copy = String(local.path.dropFirst(root.path.count))
+        }
+        let moved = base.appendingPathComponent("moved", isDirectory: true)
+        try FileManager.default.moveItem(at: root, to: moved)
+
+        let live = LiveSync(store: try Store(root: moved), watches: false)
+        let fake = FakeServer()
+        await live.connected(connection, server: fake)
+        let files = await live.files(on: connection)
+        #expect(files.map(\.path) == [note])
+        #expect(files.first?.dirty == true)
+        #expect(fake.events.allSatisfy { if case .notice = $0 { false } else { true } })
+        #expect(read(URL(fileURLWithPath: moved.path + copy)) == "unsynced edit")
+        await live.closeAll()
+        withExtendedLifetime(fake) {}
+    }
+
     // MARK: The worker and the watcher
 
     @Test func closingCancelsQueuedCommands() async throws {
