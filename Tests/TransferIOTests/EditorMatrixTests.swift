@@ -391,7 +391,10 @@ struct EditorMatrix {
         try await withHarness("conflict", connected: true) { h in
             let c = try await open(h, "note.txt", Data("first\n".utf8))
             let remoteEdit = Data("remote-edit\n".utf8)
-            try remoteEdit.write(to: c.remoteFile)
+            // In place with one longer write: truncating first let the watch see an empty file.
+            let other = try FileHandle(forWritingTo: c.remoteFile)
+            try other.write(contentsOf: remoteEdit)
+            try other.close()
             try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)], ofItemAtPath: c.remoteFile.path)
             let mine = Data("mine, saved in place\n".utf8)
             try mine.write(to: c.local)
