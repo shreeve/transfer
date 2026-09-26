@@ -129,6 +129,22 @@ struct HubTests {
         await #expect(throws: SSHConnection.retiredError) { _ = try await first.connect(prompts: TestPrompts()) }
     }
 
+    /// The first launch writes the built-in list, and a config.json as 0.1.7 wrote it, with the
+    /// bundled file's layout, loads as it is and is left alone.
+    @Test func theFirstLaunchWritesTheDefaultsAnd017sConfigLoads() throws {
+        let root = TestCaches.fresh("config017")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let file = root.appendingPathComponent("config.json")
+        #expect(ConfigLoader.load(root: root) == .builtIn)
+        #expect(ConfigLoader.load(root: root) == .builtIn)
+        #expect(FileManager.default.fileExists(atPath: file.path))
+        let released = Data("{\n  \"editableExtensions\": [\n    \"rip\",\n    \"txt\",\n    \"log\"\n  ]\n}\n".utf8)
+        try released.write(to: file)
+        #expect(ConfigLoader.load(root: root).editableExtensions == ["rip", "txt", "log"])
+        #expect(try Data(contentsOf: file) == released)
+    }
+
     /// A config.json that no longer decodes is copied aside before the defaults take over, since
     /// the next Settings save rewrites it.
     @Test func anUnreadableConfigIsKeptAside() throws {
