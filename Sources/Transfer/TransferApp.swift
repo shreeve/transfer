@@ -81,9 +81,10 @@ struct TransferApp: App {
                 Button("Copy Remote URL") { model?.copyRemoteURL() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
                     .disabled(!connected || !plainKeys)
+                // Command-Delete in a text field deletes to the line's start.
                 Button("Delete…") { model?.askToDelete() }
                     .keyboardShortcut(.delete, modifiers: .command)
-                    .disabled(model?.snapshot.selection.isEmpty ?? true)
+                    .disabled(model?.snapshot.selection.isEmpty ?? true || !plainKeys)
                 Divider()
                 Button("Filter") { model?.focusFilter() }
                     .keyboardShortcut("f")
