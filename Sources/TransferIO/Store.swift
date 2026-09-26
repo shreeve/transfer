@@ -197,7 +197,7 @@ final class Store: @unchecked Sendable {
                 try transaction {
                     try run("DELETE FROM connections WHERE id = ?", [key])
                     for table in ["pins", "live_files", "temps"] {
-                        try run("DELETE FROM \(table) WHERE connection_id = ?", [key])
+                        try run("DELETE FROM \(table) WHERE connection_id IN (?1, ?1 || ' aside')", [key])
                     }
                 }
             }
@@ -226,8 +226,11 @@ final class Store: @unchecked Sendable {
 
     // MARK: Temps
 
-    func rememberTemp(_ path: RemotePath, connection: ConnectionID) {
-        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(path.bytes), connection.rawValue.uuidString)
+    /// A remote temp, or with `aside` a file a replace set aside (`SSHConnection.asideRecord`),
+    /// kept under an owner key no older Transfer reads: 0.1.7 reads a record up to its NUL, and
+    /// would remove the aside, the old file's only copy, as a temp.
+    func rememberTemp(_ path: RemotePath, connection: ConnectionID, aside: Bool = false) {
+        write("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", StoredPath(path.bytes), connection.rawValue.uuidString + (aside ? " aside" : ""))
     }
 
     func rememberTemp(local url: URL) {
@@ -247,8 +250,9 @@ final class Store: @unchecked Sendable {
             .map { URL(fileURLWithPath: String(decoding: $0, as: UTF8.self)) }
     }
 
+    /// The server's temps and asides.
     func remoteTemps(connection: ConnectionID) -> [RemotePath] {
-        paths("SELECT DISTINCT CAST(path AS BLOB) FROM temps WHERE connection_id = ? ORDER BY 1", connection.rawValue.uuidString)
+        paths("SELECT DISTINCT CAST(path AS BLOB) FROM temps WHERE connection_id IN (?1, ?1 || ' aside') ORDER BY 1", connection.rawValue.uuidString)
             .map(RemotePath.init(bytes:))
     }
 

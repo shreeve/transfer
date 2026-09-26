@@ -206,6 +206,33 @@ struct StoreTests {
         #expect(store.remoteTemps(connection: alpha) == [RemotePath(string: "/srv/.b.transfer-2")])
     }
 
+    /// WIR-02: a file a replace set aside was recorded as a temp that 0.1.7 read up to its NUL,
+    /// as the aside itself, and removed at its next login: the old file's only copy. 0.1.7's
+    /// reads never see an aside record now; this build reads both forms, and Remove drops both.
+    @Test func olderTransferNeverSeesAFileSetAside() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Raw.fixture(.released, at: root)
+        let store = try Store(root: root)
+        let alpha = ConnectionID(rawValue: Self.alpha)
+        let aside = SSHConnection.asideRecord(RemotePath(string: "/srv/.transfer-old-1"), RemotePath(string: "/srv/a.txt"))
+        let written020 = SSHConnection.asideRecord(RemotePath(string: "/srv/.transfer-old-2"), RemotePath(string: "/srv/b.txt"))
+        store.rememberTemp(aside, connection: alpha, aside: true)
+        store.rememberTemp(written020, connection: alpha)
+
+        let old = try Raw(root)
+        old.launchAs017()
+        #expect(old.values("SELECT path FROM temps WHERE connection_id = '\(Self.alpha)'").sorted() == ["/srv/.b.transfer-2", "/srv/.transfer-old-2"])
+        #expect(old.values("SELECT path FROM temps WHERE connection_id IS NULL OR connection_id = ''").sorted() == ["/tmp/.a.transfer-1", "/tmp/.c.transfer-3"])
+        #expect(Set(store.remoteTemps(connection: alpha)) == [aside, written020, RemotePath(string: "/srv/.b.transfer-2")])
+        #expect(SSHConnection.aside(in: aside)?.placed == RemotePath(string: "/srv/a.txt"))
+        store.forgetTemp(aside)
+        #expect(Set(store.remoteTemps(connection: alpha)) == [written020, RemotePath(string: "/srv/.b.transfer-2")])
+        store.rememberTemp(aside, connection: alpha, aside: true)
+        store.remove(alpha)
+        #expect(old.value("SELECT count(*) FROM temps WHERE connection_id LIKE '\(Self.alpha)%'") == "0")
+    }
+
     /// Stars and remote temps were stored as text decoded from the path, so a name that is not
     /// UTF-8 came back as a different path: a star that opened nothing, a temp never removed.
     @Test func aNonUTF8StarAndTempRoundTripExactly() throws {
@@ -361,11 +388,16 @@ private final class Raw: @unchecked Sendable {
 
     /// The first column of the first row, as text.
     func value(_ sql: String) -> String? {
+        values(sql).first
+    }
+
+    /// The first column of every row, read as 0.1.7 read text: up to the first NUL.
+    func values(_ sql: String) -> [String] {
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
-              sqlite3_step(statement) == SQLITE_ROW,
-              let text = sqlite3_column_text(statement, 0) else { return nil }
-        return String(cString: text)
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        var rows: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW { rows.append(sqlite3_column_text(statement, 0).map { String(cString: $0) } ?? "") }
+        return rows
     }
 }
