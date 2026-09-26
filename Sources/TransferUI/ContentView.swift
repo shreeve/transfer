@@ -130,7 +130,8 @@ struct DetailColumn: View {
             if model.snapshot.connectionID != nil { ClipSlot() }
             if model.showsShelf { Shelf(model: model) }
         }
-        .sheet(item: $model.sheet) { sheet in sheetView(sheet) }
+        // A question that replaces another in the same sheet starts with fresh fields.
+        .sheet(item: $model.sheet) { sheet in sheetView(sheet).id(sheet.id) }
         .scrollEdgeEffectHidden(true, for: .top)
     }
 

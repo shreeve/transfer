@@ -39,6 +39,26 @@ struct ConnectTests {
         #expect(model.title == "A")
     }
 
+    /// FR-13: a connect to a server whose session an edit replaced logs in to the new session,
+    /// not by waiting on the old one's login.
+    @Test func aConnectAfterAnEditDoesNotWaitOnTheOldSessionsLogin() async {
+        let old = FakeSession(b, hangs: true)
+        let provider = FakeProvider([FakeSession(a), old])
+        let model = TransferModel(provider: provider)
+        await model.connect(a)
+        let first = Task { await model.connect(b) }
+        #expect(await eventually { old.connects.value == 1 })
+        let edited = FakeSession(SavedConnection(id: b.id, name: "B", host: "b2"))
+        provider.replace(edited)
+        let second = Task { await model.connect(edited.connection) }
+        #expect(await eventually { model.session.map { $0 as AnyObject === edited } ?? false })
+        #expect(edited.connects.value == 1)
+        first.cancel()
+        second.cancel()
+        await first.value
+        await second.value
+    }
+
     /// UIM2-12: a Live conflict found while the login lands, as Live sync resumes, still asks.
     @Test func aConflictDuringTheLoginIsAskedOnceItLands() async {
         let session = FakeSession(a)

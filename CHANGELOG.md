@@ -41,7 +41,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - One file that changes on the server during a folder copy fails alone and is retried, instead of restarting the whole copy.
 - A library file whose version is damaged is refused with a message instead of crashing Transfer at every launch, and a saved server with a damaged id no longer shows up as one that cannot be edited or removed.
 - Right-clicking a folder that is not selected in column view opens its menu, instead of failing and leaving the view out of step. The right-click menu's Quick Look and Rename act on the item clicked, and Open Live works on a link to a file.
-- Escape in the search field gives the keyboard back to the files, and Command-F with the search item in the toolbar's overflow no longer turns off Return and Space.
+- Escape in the search field gives the keyboard back to the files, and Command-F with the search item in the toolbar's overflow no longer turns off Return and Space. Clicking back into a search field that holds text keeps Space, Return, and Command-Delete in the field instead of acting on the files.
 - Finder's Stop always stops a drag's download.
 - Retry on a Live conflict's row keeps the conflict on the shelf, and two refused Live discards each ask in turn.
 - An Extensions edit made just before closing Settings is saved.
@@ -61,7 +61,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 ### Behavior changes
 
 - Every download is quarantined, Live working copies included, so macOS checks an app or script from a server before it first runs.
-- A file whose default app would run it (Terminal, iTerm2, Ghostty, or Python Launcher) opens in the default text editor instead, whether opened Live or to view.
+- A file whose default app would run it (Terminal, iTerm2, Ghostty, Python Launcher, or Jar Launcher) opens in the default text editor instead, whether opened Live or to view. Choosing such an app when Transfer asks which app opens a type no longer makes it the Mac's default for that type.
 - Copies opened to view or preview are read-only, so an editor says the file is locked instead of saving edits that never upload and are later overwritten.
 - A move on one server onto a name the destination already holds asks Replace, Keep Both, or Skip, instead of failing.
 - A name with no dot, such as `README` or `Makefile`, has no extension: it opens with View even when the Extensions list holds its whole name. Open Live still opens it Live.

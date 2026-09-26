@@ -13,16 +13,22 @@ public extension FocusedValues {
 @MainActor
 enum FileOpener {
     /// Apps that run the file they open rather than show it.
-    nonisolated static let runners = Set(TerminalLauncher.apps.map(\.bundle) + ["org.python.PythonLauncher"])
+    nonisolated static let runners = Set(TerminalLauncher.apps.map(\.bundle) + ["org.python.PythonLauncher", "com.apple.JavaLauncher"])
 
     /// The app, by bundle identifier, that opens a server's file in place of `defaultApp`, or nil
     /// to keep it. The user opens a file to read or edit it, so one whose default app would run
     /// it, as Terminal runs a `.command`, opens in the plain-text editor, or TextEdit when that
     /// runs files too.
     nonisolated static func editor(replacing defaultApp: String?, plainText: String?) -> String? {
-        guard let defaultApp, runners.contains(defaultApp) else { return nil }
+        guard runs(defaultApp) else { return nil }
         if let plainText, !runners.contains(plainText) { return plainText }
         return "com.apple.TextEdit"
+    }
+
+    /// Whether the app, by bundle identifier, runs what it opens. Picked in the chooser, it is
+    /// not made the type's default: Finder would then run every such file on a double-click.
+    nonisolated static func runs(_ app: String?) -> Bool {
+        app.map(runners.contains) ?? false
     }
 
     /// Throws when no app opened the file, so the window can say so.
@@ -30,14 +36,14 @@ enum FileOpener {
         let workspace = NSWorkspace.shared
         let ext = url.pathExtension
         let type = ext.isEmpty ? nil : UTType(filenameExtension: ext)
+        func bundle(_ app: URL?) -> String? { app.flatMap { Bundle(url: $0)?.bundleIdentifier } }
         var app = workspace.urlForApplication(toOpen: url)
         if let type, workspace.urlForApplication(toOpen: type) == nil {
             guard let chosen = chooseApplication(for: ext) else { return }
             // The same thing Finder's "Always Open With" does: the default for this extension.
-            try? await workspace.setDefaultApplication(at: chosen, toOpen: type)
+            if !runs(bundle(chosen)) { try? await workspace.setDefaultApplication(at: chosen, toOpen: type) }
             app = chosen
         }
-        func bundle(_ app: URL?) -> String? { app.flatMap { Bundle(url: $0)?.bundleIdentifier } }
         if let editor = editor(replacing: bundle(app), plainText: bundle(workspace.urlForApplication(toOpen: .plainText))) {
             app = workspace.urlForApplication(withBundleIdentifier: editor)
         }
