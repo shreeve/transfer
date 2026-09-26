@@ -332,7 +332,8 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
         var reasons: [Reason] = []
         for item in items where !reasons.contains(item.reason) { reasons.append(item.reason) }
         return reasons.map { reason in
-            let list = ListFormatter.localizedString(byJoining: items.filter { $0.reason == reason }.map { "“\($0.name)”" })
+            let named = items.filter { $0.reason == reason }.map { "“\($0.name)”" }
+            let list = ListFormatter.localizedString(byJoining: named)
             return switch reason {
             case .clash(let first, let second):
                 "Did not \(moving ? "move" : "paste") \(list): “\(first)” and “\(second)” differ only in case or accents, and this Mac's disk, which the items pass through, cannot hold both."
@@ -343,7 +344,8 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
             case .live(let count):
                 "Kept \(list) \(place): \(TransferError.liveUnsynced(count).localizedDescription)."
             case .changed:
-                "\(list) changed during the move, and what changed was kept \(place)."
+                // A retry keeps the request's Live save mark, so only a new move takes the rest.
+                "\(list) changed during the move, and what changed was kept \(place). Move \(named.count == 1 ? "it" : "them") again to move the rest."
             case .failed(let reason):
                 "Could not \(moving ? "move" : "copy") \(list): \(reason)\(reason.hasSuffix(".") ? "" : ".")"
             }
