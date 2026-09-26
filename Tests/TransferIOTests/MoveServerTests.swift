@@ -72,14 +72,15 @@ struct MoveServerTests {
                 try h.setTime("from/report.txt", 1_700_000_000)
                 let to = try h.folder("to")
                 let planted = Locked(false)
-                let scratch = Locked<[URL]>([])
+                let scratch = Locked<[String]>([])
+                let scratchRoot = try Store(root: h.root).scratch.path
                 let request = TransferRequest(.server(alias.connection.id, [from.appending("report.txt")]), into: to, on: h.session.connection.id, moving: true)
                 // During the download, someone else writes a file of the same size and time.
                 let engine = TransferEngine(request: request, destination: h.session) { _ in
                     guard !planted.withLock({ defer { $0 = true }; return $0 }) else { return }
                     try? h.write("to/report.txt", "BBBB")
                     try? h.setTime("to/report.txt", 1_700_000_000)
-                    scratch.value = (try? Store(root: h.root).localTemps()) ?? []
+                    scratch.value = (try? FileManager.default.contentsOfDirectory(atPath: scratchRoot)) ?? []
                 }
                 let skip = TestPrompts(collision: .skip)
                 await #expect(throws: TransferKept([.init("report.txt", .alreadyThere)], moving: true, place: "on the other server")) {
@@ -89,9 +90,10 @@ struct MoveServerTests {
                 #expect(skip.collisions == 1)
                 #expect(try h.read("from/report.txt") == "AAAA")
                 #expect(try h.read("to/report.txt") == "BBBB")
-                // The scratch folder on this Mac was recorded, so a crash leaves it to the next
-                // launch, not to the OS's purge (XFR-07), and forgotten once removed.
-                #expect(scratch.value.contains { $0.lastPathComponent.hasPrefix("Transfer-") })
+                // The copy passed through the library's scratch folder, which the next launch
+                // empties if a crash leaves anything there (XFR-07, FR-1), and was removed.
+                #expect(scratch.value.count == 1)
+                #expect(try FileManager.default.contentsOfDirectory(atPath: scratchRoot).isEmpty)
                 #expect(try Store(root: h.root).localTemps().isEmpty)
             }
         }
@@ -399,6 +401,22 @@ struct MoveServerTests {
         }
     }
 
+    /// A rename whose reply was lost did its work, and the retry of the paste found the name taken
+    /// and went on to copy an original that was gone (FR-15). The retry now counts the item moved.
+    @Test func aRetryAfterALostRenameReplyFindsTheItemMoved() async throws {
+        try await withHarness("lost", connected: true) { h in
+            let id = h.session.connection.id
+            let from = try h.folder("from", files: ["a.txt": "a"])
+            let to = try h.folder("to")
+            try FileManager.default.moveItem(at: h.remote.appendingPathComponent("from/a.txt"), to: h.remote.appendingPathComponent("to/a.txt"))
+            try await run(TransferRequest(.server(id, [from.appending("a.txt")]), into: to, on: id, moving: true), on: h.session)
+            #expect(try h.names("from").isEmpty)
+            #expect(try h.names("to") == ["a.txt"])
+            #expect(try h.read("to/a.txt") == "a")
+            #expect(h.prompts.collisions == 0)
+        }
+    }
+
     /// A move on one server onto a name the folder held failed red with "already exists" instead
     /// of asking (UIB-02). It now asks, as every other route does: Skip keeps both, Keep Both and
     /// Replace move it, and a folder merges; the original goes only once its copy is verified.
@@ -456,6 +474,38 @@ struct MoveServerTests {
             #expect(replace.collisions == 0)
             #expect(try h.names("site") == ["a.txt"])
             #expect(try h.read("site/a.txt") == "a")
+        }
+    }
+
+    /// A folder already at an item's name can be the item itself, reached another way: a bind
+    /// mount or one share at two paths, whose parents are different folders. Replace would copy
+    /// each file onto itself and the removal take the only copy (FR-14). A probe made in that
+    /// folder and found under the item refuses it, on one server and between two. Without root
+    /// there is no bind mount here: the item is a link to the folder, which the probe finds the
+    /// same way.
+    @Test func aMoveOntoAFolderThatIsTheItemItselfRemovesNothing() async throws {
+        try await withHarness("sameitem", connected: true) { h in
+            try await withAlias(h) { alias in
+                let to = try h.folder("to", files: ["x/f.txt": "f"])
+                _ = try h.folder("from")
+                let link = h.remote.appendingPathComponent("from/x").path
+                try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: "../to/x")
+                let item = h.remotePath.appending("from").appending("x")
+                let refused = TransferKept.Reason.failed("the folder of that name at the destination is this item itself, reached another way")
+                let replace = TestPrompts(collision: .replace)
+                for (source, place) in [(nil, "on the server"), (alias, "on the other server")] {
+                    let request = TransferRequest(.server((source ?? h.session).connection.id, [item]), into: to, on: h.session.connection.id, moving: true)
+                    await #expect(throws: TransferKept([.init("x", refused)], moving: true, place: place)) {
+                        try await OperationPrompts.$current.withValue(replace) { try await run(request, on: h.session, from: source) }
+                    }
+                    #expect(try h.names("to") == ["x"])
+                    #expect(try h.names("to/x") == ["f.txt"])
+                    #expect(try h.read("to/x/f.txt") == "f")
+                    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link) == "../to/x")
+                }
+                #expect(replace.collisions == 0)
+                #expect(try Store(root: h.root).remoteTemps(connection: h.session.connection.id).isEmpty)
+            }
         }
     }
 

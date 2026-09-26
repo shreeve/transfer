@@ -114,6 +114,21 @@ struct SessionUnitTests {
         #expect(result.stdout == "out\n")
         #expect(result.stderr == "err\n")
     }
+
+    /// A login's question asked from a cancelled task gets the safe answer without asking any
+    /// window still waiting (FR-6).
+    @Test func aCancelledLoginAsksNobody() async {
+        let prompts = LoginPrompts()
+        let window = TestPrompts(.trustOnce)
+        prompts.join(UUID(), window)
+        let event = HostKeyEvent(situation: .firstSeen, keyType: "ssh-ed25519", fingerprint: "SHA256:x", line: "box ssh-ed25519 AAAA")
+        let asked = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await prompts.decideHostKey(event)
+        }
+        #expect(await asked.value == .cancel)
+        #expect(window.hostKeyEvents.isEmpty)
+    }
 }
 
 /// Login, host keys, and channels against the local sshd (`ServerHarness`).
@@ -490,6 +505,37 @@ struct SessionServerTests {
             }
             #expect(state.value.early == 3)
             #expect(state.value.peak == SSHConnection.dataChannels)
+        }
+    }
+
+    /// A refusal while every open channel was held left the caller behind it waiting for one to be
+    /// given back, which a long copy may not do for minutes, though room came back 10 s later
+    /// (FR-3). The first in line now opens it once the backoff passes.
+    @Test(.timeLimit(.minutes(1))) func aCallerWaitingOutARefusalOpensOnceTheBackoffPasses() async throws {
+        try await withHarness("backoff", connected: true) { h in
+            let config = try String(contentsOf: h.configFile, encoding: .utf8)
+            let open = Locked(0)
+            let done = Locked(false)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<3 {
+                    group.addTask {
+                        try await h.session.withData { _ in
+                            open.withLock { $0 += 1 }
+                            while !done.value { try await Task.sleep(for: .milliseconds(20)) }
+                        }
+                    }
+                }
+                #expect(await waitUntil { open.value == 3 })
+                try (config + "  NoSuchOption yes\n").write(to: h.configFile, atomically: true, encoding: .utf8)
+                let started = ContinuousClock.now
+                let waiter = Task { try await h.session.withData { _ in ContinuousClock.now - started } }
+                try await Task.sleep(for: .seconds(1))
+                try config.write(to: h.configFile, atomically: true, encoding: .utf8)
+                let waited = try await waiter.value
+                done.value = true
+                try await group.waitForAll()
+                #expect(waited >= .seconds(10))
+            }
         }
     }
 

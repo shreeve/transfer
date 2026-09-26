@@ -744,6 +744,7 @@ actor LiveSync {
             guard let expecting = LiveDecision.keepLocalExpectation(entry.state, conflict: entry.conflict) else {
                 throw TransferError.typeMismatch(path.display)
             }
+            let (lost, lostDigest) = (entry.state.pending, entry.pendingDigest)
             switch await save(id, expecting: expecting, settled: try await stillStamp(entry), via: server) {
             case .done:
                 update(id) {
@@ -751,8 +752,16 @@ actor LiveSync {
                     $0.state.conflict = false
                 }
             case .serverChanged:
+                let found = await lookup(id)
+                // An earlier Keep Local whose reply was lost already put this very copy there.
+                if let lost, found?.1 == .file(lost.fingerprint), Self.stamp(entry.local) == lost {
+                    saves += 1
+                    lastSave[id] = saves
+                    adopt(id, server: lost.fingerprint, stamp: lost, digest: lostDigest)
+                    break
+                }
                 // Changed again since the conflict was raised: show the new server copy instead.
-                if let (item, fact) = await lookup(id), let kind = LiveDecision.conflictKind(for: fact) {
+                if let (item, fact) = found, let kind = LiveDecision.conflictKind(for: fact) {
                     await raiseConflict(id, kind: kind, item: item)
                 }
                 throw TransferError.failed("\(entry.name) changed on the server again")

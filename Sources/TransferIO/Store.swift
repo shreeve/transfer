@@ -38,6 +38,16 @@ final class Store: @unchecked Sendable {
     let cacheRoot: URL
     /// Previews and viewed copies, for every server.
     var previewCache: URL { cacheRoot.appendingPathComponent("Preview", isDirectory: true) }
+    /// Copies passing through this Mac, between servers or on one without `copy-data`. The hub
+    /// empties it at launch, under the library lock, so a crash leaves no copy behind.
+    var scratch: URL { cacheRoot.appendingPathComponent("Scratch", isDirectory: true) }
+
+    /// A new folder in `scratch`, which only this user can read.
+    func makeScratch() throws -> URL {
+        let folder = scratch.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        return folder
+    }
 
     /// `~/Library/Application Support/Transfer`, the library when no other root is given.
     static var standardRoot: URL {
@@ -63,6 +73,12 @@ final class Store: @unchecked Sendable {
             // of failing at once.
             sqlite3_busy_timeout(db, 5_000)
             while try transaction(migrateOneStep) {}
+            // 0.2.0 recorded a file set aside under the server's own key, where 0.1.7 reads it up
+            // to its NUL as a temp and would remove the old file's only copy. Every open moves
+            // such a record to the aside key; the schema does not change, so 0.2.0 still opens it.
+            report("re-key the records of files set aside") {
+                try execute("UPDATE temps SET connection_id = connection_id || ' aside' WHERE instr(CAST(path AS BLOB), X'00') > 0 AND connection_id <> '' AND connection_id NOT LIKE '% aside'")
+            }
             // WAL makes a commit one log append, not a rollback journal's create, write, fsync,
             // and unlink, and lets the other process read during a write. The mode persists in the
             // file but cannot change during another process's transaction; this launch then keeps

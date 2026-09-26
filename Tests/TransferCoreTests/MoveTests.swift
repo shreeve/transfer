@@ -70,7 +70,10 @@ import Testing
     let kept = TransferKept([.init("a", .incomplete), .init("b", .incomplete), .init("c", .live(2))], moving: true, place: "on this Mac")
     #expect(kept.localizedDescription == "Kept “a” and “b” on this Mac: the copy is not complete. Kept “c” on this Mac: 2 Live files have unsynced edits.")
     #expect(TransferKept([.init("d", .changed)], moving: true, place: "on the other server").localizedDescription
-        == "“d” changed during the move, and what changed was kept on the other server.")
+        == "“d” changed during the move, and what changed was kept on the other server. Move it again to move the rest.")
+    // A retry reads no new Live save mark, so the reason asks for a new move (FR-17).
+    #expect(TransferKept([.init("d", .changed), .init("e", .changed)], moving: true, place: "on the server").localizedDescription
+        == "“d” and “e” changed during the move, and what changed was kept on the server. Move them again to move the rest.")
     #expect(TransferKept([.init("a", .failed("No such file")), .init("b", .alreadyThere)], moving: false, place: "on this Mac").localizedDescription
         == "Could not copy “a”: No such file. Kept “b” on this Mac: something with that name was already at the destination and was not replaced, so this move cannot tell its own copy from it.")
     #expect(TransferKept.Reason(.remove) == nil)

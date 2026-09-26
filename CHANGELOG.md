@@ -14,9 +14,10 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - A Live save no longer replaces another writer's file that happens to have the edit's size and modification second; that is a conflict. An edit refused because the server's file changed can no longer be marked synced later without having uploaded.
 - Reopening a Live file that an editor re-saved unchanged picks up the server's newer version, instead of leaving you to edit old bytes into a conflict.
 - Live files survive a moved or restored library folder: unsynced edits are no longer forgotten, and a damaged record can never delete anything outside Transfer's Live folder.
-- A file a replace set aside is never deleted if you go back to Transfer 0.1.7.
+- A file a replace set aside, including one Transfer 0.2.0 set aside, is never deleted if you go back to Transfer 0.1.7.
 - A folder listing no longer stops at a page holding only names Transfer drops (such as `.` and `..`), so a folder copy no longer reports success with files missing.
 - A file shortened on the server while it downloads is read again instead of being saved short.
+- Moving a folder onto a folder of the same name that is the folder itself, reached another way (a bind mount, or one network share at two paths), is refused instead of copying it onto itself and removing the only copy.
 - Pasting a Mac folder into a folder inside itself, through a server that reaches this Mac's disk, is refused instead of copying itself about a hundred levels deep.
 
 ### Security
@@ -25,7 +26,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - A saved password answers only the prompt ssh itself writes for that server, so a `ProxyJump` host can no longer get it by asking for it by name.
 - A password typed into a login sheet that was withdrawn, and its Save in Keychain, no longer fill in the next login sheet, which could be another server's.
 - A server that lists wrong or missing sizes can no longer fill the disk: copying for the Finder stops staging at 1 GB actually received, and the inspector previews a file only up to 8 MB whatever its listing said. A huge listed size no longer crashes a copy or a drag to the Finder.
-- The launch removes a leftover download temp only when it is a file with a temp's name, so a copied or edited library cannot make it delete a folder.
+- The launch removes a leftover download temp only when it is a file with a temp's name, so a copied or edited library cannot make it delete a folder. Copies passing through this Mac, between servers or on a server without `copy-data`, go through a folder in Transfer's caches that each launch empties, instead of `$TMPDIR`.
 - A name holding a slash followed by a combining accent is refused as a file name, as any name with a slash is.
 - `xfer` shows C1 control characters in a file name as `?`, as it does other control characters, so a crafted name cannot drive the terminal.
 
@@ -38,11 +39,14 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - Choosing Trust after leaving a host-key question up for a long time no longer fails the login with a timeout, and Cancel during the host-key check ends the login in about a second, not two.
 - A connection that drops at the very end of a login is retried instead of failing.
 - Browsing quickly no longer leaks the server's folder and file handles until it stops listing folders.
+- Retrying a move on one server after the connection dropped or timed out during a rename no longer fails on an item that had already moved, and the timeout ends the move instead of starting a copy.
+- An item a move kept because it changed during the move says to move it again: Retry keeps it again.
 - One file that changes on the server during a folder copy fails alone and is retried, instead of restarting the whole copy.
 - A library file whose version is damaged is refused with a message instead of crashing Transfer at every launch, and a saved server with a damaged id no longer shows up as one that cannot be edited or removed.
 - Right-clicking a folder that is not selected in column view opens its menu, instead of failing and leaving the view out of step. The right-click menu's Quick Look and Rename act on the item clicked, and Open Live works on a link to a file.
 - Escape in the search field gives the keyboard back to the files, and Command-F with the search item in the toolbar's overflow no longer turns off Return and Space. Clicking back into a search field that holds text keeps Space, Return, and Command-Delete in the field instead of acting on the files.
 - Finder's Stop always stops a drag's download.
+- Choosing Keep Local again after its upload's reply was lost clears the conflict, instead of raising it again over your own bytes.
 - Retry on a Live conflict's row keeps the conflict on the shelf, and two refused Live discards each ask in turn.
 - An Extensions edit made just before closing Settings is saved.
 - View → Clear Preview Cache works in a window with no server open.
@@ -64,7 +68,6 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - A file whose default app would run it (Terminal, iTerm2, Ghostty, Python Launcher, or Jar Launcher) opens in the default text editor instead, whether opened Live or to view. Choosing such an app when Transfer asks which app opens a type no longer makes it the Mac's default for that type.
 - Copies opened to view or preview are read-only, so an editor says the file is locked instead of saving edits that never upload and are later overwritten.
 - A move on one server onto a name the destination already holds asks Replace, Keep Both, or Skip, instead of failing.
-- A name with no dot, such as `README` or `Makefile`, has no extension: it opens with View even when the Extensions list holds its whole name. Open Live still opens it Live.
 - Saved servers are listed in Finder's order.
 - In icon view, Shift-click adds or removes an item, and clicking one of several selected items selects just that one, as in Finder. In list and icon view, once a folder has listed, the selection keeps only the items shown, so a filter never leaves items selected out of sight.
 - The inspector shows the time in the Mac's own format, for example 24-hour.
@@ -77,7 +80,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 ### For maintainers
 
 - A `TransferUITests` target drives the real window model against fake sessions and a fake library; `swift test` runs it without a server.
-- With the local sshd, the full test run takes about 13 s instead of about 75: `EditorMatrix`, `MoveServerTests`, and `ThroughputServerTests` run their cases in parallel.
+- With the local sshd, the full test run takes about 18 s instead of about 75: `EditorMatrix`, `MoveServerTests`, and `ThroughputServerTests` run their cases in parallel.
 - A file a replace set aside is recorded in the `temps` table under the owner `<uuid> aside`, which 0.1.7 and 0.2.0 never select; records 0.2.0 wrote are still read. There is no schema change.
 
 ## 0.2.0 — 2026-09-24
