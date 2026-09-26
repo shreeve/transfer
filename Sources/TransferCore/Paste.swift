@@ -87,10 +87,18 @@ public struct ClipTally: Hashable, Sendable {
             break
         case .file(let size, _):
             allFiles += 1
-            bytes += size
+            bytes = bytes.saturatingAdd(size)
         case .link, .other:
             allFiles += 1
         }
+    }
+}
+
+package extension UInt64 {
+    /// The sum, or `.max` where it would overflow: sizes come from an untrusted server (SEC2-04).
+    func saturatingAdd(_ other: UInt64) -> UInt64 {
+        let (sum, overflow) = addingReportingOverflow(other)
+        return overflow ? .max : sum
     }
 }
 
@@ -153,34 +161,28 @@ public enum PasteRules {
 public enum MoveCheck {
     public enum Verdict: Equatable, Sendable {
         case remove
-        /// Files or links, by key, that the destination held before the move began and the move
-        /// did not replace. Their copy cannot be told from what was there: a lookalike the user
-        /// chose to skip, or the original itself reached through a second saved server.
+        /// Files or links, by key, that the destination holds and this move did not write: a
+        /// lookalike the user chose to skip, one that arrived during the copy, or the original
+        /// itself reached through a second saved server. None can be told from a copy.
         case alreadyThere([TreeKey])
         /// Entries, by key, that the copy lacks or holds differently.
         case incomplete([TreeKey])
     }
 
     /// `source` is the original's tree walked after the copy, so anything added meanwhile is
-    /// missing from the copy and keeps it. `before` is the destination before the move reached it
-    /// (empty if none), `after` the destination now, `written` the keys the move itself wrote over
-    /// what was there when the user chose Replace. A folder already there may be merged into; a
-    /// file or link already there counts only when replaced. A file counts only with an equal size
-    /// and a known, equal time: every copy keeps the time; an unknown one proves nothing.
-    public static func verdict(
-        source: [TreeKey: TreeEntry],
-        before: [TreeKey: TreeEntry],
-        after: [TreeKey: TreeEntry],
-        written: Set<TreeKey> = []
-    ) -> Verdict {
+    /// missing from the copy and keeps it. `after` is the destination now, and `written` the keys
+    /// this move itself wrote there (D6). A folder there may be one the copy merged into; a file
+    /// or link counts only when this move wrote it, with an equal size and a known, equal time:
+    /// every copy keeps the time; an unknown one proves nothing.
+    public static func verdict(source: [TreeKey: TreeEntry], after: [TreeKey: TreeEntry], written: Set<TreeKey>) -> Verdict {
         guard !source.isEmpty else { return .incomplete([""]) }
         var there: [TreeKey] = []
         var missing: [TreeKey] = []
         for (key, entry) in source {
-            if let old = before[key], !(entry == .directory && old == .directory), !written.contains(key) {
+            if entry == .directory, after[key] == .directory { continue }
+            if written.contains(key), let copy = after[key], proven(entry, copy) { continue }
+            if entry != .directory, entry != .other, after[key] != nil, !written.contains(key) {
                 there.append(key)
-            } else if let copy = after[key], proven(entry, copy) {
-                continue
             } else {
                 missing.append(key)
             }
@@ -215,10 +217,16 @@ public struct NameClash: Sendable {
 
     public mutating func add(_ key: TreeKey) {
         guard found == nil else { return }
-        let text = key.description.precomposedStringWithCanonicalMapping
-        let folded = ignoringCase ? text.folding(options: .caseInsensitive, locale: nil) : text
+        let folded = ignoringCase ? key.description.diskFolded : key.description.precomposedStringWithCanonicalMapping
         if let other = seen[folded] { found = (other, key) } else { seen[folded] = key }
     }
+}
+
+package extension String {
+    /// This name as a disk that ignores case and Unicode form sees it, folding case fully as APFS
+    /// does (`ß` as `ss`, `ﬁ` as `fi`, every sigma alike): two names that fold the same may be one
+    /// item there.
+    var diskFolded: String { precomposedStringWithCanonicalMapping.folding(options: .caseInsensitive, locale: nil) }
 }
 
 /// One paste or drop: items on a saved server, or files on this Mac, copied or moved into a folder
@@ -255,9 +263,9 @@ package struct TransferMemo: Sendable {
     package var done: Set<Int> = []
     /// Where each source goes, once chosen, by index.
     package var targets: [Int: RemotePath] = [:]
-    /// Each destination's tree just before that source's copy first reached it, by index: what
-    /// an earlier item wrote there is in it, and counts as already there.
-    package var before: [Int: [TreeKey: TreeEntry]] = [:]
+    /// The Live save count before the first attempt copied anything: a save since may be missing
+    /// from a copy, and keeps its original.
+    package var liveMark: UInt64?
     /// Whether the two ends of a move were proven to be different folders.
     package var checked = false
     /// The files, links, and folders each source's copy wrote on the destination, by index. Only

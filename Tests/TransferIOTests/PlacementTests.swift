@@ -138,6 +138,15 @@ struct PlacementTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: base.path) == ["spot"])
     }
 
+    /// One file that changed on the server, a growing log, ended and restarted a whole folder
+    /// copy (XFR-05); only a cancel, a dropped connection, or a timeout does.
+    @Test func onlyTheConnectionEndsACopy() {
+        #expect(!CopyTally.ends(TransferError.changedOnServer("app.log")))
+        #expect(!CopyTally.ends(TransferError.failed("Permission denied")))
+        #expect(CopyTally.ends(TransferError.connectionLost("gone")))
+        #expect(CopyTally.ends(CancellationError()))
+    }
+
     /// Keep Both never lands on a name the disk already holds in another case.
     @Test func keepBothSkipsNamesTheDiskFolds() throws {
         let base = try scratch("keep")
@@ -147,15 +156,15 @@ struct PlacementTests {
         let next = try LocalPlacement.keepBoth(base.appendingPathComponent("report.pdf"), isFolder: false)
         let caseSensitive = try base.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames == true
         #expect(next.lastPathComponent == (caseSensitive ? "report 2.pdf" : "report 3.pdf"))
-        #expect(Placement.fold("Straße.TXT") == Placement.fold("straße.txt"))
-        #expect(Placement.fold("caf\u{E9}") == Placement.fold("cafe\u{301}"))
+        #expect("Straße.TXT".diskFolded == "straße.txt".diskFolded)
+        #expect("caf\u{E9}".diskFolded == "cafe\u{301}".diskFolded)
         // A folder's name has no extension to keep (R-C3).
         try FileManager.default.createDirectory(at: base.appendingPathComponent("v1.2"), withIntermediateDirectories: true)
         #expect(try LocalPlacement.keepBoth(base.appendingPathComponent("v1.2"), isFolder: true).lastPathComponent == "v1.2 2")
         #expect(Placement.keepBoth("v1.2", among: ["v1.2"], isFolder: true) == "v1.2 2")
         // As APFS folds them (R-C1).
-        #expect(Placement.fold("Straße") == Placement.fold("STRASSE"))
-        #expect(Placement.fold("ΑΣ") == Placement.fold("ας"))
-        #expect(Placement.fold("ﬁle") == Placement.fold("FILE"))
+        #expect("Straße".diskFolded == "STRASSE".diskFolded)
+        #expect("ΑΣ".diskFolded == "ας".diskFolded)
+        #expect("ﬁle".diskFolded == "FILE".diskFolded)
     }
 }

@@ -300,13 +300,14 @@ import Testing
 
 @Test func moveCheckFindsWhatAMoveWouldLose() {
     let source: [TreeKey: TreeEntry] = ["": .directory, "a.txt": .file(size: 4, mtime: 9), "sub": .directory, "sub/b": .link]
-    #expect(MoveCheck.verdict(source: source, before: [:], after: source) == .remove)
+    let written: Set<TreeKey> = ["a.txt", "sub/b"]
+    #expect(MoveCheck.verdict(source: source, after: source, written: written) == .remove)
     var partial = source
     partial["a.txt"] = .file(size: 3, mtime: 9)
     partial["sub/b"] = nil
     partial["extra"] = .file(size: 1)
-    #expect(MoveCheck.verdict(source: source, before: [:], after: partial) == .incomplete(["a.txt", "sub/b"]))
-    #expect(MoveCheck.verdict(source: [:], before: [:], after: [:]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: partial, written: written) == .incomplete(["a.txt", "sub/b"]))
+    #expect(MoveCheck.verdict(source: [:], after: [:], written: []) == .incomplete([""]))
 }
 
 /// A FIFO, socket, or device walked as a plain empty file once let a move pass the check with
@@ -314,9 +315,9 @@ import Testing
 @Test func moveCheckNeverCountsASpecialFileAsCopied() {
     #expect(TreeEntry(RemoteItem(path: RemotePath(string: "/srv/fifo"), kind: .other, size: 0, mtime: 1)) == .other)
     let source: [TreeKey: TreeEntry] = ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .other]
-    #expect(MoveCheck.verdict(source: source, before: [:], after: source) == .incomplete(["fifo"]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .file(size: 0)]) == .incomplete(["fifo"]))
-    #expect(MoveCheck.verdict(source: ["": .other], before: [:], after: ["": .other]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: source, written: Set(source.keys)) == .incomplete(["fifo"]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .file(size: 0)], written: ["a.txt", "fifo"]) == .incomplete(["fifo"]))
+    #expect(MoveCheck.verdict(source: ["": .other], after: ["": .other], written: []) == .incomplete([""]))
     var tally = ClipTally()
     tally.add(root: .other)
     tally.add(root: .directory)
@@ -331,15 +332,15 @@ import Testing
 @Test func moveCheckTellsAFileAlreadyThereFromTheCopy() {
     let source: [TreeKey: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
     let copy: [TreeKey: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
-    #expect(MoveCheck.verdict(source: source, before: [:], after: copy) == .remove)
-    #expect(MoveCheck.verdict(source: source, before: copy, after: copy) == .alreadyThere([""]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4, mtime: 1_600_000_000)]) == .incomplete([""]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4)]) == .incomplete([""]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 5, mtime: 1_700_000_000)]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: copy, written: [""]) == .remove)
+    #expect(MoveCheck.verdict(source: source, after: copy, written: []) == .alreadyThere([""]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .file(size: 4, mtime: 1_600_000_000)], written: [""]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .file(size: 4)], written: [""]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .file(size: 5, mtime: 1_700_000_000)], written: [""]) == .incomplete([""]))
     // A folder that was already there may be merged into; a file inside it that was there may not.
     let tree: [TreeKey: TreeEntry] = ["": .directory, "a": .file(size: 1, mtime: 2)]
-    #expect(MoveCheck.verdict(source: tree, before: ["": .directory], after: tree) == .remove)
-    #expect(MoveCheck.verdict(source: tree, before: tree, after: tree) == .alreadyThere(["a"]))
+    #expect(MoveCheck.verdict(source: tree, after: tree, written: ["a"]) == .remove)
+    #expect(MoveCheck.verdict(source: tree, after: tree, written: []) == .alreadyThere(["a"]))
 }
 
 /// Quit asks whenever it could lose something, including when the Live count never arrived.
