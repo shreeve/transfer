@@ -396,6 +396,28 @@ struct ServerTests {
         }
     }
 
+    /// A Live save once replaced another writer's file that had its size and whole-second time
+    /// (LIV2-05): only the base it expects lets the rename happen.
+    @Test func liveSaveNeverReplacesAFileWithItsOwnFingerprint() async throws {
+        try await withHarness("ownprint") { h in
+            _ = try await h.session.connect(prompts: h.prompts)
+            let when = Date(timeIntervalSince1970: 1_700_000_000)
+            let remoteFile = h.remote.appendingPathComponent("notes.txt")
+            try Data("theirs".utf8).write(to: remoteFile)
+            try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: remoteFile.path)
+            let snapshot = h.staging.appendingPathComponent("notes.txt")
+            try Data("mine!!".utf8).write(to: snapshot)
+            try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: snapshot.path)
+            let path = h.remotePath.appending(name: Array("notes.txt".utf8))
+
+            await #expect(throws: LiveRemoteChanged.self) {
+                _ = try await h.session.liveSave(snapshot, to: path, expecting: .file(Fingerprint(size: 1, mtime: 1))) { _ in }
+            }
+            #expect(try Data(contentsOf: remoteFile) == Data("theirs".utf8))
+            await h.session.disconnect()
+        }
+    }
+
     /// Rename and a move between folders once replaced whatever already had the name.
     @Test func renameNeverReplacesAnExistingItem() async throws {
         try await withHarness("rename") { h in

@@ -12,9 +12,8 @@ protocol LiveServer: AnyObject, Sendable {
     /// Downloads `item` over `local` in one rename. `interactive` uses the lane the user waits on.
     func liveFetch(_ item: RemoteItem, to local: URL, interactive: Bool) async throws
     /// Uploads `snapshot` to `path` with temp-and-rename on the interactive lane. Just before the
-    /// rename the server must match `expecting`, or hold a file with this save's size and
-    /// whole-second time (the lane ran it again after it landed), else it throws
-    /// `LiveRemoteChanged`. Returns the server file's new fingerprint.
+    /// rename the server must match `expecting`, else it throws `LiveRemoteChanged`. Returns the
+    /// server file's new fingerprint.
     func liveSave(_ snapshot: URL, to path: RemotePath, expecting: ServerExpectation, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> Fingerprint
     func liveNames(in folder: RemotePath) async throws -> Set<String>
     func liveEmit(_ event: SessionEvent)

@@ -7,7 +7,7 @@ import TransferCore
 /// held open by a `Gate`: fixed sleeps lost those races under load.
 @Suite struct LaneTests {
     /// A save that a preview arrives behind must not be cancelled, or run again: a second run
-    /// would upload twice and, for a Live file, meet its own bytes on the server.
+    /// would upload twice and, for a Live file, find its own bytes on the server and call them a change.
     @Test func aPreviewNeitherInterruptsNorRepeatsASave() async throws {
         let lane = InteractiveLane()
         let gate = Gate()

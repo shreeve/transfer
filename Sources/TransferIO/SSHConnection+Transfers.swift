@@ -171,14 +171,12 @@ extension SSHConnection {
             let link = try await metadataLink()
             let written = Fingerprint(item: try await link.lstat(temp))
             let found = try await link.lookup(placed)
-            let now = found.flatMap(Fingerprint.init(item:))
             // "Absent" means nothing at all there: a folder or a link is not absent.
             let matches = switch expecting {
-            case .file(let print): now == print
+            case .file(let print): found.flatMap(Fingerprint.init(item:)) == print
             case .absent: found == nil
             }
-            // A save that runs again after it already landed finds its own bytes there.
-            if !matches, now == nil || now != written { throw LiveRemoteChanged() }
+            if !matches { throw LiveRemoteChanged() }
             // A new file keeps the mode the server gave the temp when it was created.
             if let kept = found?.mode { try? await link.setstat(temp, SFTPAttrs(permissions: kept & 0o7777)) }
             try await link.replace(temp, onto: placed, log: asides)

@@ -1396,9 +1396,7 @@ actor FakeServer: LiveServer {
         case .file(let print): now?.print == print
         case .absent: now == nil
         }
-        // A save that already landed finds its own bytes there.
-        let ownBytes = now.map { $0.data == data && $0.print == written.print } ?? false
-        if !matches, !ownBytes { throw LiveRemoteChanged() }
+        if !matches { throw LiveRemoteChanged() }
         files[path] = written
         saves += 1
         savedContents.append(String(decoding: data, as: UTF8.self))
