@@ -51,6 +51,23 @@ import Testing
     }
 }
 
+/// A name with no dot was taken whole as its extension, so a list holding "makefile" opened
+/// Makefile Live by accident (COR-1). Only what follows the last dot is the extension.
+@Test func anExtensionIsWhatFollowsTheLastDot() {
+    func kind(_ name: String, _ extensions: Set<String>) -> OpenKind { EditableFile.openKind(fileName: name, extensions: extensions) }
+    for name in ["README", "Makefile", "LICENSE", "notes.", "..", ".bashrc", "a.tar.gz"] {
+        #expect(kind(name, TransferConfig.builtIn.extensionSet) == .view, "\(name)")
+    }
+    #expect(kind("README", ["readme"]) == .view)
+    #expect(kind("Makefile", ["makefile"]) == .view)
+    #expect(kind("notes.", ["notes"]) == .view)
+    #expect(kind("Notes", [""]) == .view)
+    #expect(kind(".env", ["env"]) == .live)
+    #expect(kind("a.tar.gz", ["gz"]) == .live)
+    #expect(kind("a.tar.gz", ["tar"]) == .view)
+    #expect(kind("NOTES.TXT", TransferConfig.builtIn.extensionSet) == .live)
+}
+
 @Test func keepBothInsertsANumberBeforeTheExtension() {
     let name = KeepBothName.next(existing: ["report.pdf", "report 2.pdf"], original: "report.pdf")
     #expect(name == "report 3.pdf")
