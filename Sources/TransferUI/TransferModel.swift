@@ -34,12 +34,13 @@ public enum SidebarItem: Hashable {
 }
 
 /// The server a window shows, as one value: made when a connect starts, installed once the login
-/// works, then never changed. Switching servers installs a new one and closes the old, cancelling
-/// its listener and listings. Work for a server holds its context and counts only while that
-/// context is installed, so a slow listing or late login never lands in a window that has moved on.
+/// works, then kept, taking only the library's edits of its settings. Switching servers installs a
+/// new one and closes the old, cancelling its listener and listings. Work for a server holds its
+/// context and counts only while that context is installed, so a slow listing or late login never
+/// lands in a window that has moved on.
 @MainActor
 final class ServerContext {
-    let connection: SavedConnection
+    var connection: SavedConnection
     let session: any RemoteSession
     /// Which connect made it, so a notice raised during that login can be shown before it lands.
     let generation: Int
@@ -353,16 +354,21 @@ public final class TransferModel {
 
     // MARK: Servers
 
-    /// Reads the saved servers. A window whose server another window removed shows none.
+    /// Reads the saved servers. A window whose server another window removed shows none; one
+    /// whose server's edit replaced its session logs in to the new one, at the same folder.
     public func reloadConnections() async {
         guard let loaded = try? await provider.savedConnections() else { return }
         Self.lastConnections = loaded
         if connections != loaded { connections = loaded }
         guard let context else { return }
-        if let saved = loaded.first(where: { $0.id == context.connection.id }) {
-            if saved != context.connection { _ = try? await currentContext() }
+        guard let saved = loaded.first(where: { $0.id == context.connection.id }) else { return uninstall() }
+        guard saved != context.connection, let session = try? await provider.session(for: saved.id), isCurrent(context) else { return }
+        if session as AnyObject === context.session as AnyObject {
+            context.connection = saved
         } else {
-            uninstall()
+            // Not awaited: the new login may ask, and a Save or another window's edit that
+            // reloaded has closed its sheet and moved on.
+            Task { await connect(saved, landing: snapshot.path) }
         }
     }
 
@@ -602,9 +608,10 @@ public final class TransferModel {
         let wasEdit = draftIsEdit
         await reporting {
             try await provider.save(connection)
-            await reloadConnections()
-            NotificationCenter.default.post(name: Preferences.libraryChanged, object: nil)
+            // Closed first, so a login the edit starts can ask.
             sheet = nil
+            NotificationCenter.default.post(name: Preferences.libraryChanged, object: nil)
+            await reloadConnections()
             let landing = pendingLanding
             pendingLanding = nil
             if !wasEdit { await connect(connection, landing: landing) }

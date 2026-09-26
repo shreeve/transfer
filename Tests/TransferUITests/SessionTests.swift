@@ -59,8 +59,49 @@ struct SessionTests {
         let edited = FakeSession(SavedConnection(id: a.id, name: "A2", host: "a2"), folders: files(2, in: "/home/work"))
         provider.replace(edited)
         await model.reloadConnections()
-        #expect(same(model.session, edited))
+        #expect(await eventually { same(model.session, edited) && model.connectingTo == nil })
         #expect(model.snapshot.path == RemotePath(string: "/home/work"))
         #expect(model.title == "A2")
+    }
+
+    /// FR-8: Save closes the form before the edit's new login starts, so that login can ask.
+    @Test func savingAnEditOfTheShownServerLetsItsNewLoginAsk() async {
+        let old = FakeSession(a)
+        let provider = FakeProvider([old])
+        let model = TransferModel(provider: provider)
+        await model.connect(a)
+        model.editConnection(a)
+        let edited = FakeSession(SavedConnection(id: a.id, name: "A", host: "a2"))
+        edited.asksPassword.value = true
+        provider.replace(edited)
+        model.draft = edited.connection
+        let save = Task { await model.saveDraft() }
+        #expect(await eventually { if case .prompt? = model.sheet { true } else { false } })
+        model.sheet = nil
+        save.cancel()
+        await save.value
+        #expect(await eventually { model.connectingTo == nil })
+        #expect(same(model.session, old))
+    }
+
+    /// FR-8: an edit that kept the session is taken by the window, so a later change to the
+    /// library does not log in again with settings the window already has.
+    @Test func anEditThatKeptTheSessionIsNotLoggedInAgainLater() async {
+        let old = FakeSession(a)
+        let provider = FakeProvider([old])
+        let model = TransferModel(provider: provider)
+        await model.connect(a)
+        provider.saved.withLock { $0 = [SavedConnection(id: a.id, name: "A renamed", host: "a")] }
+        await model.reloadConnections()
+        #expect(same(model.session, old))
+        let fresh = FakeSession(SavedConnection(id: a.id, name: "A renamed", host: "a"))
+        fresh.asksPassword.value = true
+        provider.replace(fresh)
+        let reload = Task { await model.reloadConnections() }
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(model.sheet == nil)
+        #expect(fresh.connects.value == 0)
+        reload.cancel()
+        await reload.value
     }
 }

@@ -19,6 +19,8 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     let starred = Locked<[RemotePath]>([])
     /// Discards refused as unsynced unless forced.
     let refusesDiscard = Locked(false)
+    /// Asks for a password during login; no answer cancels it.
+    let asksPassword = Locked(false)
     private let eventStream: AsyncStream<SessionEvent>
     let send: AsyncStream<SessionEvent>.Continuation
 
@@ -37,10 +39,10 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     func connect(prompts: any PromptSink) async throws -> RemotePath {
         connects.withLock { $0 += 1 }
         if let time = loginTime.value { try await Task.sleep(for: time) }
+        if asksPassword.value, await prompts.answer(PromptRequest(text: "pw:", offerKeychain: false)).text == nil { throw CancellationError() }
         loggedIn.value = true
         return home
     }
-
 
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         let items = folders.value[path] ?? []
