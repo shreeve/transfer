@@ -55,6 +55,11 @@ struct SessionUnitTests {
         #expect(SSHConnection.storedSecretKind("Enter passphrase for key '/Users/alice/.ssh/id_ed25519': ", user: "alice", host: "box.example") == .passphrase)
         #expect(SSHConnection.storedSecretKind("alice@jump.example's password: ", user: "alice", host: "box.example") == nil)
         #expect(SSHConnection.storedSecretKind("(alice@box.example) Verification code: ", user: "alice", host: "box.example") == nil)
+        // A jump host chooses the text of its own keyboard-interactive prompt, after its own prefix.
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) alice@box.example's password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) (alice@box.example) Password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("Enter alice@box.example's old password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) Enter passphrase for key '/k': ", user: "alice", host: "box.example") == nil)
     }
 
     /// Always Trust saves where `ssh -G` says; when `ssh -G` failed it says so rather than

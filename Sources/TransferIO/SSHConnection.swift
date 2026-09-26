@@ -935,12 +935,16 @@ public actor SSHConnection: RemoteSession {
         return (values["user"] ?? connection.user, alias ?? values["hostname"] ?? connection.host)
     }
 
-    /// Which stored secret may answer `prompt`: this server's own password prompt takes its
-    /// password; a key's passphrase prompt, which never leaves the Mac, its passphrase; nil for
-    /// anything else.
+    /// Which stored secret may answer `prompt`, matched on what ssh itself writes: this server's
+    /// password prompt, or its keyboard-interactive prefix `(user@host) ` before a question about
+    /// the password, takes its password; a key's passphrase prompt, which never leaves the Mac, its
+    /// passphrase; nil for anything else. The text after that prefix is the server's own, and a
+    /// ProxyJump host's comes after its own prefix, so it can name this server but never match.
     static func storedSecretKind(_ prompt: String, user: String, host: String) -> KeychainStore.Kind? {
-        if prompt.hasPrefix("Enter passphrase for") { return .passphrase }
-        return prompt.contains("\(user)@\(host)") && prompt.lowercased().contains("password") ? .password : nil
+        if prompt.hasPrefix("Enter passphrase for key '"), prompt.hasSuffix("': ") { return .passphrase }
+        if prompt == "\(user)@\(host)'s password: " { return .password }
+        let interactive = "(\(user)@\(host)) "
+        return prompt.hasPrefix(interactive) && prompt.dropFirst(interactive.count).lowercased().contains("password") ? .password : nil
     }
 }
 
