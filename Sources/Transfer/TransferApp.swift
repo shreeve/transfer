@@ -48,9 +48,10 @@ struct TransferApp: App {
                 Button("Open") { Task { await model?.openSelection() } }
                     .keyboardShortcut("o")
                     .disabled(primary == nil)
-                Button("Open Live") { Task { await model?.openLiveSelection() } }
+                // A link opens Live too once resolved to a file.
+                Button("Open Live") { if let primary { Task { await model?.open(primary, forceLive: true) } } }
                     .keyboardShortcut("o", modifiers: [.command, .option])
-                    .disabled(primary?.kind != .file)
+                    .disabled(primary?.kind != .file && primary?.kind != .symlink)
                 Button("Download Copy…") { Task { await model?.downloadCopy() } }
                     .disabled(primary == nil)
                 Button("Upload…") { Task { await model?.uploadFromPanel() } }

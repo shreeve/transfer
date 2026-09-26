@@ -315,12 +315,12 @@ enum ItemMenu {
             return menu
         }
         add("Open") { Task { await model.open(item) } }
-        add("Open Live", enabled: item.kind == .file) { Task { await model.open(item, forceLive: true) } }
-        add("Quick Look") { model.showPreview() }
+        add("Open Live", enabled: item.kind == .file || item.kind == .symlink) { Task { await model.open(item, forceLive: true) } }
+        add("Quick Look") { model.showPreview(item) }
         menu.addItem(.separator())
         add("Download Copy…") { Task { await model.downloadCopy() } }
         add("Duplicate") { Task { await model.duplicateSelection() } }
-        add("Rename") { model.beginRename() }
+        add("Rename") { model.beginRename(item) }
         let targets = model.dragItems(including: item).map(\.path)
         add(model.starTitle(targets)) { Task { await model.toggleStar(targets) } }
         add("Copy") { model.copySelection() }
