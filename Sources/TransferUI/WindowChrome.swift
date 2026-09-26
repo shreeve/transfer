@@ -109,6 +109,9 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 view.field.placeholderString = "Search"
                 view.field.delegate = self
                 view.field.sendsSearchStringImmediately = true
+                // However the field takes the keyboard (Command-F, a click, Tab), Space and Return
+                // stay with it; searching starts only when the text changes, so it cannot say so.
+                view.field.onFocus = { [weak self] in self?.model.textEditing = true }
                 view.button.target = self
                 view.button.action = #selector(beginSearch(_:))
                 // Escape or Return in the field leaves the keyboard with the window; the browser takes it.
@@ -152,10 +155,10 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         }
 
         /// Command-F and the magnifier. The field takes focus now, so Return and Space reach it
-        /// before the first character, when AppKit first reports that searching started. A field
-        /// that could not take it (the item in the toolbar's overflow) leaves the plain keys on.
+        /// before the first character. A field that could not take it (the item in the toolbar's
+        /// overflow) leaves the plain keys on.
         @objc func beginSearch(_ sender: Any?) {
-            if searchView?.expand() == true { model.textEditing = true }
+            _ = searchView?.expand()
         }
 
         @objc private func navigate(_ sender: NSToolbarItemGroup) {
@@ -184,8 +187,6 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             searchView?.collapse()
             return true
         }
-
-        func searchFieldDidStartSearching(_ sender: NSSearchField) { model.textEditing = true }
 
         /// Sent when the text becomes empty, by typing or the clear button. A field still being
         /// edited keeps its focus, as Finder's does, and so keeps Return and Space; one that is
@@ -833,6 +834,17 @@ final class BelowToolbarView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 }
 
+/// The toolbar filter, which says when it takes the keyboard.
+final class FilterField: NSSearchField {
+    var onFocus: (() -> Void)?
+
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else { return false }
+        onFocus?()
+        return true
+    }
+}
+
 /// The search control: a magnifier that becomes a fixed-width field on demand.
 final class SearchToolbarView: NSView {
     static let collapsedWidth: CGFloat = 32
@@ -841,7 +853,7 @@ final class SearchToolbarView: NSView {
     static let expandedWidth: CGFloat = 160
 
     let button = NSButton()
-    let field = NSSearchField()
+    let field = FilterField()
     var onCollapse: (() -> Void)?
     /// The toolbar measures a view item once, when the view is attached. After a state change the
     /// view is attached again so the toolbar re-reads the new range and lays out for it.

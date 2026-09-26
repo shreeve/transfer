@@ -49,6 +49,28 @@ struct ViewTests {
         #expect(model.connectingTo?.id == b.id)
     }
 
+    /// FR-9: going back to a filter that still holds text keeps Space and Return with it.
+    @Test func refocusingTheFilterKeepsThePlainKeysWithIt() async throws {
+        _ = NSApplication.shared
+        let model = TransferModel(provider: FakeProvider([]))
+        let coordinator = WindowChrome<EmptyView, EmptyView, EmptyView>.Coordinator(model: model)
+        let item = try #require(coordinator.toolbar(NSToolbar(), itemForItemIdentifier: ChromeItem.search, willBeInsertedIntoToolbar: true))
+        let view = try #require(item.view as? SearchToolbarView)
+        let window = NSWindow(contentRect: NSRect(x: -5000, y: -5000, width: 400, height: 100), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = view
+        coordinator.beginSearch(nil)
+        #expect(model.textEditing)
+        view.field.stringValue = "notes"
+        model.filter = "notes"
+        window.makeFirstResponder(nil)
+        #expect(!model.textEditing)
+        #expect(window.makeFirstResponder(view.field))
+        #expect(model.textEditing)
+        #expect(!model.plainKeysAvailable)
+    }
+
     /// UIV-03: an Extensions edit made just before the tab goes away is saved, not dropped with
     /// the pause that waits for typing to stop.
     @Test func anExtensionsEditIsSavedWhenTheTabGoes() async throws {
