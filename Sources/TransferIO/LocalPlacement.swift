@@ -47,20 +47,13 @@ enum Placement: Equatable {
         }
     }
 
-    /// A name as a disk that ignores case and Unicode form sees it, folding case fully as APFS
-    /// does (`ß` as `ss`, `ﬁ` as `fi`, every sigma alike): two names that fold the same may be one
-    /// item there.
-    static func fold(_ name: String) -> String {
-        name.precomposedStringWithCanonicalMapping.folding(options: .caseInsensitive, locale: nil)
-    }
-
-    /// Keep Both's name for `name`: the next that no name in `names` folds to.
+    /// Keep Both's name for `name`: the next that no name in `names` folds to (`diskFolded`).
     static func keepBoth(_ name: String, among names: Set<String>, isFolder: Bool = false) -> String {
-        let folded = Set(names.map(fold))
+        let folded = Set(names.map(\.diskFolded))
         var taken = names
         while true {
             let next = KeepBothName.next(existing: taken, original: name, isFolder: isFolder)
-            if !folded.contains(fold(next)) { return next }
+            if !folded.contains(next.diskFolded) { return next }
             taken.insert(next)
         }
     }

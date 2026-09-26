@@ -217,10 +217,16 @@ public struct NameClash: Sendable {
 
     public mutating func add(_ key: TreeKey) {
         guard found == nil else { return }
-        let text = key.description.precomposedStringWithCanonicalMapping
-        let folded = ignoringCase ? text.folding(options: .caseInsensitive, locale: nil) : text
+        let folded = ignoringCase ? key.description.diskFolded : key.description.precomposedStringWithCanonicalMapping
         if let other = seen[folded] { found = (other, key) } else { seen[folded] = key }
     }
+}
+
+package extension String {
+    /// This name as a disk that ignores case and Unicode form sees it, folding case fully as APFS
+    /// does (`ß` as `ss`, `ﬁ` as `fi`, every sigma alike): two names that fold the same may be one
+    /// item there.
+    var diskFolded: String { precomposedStringWithCanonicalMapping.folding(options: .caseInsensitive, locale: nil) }
 }
 
 /// One paste or drop: items on a saved server, or files on this Mac, copied or moved into a folder

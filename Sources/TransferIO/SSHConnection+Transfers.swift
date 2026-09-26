@@ -287,7 +287,7 @@ extension SSHConnection {
             var used: Set<String> = []
             for try await child in await link.list(item.path) {
                 try Task.checkCancellation()
-                let taken = !used.insert(Placement.fold(child.name)).inserted
+                let taken = !used.insert(child.name.diskFolded).inserted
                 do {
                     try await placeDown(child, named: child.name, in: local.url, taken: taken, link: link, group: &group, tally: tally)
                 } catch {
@@ -844,9 +844,8 @@ final class CopyTally: Sendable {
 
     /// Twice what the data channels carry at once (seven, sixteen small files each): as many jobs
     /// again have settled their names and wait, so a channel never idles while the walk finds the
-    /// next. Only a job holding a channel has a file open. 2,000 small files at 20 ms, files/s
-    /// down / up / server copy: 16 jobs 339 / 226 / 199; 112 jobs 1,590 / 1,578 / 1,269; 224 jobs
-    /// 2,194 / 1,624 / 1,482.
+    /// next. Only a job holding a channel has a file open. At 20 ms, 224 jobs moved 2,000
+    /// small files fastest of 16, 112, and 224 in every direction (2,194 files/s down).
     static let jobLimit = 2 * SSHConnection.dataChannels * SSHConnection.DataShare.whole.rawValue
 
     init(_ report: @escaping @Sendable (TransferProgress) -> Void, memo: Locked<TransferMemo>? = nil, item: Int = 0, moving: Bool = false) {
@@ -947,14 +946,14 @@ private struct Holdings: Sendable {
 
     mutating func add(_ item: RemoteItem) {
         items[item.path.nameBytes] = item
-        folded.insert(Placement.fold(item.name))
+        folded.insert(item.name.diskFolded)
     }
 
     /// The item named `name`. A name the listing holds only in another case or Unicode form is
     /// looked up, since the server's disk may take the two for one.
     func item(named name: [UInt8], at path: RemotePath, on session: SSHConnection) async throws -> RemoteItem? {
         if let item = items[name] { return item }
-        guard folded.contains(Placement.fold(String(decoding: name, as: UTF8.self))) else { return nil }
+        guard folded.contains(String(decoding: name, as: UTF8.self).diskFolded) else { return nil }
         return try await session.existing(path)
     }
 }
