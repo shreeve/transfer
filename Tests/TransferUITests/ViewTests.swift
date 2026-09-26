@@ -49,6 +49,19 @@ struct ViewTests {
         #expect(model.connectingTo?.id == b.id)
     }
 
+    /// A folder's menu offered Open Live and Quick Look, which do nothing for a folder (E2E P3).
+    @Test func aFolderMenuOffersNeitherOpenLiveNorQuickLook() {
+        let model = TransferModel(provider: FakeProvider([]))
+        func titles(_ kind: ItemKind) -> [String] {
+            ItemMenu.fill(item: RemoteItem(path: RemotePath(string: "/home/x"), kind: kind), model: model).items.map(\.title)
+        }
+        #expect(!titles(.directory).contains("Open Live"))
+        #expect(!titles(.directory).contains("Quick Look"))
+        #expect(titles(.directory).contains("Open"))
+        #expect(titles(.file).contains("Open Live"))
+        #expect(titles(.file).contains("Quick Look"))
+    }
+
     /// FR-9: going back to a filter that still holds text keeps Space and Return with it.
     @Test func refocusingTheFilterKeepsThePlainKeysWithIt() async throws {
         _ = NSApplication.shared

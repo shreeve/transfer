@@ -315,8 +315,10 @@ enum ItemMenu {
             return menu
         }
         add("Open") { Task { await model.open(item) } }
-        add("Open Live", enabled: item.kind == .file || item.kind == .symlink) { Task { await model.open(item, forceLive: true) } }
-        add("Quick Look") { model.showPreview(item) }
+        if item.kind != .directory {
+            add("Open Live", enabled: item.kind == .file || item.kind == .symlink) { Task { await model.open(item, forceLive: true) } }
+            add("Quick Look") { model.showPreview(item) }
+        }
         menu.addItem(.separator())
         add("Download Copy…") { Task { await model.downloadCopy() } }
         add("Duplicate") { Task { await model.duplicateSelection() } }
