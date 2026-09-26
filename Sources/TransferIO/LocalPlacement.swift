@@ -49,13 +49,7 @@ enum Placement: Equatable {
 
     /// Keep Both's name for `name`: the next that no name in `names` folds to (`diskFolded`).
     static func keepBoth(_ name: String, among names: Set<String>, isFolder: Bool = false) -> String {
-        let folded = Set(names.map(\.diskFolded))
-        var taken = names
-        while true {
-            let next = KeepBothName.next(existing: taken, original: name, isFolder: isFolder)
-            if !folded.contains(next.diskFolded) { return next }
-            taken.insert(next)
-        }
+        KeepBothName.next(existing: Set(names.map(\.diskFolded)), original: name, isFolder: isFolder, key: \.diskFolded)
     }
 }
 

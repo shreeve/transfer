@@ -55,10 +55,10 @@ public enum LiveConflictChoice: String, Sendable {
 
 /// Every name the app makes up so as not to take an existing one.
 public enum KeepBothName {
-    /// The first of `candidate(first)`, `candidate(first + 1)`, … that `existing` lacks.
-    public static func firstFree(existing: Set<String>, from first: Int = 1, _ candidate: (Int) -> String) -> String {
+    /// The first of `candidate(first)`, `candidate(first + 1)`, … whose `key` `existing` lacks.
+    public static func firstFree(existing: Set<String>, from first: Int = 1, key: (String) -> String = { $0 }, _ candidate: (Int) -> String) -> String {
         var n = first
-        while existing.contains(candidate(n)) { n += 1 }
+        while existing.contains(key(candidate(n))) { n += 1 }
         return candidate(n)
     }
 
@@ -70,9 +70,10 @@ public enum KeepBothName {
     }
 
     /// Keep Both: "report 2.pdf", "report 3.pdf", …; a folder's whole name is kept: "v1.2 2".
-    public static func next(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
+    /// `existing` holds names as `key` gives them.
+    public static func next(existing: Set<String>, original: String, isFolder: Bool = false, key: (String) -> String = { $0 }) -> String {
         let split = splitExtension(original, isFolder: isFolder)
-        return firstFree(existing: existing, from: 2) { "\(split.base) \($0)\(split.ext)" }
+        return firstFree(existing: existing, from: 2, key: key) { "\(split.base) \($0)\(split.ext)" }
     }
 
     /// Duplicate: "notes copy.txt", "notes copy 2.txt", …; a folder's whole name is kept: "v1.2 copy".

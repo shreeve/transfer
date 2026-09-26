@@ -71,6 +71,8 @@ import Testing
 @Test func keepBothInsertsANumberBeforeTheExtension() {
     let name = KeepBothName.next(existing: ["report.pdf", "report 2.pdf"], original: "report.pdf")
     #expect(name == "report 3.pdf")
+    // Compared as the disk folds names, in one pass.
+    #expect(KeepBothName.next(existing: ["report.pdf", "report 2.pdf"], original: "Report.pdf", key: { $0.lowercased() }) == "Report 3.pdf")
 }
 
 @Test func duplicateUsesCopySuffix() {
