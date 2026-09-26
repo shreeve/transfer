@@ -175,7 +175,7 @@ struct DetailColumn: View {
                 LabeledContent("Server", value: hostKeyServer(server, event))
                 LabeledContent("Key type", value: event.keyType)
                 // A SHA-256 fingerprint is always 43 characters of base64: one line at this size.
-                LabeledContent("SHA256", value: event.fingerprint)
+                LabeledContent("Fingerprint", value: event.fingerprint)
                     .font(.callout.monospaced())
                     .lineLimit(1)
                     .textSelection(.enabled)
