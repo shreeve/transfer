@@ -72,7 +72,7 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
         let prompts = prompts
         let finish = Locked(completionHandler)
         // Published so Finder draws progress on the icon it is filling in, and can cancel it.
-        let progress = Progress(totalUnitCount: item.kind == .directory ? -1 : Int64(item.size ?? 0))
+        let progress = Progress(totalUnitCount: item.kind == .directory ? -1 : Int64(clamping: item.size ?? 0))
         progress.kind = .file
         progress.fileOperationKind = .downloading
         progress.fileURL = url
@@ -82,7 +82,7 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
             do {
                 try await OperationPrompts.$current.withValue(prompts) {
                     try await session.download(path, to: url) { done in
-                        progress.completedUnitCount = Int64(done.completed)
+                        progress.completedUnitCount = Int64(clamping: done.completed)
                     }
                 }
                 finish.value(nil)
@@ -92,6 +92,8 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
             progress.unpublish()
         }
         progress.cancellationHandler = { task.cancel() }
+        // A cancel from Finder before the handler was set.
+        if progress.isCancelled { task.cancel() }
     }
 
     static func providers(for items: [RemoteItem], session: any RemoteSession, prompts: any PromptSink) -> [RemoteItemPromise] {
