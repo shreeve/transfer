@@ -138,6 +138,15 @@ struct PlacementTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: base.path) == ["spot"])
     }
 
+    /// One file that changed on the server, a growing log, ended and restarted a whole folder
+    /// copy (XFR-05); only a cancel, a dropped connection, or a timeout does.
+    @Test func onlyTheConnectionEndsACopy() {
+        #expect(!CopyTally.ends(TransferError.changedOnServer("app.log")))
+        #expect(!CopyTally.ends(TransferError.failed("Permission denied")))
+        #expect(CopyTally.ends(TransferError.connectionLost("gone")))
+        #expect(CopyTally.ends(CancellationError()))
+    }
+
     /// Keep Both never lands on a name the disk already holds in another case.
     @Test func keepBothSkipsNamesTheDiskFolds() throws {
         let base = try scratch("keep")

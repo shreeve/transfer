@@ -77,6 +77,15 @@ import Testing
     #expect(TransferKept.Reason(.alreadyThere(["x"])) == .alreadyThere)
 }
 
+/// Sizes are a server's numbers: two that add past 2^64 trapped Copy (SEC2-04).
+@Test func sizesFromAServerSaturate() {
+    var tally = ClipTally()
+    tally.add(root: .file(size: .max - 1))
+    tally.add(root: .file(size: 2))
+    #expect(tally.bytes == .max)
+    #expect(UInt64(3).saturatingAdd(4) == 7)
+}
+
 /// A paste whose items could not be copied is a failure the user must see, not a grey "Kept".
 @Test func keptWithAFailedItemIsAFailure() {
     #expect(!TransferKept([.init("a", .alreadyThere), .init("b", .live(1))], moving: true, place: "on this Mac").hasFailures)

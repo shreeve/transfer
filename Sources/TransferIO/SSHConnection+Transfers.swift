@@ -151,7 +151,7 @@ extension SSHConnection {
             // The temp is renamed on the channel that wrote it, once every write is acknowledged.
             try await withData(DataShare(size: local?.size)) { link in
                 try await self.send(source, size: local?.size, to: temp, on: link, stamp: stamp, progress: progress)
-                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
+                try await self.place(temp, onto: placed, replacing: replacing, on: link)
             }
         }
     }
@@ -541,18 +541,37 @@ extension SSHConnection {
             let onServer = try await withData(DataShare(size: item.size)) { link in
                 guard await link.extensions.contains("copy-data") else { return false }
                 try await link.copyData(item.path, to: temp, stamp: stamp)
-                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
+                try await self.place(temp, onto: placed, replacing: replacing, on: link)
                 return true
             }
             guard !onServer else { return }
             let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            defer { try? FileManager.default.removeItem(at: scratch) }
+            store.rememberTemp(local: scratch)
+            defer { removeScratch(scratch) }
             try await fetch(item.path, info: item, to: scratch) { _ in }
             try await withData(DataShare(size: item.size)) { link in
                 try await self.send(scratch, size: item.size, to: temp, on: link, stamp: stamp) { _ in }
-                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
+                try await self.place(temp, onto: placed, replacing: replacing, on: link)
             }
         }
+    }
+
+    /// Renames the finished `temp` onto `placed` on `link`, the channel that wrote it. Without
+    /// `replacing` the rename refuses a name taken since it was looked up, which is said so rather
+    /// than with the server's bare "Failure" (XFR-06).
+    private func place(_ temp: RemotePath, onto placed: RemotePath, replacing: Bool, on link: SFTPChannel) async throws {
+        do {
+            try await link.place(temp, onto: placed, replacing: replacing, log: asides)
+        } catch where !replacing && !CopyTally.ends(error) {
+            guard try await link.lookup(placed) != nil else { throw error }
+            throw TransferError.failed("“\(placed.name)” appeared at the destination while it was being copied, and was not replaced")
+        }
+    }
+
+    /// Removes a scratch file or folder on this Mac, recorded as a temp, and forgets it once gone.
+    nonisolated func removeScratch(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
+        if !FileManager.default.fileExists(atPath: url.path) { store.forgetTemp(local: url) }
     }
 
     /// Runs `body` on a hidden temp beside `placed`, recorded so a later login removes it if this
@@ -660,17 +679,23 @@ extension SSHConnection {
         try await cachedCopy(stat(path), lane: .view)
     }
 
+    /// The inspector previews a file that is not text only up to this size. A download reads no
+    /// more than the size listed, so the limit holds against what is read; a file listed without
+    /// one could be read without end, and is refused (SEC2-03).
+    static let inspectorLimit: UInt64 = 8 << 20
+
     public func prepareInspectorPreview(_ path: RemotePath) async throws -> URL {
         let item = try await stat(path)
         let head = UInt64(EditableFile.previewHead)
-        guard EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live,
-              let print = Fingerprint(item: item), print.size > head else {
+        guard EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live, (item.size ?? .max) > head else {
+            guard (item.size ?? .max) <= Self.inspectorLimit else { throw TransferError.failed("“\(item.name)” is too large to preview here") }
             return try await cachedCopy(item, lane: .preview)
         }
         // Only the head of a text file is shown, so only the head is fetched. The copy is named for
         // the file's size and time, so an unchanged file reuses it.
-        let file = try previewURL(path, name: item.name, version: "head \(print.size):\(print.mtime)")
-        if FileManager.default.fileExists(atPath: file.path) { return file }
+        let print = Fingerprint(item: item)
+        let file = try previewURL(path, name: item.name, version: "head " + (print.map { "\($0.size):\($0.mtime)" } ?? ""))
+        if print != nil, FileManager.default.fileExists(atPath: file.path) { return file }
         try await fetchHead(path, limit: head, to: file)
         trimPreviewCache()
         return file
@@ -708,7 +733,9 @@ extension SSHConnection {
             try await fetchHead(path, limit: min(item.size ?? limit, limit), to: part)
             defer { try? FileManager.default.removeItem(at: part) }
             let data = try Data(contentsOf: part)
-            guard let text = String(data: data, encoding: .utf8) else {
+            // A head cut short may end inside a character: up to three of its bytes are dropped.
+            let cut = (item.size ?? .max) > limit ? 3 : 0
+            guard let text = (0...cut).lazy.compactMap({ String(validating: data.dropLast($0), as: UTF8.self) }).first else {
                 return try await cachedCopy(item, lane: .preview)
             }
             let html = SyntaxPreview.html(text: text, fileName: item.name)
@@ -883,8 +910,10 @@ final class CopyTally: Sendable {
     }
 
     /// Whether `error` ends a whole copy or paste, not just one item: a cancel, a dropped
-    /// connection, or a timeout, on which it stops or is retried.
+    /// connection, or a timeout, on which it stops or is retried. A file that changed on the
+    /// server is that file's fault: the others go on, and a retry fetches only it (XFR-05).
     static func ends(_ error: any Error) -> Bool {
+        if case .changedOnServer? = error as? TransferError { return false }
         if error is CancellationError || RetryPolicy.isRetryable(error) { return true }
         guard let error = error as? TransferError else { return false }
         return error == .cancelled || error == .notConnected
@@ -902,7 +931,7 @@ final class CopyTally: Sendable {
 
     private func add(bytes: UInt64, items: Int) {
         let progress = state.withLock { state in
-            state.bytes += bytes
+            state.bytes = state.bytes.saturatingAdd(bytes)
             state.items += items
             return TransferProgress(completed: state.bytes, itemsCompleted: state.items)
         }

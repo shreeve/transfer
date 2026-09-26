@@ -24,9 +24,9 @@ struct TransferEngine {
         self.request = request
         self.destination = destination
         // Between servers, every byte passes twice: down to this Mac and up again.
-        var passes: UInt64 = 1
-        if case .server(let id, _) = request.sources, id != request.connection { passes = 2 }
-        sum = ProgressSum(progress, total: request.bytes.map { $0 * passes })
+        var total = request.bytes
+        if case .server(let id, _) = request.sources, id != request.connection { total = total.map { $0.saturatingAdd($0) } }
+        sum = ProgressSum(progress, total: total)
     }
 
     /// `source` is the server the items are on, when it is not the destination.
@@ -98,8 +98,10 @@ struct TransferEngine {
             let parents = Set(paths.compactMap(\.parent))
             try await proveApart { try await source.holds($0, inAny: parents) ? Self.ontoItself("the folder the items came from, reached through another saved server") : nil }
         }
+        // Recorded like a temp, so the next launch removes what a crash left (XFR-07).
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("Transfer-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: scratch) }
+        destination.store.rememberTemp(local: scratch)
+        defer { destination.removeScratch(scratch) }
         let ignoresCase = (try? FileManager.default.temporaryDirectory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames != true
         try await each(paths, place: "on the other server", name: \.name) { index, path in
             // The Mac's disk may not hold two names the server keeps apart. Refused before
@@ -318,7 +320,7 @@ final class ProgressSum: Sendable {
     /// The reporter for the next copy. What the previous one reported is kept.
     func next() -> @Sendable (TransferProgress) -> Void {
         state.withLock { state in
-            state.base.completed += state.current.completed
+            state.base.completed = state.base.completed.saturatingAdd(state.current.completed)
             state.base.itemsCompleted += state.current.itemsCompleted
             state.current = TransferProgress(completed: 0)
         }
@@ -326,7 +328,7 @@ final class ProgressSum: Sendable {
             let combined = state.withLock { state in
                 state.current = progress
                 return TransferProgress(
-                    completed: state.base.completed + progress.completed,
+                    completed: state.base.completed.saturatingAdd(progress.completed),
                     total: total,
                     itemsCompleted: state.base.itemsCompleted + progress.itemsCompleted
                 )

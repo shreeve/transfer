@@ -87,10 +87,18 @@ public struct ClipTally: Hashable, Sendable {
             break
         case .file(let size, _):
             allFiles += 1
-            bytes += size
+            bytes = bytes.saturatingAdd(size)
         case .link, .other:
             allFiles += 1
         }
+    }
+}
+
+package extension UInt64 {
+    /// The sum, or `.max` where it would overflow: sizes come from an untrusted server (SEC2-04).
+    func saturatingAdd(_ other: UInt64) -> UInt64 {
+        let (sum, overflow) = addingReportingOverflow(other)
+        return overflow ? .max : sum
     }
 }
 
