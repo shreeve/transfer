@@ -231,12 +231,9 @@ struct DetailColumn: View {
     /// The server's name, and the host its key line names when that says more.
     private func hostKeyServer(_ server: String?, _ event: HostKeyEvent) -> String {
         let host = HostKeyLine(line: event.line)?.host
-        switch (server, host) {
-        case let (server?, host?) where host != server: return "\(server) (\(host))"
-        case let (server?, _): return server
-        case let (nil, host?): return host
-        case (nil, nil): return "Unknown"
-        }
+        guard let server else { return host ?? "Unknown" }
+        guard let host, host != server else { return server }
+        return "\(server) (\(host))"
     }
 
     /// "Delete “notes.txt”?" for one item, "Delete 3 items?" for more, so the sheet says what
@@ -395,18 +392,16 @@ private struct Shelf: View {
                     Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if let label = stateLabel(operation) {
+            if let label = model.stateLabel(operation) {
                 Text(label).font(.caption).foregroundStyle(.secondary)
             }
             // A Live file's sync pauses and resumes. A transfer can only stop: it restarts from its
             // first byte, since a stopped transfer's temp is removed.
             let live = operation.livePath != nil
             switch operation.state {
-            case .active:
+            case .active, .queued:
                 Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
-            case .queued:
-                Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
-                if !live { Button("Remove") { model.remove(operation) } }
+                if operation.state == .queued, !live { Button("Remove") { model.remove(operation) } }
             case .paused:
                 Button(live ? "Resume" : "Restart") { Task { await model.resume(operation) } }
                 if !live { Button("Remove") { model.remove(operation) } }
@@ -433,16 +428,6 @@ private struct Shelf: View {
         if let message = operation.message, operation.state != .active { parts.append(message) }
         if let server = model.otherServerName(for: operation) { parts.append("on \(server)") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    private func stateLabel(_ operation: TransferOperation) -> String? {
-        switch operation.state {
-        case .queued: "Waiting"
-        case .active: nil
-        case .paused: operation.livePath == nil ? "Stopped" : "Paused"
-        case .failed: model.isKept(operation) ? "Kept" : "Failed"
-        case .succeeded: "Done"
-        }
     }
 
     private func progressText(_ progress: TransferProgress) -> String {
@@ -604,7 +589,7 @@ struct InspectorColumn: View {
             if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
             if let live = model.liveFile(for: item.path) { line(live.status.label) }
             if let operation = model.operation(for: item.path) {
-                line(operation.message ?? operation.state.rawValue.capitalized)
+                line(operation.message ?? model.stateLabel(operation) ?? "Active")
             }
         }
         .font(.subheadline)
@@ -759,7 +744,8 @@ private struct RenameBar: View {
             focused = true
             DispatchQueue.main.async { focused = true }
         }
-        .onChange(of: focused) { model.textEditing = focused }
+        // Command-F takes the keyboard from this field to the search field, which edits text too.
+        .onChange(of: focused) { model.textEditing = focused || NSApp.keyWindow?.firstResponder is NSText }
         .onDisappear {
             model.textEditing = false
             // Escape or Return leaves the keyboard with the window itself; it goes back to the
@@ -815,8 +801,8 @@ struct SourcePreview: NSViewRepresentable {
     }
 
     private func load(into view: WKWebView, context: Context) {
-        let page = Coordinator.Page(text: text, fileName: fileName, wraps: wraps)
-        guard context.coordinator.page != page else { return }
+        let page = (text: text, fileName: fileName, wraps: wraps)
+        if let shown = context.coordinator.page, shown == page { return }
         context.coordinator.page = page
         view.loadHTMLString(SyntaxPreview.html(text: text, fileName: fileName, compact: true, wraps: wraps), baseURL: nil)
     }
@@ -824,13 +810,7 @@ struct SourcePreview: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
-        struct Page: Equatable {
-            var text: String
-            var fileName: String
-            var wraps: Bool
-        }
-
-        var page: Page?
+        var page: (text: String, fileName: String, wraps: Bool)?
     }
 }
 

@@ -34,4 +34,18 @@ struct SheetTests {
         #expect(reply.text == "typed for B")
         #expect(!reply.saveInKeychain)
     }
+
+    /// UIM2-04: a second Discard sheet waits for the first instead of replacing it.
+    @Test func eachRefusedDiscardAsksInTurn() async {
+        let session = FakeSession(a)
+        session.refusesDiscard.value = true
+        let model = TransferModel(provider: FakeProvider([session]))
+        await model.connect(a)
+        let one = RemotePath(string: "/home/one.txt"), two = RemotePath(string: "/home/two.txt")
+        await model.discardLive(one)
+        await model.discardLive(two)
+        #expect(model.sheet?.id == AppSheet.discardLive(one, a.id).id)
+        model.sheet = nil
+        #expect(model.sheet?.id == AppSheet.discardLive(two, a.id).id)
+    }
 }

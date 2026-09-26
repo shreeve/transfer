@@ -1256,6 +1256,17 @@ public final class TransferModel {
         operation.state == .failed && keptRows.contains(operation.id)
     }
 
+    /// A row's state in the words the shelf and the inspector share; nil while it runs.
+    public func stateLabel(_ operation: TransferOperation) -> String? {
+        switch operation.state {
+        case .queued: "Waiting"
+        case .active: nil
+        case .paused: operation.livePath == nil ? "Stopped" : "Paused"
+        case .failed: isKept(operation) ? "Kept" : "Failed"
+        case .succeeded: "Done"
+        }
+    }
+
     private func update(_ id: String, _ change: (inout TransferOperation) -> Void) {
         guard let index = operations.firstIndex(where: { $0.id == id }) else { return }
         change(&operations[index])
@@ -1427,6 +1438,7 @@ public final class TransferModel {
                 }
             } else {
                 await refresh()
+                guard isCurrent(context) else { return }
                 snapshot.selection = [destination]
                 // The icon view makes a new cell for the new name; the old one had the keyboard.
                 DispatchQueue.main.async { [weak self] in
@@ -1682,9 +1694,9 @@ public final class TransferModel {
     }
 
     public func reveal(_ path: RemotePath) async {
-        guard let parent = path.parent else { return }
+        guard let context, let parent = path.parent else { return }
         if parent != snapshot.path { await navigate(parent) }
-        snapshot.selection = [path]
+        if isCurrent(context) { snapshot.selection = [path] }
     }
 
     public func openTerminal() async {
@@ -1849,7 +1861,7 @@ public enum AppSheet: Identifiable {
         case .conflict(let path, _): "conflict-\(path.display)"
         case .goToFolder: "goto"
         case .removeServer: "remove"
-        case .discardLive: "discard"
+        case .discardLive(let path, _): "discard-\(path.display)"
         }
     }
 
@@ -2066,6 +2078,8 @@ final class OperationPrompt: PromptSink {
             _ = await current.value
             if asking == current { asking = nil }
         }
+        // Cancelled while waiting its turn: no question flickers up only to be withdrawn.
+        if Task.isCancelled { return nil }
         if let applyToAll { return applyToAll }
         let window = window
         // The question records Apply to All itself, before anyone waiting on it looks.
