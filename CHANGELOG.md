@@ -14,7 +14,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - A Live save no longer replaces another writer's file that happens to have the edit's size and modification second; that is a conflict. An edit refused because the server's file changed can no longer be marked synced later without having uploaded.
 - Reopening a Live file that an editor re-saved unchanged picks up the server's newer version, instead of leaving you to edit old bytes into a conflict.
 - Live files survive a moved or restored library folder: unsynced edits are no longer forgotten, and a damaged record can never delete anything outside Transfer's Live folder.
-- A file a replace set aside is never deleted if you go back to Transfer 0.1.7.
+- A file a replace set aside, including one Transfer 0.2.0 set aside, is never deleted if you go back to Transfer 0.1.7.
 - A folder listing no longer stops at a page holding only names Transfer drops (such as `.` and `..`), so a folder copy no longer reports success with files missing.
 - A file shortened on the server while it downloads is read again instead of being saved short.
 - Moving a folder onto a folder of the same name that is the folder itself, reached another way (a bind mount, or one network share at two paths), is refused instead of copying it onto itself and removing the only copy.

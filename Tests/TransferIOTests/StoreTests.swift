@@ -208,7 +208,9 @@ struct StoreTests {
 
     /// WIR-02: a file a replace set aside was recorded as a temp that 0.1.7 read up to its NUL,
     /// as the aside itself, and removed at its next login: the old file's only copy. 0.1.7's
-    /// reads never see an aside record now; this build reads both forms, and Remove drops both.
+    /// reads never see an aside record now, nor one 0.2.0 wrote under the server's own key, which
+    /// the next open moves to the aside key (FR-5) without a schema change, so 0.2.0 still opens
+    /// the library. This build reads both forms, and Remove drops both.
     @Test func olderTransferNeverSeesAFileSetAside() throws {
         let root = TestCaches.fresh("store")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -219,10 +221,13 @@ struct StoreTests {
         let written020 = SSHConnection.asideRecord(RemotePath(string: "/srv/.transfer-old-2"), RemotePath(string: "/srv/b.txt"))
         store.rememberTemp(aside, connection: alpha, aside: true)
         store.rememberTemp(written020, connection: alpha)
+        for _ in 0..<2 { _ = try Store(root: root) }
 
         let old = try Raw(root)
+        #expect(old.value("PRAGMA user_version") == String(Store.schemaVersion))
+        #expect(old.value("SELECT count(*) FROM temps WHERE connection_id = '\(Self.alpha) aside'") == "2")
         old.launchAs017()
-        #expect(old.values("SELECT path FROM temps WHERE connection_id = '\(Self.alpha)'").sorted() == ["/srv/.b.transfer-2", "/srv/.transfer-old-2"])
+        #expect(old.values("SELECT path FROM temps WHERE connection_id = '\(Self.alpha)'").sorted() == ["/srv/.b.transfer-2"])
         #expect(old.values("SELECT path FROM temps WHERE connection_id IS NULL OR connection_id = ''").sorted() == ["/tmp/.a.transfer-1", "/tmp/.c.transfer-3"])
         #expect(Set(store.remoteTemps(connection: alpha)) == [aside, written020, RemotePath(string: "/srv/.b.transfer-2")])
         #expect(SSHConnection.aside(in: aside)?.placed == RemotePath(string: "/srv/a.txt"))

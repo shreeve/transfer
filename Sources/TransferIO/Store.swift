@@ -73,6 +73,12 @@ final class Store: @unchecked Sendable {
             // of failing at once.
             sqlite3_busy_timeout(db, 5_000)
             while try transaction(migrateOneStep) {}
+            // 0.2.0 recorded a file set aside under the server's own key, where 0.1.7 reads it up
+            // to its NUL as a temp and would remove the old file's only copy. Every open moves
+            // such a record to the aside key; the schema does not change, so 0.2.0 still opens it.
+            report("re-key the records of files set aside") {
+                try execute("UPDATE temps SET connection_id = connection_id || ' aside' WHERE instr(CAST(path AS BLOB), X'00') > 0 AND connection_id <> '' AND connection_id NOT LIKE '% aside'")
+            }
             // WAL makes a commit one log append, not a rollback journal's create, write, fsync,
             // and unlink, and lets the other process read during a write. The mode persists in the
             // file but cannot change during another process's transaction; this launch then keeps
