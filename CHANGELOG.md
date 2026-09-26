@@ -26,7 +26,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - A saved password answers only the prompt ssh itself writes for that server, so a `ProxyJump` host can no longer get it by asking for it by name.
 - A password typed into a login sheet that was withdrawn, and its Save in Keychain, no longer fill in the next login sheet, which could be another server's.
 - A server that lists wrong or missing sizes can no longer fill the disk: copying for the Finder stops staging at 1 GB actually received, and the inspector previews a file only up to 8 MB whatever its listing said. A huge listed size no longer crashes a copy or a drag to the Finder.
-- The launch removes a leftover download temp only when it is a file with a temp's name, so a copied or edited library cannot make it delete a folder.
+- The launch removes a leftover download temp only when it is a file with a temp's name, so a copied or edited library cannot make it delete a folder. Copies passing through this Mac, between servers or on a server without `copy-data`, go through a folder in Transfer's caches that each launch empties, instead of `$TMPDIR`.
 - A name holding a slash followed by a combining accent is refused as a file name, as any name with a slash is.
 - `xfer` shows C1 control characters in a file name as `?`, as it does other control characters, so a crafted name cannot drive the terminal.
 

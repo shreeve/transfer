@@ -100,11 +100,9 @@ struct TransferEngine {
             let parents = Set(paths.compactMap(\.parent))
             try await proveApart { try await source.holds($0, inAny: parents) ? Self.ontoItself("the folder the items came from, reached through another saved server") : nil }
         }
-        // Recorded like a temp, so the next launch removes what a crash left (XFR-07).
-        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("Transfer-\(UUID().uuidString)", isDirectory: true)
-        destination.store.rememberTemp(local: scratch)
-        defer { destination.removeScratch(scratch) }
-        let ignoresCase = (try? FileManager.default.temporaryDirectory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames != true
+        let scratch = try destination.store.makeScratch()
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let ignoresCase = (try? scratch.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames != true
         try await each(paths, place: "on the other server", name: \.name) { index, path in
             // The Mac's disk may not hold two names the server keeps apart. Refused before
             // anything is copied, since one of the two would stand in for the other.

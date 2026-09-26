@@ -72,14 +72,15 @@ struct MoveServerTests {
                 try h.setTime("from/report.txt", 1_700_000_000)
                 let to = try h.folder("to")
                 let planted = Locked(false)
-                let scratch = Locked<[URL]>([])
+                let scratch = Locked<[String]>([])
+                let scratchRoot = try Store(root: h.root).scratch.path
                 let request = TransferRequest(.server(alias.connection.id, [from.appending("report.txt")]), into: to, on: h.session.connection.id, moving: true)
                 // During the download, someone else writes a file of the same size and time.
                 let engine = TransferEngine(request: request, destination: h.session) { _ in
                     guard !planted.withLock({ defer { $0 = true }; return $0 }) else { return }
                     try? h.write("to/report.txt", "BBBB")
                     try? h.setTime("to/report.txt", 1_700_000_000)
-                    scratch.value = (try? Store(root: h.root).localTemps()) ?? []
+                    scratch.value = (try? FileManager.default.contentsOfDirectory(atPath: scratchRoot)) ?? []
                 }
                 let skip = TestPrompts(collision: .skip)
                 await #expect(throws: TransferKept([.init("report.txt", .alreadyThere)], moving: true, place: "on the other server")) {
@@ -89,9 +90,10 @@ struct MoveServerTests {
                 #expect(skip.collisions == 1)
                 #expect(try h.read("from/report.txt") == "AAAA")
                 #expect(try h.read("to/report.txt") == "BBBB")
-                // The scratch folder on this Mac was recorded, so a crash leaves it to the next
-                // launch, not to the OS's purge (XFR-07), and forgotten once removed.
-                #expect(scratch.value.contains { $0.lastPathComponent.hasPrefix("Transfer-") })
+                // The copy passed through the library's scratch folder, which the next launch
+                // empties if a crash leaves anything there (XFR-07, FR-1), and was removed.
+                #expect(scratch.value.count == 1)
+                #expect(try FileManager.default.contentsOfDirectory(atPath: scratchRoot).isEmpty)
                 #expect(try Store(root: h.root).localTemps().isEmpty)
             }
         }

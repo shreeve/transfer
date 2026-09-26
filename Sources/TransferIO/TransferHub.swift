@@ -22,6 +22,7 @@ public actor TransferHub: SessionProvider {
         libraryLock = try Self.lockLibrary(root)
         store = try Store(root: root)
         SSHConnection.removeLoginScratch(in: store.root)
+        try? FileManager.default.removeItem(at: store.scratch)
         config = ConfigLoader.load(root: store.root)
         live = LiveSync(store: store)
         for temp in store.localTemps() {

@@ -543,12 +543,12 @@ extension SSHConnection {
                 return true
             }
             guard !onServer else { return }
-            let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            store.rememberTemp(local: scratch)
-            defer { removeScratch(scratch) }
-            try await fetch(item.path, info: item, to: scratch) { _ in }
+            let scratch = try store.makeScratch()
+            defer { try? FileManager.default.removeItem(at: scratch) }
+            let file = scratch.appendingPathComponent("file")
+            try await fetch(item.path, info: item, to: file) { _ in }
             try await withData(DataShare(size: item.size)) { link in
-                try await self.send(scratch, size: item.size, to: temp, on: link, stamp: stamp) { _ in }
+                try await self.send(file, size: item.size, to: temp, on: link, stamp: stamp) { _ in }
                 try await self.place(temp, onto: placed, replacing: replacing, on: link)
             }
         }
@@ -564,12 +564,6 @@ extension SSHConnection {
             guard try await link.lookup(placed) != nil else { throw error }
             throw TransferError.failed("“\(placed.name)” appeared at the destination while it was being copied, and was not replaced")
         }
-    }
-
-    /// Removes a scratch file or folder on this Mac, recorded as a temp, and forgets it once gone.
-    nonisolated func removeScratch(_ url: URL) {
-        try? FileManager.default.removeItem(at: url)
-        if !FileManager.default.fileExists(atPath: url.path) { store.forgetTemp(local: url) }
     }
 
     /// Runs `body` on a hidden temp beside `placed`, recorded so a later login removes it if this

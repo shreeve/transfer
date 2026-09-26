@@ -54,6 +54,24 @@ struct HubTests {
         #expect(!TransferHub.isTempName("a.transfer-\(UUID().uuidString)"))
     }
 
+    /// A copy passing through this Mac, between servers or on one without `copy-data`, is whole
+    /// items in `Scratch/`. Recorded as temps in `$TMPDIR`, a crash left them there, since the sweep
+    /// removes only temp-named files (FR-1). The launch empties `Scratch/` instead.
+    @Test func launchEmptiesTheScratchFolder() throws {
+        let base = TestCaches.fresh("hubscratch")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        let left = try Store(root: root).makeScratch()
+        #expect(left.deletingLastPathComponent() == root.appendingPathComponent("Caches/Scratch", isDirectory: true))
+        try FileManager.default.createDirectory(at: left.appendingPathComponent("0/sub"), withIntermediateDirectories: true)
+        try Data("copy".utf8).write(to: left.appendingPathComponent("0/sub/a.txt"))
+
+        _ = try TransferHub(root: root)
+
+        #expect(!FileManager.default.fileExists(atPath: left.deletingLastPathComponent().path))
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("transfer.sqlite").path))
+    }
+
     /// Two copies on one library would sweep each other's login scratch, temps, and control
     /// sockets, so the second copy is refused until the first lets go.
     @Test func oneCopyOfTransferPerLibrary() async throws {

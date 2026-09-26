@@ -38,6 +38,16 @@ final class Store: @unchecked Sendable {
     let cacheRoot: URL
     /// Previews and viewed copies, for every server.
     var previewCache: URL { cacheRoot.appendingPathComponent("Preview", isDirectory: true) }
+    /// Copies passing through this Mac, between servers or on one without `copy-data`. The hub
+    /// empties it at launch, under the library lock, so a crash leaves no copy behind.
+    var scratch: URL { cacheRoot.appendingPathComponent("Scratch", isDirectory: true) }
+
+    /// A new folder in `scratch`, which only this user can read.
+    func makeScratch() throws -> URL {
+        let folder = scratch.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        return folder
+    }
 
     /// `~/Library/Application Support/Transfer`, the library when no other root is given.
     static var standardRoot: URL {
