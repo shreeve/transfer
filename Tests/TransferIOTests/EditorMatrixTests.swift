@@ -324,7 +324,7 @@ struct EditorMatrix {
             #expect(h.events.succeeded(c.path) == 0)
             #expect(c.watch.renames == 0)
             #expect(file?.dirty == false && file?.uploading == false && file?.conflict == false)
-            #expect(await h.session.unsyncedLiveCount == 0)
+            #expect(await h.live.unsyncedCount(on: h.session.connection.id) == 0)
         }
     }
 

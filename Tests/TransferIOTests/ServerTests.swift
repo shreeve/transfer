@@ -333,7 +333,7 @@ struct ServerTests {
             #expect(uploaded)
             let clean = await waitUntil { await h.session.liveFiles().first?.dirty == false }
             #expect(clean)
-            #expect(await h.session.unsyncedLiveCount == 0)
+            #expect(await h.live.unsyncedCount(on: h.session.connection.id) == 0)
 
             // Someone else changes the server copy; the next local edit becomes a conflict.
             try Data("remote-edit".utf8).write(to: remoteFile)

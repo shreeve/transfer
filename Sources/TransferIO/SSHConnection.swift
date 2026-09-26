@@ -95,7 +95,6 @@ public actor SSHConnection: RemoteSession {
     }
 
     public var isConnected: Bool { startPath != nil && master?.isRunning == true }
-    var unsyncedLiveCount: Int { get async { await live.unsyncedCount(on: connection.id) } }
 
     // MARK: Login
 
