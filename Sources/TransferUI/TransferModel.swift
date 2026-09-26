@@ -344,6 +344,13 @@ public final class TransferModel {
             displayedIndexCache = nil
         }
         if filteredColumn != column { filteredColumn = column }
+        // In list and icon view the selection keeps only what is shown, as in Finder, so nothing
+        // the filter or hidden files took away is copied, dragged, or deleted unseen. A listing
+        // still arriving keeps it whole.
+        if snapshot.viewMode != .columns, listing?.complete == true {
+            let shownSelection = snapshot.selection.filter { displayedIndex[$0] != nil }
+            if shownSelection.count != snapshot.selection.count { snapshot.selection = shownSelection }
+        }
     }
 
     // MARK: Servers
@@ -788,29 +795,31 @@ public final class TransferModel {
         snapshot.showsHidden ? items : items.filter { !$0.isHidden }
     }
 
-    /// A selected item the location does not list. In column view a selected folder is the
-    /// location itself, so it is in its parent's listing.
+    /// An item in its folder's cached listing.
     private func listedItem(_ path: RemotePath) -> RemoteItem? {
         guard let parent = path.parent else { return nil }
         return listings[parent]?.items.first { $0.path == path }
     }
 
-    public var primaryItem: RemoteItem? {
-        let shown = displayedItems
-        guard !snapshot.selection.isEmpty else { return nil }
-        if let index = snapshot.selection.compactMap({ displayedIndex[$0] }).min() { return shown[index] }
-        return snapshot.selection.compactMap(listedItem).min { $0.path.display < $1.path.display }
-    }
+    public var primaryItem: RemoteItem? { selectedItems.first }
 
     /// Menu items whose shortcut is a plain key stay out of the way of text entry.
     public var plainKeysAvailable: Bool { !textEditing && sheet == nil }
 
+    /// The selected items shown, in list order, then any others by path: in column view a selected
+    /// folder is the location itself, found in its parent's listing. One pass per folder, since
+    /// the menus and the inspector read this on every change.
     public var selectedItems: [RemoteItem] {
-        let shown = displayedItems
         guard !snapshot.selection.isEmpty else { return [] }
-        let indexes = snapshot.selection.compactMap { displayedIndex[$0] }
-        if indexes.count == snapshot.selection.count { return indexes.sorted().map { shown[$0] } }
-        return snapshot.selection.compactMap(listedItem).sorted { $0.path.display < $1.path.display }
+        var rows: [Int] = []
+        var unshown: Set<RemotePath> = []
+        for path in snapshot.selection {
+            if let row = displayedIndex[path] { rows.append(row) } else { unshown.insert(path) }
+        }
+        let shown = rows.sorted().map { displayedItems[$0] }
+        guard !unshown.isEmpty else { return shown }
+        let listed = Set(unshown.compactMap(\.parent)).flatMap { listings[$0]?.items.filter { unshown.contains($0.path) } ?? [] }
+        return shown + listed.sorted { $0.path.display < $1.path.display }
     }
 
     /// A single selected folder becomes the location, as in Finder, and stays selected; files and
@@ -884,6 +893,7 @@ public final class TransferModel {
         snapshot.viewMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: Preferences.viewMode)
         if mode == .columns { columnRoot = snapshot.path }
+        refreshItems()
     }
 
     // MARK: Open
