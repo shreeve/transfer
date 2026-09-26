@@ -70,6 +70,9 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - A move on one server onto a name the destination already holds asks Replace, Keep Both, or Skip, instead of failing.
 - Saved servers are listed in Finder's order.
 - In icon view, Shift-click adds or removes an item, and clicking one of several selected items selects just that one, as in Finder. In list and icon view, once a folder has listed, the selection keeps only the items shown, so a filter never leaves items selected out of sight.
+- A click or drag on an item in a background window selects or drags it at once, as in Finder, instead of only bringing the window forward.
+- Rename selects a file's name up to its extension, as Finder does; a folder's whole name stays selected.
+- A folder's shortcut menu no longer offers Open Live or Quick Look.
 - The inspector shows the time in the Mac's own clock format, for example 24-hour; the date stays year-month-day.
 - Command-Delete in the filter or rename field edits the text instead of offering to delete files.
 - Open in Terminal says why when it does nothing.
