@@ -64,6 +64,12 @@ actor LiveSync {
         var name: String { path.name }
         var folder: URL { local.deletingLastPathComponent() }
 
+        /// How a copy with `stamp` compares with the last sync, from the digest measured at that
+        /// stamp if there is one: `.needDigest` when its bytes must be read to tell.
+        func change(at stamp: LiveStamp) -> LiveLocalChange {
+            LiveDecision.localChange(state, stamp, digest: measured.flatMap { $0.stamp == stamp ? $0.digest : nil })
+        }
+
         /// The working copy with `stamp` and `digest` holds what the server holds as `print`.
         mutating func recordSync(_ print: Fingerprint, _ stamp: LiveStamp?, _ digest: String?) {
             state.base = print
@@ -144,11 +150,14 @@ actor LiveSync {
             }
             entry.observed = stamp
             let folderTime = (try? FileManager.default.attributesOfItem(atPath: folder.path)[.modificationDate] as? Date) ?? .distantPast
-            if Date().timeIntervalSince(max(stamp.mtime, folderTime)) > expiry,
-               !LiveDecision.isUnsynced(entry.state, localChange(entry.state, entry.local, stamp)) {
-                store.deleteLive(row.id)
-                try? FileManager.default.removeItem(at: folder)
-                continue
+            if Date().timeIntervalSince(max(stamp.mtime, folderTime)) > expiry {
+                var change = entry.change(at: stamp)
+                if change == .needDigest { change = LiveDecision.localChange(entry.state, stamp, digest: digest(of: entry.local) ?? unreadable) }
+                if !LiveDecision.isUnsynced(entry.state, change) {
+                    store.deleteLive(row.id)
+                    try? FileManager.default.removeItem(at: folder)
+                    continue
+                }
             }
             loaded[row.id] = entry
         }
@@ -468,7 +477,7 @@ actor LiveSync {
         while let entry = entries[id] {
             let local: LiveLocal = stamp.map { .present($0, digest: digest) } ?? .missing(again: entry.missingSeen)
             switch LiveDecision.decide(entry.state, local: local, server: server) {
-            case .none, .refreshLocal: return
+            case .none: return
             case .markClean: return change(id) { $0.state.dirty = false }
             case .markDirty: return change(id) { $0.state.dirty = true }
             case .restamp:
@@ -488,12 +497,8 @@ actor LiveSync {
                 return report(entry, .failed, "The working copy disappeared before its edits were uploaded")
             case .forget: return drop(entry)
             case .needDigest:
-                // Deleted since its stamp was read: look again, as a missing file.
-                guard let read = await Self.readDigest(entry.local) else {
-                    if Self.stamp(entry.local) == nil { return look(id) }
-                    digest = Self.unreadable
-                    continue
-                }
+                // Moved or deleted during the read: look again.
+                guard let stamp, let read = await measure(entry, at: stamp) else { return look(id) }
                 digest = read
             case .needServer:
                 if !entry.state.dirty { change(id) { $0.state.dirty = true } }
@@ -651,15 +656,14 @@ actor LiveSync {
         guard item.kind == .file, let print = Fingerprint(item: item) else { throw TransferError.typeMismatch(path.display) }
         if let id = find(path, on: connection), let entry = entries[id] {
             if let stamp = Self.stamp(entry.local) {
-                let digest = await Self.digestIfNeeded(entry.state, entry.local, stamp)
-                let action = LiveDecision.decide(entry.state, local: .present(stamp, digest: digest), server: .file(print), intent: .open)
-                if case .refreshLocal = action {
+                let change = await localChange(of: entry)
+                if LiveDecision.refreshesOnOpen(entry.state, change, server: print) {
                     if try await placeServerBytes(item, print, for: id, ifStill: stamp, via: server, interactive: true), let refreshed = entries[id] {
                         emit(refreshed, .liveChanged)
                     } else {
                         look(id)
                     }
-                } else if LiveDecision.localChange(entry.state, stamp, digest: digest) == .changed {
+                } else if change == .changed || change == .needDigest {
                     look(id)
                 }
                 return entry.local
@@ -965,19 +969,24 @@ actor LiveSync {
         LiveDecision.isUnsynced(entry.state, await localChange(of: entry))
     }
 
-    /// How the copy compares with the last sync, nil when it is missing; bytes are read off the
-    /// actor, only when the stamp alone cannot tell, and once per stamp (`measured`).
+    /// How the copy compares with the last sync, nil when it is missing; bytes are read only when
+    /// the stamp alone cannot tell. `.needDigest` when it moved while they were read.
     private func localChange(of entry: Entry) async -> LiveLocalChange? {
         guard let stamp = Self.stamp(entry.local) else { return nil }
-        let change = LiveDecision.localChange(entry.state, stamp, digest: nil)
-        guard change == .needDigest else { return change }
-        if let measured = entries[entry.id]?.measured, measured.stamp == stamp {
-            return LiveDecision.localChange(entry.state, stamp, digest: measured.digest)
-        }
-        let digest = await Self.readDigest(entry.local) ?? Self.unreadable
-        // Bytes saved during the read are not the bytes of `stamp`.
-        if Self.stamp(entry.local) == stamp { mark(entry.id) { $0.measured = (stamp, digest) } }
+        let change = (entries[entry.id] ?? entry).change(at: stamp)
+        guard change == .needDigest, let digest = await measure(entry, at: stamp) else { return change }
         return LiveDecision.localChange(entry.state, stamp, digest: digest)
+    }
+
+    /// The working copy's digest while it has `stamp`, read off the actor once per stamp and kept
+    /// (`measured`). Unreadable bytes count as an edit. Nil when the copy moved during the read:
+    /// those are not the bytes of `stamp`.
+    private func measure(_ entry: Entry, at stamp: LiveStamp) async -> String? {
+        if let measured = entries[entry.id]?.measured, measured.stamp == stamp { return measured.digest }
+        let digest = await Self.readDigest(entry.local) ?? Self.unreadable
+        guard Self.stamp(entry.local) == stamp else { return nil }
+        mark(entry.id) { $0.measured = (stamp, digest) }
+        return digest
     }
 
     /// `unsyncedCount` from what is known now, reading no bytes: nil when a copy's stamp has no
@@ -985,11 +994,8 @@ actor LiveSync {
     private func unsyncedNow(on connection: ConnectionID) -> Int? {
         var count = 0
         for entry in entries.values where entry.connection == connection {
-            var change = Self.stamp(entry.local).map { LiveDecision.localChange(entry.state, $0, digest: nil) }
-            if change == .needDigest {
-                guard let measured = entry.measured, measured.stamp == Self.stamp(entry.local) else { return nil }
-                change = LiveDecision.localChange(entry.state, measured.stamp, digest: measured.digest)
-            }
+            let change = Self.stamp(entry.local).map(entry.change(at:))
+            if change == .needDigest { return nil }
             if LiveDecision.isUnsynced(entry.state, change) { count += 1 }
         }
         return count
@@ -1002,19 +1008,6 @@ actor LiveSync {
               let size = (attributes[.size] as? NSNumber)?.uint64Value,
               let mtime = attributes[.modificationDate] as? Date else { return nil }
         return LiveStamp(size: size, mtime: mtime)
-    }
-
-    /// `localChange`, for launch, where the actor does not exist yet.
-    private static func localChange(_ state: LiveState, _ url: URL, _ stamp: LiveStamp) -> LiveLocalChange {
-        let change = LiveDecision.localChange(state, stamp, digest: nil)
-        return change == .needDigest ? LiveDecision.localChange(state, stamp, digest: digest(of: url) ?? unreadable) : change
-    }
-
-    /// The copy's digest when the stamp alone cannot tell whether it changed, else nil. Bytes that
-    /// cannot be read count as an edit, which the upload then reports.
-    private static func digestIfNeeded(_ state: LiveState, _ url: URL, _ stamp: LiveStamp) async -> String? {
-        guard LiveDecision.localChange(state, stamp, digest: nil) == .needDigest else { return nil }
-        return await readDigest(url) ?? unreadable
     }
 
     static func digest(of url: URL) -> String? {

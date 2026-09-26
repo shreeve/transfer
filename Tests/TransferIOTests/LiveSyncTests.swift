@@ -1138,6 +1138,21 @@ struct LiveSyncTests {
         }
     }
 
+    /// A copy re-saved unchanged (new time, same bytes) was never refreshed on reopen, so the
+    /// user edited stale bytes and met a conflict (LIV2-08).
+    @Test func reopenRefreshesATouchedCopy() async throws {
+        try await withLive("reopen-touched") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: local.path)
+            await h.fake.changeBehind(note, "newer on server")
+            #expect(try await h.live.open(note, on: h.connection) == local)
+            #expect(read(local) == "newer on server")
+            #expect(await h.file().map { !$0.dirty && !$0.conflict } == true)
+            #expect(await settled(h))
+            #expect(await h.fake.saves == 0)
+        }
+    }
+
     // MARK: The worker and the watcher
 
     @Test func closingCancelsQueuedCommands() async throws {

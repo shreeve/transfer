@@ -61,12 +61,6 @@ public enum LiveServerFact: Hashable, Sendable {
     case unreachable(String)
 }
 
-/// Why a pass is running: a change, a login, or Retry; or the user opening the file again.
-public enum LiveIntent: Hashable, Sendable {
-    case sync
-    case open
-}
-
 /// What the server holds when a conflict is raised.
 public enum LiveConflictKind: Hashable, Sendable {
     case changed(Fingerprint)
@@ -99,7 +93,6 @@ public enum LiveAction: Hashable, Sendable {
     /// The server holds our own last upload of exactly this copy, whose reply was lost: take its
     /// fingerprint as the base, upload nothing.
     case adopt(Fingerprint)
-    case refreshLocal(Fingerprint)
     case conflict(LiveConflictKind)
     case failRetryable(String)
 }
@@ -190,7 +183,14 @@ public enum LiveDecision {
         force || !isUnsynced(state, change) ? .forget : .conflict(.removed)
     }
 
-    public static func decide(_ state: LiveState, local: LiveLocal, server: LiveServerFact, intent: LiveIntent = .sync) -> LiveAction {
+    /// The user opens a Live file again: a working copy holding the synced bytes, touched since
+    /// or not, takes the server's newer file, unless a conflict waits for an answer. A pass never
+    /// refreshes, since an editor may hold unsaved text.
+    public static func refreshesOnOpen(_ state: LiveState, _ change: LiveLocalChange?, server: Fingerprint) -> Bool {
+        !state.conflict && (change == .same || change == .touched) && server != state.base
+    }
+
+    public static func decide(_ state: LiveState, local: LiveLocal, server: LiveServerFact) -> LiveAction {
         guard case .present(let stamp, let digest) = local else {
             if local == .missing(again: false) { return .recheckMissing }
             return state.dirty || state.conflict ? .failMissing : .forget
@@ -201,9 +201,6 @@ public enum LiveDecision {
         case .touched:
             return .restamp
         case .same:
-            if state.conflict { return state.dirty ? .markClean : .none }
-            if intent == .open, case .file(let now) = server, now != state.base { return .refreshLocal(now) }
-            if intent == .open, server == .notChecked { return .needServer }
             return state.dirty ? .markClean : .none
         case .changed:
             if state.conflict || state.paused { return state.dirty ? .none : .markDirty }
