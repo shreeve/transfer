@@ -168,6 +168,24 @@ struct ServerTests {
         }
     }
 
+    /// Deleting a folder removes a link it holds, never what the link points to, and deleting a
+    /// link to a folder removes only the link (SPEC: links are removed, not followed; TD2-05).
+    @Test func removeNeverFollowsALink() async throws {
+        try await withHarness("unlink", connected: true) { h in
+            let fm = FileManager.default
+            try fm.createDirectory(at: h.remote.appendingPathComponent("keep"), withIntermediateDirectories: true)
+            try Data("kept".utf8).write(to: h.remote.appendingPathComponent("keep/file.txt"))
+            try fm.createDirectory(at: h.remote.appendingPathComponent("dir"), withIntermediateDirectories: true)
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("dir/out").path, withDestinationPath: "../keep")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("top").path, withDestinationPath: "keep")
+
+            try await h.session.remove(h.remotePath.appending("dir"), force: false)
+            try await h.session.remove(h.remotePath.appending("top"), force: false)
+            #expect(try fm.contentsOfDirectory(atPath: h.remote.path).sorted() == ["keep"])
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("keep/file.txt")) == Data("kept".utf8))
+        }
+    }
+
     /// Links were followed one hop, so a chain such as /usr/bin/java → /etc/alternatives/java →
     /// the JDK's binary would not open (UIM-19). The server's REALPATH follows the whole chain;
     /// a loop or a dangling link fails with an error rather than hanging.
