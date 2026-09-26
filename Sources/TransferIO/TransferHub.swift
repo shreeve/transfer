@@ -25,9 +25,17 @@ public actor TransferHub: SessionProvider {
         config = ConfigLoader.load(root: store.root)
         live = LiveSync(store: store)
         for temp in store.localTemps() {
-            try? FileManager.default.removeItem(at: temp)
+            // One file, and only by a download temp's name: the path is whatever the library
+            // holds, which may have been copied from another library or edited.
+            if Self.isTempName(temp.lastPathComponent) { unlink(temp.path) }
             store.forgetTemp(local: temp)
         }
+    }
+
+    /// `CopyRules.tempName`'s shape, `.<name>.transfer-<UUID>`, as every Transfer has named them.
+    static func isTempName(_ name: String) -> Bool {
+        guard name.hasPrefix("."), let marker = name.range(of: ".transfer-", options: .backwards) else { return false }
+        return UUID(uuidString: String(name[marker.upperBound...])) != nil
     }
 
     deinit { close(libraryLock) }
@@ -50,7 +58,8 @@ public actor TransferHub: SessionProvider {
         store.save(connection)
         // A session that is not logged in, perhaps mid-login with the old settings, is replaced
         // and stopped, so no orphaned master finishes that login.
-        guard let existing = sessions[connection.id], !(await existing.isConnected), sessions[connection.id] === existing else { return }
+        guard let existing = sessions[connection.id], existing.connection != connection, !(await existing.isConnected),
+              sessions[connection.id] === existing else { return }
         makeSession(connection, replacing: existing)
     }
 
@@ -61,8 +70,7 @@ public actor TransferHub: SessionProvider {
         // Out of the library first, so no caller makes a new session while this one disconnects.
         store.remove(id)
         KeychainStore.delete(id)
-        let session = sessions.removeValue(forKey: id)
-        await session?.disconnect()
+        await sessions.removeValue(forKey: id)?.retire()
     }
 
     public func session(for id: ConnectionID) async throws -> any RemoteSession {

@@ -55,6 +55,11 @@ struct SessionUnitTests {
         #expect(SSHConnection.storedSecretKind("Enter passphrase for key '/Users/alice/.ssh/id_ed25519': ", user: "alice", host: "box.example") == .passphrase)
         #expect(SSHConnection.storedSecretKind("alice@jump.example's password: ", user: "alice", host: "box.example") == nil)
         #expect(SSHConnection.storedSecretKind("(alice@box.example) Verification code: ", user: "alice", host: "box.example") == nil)
+        // A jump host chooses the text of its own keyboard-interactive prompt, after its own prefix.
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) alice@box.example's password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) (alice@box.example) Password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("Enter alice@box.example's old password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) Enter passphrase for key '/k': ", user: "alice", host: "box.example") == nil)
     }
 
     /// Always Trust saves where `ssh -G` says; when `ssh -G` failed it says so rather than
@@ -157,6 +162,26 @@ struct SessionServerTests {
         }
     }
 
+    /// A window that leaves a login takes its question back with the safe answer. That is not a
+    /// Cancel from the window still waiting for the same login, which is asked in its place.
+    @Test func aQuestionTakenBackGoesToTheCallerStillWaiting() async throws {
+        try await withHarness("handover", knownHost: false) { h in
+            let leaving = StalledPrompts()
+            let first = Task { try await h.session.connect(prompts: leaving) }
+            #expect(await waitUntil { leaving.asked.value > 0 })
+            let staying = RecordingPrompts(.trustOnce)
+            let second = Task { try await h.session.connect(prompts: staying) }
+            try await Task.sleep(for: .milliseconds(200))
+            first.cancel()
+            try await Task.sleep(for: .milliseconds(100))
+            leaving.released.value = true
+            _ = try await second.value
+            #expect(staying.events.count == 1)
+            #expect(await h.session.isConnected)
+            _ = await first.result
+        }
+    }
+
     /// Cancel on a question a ProxyJump host asks during the host-key probe stops the login at
     /// once. The probe's askpass helper, still waiting for a reply, used to hold the probe's
     /// stderr open, and the login hung until the helper gave up minutes later (R-S1).
@@ -229,6 +254,11 @@ struct SessionServerTests {
                                             live: h.live, sshConfigFile: h.configFile.path, replacing: h.session)
             _ = try await replacement.connect(prompts: RecordingPrompts(.cancel))
             #expect(await h.session.isConnected == false)
+            // The old session, which a window may still hold, never logs in again: that login
+            // would take the socket and end the replacement's master.
+            await #expect(throws: SSHConnection.retiredError) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            #expect(!RetryPolicy.isRetryable(SSHConnection.retiredError))
+            #expect(await replacement.isConnected)
             await h.session.disconnect()
             try await killPassengers(h)
             _ = try await replacement.stat(h.remotePath)
@@ -405,6 +435,53 @@ struct SessionServerTests {
         }
     }
 
+    /// After a data channel fails to open, as when sshd refuses one for MaxSessions (a Terminal
+    /// tab on the master), the pool grows back once 10 s have passed, although callers never stop
+    /// waiting meanwhile. The opens fail here through a config error, so no other suite reading
+    /// sshd's log sees a refusal.
+    @Test(.timeLimit(.minutes(1))) func thePoolGrowsBackAfterARefusalWhileCallersWait() async throws {
+        try await withHarness("regrow", connected: true) { h in
+            let config = try String(contentsOf: h.configFile, encoding: .utf8)
+            let state = Locked((inUse: 0, peak: 0, early: 0))
+            let open = Locked(0)
+            let broken = Locked(false)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<3 {
+                    group.addTask {
+                        try await h.session.withData { _ in
+                            open.withLock { $0 += 1 }
+                            while !broken.value { try await Task.sleep(for: .milliseconds(20)) }
+                        }
+                    }
+                }
+                #expect(await waitUntil { open.value == 3 })
+                try (config + "  NoSuchOption yes\n").write(to: h.configFile, atomically: true, encoding: .utf8)
+                broken.value = true
+                let started = ContinuousClock.now
+                for _ in 0..<(2 * SSHConnection.dataChannels) {
+                    group.addTask {
+                        while state.value.peak < SSHConnection.dataChannels, ContinuousClock.now - started < .seconds(15) {
+                            try await h.session.withData { _ in
+                                state.withLock {
+                                    $0.inUse += 1
+                                    $0.peak = max($0.peak, $0.inUse)
+                                    if ContinuousClock.now - started < .seconds(1) { $0.early = $0.peak }
+                                }
+                                try await Task.sleep(for: .milliseconds(50))
+                                state.withLock { $0.inUse -= 1 }
+                            }
+                        }
+                    }
+                }
+                try await Task.sleep(for: .seconds(1))
+                try config.write(to: h.configFile, atomically: true, encoding: .utf8)
+                try await group.waitForAll()
+            }
+            #expect(state.value.early == 3)
+            #expect(state.value.peak == SSHConnection.dataChannels)
+        }
+    }
+
     /// Dead reserved channels are reopened, as often as every 5 s; a live master with no channel
     /// is a lost connection, which transfers retry, and the master's death is reported.
     @Test func reservedChannelsReopenAndTheMastersDeathIsReported() async throws {
@@ -470,15 +547,17 @@ private final class RecordingPrompts: PromptSink {
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
 }
 
-/// A host-key sheet nobody answers, taken back when its question is cancelled.
+/// A host-key sheet nobody answers, taken back when its question is cancelled or when `released`
+/// is set, as a window's is when it moves away.
 private final class StalledPrompts: PromptSink {
     let asked = Locked(0)
     let withdrawn = Locked(0)
+    let released = Locked(false)
 
     func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
         asked.withLock { $0 += 1 }
-        do { try await Task.sleep(for: .seconds(120)) } catch { withdrawn.withLock { $0 += 1 } }
+        do { while !released.value { try await Task.sleep(for: .milliseconds(20)) } } catch { withdrawn.withLock { $0 += 1 } }
         return .cancel
     }
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }

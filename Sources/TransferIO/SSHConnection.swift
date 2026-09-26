@@ -24,6 +24,11 @@ public actor SSHConnection: RemoteSession {
     /// The latest release of a master and its channels. The next login waits for it, so an old
     /// master never exits, unlinking the socket, after a new one has bound it.
     private var releasing: Task<Void, Never>?
+    /// Set once the hub has replaced this session or removed its server. A window may still hold
+    /// it, but it never logs in again: its login would take the socket path of the replacement
+    /// and end that one's master.
+    private let retired = Locked(false)
+    static let retiredError = TransferError.failed("This server's settings changed or it was removed. Choose it again to connect.")
     /// Bumped by every login and teardown, so a channel that finishes opening afterwards is closed.
     private var generation = 0
     private var reserved: [ChannelRole: SFTPChannel] = [:]
@@ -35,7 +40,7 @@ public actor SSHConnection: RemoteSession {
     /// during the open would see room and open its own.
     private var opening = 0
     /// Callers waiting for a data channel, in order, with the share each takes. Each gets a
-    /// channel with room, or nil to look again when an open it was counting on was cancelled.
+    /// channel with room, or nil to open one itself, already counted in `opening`.
     private var waiters: [(id: UUID, share: Int, continuation: CheckedContinuation<SFTPChannel?, Error>)] = []
     private var refusedAt: ContinuousClock.Instant?
     let pipe = EventPipe()
@@ -64,12 +69,13 @@ public actor SSHConnection: RemoteSession {
             self = (size ?? .max) <= 256 << 10 ? .small : .whole
         }
     }
-    /// How long a login may take, prompts included, before it gives up.
+    /// How long a master may take to log in, password prompts included, before it gives up.
     static let loginTimeout: Duration = .seconds(300)
 
     /// `live` is the hub's one `LiveSync`, shared by every connection. `replacing` is the session
     /// for this server that this one takes over from, as when its settings changed: it disconnects
-    /// now, and this one's first login waits for that, since both use one socket path.
+    /// now and never logs in again, and this one's first login waits for that, since both use one
+    /// socket path.
     init(connection: SavedConnection, store: Store, editableExtensions: Set<String>, live: LiveSync, sshConfigFile: String? = nil,
          replacing previous: SSHConnection? = nil) {
         self.connection = connection
@@ -78,6 +84,7 @@ public actor SSHConnection: RemoteSession {
         self.live = live
         self.sshConfigFile = sshConfigFile
         socketPath = store.root.appendingPathComponent("ssh/\(connection.id.socketName)").path
+        previous?.retired.value = true
         releasing = previous.map { old in Task { await old.disconnect() } }
     }
 
@@ -108,6 +115,7 @@ public actor SSHConnection: RemoteSession {
             _ = await stopping.task.result
             if login?.task == stopping.task { login = nil }
         }
+        if retired.value { throw Self.retiredError }
         let current: Login
         if let login {
             current = login
@@ -141,6 +149,12 @@ public actor SSHConnection: RemoteSession {
         await tearDown(reason: .cancelled)
     }
 
+    /// Disconnects for good: the hub removed this session's server.
+    func retire() async {
+        retired.value = true
+        await disconnect()
+    }
+
     /// What one login has started, released together when it fails or the session ends.
     private struct Held {
         var master: Process?
@@ -169,8 +183,9 @@ public actor SSHConnection: RemoteSession {
         }
         // The temps an earlier run could not remove; each is forgotten only once it is gone.
         for temp in store.remoteTemps(connection: connection.id) { await discardRemoteTemp(temp) }
+        // A master that died meanwhile has already told Live; a shelf row retries this.
+        guard isConnected, let startPath else { throw TransferError.connectionLost("The SSH connection closed") }
         await live.connected(connection.id, server: self)
-        guard let startPath else { throw TransferError.notConnected }
         return startPath
     }
 
@@ -187,7 +202,7 @@ public actor SSHConnection: RemoteSession {
         }
         let ask = try prepareAskpass()
         held.scratch.append(ask)
-        let deadline = ContinuousClock.now + Self.loginTimeout
+        var deadline = ContinuousClock.now + Self.loginTimeout
         let poller = Task { await self.servePrompts(prompts, directory: ask) }
         defer { poller.cancel() }
         var hostKeyArguments: [String] = []
@@ -214,6 +229,8 @@ public actor SSHConnection: RemoteSession {
             if failure == .revoked || askedAboutHostKey { throw TransferError.hostKeyRejected }
             askedAboutHostKey = true
             hostKeyArguments = try await trustHostKey(failure, prompts: prompts, ask: ask, holding: &held)
+            // The question may have waited on the user for any time; the retry gets its own limit.
+            deadline = ContinuousClock.now + Self.loginTimeout
         }
         let browse = try await openLink()
         held.reserved[.browse] = browse
@@ -407,9 +424,10 @@ public actor SSHConnection: RemoteSession {
         store.star(connection: connection.id, path: path, on: on)
     }
 
-    /// Joins the master when up, else logs in with the same port and identity, never as a master on
-    /// this socket. Nil when a field holds a control character: the command is typed into a shell,
-    /// where a CR or LF in a folder name the server chose would end the line and run the rest.
+    /// Joins the master; if it has gone by the time the command runs, ssh logs in with the same
+    /// port and identity, never as a master on this socket. Nil when not connected, or when a field
+    /// holds a control character: the command is typed into a shell, where a CR or LF in a folder
+    /// name the server chose would end the line and run the rest.
     public func terminalCommand(directory: RemotePath) async -> String? {
         guard isConnected else { return nil }
         let remote = "cd \(Self.quote(directory.display)) && exec \"$SHELL\" -l"
@@ -479,8 +497,9 @@ public actor SSHConnection: RemoteSession {
     /// A data channel with room for `share`: an idle one, a new one while fewer than seven are
     /// open or opening, else the least loaded with room, else the next with room once others let
     /// go. Callers queue in order and leave the queue when cancelled. While any wait, a newcomer
-    /// neither takes a channel nor opens one ahead of them, as when room opens again after the
-    /// server refused a channel, unless nothing is open or opening that could come back to them.
+    /// neither takes a channel nor opens one ahead of them, unless nothing is open or opening that
+    /// could come back to them: when room opens again, as after the server refused a channel, the
+    /// first in line opens it (`dispatch`), and goes to the back of the line if it is refused.
     private func acquire(_ share: Int) async throws -> SFTPChannel {
         while true {
             if waiters.isEmpty, let link = fitting(share, sharing: !canOpen) {
@@ -488,13 +507,17 @@ public actor SSHConnection: RemoteSession {
                 continue
             }
             if canOpen, waiters.isEmpty || pool.isEmpty && opening == 0 {
+                opening += 1
                 guard let link = try await openData(share) else { continue }
                 return link
             }
             guard !pool.isEmpty || opening > 0 else {
                 throw master?.isRunning == true ? TransferError.connectionLost("No SFTP channel could open") : TransferError.notConnected
             }
-            guard let link = try await nextReleased(share) else { continue }
+            guard let link = try await nextReleased(share) else {
+                guard let link = try await openData(share) else { continue }
+                return link
+            }
             if await link.isOpen { return link }
             drop(link)
         }
@@ -506,6 +529,7 @@ public actor SSHConnection: RemoteSession {
         let whole = DataShare.whole.rawValue
         if let link = fitting(whole, sharing: false) { return await hold(link, whole) }
         guard canOpen else { return nil }
+        opening += 1
         return try? await openData(whole)
     }
 
@@ -532,10 +556,10 @@ public actor SSHConnection: RemoteSession {
         return loads.filter { $0.load + share <= DataShare.whole.rawValue }.min { $0.load < $1.load }?.link
     }
 
-    /// Opens a data channel for a caller taking `share` of it. Nil when the server refused it
-    /// while other channels are open or opening, which the caller then waits for.
+    /// Opens a data channel for a caller taking `share` of it, which the caller has already counted
+    /// in `opening`. Nil when the server refused it while other channels are open or opening,
+    /// which the caller then waits for.
     private func openData(_ share: Int) async throws -> SFTPChannel? {
-        opening += 1
         let generation = generation
         do {
             let link = try await openLink()
@@ -553,7 +577,10 @@ public actor SSHConnection: RemoteSession {
             opening -= 1
             let nothingLeft = pool.isEmpty && opening == 0
             if error is CancellationError || (error as? TransferError) == .cancelled {
-                if nothingLeft, !waiters.isEmpty { waiters.removeFirst().continuation.resume(returning: nil) }
+                if nothingLeft, !waiters.isEmpty {
+                    opening += 1
+                    waiters.removeFirst().continuation.resume(returning: nil)
+                }
                 throw error
             }
             // The server allows no more sessions for now (MaxSessions); share what is open.
@@ -567,6 +594,7 @@ public actor SSHConnection: RemoteSession {
         }
     }
 
+    /// The channel `dispatch` hands this caller, or nil when it counted an open for this caller to make.
     private func nextReleased(_ share: Int) async throws -> SFTPChannel? {
         let id = UUID()
         return try await withTaskCancellationHandler {
@@ -598,11 +626,14 @@ public actor SSHConnection: RemoteSession {
     }
 
     /// Hands channels to the callers waiting, first come first served, for as long as the first
-    /// one's share fits: a large file first in line is not passed by small ones behind it.
+    /// one's share fits: a large file first in line is not passed by small ones behind it. When
+    /// none fits but another channel may open, the first in line opens it.
     private func dispatch() {
-        while let first = waiters.first, let link = fitting(first.share, sharing: true) {
+        while let first = waiters.first {
+            let link = fitting(first.share, sharing: true)
+            guard link != nil || canOpen else { return }
             waiters.removeFirst()
-            load[ObjectIdentifier(link), default: 0] += first.share
+            if let link { load[ObjectIdentifier(link), default: 0] += first.share } else { opening += 1 }
             first.continuation.resume(returning: link)
         }
     }
@@ -621,7 +652,7 @@ public actor SSHConnection: RemoteSession {
         // A passenger only joins the master. When the master is gone or refuses it, ssh would log in
         // on its own instead, with none of the master's port, identity, or host-key answer:
         // ProxyCommand makes that attempt fail at once, and BatchMode keeps it from prompting.
-        process.arguments = configArguments + ["-S", socketPath, "-o", "Compression=no", "-o", "ControlMaster=no", "-o", "BatchMode=yes",
+        process.arguments = configArguments + ["-S", socketPath, "-o", "ControlMaster=no", "-o", "BatchMode=yes",
                                                "-o", "ProxyCommand=/usr/bin/false"]
             + Self.plainSession + ["-s", "--", connection.destination, "sftp"]
         let input = Pipe()
@@ -738,7 +769,9 @@ public actor SSHConnection: RemoteSession {
             throw TransferError.failed("Could not read the host key: \(reason.isEmpty ? "no reply" : reason)")
         }
         let event = HostKeyEvent(situation: failure == .changed ? .changed : .firstSeen, keyType: offered.keyType, fingerprint: Self.fingerprint(offered.key), line: offered.text)
-        let decision = try await Self.untilCancelled({ await prompts.decideHostKey(event) })
+        let decision = await prompts.decideHostKey(event)
+        // A sink whose task is cancelled gives the safe answer at once; any answer is then dropped.
+        try Task.checkCancellation()
         // Declining a new server's key is a Cancel like any other; declining to replace a key
         // that changed is a refusal of that key.
         if decision == .cancel { throw failure == .changed ? TransferError.hostKeyRejected : TransferError.cancelled }
@@ -806,31 +839,6 @@ public actor SSHConnection: RemoteSession {
     static func fingerprint(_ key: String) -> String {
         guard let blob = Data(base64Encoded: key) else { return key }
         return "SHA256:" + Data(SHA256.hash(data: blob)).base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "="))
-    }
-
-    /// `body`'s answer, or `.cancelled` as soon as the calling task is cancelled. Cancelling also
-    /// cancels `body`, which withdraws the window's sheet; an answer it gives anyway is dropped.
-    private static func untilCancelled<T: Sendable>(_ body: @escaping @Sendable () async -> T) async throws -> T {
-        let slot = Locked<CheckedContinuation<T, Error>?>(nil)
-        let asking = Locked<Task<Void, Never>?>(nil)
-        let take: @Sendable () -> CheckedContinuation<T, Error>? = { slot.withLock { waiting in defer { waiting = nil }; return waiting } }
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                slot.value = continuation
-                asking.value = Task {
-                    let answer = await body()
-                    take()?.resume(returning: answer)
-                }
-                if Task.isCancelled {
-                    take()?.resume(throwing: TransferError.cancelled)
-                    asking.value?.cancel()
-                }
-            }
-        } onCancel: {
-            // Cancelled first, then asked to stop: `body` may answer at once, and that answer is dropped.
-            take()?.resume(throwing: TransferError.cancelled)
-            asking.value?.cancel()
-        }
     }
 
     // MARK: Askpass
@@ -916,8 +924,8 @@ public actor SSHConnection: RemoteSession {
                     storedTried.insert(kind)
                     answer = PromptReply(text: stored)
                 } else {
-                    guard let asked = try? await Self.untilCancelled({ await prompts.answer(PromptRequest(text: text, offerKeychain: kind != nil)) }) else { return }
-                    answer = asked
+                    answer = await prompts.answer(PromptRequest(text: text, offerKeychain: kind != nil))
+                    if Task.isCancelled { return }
                 }
                 guard let text = answer.text else { return cancelLogin(prompts) }
                 if answer.saveInKeychain, let kind { KeychainStore.save(text, for: connection.id, kind) }
@@ -935,12 +943,16 @@ public actor SSHConnection: RemoteSession {
         return (values["user"] ?? connection.user, alias ?? values["hostname"] ?? connection.host)
     }
 
-    /// Which stored secret may answer `prompt`: this server's own password prompt takes its
-    /// password; a key's passphrase prompt, which never leaves the Mac, its passphrase; nil for
-    /// anything else.
+    /// Which stored secret may answer `prompt`, matched on what ssh itself writes: this server's
+    /// password prompt, or its keyboard-interactive prefix `(user@host) ` before a question about
+    /// the password, takes its password; a key's passphrase prompt, which never leaves the Mac, its
+    /// passphrase; nil for anything else. The text after that prefix is the server's own, and a
+    /// ProxyJump host's comes after its own prefix, so it can name this server but never match.
     static func storedSecretKind(_ prompt: String, user: String, host: String) -> KeychainStore.Kind? {
-        if prompt.hasPrefix("Enter passphrase for") { return .passphrase }
-        return prompt.contains("\(user)@\(host)") && prompt.lowercased().contains("password") ? .password : nil
+        if prompt.hasPrefix("Enter passphrase for key '"), prompt.hasSuffix("': ") { return .passphrase }
+        if prompt == "\(user)@\(host)'s password: " { return .password }
+        let interactive = "(\(user)@\(host)) "
+        return prompt.hasPrefix(interactive) && prompt.dropFirst(interactive.count).lowercased().contains("password") ? .password : nil
     }
 }
 
@@ -1017,7 +1029,9 @@ final class EventPipe: Sendable {
 
 /// Who answers a login's questions: the caller that joined it last and still waits, so a window
 /// that joined a login another window started, and then gave up on, is the one asked. A question
-/// already on screen stays with the window showing it.
+/// already on screen stays with the window showing it. When that window leaves (it moved away or
+/// closed, which takes its sheet back with the safe answer), the next caller still waiting is
+/// asked, so a login stops only for the Cancel of someone who still waits for it.
 final class LoginPrompts: PromptSink {
     private let callers = Locked<[(id: UUID, sink: any PromptSink)]>([])
 
@@ -1033,14 +1047,20 @@ final class LoginPrompts: PromptSink {
         }
     }
 
-    private var asked: (any PromptSink)? { callers.value.last?.sink }
-
     func answer(_ request: PromptRequest) async -> PromptReply {
-        await asked?.answer(request) ?? PromptReply(text: nil)
+        await ask(safe: PromptReply(text: nil), isSafe: { $0.text == nil }) { await $0.answer(request) }
     }
 
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        await asked?.decideHostKey(event) ?? .cancel
+        await ask(safe: .cancel, isSafe: { $0 == .cancel }) { await $0.decideHostKey(event) }
+    }
+
+    private func ask<Answer>(safe: Answer, isSafe: (Answer) -> Bool, _ question: (any PromptSink) async -> Answer) async -> Answer {
+        while let caller = callers.value.last {
+            let answer = await question(caller.sink)
+            if !isSafe(answer) || callers.value.contains(where: { $0.id == caller.id }) { return answer }
+        }
+        return safe
     }
 
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
