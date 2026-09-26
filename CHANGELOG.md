@@ -39,6 +39,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - Choosing Trust after leaving a host-key question up for a long time no longer fails the login with a timeout, and Cancel during the host-key check ends the login in about a second, not two.
 - A connection that drops at the very end of a login is retried instead of failing.
 - Browsing quickly no longer leaks the server's folder and file handles until it stops listing folders.
+- Retrying a move on one server after the connection dropped or timed out during a rename no longer fails on an item that had already moved, and the timeout ends the move instead of starting a copy.
 - One file that changes on the server during a folder copy fails alone and is retried, instead of restarting the whole copy.
 - A library file whose version is damaged is refused with a message instead of crashing Transfer at every launch, and a saved server with a damaged id no longer shows up as one that cannot be edited or removed.
 - Right-clicking a folder that is not selected in column view opens its menu, instead of failing and leaving the view out of step. The right-click menu's Quick Look and Rename act on the item clicked, and Open Live works on a link to a file.

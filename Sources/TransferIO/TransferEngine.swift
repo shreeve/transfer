@@ -83,7 +83,13 @@ struct TransferEngine {
             finish(index)
             return nil
         } catch {
+            if CopyTally.ends(error) { throw error }
             guard try await destination.existing(target) != nil else { throw error }
+            // A retry after a rename whose reply was lost finds the item already moved.
+            if try await destination.existing(path) == nil {
+                finish(index)
+                return nil
+            }
         }
         // Two paths on one server may be one folder, through a link or a bind mount.
         let parents = Set(paths.compactMap(\.parent)).subtracting([request.folder])

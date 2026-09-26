@@ -401,6 +401,22 @@ struct MoveServerTests {
         }
     }
 
+    /// A rename whose reply was lost did its work, and the retry of the paste found the name taken
+    /// and went on to copy an original that was gone (FR-15). The retry now counts the item moved.
+    @Test func aRetryAfterALostRenameReplyFindsTheItemMoved() async throws {
+        try await withHarness("lost", connected: true) { h in
+            let id = h.session.connection.id
+            let from = try h.folder("from", files: ["a.txt": "a"])
+            let to = try h.folder("to")
+            try FileManager.default.moveItem(at: h.remote.appendingPathComponent("from/a.txt"), to: h.remote.appendingPathComponent("to/a.txt"))
+            try await run(TransferRequest(.server(id, [from.appending("a.txt")]), into: to, on: id, moving: true), on: h.session)
+            #expect(try h.names("from").isEmpty)
+            #expect(try h.names("to") == ["a.txt"])
+            #expect(try h.read("to/a.txt") == "a")
+            #expect(h.prompts.collisions == 0)
+        }
+    }
+
     /// A move on one server onto a name the folder held failed red with "already exists" instead
     /// of asking (UIB-02). It now asks, as every other route does: Skip keeps both, Keep Both and
     /// Replace move it, and a folder merges; the original goes only once its copy is verified.
