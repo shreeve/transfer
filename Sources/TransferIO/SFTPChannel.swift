@@ -127,7 +127,7 @@ actor SFTPChannel {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let handle = try self.handle(in: await call(SFTPCode.opendir) { $0.appendPath(path) })
+                    let handle = try await handles(opening: [send(SFTPCode.opendir) { $0.appendPath(path) }])[0]
                     var inFlight: [Task<[RemoteItem]?, Error>] = []
                     defer {
                         for page in inFlight { page.cancel() }
@@ -318,10 +318,11 @@ actor SFTPChannel {
         _ = try await reply(finishing[finishing.count - 1])
     }
 
-    /// The handles OPEN requests already sent return, in order. The replies are awaited even when
-    /// the caller is cancelled: an OPEN may create a temp, whose removal, sent on another channel
-    /// once the cancel lands, must not reach the server first and leave the temp behind. When any
-    /// fails, or the caller was cancelled, those that opened are closed and it throws.
+    /// The handles OPEN or OPENDIR requests already sent return, in order. The replies are awaited
+    /// even when the caller is cancelled, so every handle the server opens is closed: an OPEN may
+    /// also create a temp, whose removal, sent on another channel once the cancel lands, must not
+    /// reach the server first. When any fails, or the caller was cancelled, those that opened are
+    /// closed and it throws.
     private func handles(opening ids: [UInt32]) async throws -> [Data] {
         var handles: [Data] = []
         var failure: (any Error)?
@@ -426,8 +427,7 @@ actor SFTPChannel {
 
     /// Opens `path` for writing, creating it or cutting it to nothing.
     func create(_ path: RemotePath) async throws -> Data {
-        try Task.checkCancellation()
-        return try await handles(opening: [send(SFTPCode.open) { $0.openFields(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc) }])[0]
+        try await openFile(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
     }
 
     /// Writes what `parts` hands out into `path`, which another channel created.
@@ -528,7 +528,8 @@ actor SFTPChannel {
     }
 
     private func openFile(_ path: RemotePath, flags: UInt32) async throws -> Data {
-        try handle(in: await call(SFTPCode.open) { $0.openFields(path, flags: flags) })
+        try Task.checkCancellation()
+        return try await handles(opening: [send(SFTPCode.open) { $0.openFields(path, flags: flags) }])[0]
     }
 
     /// Sends CLOSE for each handle and forgets the replies. Cleanup after a cancellation must

@@ -97,6 +97,30 @@ import TransferCore
         await server.stop()
     }
 
+    /// WIR-01: a listing or download cancelled while its OPENDIR or OPEN was at the server dropped
+    /// the handle the reply named, and the server kept it open until the channel died.
+    @Test(arguments: [SFTPCode.opendir, SFTPCode.open]) func aCancelledOpenClosesTheHandleItGets(type: UInt8) async throws {
+        let server = try await ScriptedServer { $0.type == SFTPCode.close ? ScriptedServer.ok($0.id) : nil }
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("open-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let path = RemotePath(string: "/srv/f")
+        let reader = Task {
+            if type == SFTPCode.opendir {
+                for try await _ in await server.channel.list(path) {}
+            } else {
+                try await server.channel.download(path, to: file, size: 10) { _ in }
+            }
+        }
+        #expect(await eventually { !server.sent(type).isEmpty })
+        reader.cancel()
+        try await Task.sleep(for: .milliseconds(50))
+        server.send(ScriptedServer.handle(server.sent(type)[0].id, "late"))
+        _ = try? await reader.value
+        #expect(await eventually { server.sent(SFTPCode.close).map(\.paths) == [["late"]] })
+        #expect(server.sent(SFTPCode.readdir).isEmpty && server.sent(SFTPCode.read).isEmpty)
+        await server.stop()
+    }
+
     // MARK: Transfers
 
     /// A server holding one file of `size` bytes, answering reads and writes when `answers`.
