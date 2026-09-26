@@ -459,6 +459,38 @@ struct MoveServerTests {
         }
     }
 
+    /// A folder already at an item's name can be the item itself, reached another way: a bind
+    /// mount or one share at two paths, whose parents are different folders. Replace would copy
+    /// each file onto itself and the removal take the only copy (FR-14). A probe made in that
+    /// folder and found under the item refuses it, on one server and between two. Without root
+    /// there is no bind mount here: the item is a link to the folder, which the probe finds the
+    /// same way.
+    @Test func aMoveOntoAFolderThatIsTheItemItselfRemovesNothing() async throws {
+        try await withHarness("sameitem", connected: true) { h in
+            try await withAlias(h) { alias in
+                let to = try h.folder("to", files: ["x/f.txt": "f"])
+                _ = try h.folder("from")
+                let link = h.remote.appendingPathComponent("from/x").path
+                try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: "../to/x")
+                let item = h.remotePath.appending("from").appending("x")
+                let refused = TransferKept.Reason.failed("the folder of that name at the destination is this item itself, reached another way")
+                let replace = TestPrompts(collision: .replace)
+                for (source, place) in [(nil, "on the server"), (alias, "on the other server")] {
+                    let request = TransferRequest(.server((source ?? h.session).connection.id, [item]), into: to, on: h.session.connection.id, moving: true)
+                    await #expect(throws: TransferKept([.init("x", refused)], moving: true, place: place)) {
+                        try await OperationPrompts.$current.withValue(replace) { try await run(request, on: h.session, from: source) }
+                    }
+                    #expect(try h.names("to") == ["x"])
+                    #expect(try h.names("to/x") == ["f.txt"])
+                    #expect(try h.read("to/x/f.txt") == "f")
+                    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link) == "../to/x")
+                }
+                #expect(replace.collisions == 0)
+                #expect(try Store(root: h.root).remoteTemps(connection: h.session.connection.id).isEmpty)
+            }
+        }
+    }
+
     /// Files from this Mac go to the Trash only once their copy is verified; a folder holding a
     /// FIFO, which no copy can hold, stays. Moving a Mac folder onto itself on the server, which
     /// the local sshd serves from this very disk, removes nothing.

@@ -17,6 +17,7 @@ A second pass over the whole app. It closes a way for a server's script to run o
 - A file a replace set aside is never deleted if you go back to Transfer 0.1.7.
 - A folder listing no longer stops at a page holding only names Transfer drops (such as `.` and `..`), so a folder copy no longer reports success with files missing.
 - A file shortened on the server while it downloads is read again instead of being saved short.
+- Moving a folder onto a folder of the same name that is the folder itself, reached another way (a bind mount, or one network share at two paths), is refused instead of copying it onto itself and removing the only copy.
 - Pasting a Mac folder into a folder inside itself, through a server that reaches this Mac's disk, is refused instead of copying itself about a hundred levels deep.
 
 ### Security

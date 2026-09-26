@@ -9,7 +9,8 @@ import TransferCore
 /// file or link counts only where this item's own copy wrote it (D6), so nothing else at the
 /// destination, a lookalike the user skipped or another item's copy of the same name, ever passes
 /// for it. A lookalike already there is asked about, never skipped. A move first proves the two
-/// ends are different folders on disk: two servers, or two paths on one, may reach one disk.
+/// ends are different folders on disk: two servers, or two paths on one, may reach one disk; and
+/// that a folder already at an item's name is not the item itself.
 ///
 /// A retry passes the same request, whose memo keeps what earlier attempts did: finished items are
 /// skipped, chosen names reused, and what each item wrote remembered.
@@ -87,6 +88,7 @@ struct TransferEngine {
         // Two paths on one server may be one folder, through a link or a bind mount.
         let parents = Set(paths.compactMap(\.parent)).subtracting([request.folder])
         try await proveApart { try await destination.holds($0, inAny: parents) ? Self.ontoItself("the folder the items came from, reached another way") : nil }
+        if let refused = try await sameItem(path, at: target, on: destination) { return refused }
         return try await place(index, at: target) {
             try await destination.copy(path, to: target, tally: tally(index, sum.next()))
         } original: { try await destination.tree(path) } remove: { try await destination.removeMoved(path, verified: $0, savedSince: liveMark) }
@@ -115,9 +117,10 @@ struct TransferEngine {
                 clash.add(key)
             }
             if let (first, second) = clash.found { return .clash(first.description, second.description) }
+            let target = request.folder.appending(name: path.nameBytes)
+            if request.moving, let refused = try await sameItem(path, at: target, on: source) { return refused }
             let local = scratch.appendingPathComponent(String(index))
             defer { try? FileManager.default.removeItem(at: local) }
-            let target = request.folder.appending(name: path.nameBytes)
             return try await place(index, at: target) {
                 try await source.download(path, to: local, progress: sum.next())
                 try await destination.upload(local, to: target, tally: tally(index, sum.next()))
@@ -211,28 +214,44 @@ struct TransferEngine {
         CopyTally(progress, memo: memo, item: index, moving: request.moving)
     }
 
-    /// Once per request: makes a uniquely named folder at the destination, and has `refusal` look
-    /// for it at the sources. Found there, the two ends are one place on disk (two saved servers
-    /// for one host, two hosts on one disk, a link), and `refusal` says why nothing goes. Only "no
-    /// such file" proves two places.
+    /// Once per request: has `probe` look at the sources for a folder made at the destination.
+    /// Found there, the two ends are one place on disk (two saved servers for one host, two hosts
+    /// on one disk, a link), and `refusal` says why nothing goes.
     private func proveApart(_ refusal: @Sendable (String) async throws -> String?) async throws {
         guard !memo.withLock({ $0.checked }) else { return }
+        if let refused = try await probe(in: request.folder, refusal) { throw TransferError.failed(refused) }
+        memo.withLock { $0.checked = true }
+    }
+
+    /// A folder already at `target` may be the item at `path` itself, reached another way (a bind
+    /// mount, one share at two paths), which no check of their parents sees. Replace would copy
+    /// each file onto itself and the removal take the only copy. A probe made in that folder and
+    /// found under the item refuses it.
+    private func sameItem(_ path: RemotePath, at target: RemotePath, on source: SSHConnection) async throws -> TransferKept.Reason? {
+        guard try await destination.existing(target)?.kind == .directory else { return nil }
+        return try await probe(in: target) { name in
+            try await source.existing(path.appending(name)) != nil ? .failed("the folder of that name at the destination is this item itself, reached another way") : nil
+        }
+    }
+
+    /// Makes a uniquely named folder in `folder` at the destination, returns what `found` makes of
+    /// its name, and removes it. Only "no such file" proves two places.
+    private func probe<Found>(in folder: RemotePath, _ found: (String) async throws -> Found?) async throws -> Found? {
         let name = ".transfer-move-check-\(UUID().uuidString)"
-        let probe = request.folder.appending(name)
+        let probe = folder.appending(name)
         // Recorded like a temp, so a dropped connection leaves no folder behind for good.
         destination.store.rememberTemp(probe, connection: destination.connection.id)
-        let refused: String?
+        let result: Found?
         do {
             try await destination.mkdir(probe)
-            refused = try await refusal(name)
+            result = try await found(name)
         } catch {
             await destination.discardRemoteTemp(probe)
             throw error
         }
         await destination.discardRemoteTemp(probe)
-        destination.pipe.emit(.directoryChanged(request.folder))
-        if let refused { throw TransferError.failed(refused) }
-        memo.withLock { $0.checked = true }
+        destination.pipe.emit(.directoryChanged(folder))
+        return result
     }
 
     private static func ontoItself(_ place: String) -> String {
