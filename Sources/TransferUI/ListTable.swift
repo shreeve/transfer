@@ -143,6 +143,8 @@ struct ListTable: NSViewRepresentable {
             return cell
         }
 
+        func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { FirstMouseRowView() }
+
         private func makeCell(_ id: NSUserInterfaceItemIdentifier) -> NSTableCellView {
             let cell = NSTableCellView()
             cell.identifier = id
@@ -294,6 +296,12 @@ final class RowMenuTableView: NSTableView {
         let point = convert(event.locationInWindow, from: nil)
         return coordinator?.menu(forRow: row(at: point))
     }
+}
+
+/// A click on a row's icon, or past its last column, lands on the row view. It selects and drags in
+/// a background window too, as the table itself does and as Finder's rows do.
+final class FirstMouseRowView: NSTableRowView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 /// The list and column views' right-click menu: for the clicked item, already in the selection, or

@@ -76,6 +76,22 @@ struct ViewTests {
         #expect(stem("notes.") == "notes.")
     }
 
+    /// A click or drag in a background window only brought it forward (E2E P5): an icon cell, over
+    /// its glyph and name too, and a list row's icon and empty end take the first click, as the
+    /// list table and the column browser's tables already do.
+    @Test func aBackgroundWindowTakesTheFirstClickOnAnItem() {
+        _ = NSApplication.shared
+        let cell = IconItemView(frame: NSRect(origin: .zero, size: IconItemView.size))
+        cell.apply(item: RemoteItem(path: RemotePath(string: "/home/a.txt"), kind: .file), model: TransferModel(provider: FakeProvider([])))
+        cell.layoutSubtreeIfNeeded()
+        for point in [NSPoint(x: 54, y: 70), NSPoint(x: 54, y: 20), NSPoint(x: 3, y: 3)] {
+            #expect(cell.hitTest(point) === cell)
+        }
+        #expect(cell.acceptsFirstMouse(for: nil))
+        let coordinator = ListTable.Coordinator(model: TransferModel(provider: FakeProvider([])))
+        #expect(coordinator.tableView(NSTableView(), rowViewForRow: 0)?.acceptsFirstMouse(for: nil) == true)
+    }
+
     /// FR-9: going back to a filter that still holds text keeps Space and Return with it.
     @Test func refocusingTheFilterKeepsThePlainKeysWithIt() async throws {
         _ = NSApplication.shared

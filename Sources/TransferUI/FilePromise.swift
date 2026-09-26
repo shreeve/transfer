@@ -247,6 +247,12 @@ final class IconItemView: DropTargetView, NSDraggingSource {
 
     override var dropFolder: RemotePath? { item.kind == .directory ? item.path : super.dropFolder }
 
+    /// The glyph and name are the cell's to click: in a background window too, a click selects
+    /// and a drag starts, as in Finder, rather than only bringing the window forward.
+    override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) == nil ? nil : self }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     /// Command or Shift adds or removes the cell, as in Finder's icon view.
     override func mouseDown(with event: NSEvent) {
         down = event.locationInWindow
