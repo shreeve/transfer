@@ -31,7 +31,8 @@ struct TransferApp: App {
             let connected = model?.snapshot.connectionID != nil
             let plainKeys = model?.plainKeysAvailable == true
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesButton(state: delegate.updates)
+                Button("Check for Updates…") { delegate.updates.updater.checkForUpdates() }
+                    .disabled(!delegate.updates.canCheck)
             }
             CommandGroup(replacing: .newItem) {
                 Button("New Connection…") { model?.newConnection() }
@@ -48,9 +49,10 @@ struct TransferApp: App {
                 Button("Open") { Task { await model?.openSelection() } }
                     .keyboardShortcut("o")
                     .disabled(primary == nil)
-                Button("Open Live") { Task { await model?.openLiveSelection() } }
+                // A link opens Live too once resolved to a file.
+                Button("Open Live") { if let primary { Task { await model?.open(primary, forceLive: true) } } }
                     .keyboardShortcut("o", modifiers: [.command, .option])
-                    .disabled(primary?.kind != .file)
+                    .disabled(primary?.kind != .file && primary?.kind != .symlink)
                 Button("Download Copy…") { Task { await model?.downloadCopy() } }
                     .disabled(primary == nil)
                 Button("Upload…") { Task { await model?.uploadFromPanel() } }
@@ -80,9 +82,10 @@ struct TransferApp: App {
                 Button("Copy Remote URL") { model?.copyRemoteURL() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
                     .disabled(!connected || !plainKeys)
+                // Command-Delete in a text field deletes to the line's start.
                 Button("Delete…") { model?.askToDelete() }
                     .keyboardShortcut(.delete, modifiers: .command)
-                    .disabled(model?.snapshot.selection.isEmpty ?? true)
+                    .disabled(model?.snapshot.selection.isEmpty ?? true || !plainKeys)
                 Divider()
                 Button("Filter") { model?.focusFilter() }
                     .keyboardShortcut("f")
@@ -193,15 +196,6 @@ struct BrowserWindow: View {
             // An open window takes each `sftp://` link, so SwiftUI opens a window for one only
             // when none is open. The app delegate decides where the link goes.
             .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
-    }
-}
-
-struct CheckForUpdatesButton: View {
-    let state: UpdaterState
-
-    var body: some View {
-        Button("Check for Updates…") { state.updater.checkForUpdates() }
-            .disabled(!state.canCheck)
     }
 }
 

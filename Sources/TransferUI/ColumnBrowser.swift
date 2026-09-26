@@ -65,6 +65,7 @@ struct ColumnBrowser: NSViewRepresentable {
             syncing = true
             defer { syncing = false }
             var trail: [ColumnTrail.Column]?
+            let modelTrail = { ColumnTrail.columns(root: newRoot, path: self.model.snapshot.path, selection: self.model.snapshot.selection) }
             if root != newRoot {
                 // A new root rebuilds every column, each selected from the trail as after a
                 // reload; else a view switch, a link to a file, or Back showed nothing selected.
@@ -72,14 +73,14 @@ struct ColumnBrowser: NSViewRepresentable {
                 showsUpEntry = newRoot.parent != nil
                 shown = [newRoot: listing(newRoot)]
                 browser.loadColumnZero()
-                trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
+                trail = modelTrail()
             }
             // A selection the model made (a renamed item, a file Go to or a link reveals) is shown
             // too; else it waited for the next reload, which often came first, with the old one.
             // The browser's own clicks reach the model already shown here, and restoring them
             // changes nothing.
             if trail == nil, model.snapshot.selection != syncedSelection {
-                trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
+                trail = modelTrail()
             }
             syncedSelection = model.snapshot.selection
             // Reloading a column makes it the last and drops its selection, so changing any but
@@ -101,9 +102,7 @@ struct ColumnBrowser: NSViewRepresentable {
                     // Every later column is then rebuilt below from listings read in this pass,
                     // so the rows selected in it are rows it has.
                     if browser.lastColumn > column { browser.lastColumn = column }
-                    if trail == nil {
-                        trail = ColumnTrail.columns(root: newRoot, path: model.snapshot.path, selection: model.snapshot.selection)
-                    }
+                    if trail == nil { trail = modelTrail() }
                 }
                 loaded.insert(path)
                 if let trail { restoreSelection(browser, column: column, folder: path, items: current, trail: trail) }
@@ -126,6 +125,7 @@ struct ColumnBrowser: NSViewRepresentable {
             }
             let opens = indexes.count == 1 && items[indexes[0]].kind == .directory
             if opens {
+                // Selecting it opened its column; one left selected whose column closed needs this.
                 if browser.lastColumn == column { browser.addColumn() }
             } else if browser.lastColumn > column {
                 browser.lastColumn = column
@@ -299,8 +299,8 @@ struct ColumnBrowser: NSViewRepresentable {
             if let clicked {
                 if !model.snapshot.selection.contains(clicked.path) {
                     if browser.lastColumn > column { browser.lastColumn = column }
+                    // Selecting one folder opens its column; `addColumn` after it throws (measured).
                     browser.selectRowIndexes(IndexSet(integer: row), inColumn: column)
-                    if clicked.kind == .directory { browser.addColumn() }
                     selectionChanged(nil)
                 }
             } else {
@@ -366,11 +366,8 @@ struct ColumnBrowser: NSViewRepresentable {
         }
 
         func browser(_ browser: NSBrowser, acceptDrop info: any NSDraggingInfo, atRow row: Int, column: Int, dropOperation: NSBrowser.DropOperation) -> Bool {
-            guard let folder = dropFolder(row: row, column: column),
-                  let action = dropAction(for: info, onto: folder, model: model) else { return false }
-            let model = model
-            Task { await model.perform(action) }
-            return true
+            guard let folder = dropFolder(row: row, column: column) else { return false }
+            return performDrop(info, onto: folder, model: model)
         }
 
         /// A folder row, else the column's folder. Beyond every column it is the location, the

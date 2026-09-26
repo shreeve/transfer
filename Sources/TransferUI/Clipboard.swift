@@ -41,25 +41,25 @@ public final class Clipboard {
 
     public private(set) var clip: Clip?
 
-    /// Copies larger than this are not downloaded for Finder; the bar says so.
-    static let finderLimit: UInt64 = 1 << 30
+    /// Copies larger than this are not downloaded for Finder; the bar says so. It holds for the
+    /// bytes that arrive, not only the sizes the server listed.
+    nonisolated static let finderLimit: UInt64 = 1 << 30
 
     @ObservationIgnored private var seenChangeCount = -1
     @ObservationIgnored private var written: (payload: Data, text: String)?
     @ObservationIgnored private var work: Task<Void, Never>?
-    @ObservationIgnored private var observers: [any NSObjectProtocol] = []
-    @ObservationIgnored private var escapeMonitor: Any?
 
     private init() {
-        // Empties what an earlier run left.
+        // Empties what an earlier run left. The clipboard lives as long as the app, so neither
+        // the observers nor the monitor below is ever removed.
         _ = Self.stagingRoot
         let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+        _ = center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { Clipboard.shared.poll() }
-        })
-        observers.append(center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+        }
+        _ = center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { Clipboard.shared.leave() }
-        })
+        }
         // The pasteboard posts no change notification; its change count is cheap to read, and the
         // run loop holds the timer.
         RunLoop.main.add(Timer(timeInterval: 0.5, repeats: true) { _ in
@@ -70,7 +70,7 @@ public final class Clipboard {
         // No responder gets Escape as cancelOperation when a button or the window has focus, so it
         // is watched here, except in text fields, sheets, and non-browser windows. An open rename
         // bar goes first: Escape cancels it wherever focus is, and the clip stays.
-        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             MainActor.assumeIsolated { Clipboard.shared.takesEscape(event) } ? nil : event
         }
         poll()
@@ -198,23 +198,24 @@ public final class Clipboard {
         clip = Clip(id: id, source: .finder(urls), name: urls.count == 1 ? urls[0].lastPathComponent : nil, tally: ClipTally(), finder: .notNeeded)
         let box = Locked(ClipTally())
         work = Task {
-            await publishing(box, to: id) {
-                // Off the main thread, and stopped when the clip is: copying a whole disk in
-                // Finder must not leave a walk running after the next copy replaces it.
-                let walk = Task.detached {
-                    let manager = FileManager.default
-                    for url in urls {
-                        guard let attributes = try? manager.attributesOfItem(atPath: url.path) else { continue }
-                        let root = TreeEntry(attributes)
-                        box.withLock { $0.add(root: root) }
-                        guard root == .directory, let enumerator = manager.enumerator(atPath: url.path) else { continue }
-                        while !Task.isCancelled, enumerator.nextObject() != nil {
-                            if let attributes = enumerator.fileAttributes { box.withLock { $0.add(inside: TreeEntry(attributes)) } }
-                        }
+            // Off the main thread, and stopped when the clip is: copying a whole disk in Finder
+            // must not leave a walk running after the next copy replaces it.
+            let walk = Task.detached {
+                let manager = FileManager.default
+                for url in urls {
+                    guard let attributes = try? manager.attributesOfItem(atPath: url.path) else { continue }
+                    let root = TreeEntry(attributes)
+                    box.withLock { $0.add(root: root) }
+                    guard root == .directory, let enumerator = manager.enumerator(atPath: url.path) else { continue }
+                    while !Task.isCancelled, enumerator.nextObject() != nil {
+                        if let attributes = enumerator.fileAttributes { box.withLock { $0.add(inside: TreeEntry(attributes)) } }
                     }
                 }
-                await withTaskCancellationHandler { await walk.value } onCancel: { walk.cancel() }
             }
+            let ticker = ticking { self.update(id) { $0.tally = box.value } }
+            await withTaskCancellationHandler { await walk.value } onCancel: { walk.cancel() }
+            ticker.cancel()
+            update(id) { $0.tally = box.value }
             if !Task.isCancelled { update(id) { $0.tally.complete = true } }
         }
     }
@@ -261,7 +262,8 @@ public final class Clipboard {
     }
 
     /// Downloads the clip into its own staging folder, then adds the file URLs to the pasteboard,
-    /// unless something else has been copied in the meantime.
+    /// unless something else has been copied in the meantime. The listed sizes can be missing or
+    /// wrong, so a download that brings more than `finderLimit` is stopped and its folder removed.
     private func stageForFinder(_ items: [RemoteItem], session: any RemoteSession, id: UUID) async {
         guard let clip, clip.id == id, case .preparing = clip.finder, clip.tally.complete, !Task.isCancelled else { return }
         guard clip.tally.bytes <= Self.finderLimit else {
@@ -273,31 +275,41 @@ public final class Clipboard {
         let done = Locked<UInt64>(0)
         let ticker = ticking { self.update(id) { $0.finder = .preparing(min(Double(done.value) / Double(total), 0.99)) } }
         defer { ticker.cancel() }
-        var urls: [URL] = []
-        do {
+        let fetching = Locked<Task<[URL], any Error>?>(nil)
+        let fetch = Task {
+            var urls: [URL] = []
             for item in items {
                 try Task.checkCancellation()
                 let url = folder.appendingPathComponent(item.name)
                 let base = done.value
-                try await session.download(item.path, to: url) { progress in done.value = base + progress.completed }
+                try await session.download(item.path, to: url) { progress in
+                    let bytes = base + progress.completed
+                    done.value = bytes
+                    if bytes > Self.finderLimit { fetching.value?.cancel() }
+                }
                 urls.append(url)
             }
+            return urls
+        }
+        fetching.value = fetch
+        let urls: [URL]
+        do {
+            urls = try await withTaskCancellationHandler { try await fetch.value } onCancel: { fetch.cancel() }
+            // The last bytes can land before the cancel does.
+            guard done.value <= Self.finderLimit else { throw CancellationError() }
         } catch {
-            if !Task.isCancelled { update(id) { $0.finder = .failed(error.localizedDescription) } }
+            if done.value > Self.finderLimit {
+                try? FileManager.default.removeItem(at: folder)
+                update(id) { $0.finder = .tooLarge }
+            } else if !Task.isCancelled {
+                update(id) { $0.finder = .failed(error.localizedDescription) }
+            }
             return
         }
         ticker.cancel()
         guard self.clip?.id == id, NSPasteboard.general.changeCount == seenChangeCount else { return }
         write(files: urls)
         update(id) { $0.finder = .ready }
-    }
-
-    /// Runs `body` while copying the box's tally into the clip every 0.2 s, and once at the end.
-    private func publishing(_ box: Locked<ClipTally>, to id: UUID, _ body: () async -> Void) async {
-        let ticker = ticking { self.update(id) { $0.tally = box.value } }
-        await body()
-        ticker.cancel()
-        update(id) { $0.tally = box.value }
     }
 
     /// Runs `tick` now and every 0.2 s until the task it returns is cancelled.
