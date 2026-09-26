@@ -1069,6 +1069,42 @@ struct LiveSyncTests {
         withExtendedLifetime(fake) {}
     }
 
+    /// The upload's coordinated read asked an NSDocument editor holding the copy to save first, so
+    /// the text it had not saved uploaded over the save the user made (LIV2-04).
+    @Test func anUploadNeverAsksAnEditorToSaveItsUnsavedText() async throws {
+        try await withLive("no-ask") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let editor = UnsavedEditor(local)
+            NSFileCoordinator.addFilePresenter(editor)
+            defer { NSFileCoordinator.removeFilePresenter(editor) }
+            try await edit(h, local, id, "saved by the user")
+            #expect(await waitUntil { await h.fake.contents(note) == "saved by the user" })
+            #expect(await settled(h))
+            #expect(editor.asked.value == 0)
+            #expect(read(local) == "saved by the user")
+            #expect(await h.fake.savedContents == ["saved by the user"])
+        }
+    }
+
+    /// An editor slow to let a refresh in held the actor's thread, and with it every server's Live
+    /// work and the Live list (LIV2-07).
+    @Test func anEditorSlowToLetARefreshInStallsNothingElse() async throws {
+        try await withLive("slow-editor") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            await h.fake.changeBehind(note, "newer on server")
+            let editor = SlowEditor(local)
+            NSFileCoordinator.addFilePresenter(editor)
+            defer { NSFileCoordinator.removeFilePresenter(editor) }
+            let reopening = Task { try await h.live.open(note, on: h.connection) }
+            #expect(await waitUntil { editor.asked.value })
+            let start = ContinuousClock.now
+            #expect(await h.files().count == 1)
+            #expect(ContinuousClock.now - start < .milliseconds(500))
+            _ = try await reopening.value
+            #expect(read(local) == "newer on server")
+        }
+    }
+
     // MARK: The worker and the watcher
 
     @Test func closingCancelsQueuedCommands() async throws {
@@ -1114,6 +1150,36 @@ private final class SavingEditor: NSObject, NSFilePresenter, @unchecked Sendable
     func relinquishPresentedItem(toWriter writer: @escaping @Sendable ((@Sendable () -> Void)?) -> Void) {
         relinquished.value = true
         if let url = presentedItemURL { try? Data(text.utf8).write(to: url) }
+        writer(nil)
+    }
+}
+
+/// An NSDocument-like editor with unsaved text that it saves when a coordinated reader asks.
+private final class UnsavedEditor: NSObject, NSFilePresenter, @unchecked Sendable {
+    let presentedItemURL: URL?
+    let presentedItemOperationQueue = OperationQueue()
+    let asked = Locked(0)
+
+    init(_ url: URL) { presentedItemURL = url }
+
+    func savePresentedItemChanges(completionHandler: @escaping @Sendable (Error?) -> Void) {
+        asked.withLock { $0 += 1 }
+        if let url = presentedItemURL { try? Data("unsaved typing".utf8).write(to: url) }
+        completionHandler(nil)
+    }
+}
+
+/// An editor that takes a second and a half to let a writer in.
+private final class SlowEditor: NSObject, NSFilePresenter, @unchecked Sendable {
+    let presentedItemURL: URL?
+    let presentedItemOperationQueue = OperationQueue()
+    let asked = Locked(false)
+
+    init(_ url: URL) { presentedItemURL = url }
+
+    func relinquishPresentedItem(toWriter writer: @escaping @Sendable ((@Sendable () -> Void)?) -> Void) {
+        asked.value = true
+        Thread.sleep(forTimeInterval: 1.5)
         writer(nil)
     }
 }

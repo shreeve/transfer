@@ -555,15 +555,17 @@ actor LiveSync {
             return .unstable
         }
         let snapshot: URL
-        do { snapshot = try Self.snapshot(of: entry.local) } catch {
+        do {
+            guard let taken = try await Self.snapshot(of: entry.local, holding: before) else {
+                look(id)
+                return .unstable
+            }
+            snapshot = taken
+        } catch {
             report(entry, .failed, error.localizedDescription)
             return .failed
         }
         defer { try? FileManager.default.removeItem(at: snapshot) }
-        guard Self.stamp(entry.local) == before else {
-            look(id)
-            return .unstable
-        }
         guard let digest = await Self.readDigest(snapshot) else {
             report(entry, .failed, "Could not read \(entry.name)")
             return .failed
@@ -693,7 +695,8 @@ actor LiveSync {
     /// Replaces the working copy with the server's bytes, only if it still has the stamp `expected`
     /// (nil: still missing), so an editor's save is never overwritten. The bytes are downloaded
     /// beside it and measured there, then renamed over it in a coordinated write, which tells an
-    /// NSDocument editor that has it open. Returns false, changing nothing, when the copy moved.
+    /// NSDocument editor that has it open, off the actor, as an editor may be slow to answer.
+    /// Returns false, changing nothing, when the copy moved.
     private func placeServerBytes(_ item: RemoteItem, _ print: Fingerprint, for id: LiveFileID, ifStill expected: LiveStamp?,
                                   via server: any LiveServer, interactive: Bool) async throws -> Bool {
         guard let entry = entries[id] else { return false }
@@ -704,12 +707,15 @@ actor LiveSync {
         // A rename keeps both, and an editor saving just after it cannot slip its bytes into the record.
         let stamp = Self.stamp(fresh)
         let digest = await Self.readDigest(fresh)
-        var placed = false
-        var coordinatorError: NSError?
-        NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: entry.local, options: .forReplacing, error: &coordinatorError) { url in
-            guard Self.stamp(url) == expected else { return }
-            placed = Darwin.rename(fresh.path, url.path) == 0
-        }
+        let placed = await Task.detached { [local = entry.local] in
+            var placed = false
+            var coordinatorError: NSError?
+            NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: local, options: .forReplacing, error: &coordinatorError) { url in
+                guard Self.stamp(url) == expected else { return }
+                placed = Darwin.rename(fresh.path, url.path) == 0
+            }
+            return placed
+        }.value
         guard placed else { return false }
         adopt(id, server: print, stamp: stamp, digest: digest)
         return true
@@ -748,9 +754,8 @@ actor LiveSync {
         case .keepBoth:
             let server = try loggedIn(connection)
             guard let before = try await stillStamp(entry) else { throw TransferError.failed("The working copy of \(entry.name) is missing") }
-            let snapshot = try Self.snapshot(of: entry.local)
+            guard let snapshot = try await Self.snapshot(of: entry.local, holding: before) else { throw TransferError.failed("\(entry.name) is still being written") }
             defer { try? FileManager.default.removeItem(at: snapshot) }
-            guard Self.stamp(entry.local) == before else { throw TransferError.failed("\(entry.name) is still being written") }
             let parent = entry.path.parent ?? RemotePath(string: "/")
             let name = KeepBothName.fromThisMac(existing: try await server.liveNames(in: parent), original: entry.name)
             do {
@@ -1019,21 +1024,29 @@ actor LiveSync {
         (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) } != nil
     }
 
-    /// A copy of the working file taken under an `NSFileCoordinator` read, with the same mtime.
-    private static func snapshot(of file: URL) throws -> URL {
-        let snapshot = FileManager.default.temporaryDirectory.appendingPathComponent("live-\(UUID().uuidString)")
-        var coordinatorError: NSError?
-        var copyError: Error?
-        NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: file, options: [], error: &coordinatorError) { url in
-            do {
-                try FileManager.default.copyItem(at: url, to: snapshot)
-                if let date = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date {
-                    try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: snapshot.path)
-                }
-            } catch { copyError = error }
-        }
-        if let error = coordinatorError ?? copyError { throw TransferError.failed(error.localizedDescription) }
-        return snapshot
+    /// A copy of the working file with the same mtime, or nil when the file no longer has `stamp`
+    /// after it was read. It is read under an `NSFileCoordinator` read that waits for a coordinated
+    /// writer but asks no editor to save: an NSDocument editor asked would save text the user has
+    /// not saved, and that would upload. It runs off the actor, as an editor may be slow to answer.
+    private static func snapshot(of file: URL, holding stamp: LiveStamp) async throws -> URL? {
+        try await Task.detached {
+            let snapshot = FileManager.default.temporaryDirectory.appendingPathComponent("live-\(UUID().uuidString)")
+            var coordinatorError: NSError?
+            var copyError: Error?
+            NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: file, options: .withoutChanges, error: &coordinatorError) { url in
+                do {
+                    try FileManager.default.copyItem(at: url, to: snapshot)
+                    if let date = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date {
+                        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: snapshot.path)
+                    }
+                } catch { copyError = error }
+            }
+            let error = coordinatorError ?? copyError
+            if error == nil, Self.stamp(file) == stamp { return snapshot }
+            try? FileManager.default.removeItem(at: snapshot)
+            if let error { throw TransferError.failed(error.localizedDescription) }
+            return nil
+        }.value
     }
 }
 
