@@ -40,7 +40,7 @@ public actor SSHConnection: RemoteSession {
     /// during the open would see room and open its own.
     private var opening = 0
     /// Callers waiting for a data channel, in order, with the share each takes. Each gets a
-    /// channel with room, or nil to look again when an open it was counting on was cancelled.
+    /// channel with room, or nil to open one itself, already counted in `opening`.
     private var waiters: [(id: UUID, share: Int, continuation: CheckedContinuation<SFTPChannel?, Error>)] = []
     private var refusedAt: ContinuousClock.Instant?
     let pipe = EventPipe()
@@ -493,8 +493,9 @@ public actor SSHConnection: RemoteSession {
     /// A data channel with room for `share`: an idle one, a new one while fewer than seven are
     /// open or opening, else the least loaded with room, else the next with room once others let
     /// go. Callers queue in order and leave the queue when cancelled. While any wait, a newcomer
-    /// neither takes a channel nor opens one ahead of them, as when room opens again after the
-    /// server refused a channel, unless nothing is open or opening that could come back to them.
+    /// neither takes a channel nor opens one ahead of them, unless nothing is open or opening that
+    /// could come back to them: when room opens again, as after the server refused a channel, the
+    /// first in line opens it (`dispatch`), and goes to the back of the line if it is refused.
     private func acquire(_ share: Int) async throws -> SFTPChannel {
         while true {
             if waiters.isEmpty, let link = fitting(share, sharing: !canOpen) {
@@ -502,13 +503,17 @@ public actor SSHConnection: RemoteSession {
                 continue
             }
             if canOpen, waiters.isEmpty || pool.isEmpty && opening == 0 {
+                opening += 1
                 guard let link = try await openData(share) else { continue }
                 return link
             }
             guard !pool.isEmpty || opening > 0 else {
                 throw master?.isRunning == true ? TransferError.connectionLost("No SFTP channel could open") : TransferError.notConnected
             }
-            guard let link = try await nextReleased(share) else { continue }
+            guard let link = try await nextReleased(share) else {
+                guard let link = try await openData(share) else { continue }
+                return link
+            }
             if await link.isOpen { return link }
             drop(link)
         }
@@ -520,6 +525,7 @@ public actor SSHConnection: RemoteSession {
         let whole = DataShare.whole.rawValue
         if let link = fitting(whole, sharing: false) { return await hold(link, whole) }
         guard canOpen else { return nil }
+        opening += 1
         return try? await openData(whole)
     }
 
@@ -546,10 +552,10 @@ public actor SSHConnection: RemoteSession {
         return loads.filter { $0.load + share <= DataShare.whole.rawValue }.min { $0.load < $1.load }?.link
     }
 
-    /// Opens a data channel for a caller taking `share` of it. Nil when the server refused it
-    /// while other channels are open or opening, which the caller then waits for.
+    /// Opens a data channel for a caller taking `share` of it, which the caller has already counted
+    /// in `opening`. Nil when the server refused it while other channels are open or opening,
+    /// which the caller then waits for.
     private func openData(_ share: Int) async throws -> SFTPChannel? {
-        opening += 1
         let generation = generation
         do {
             let link = try await openLink()
@@ -567,7 +573,10 @@ public actor SSHConnection: RemoteSession {
             opening -= 1
             let nothingLeft = pool.isEmpty && opening == 0
             if error is CancellationError || (error as? TransferError) == .cancelled {
-                if nothingLeft, !waiters.isEmpty { waiters.removeFirst().continuation.resume(returning: nil) }
+                if nothingLeft, !waiters.isEmpty {
+                    opening += 1
+                    waiters.removeFirst().continuation.resume(returning: nil)
+                }
                 throw error
             }
             // The server allows no more sessions for now (MaxSessions); share what is open.
@@ -581,6 +590,7 @@ public actor SSHConnection: RemoteSession {
         }
     }
 
+    /// The channel `dispatch` hands this caller, or nil when it counted an open for this caller to make.
     private func nextReleased(_ share: Int) async throws -> SFTPChannel? {
         let id = UUID()
         return try await withTaskCancellationHandler {
@@ -612,11 +622,14 @@ public actor SSHConnection: RemoteSession {
     }
 
     /// Hands channels to the callers waiting, first come first served, for as long as the first
-    /// one's share fits: a large file first in line is not passed by small ones behind it.
+    /// one's share fits: a large file first in line is not passed by small ones behind it. When
+    /// none fits but another channel may open, the first in line opens it.
     private func dispatch() {
-        while let first = waiters.first, let link = fitting(first.share, sharing: true) {
+        while let first = waiters.first {
+            let link = fitting(first.share, sharing: true)
+            guard link != nil || canOpen else { return }
             waiters.removeFirst()
-            load[ObjectIdentifier(link), default: 0] += first.share
+            if let link { load[ObjectIdentifier(link), default: 0] += first.share } else { opening += 1 }
             first.continuation.resume(returning: link)
         }
     }

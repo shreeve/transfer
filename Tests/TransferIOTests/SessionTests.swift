@@ -435,6 +435,53 @@ struct SessionServerTests {
         }
     }
 
+    /// After a data channel fails to open, as when sshd refuses one for MaxSessions (a Terminal
+    /// tab on the master), the pool grows back once 10 s have passed, although callers never stop
+    /// waiting meanwhile. The opens fail here through a config error, so no other suite reading
+    /// sshd's log sees a refusal.
+    @Test(.timeLimit(.minutes(1))) func thePoolGrowsBackAfterARefusalWhileCallersWait() async throws {
+        try await withHarness("regrow", connected: true) { h in
+            let config = try String(contentsOf: h.configFile, encoding: .utf8)
+            let state = Locked((inUse: 0, peak: 0, early: 0))
+            let open = Locked(0)
+            let broken = Locked(false)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<3 {
+                    group.addTask {
+                        try await h.session.withData { _ in
+                            open.withLock { $0 += 1 }
+                            while !broken.value { try await Task.sleep(for: .milliseconds(20)) }
+                        }
+                    }
+                }
+                #expect(await waitUntil { open.value == 3 })
+                try (config + "  NoSuchOption yes\n").write(to: h.configFile, atomically: true, encoding: .utf8)
+                broken.value = true
+                let started = ContinuousClock.now
+                for _ in 0..<(2 * SSHConnection.dataChannels) {
+                    group.addTask {
+                        while state.value.peak < SSHConnection.dataChannels, ContinuousClock.now - started < .seconds(15) {
+                            try await h.session.withData { _ in
+                                state.withLock {
+                                    $0.inUse += 1
+                                    $0.peak = max($0.peak, $0.inUse)
+                                    if ContinuousClock.now - started < .seconds(1) { $0.early = $0.peak }
+                                }
+                                try await Task.sleep(for: .milliseconds(50))
+                                state.withLock { $0.inUse -= 1 }
+                            }
+                        }
+                    }
+                }
+                try await Task.sleep(for: .seconds(1))
+                try config.write(to: h.configFile, atomically: true, encoding: .utf8)
+                try await group.waitForAll()
+            }
+            #expect(state.value.early == 3)
+            #expect(state.value.peak == SSHConnection.dataChannels)
+        }
+    }
+
     /// Dead reserved channels are reopened, as often as every 5 s; a live master with no channel
     /// is a lost connection, which transfers retry, and the master's death is reported.
     @Test func reservedChannelsReopenAndTheMastersDeathIsReported() async throws {
