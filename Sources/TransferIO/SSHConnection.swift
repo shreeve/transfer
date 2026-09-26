@@ -424,9 +424,10 @@ public actor SSHConnection: RemoteSession {
         store.star(connection: connection.id, path: path, on: on)
     }
 
-    /// Joins the master when up, else logs in with the same port and identity, never as a master on
-    /// this socket. Nil when a field holds a control character: the command is typed into a shell,
-    /// where a CR or LF in a folder name the server chose would end the line and run the rest.
+    /// Joins the master; if it has gone by the time the command runs, ssh logs in with the same
+    /// port and identity, never as a master on this socket. Nil when not connected, or when a field
+    /// holds a control character: the command is typed into a shell, where a CR or LF in a folder
+    /// name the server chose would end the line and run the rest.
     public func terminalCommand(directory: RemotePath) async -> String? {
         guard isConnected else { return nil }
         let remote = "cd \(Self.quote(directory.display)) && exec \"$SHELL\" -l"
@@ -651,7 +652,7 @@ public actor SSHConnection: RemoteSession {
         // A passenger only joins the master. When the master is gone or refuses it, ssh would log in
         // on its own instead, with none of the master's port, identity, or host-key answer:
         // ProxyCommand makes that attempt fail at once, and BatchMode keeps it from prompting.
-        process.arguments = configArguments + ["-S", socketPath, "-o", "Compression=no", "-o", "ControlMaster=no", "-o", "BatchMode=yes",
+        process.arguments = configArguments + ["-S", socketPath, "-o", "ControlMaster=no", "-o", "BatchMode=yes",
                                                "-o", "ProxyCommand=/usr/bin/false"]
             + Self.plainSession + ["-s", "--", connection.destination, "sftp"]
         let input = Pipe()
