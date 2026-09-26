@@ -1138,6 +1138,32 @@ struct LiveSyncTests {
         }
     }
 
+    /// Retry on a conflict's row reported it succeeded, and no pass reports a conflict again, so
+    /// the shelf lost it (LIV2-11).
+    @Test func retryOnAConflictsRowKeepsIt() async throws {
+        try await withLive("retry-conflict") { h in
+            _ = try await conflicted(h, server: "theirs", local: "mine")
+            await h.live.setPaused(note, on: h.connection, paused: false)
+            #expect(await settled(h))
+            #expect(shelf(h) == .failed)
+            #expect(h.fake.failures.last == "Changed on the server")
+            #expect(await h.file()?.conflict == true)
+        }
+    }
+
+    /// Compare read both copies whole on the actor to tell whether they are text; it is offered
+    /// only up to 16 MB now (LIV2-09).
+    @Test func aHugeConflictIsNotOfferedCompare() async throws {
+        try await withLive("huge") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.fake.changeBehind(note, "theirs")
+            try await edit(h, local, id, String(repeating: "a", count: (16 << 20) + 1))
+            #expect(await waitUntil { await raised(h) })
+            let comparable = h.fake.events.compactMap { if case .conflict(_, let comparable) = $0 { comparable } else { nil } }
+            #expect(comparable == [false])
+        }
+    }
+
     /// A copy re-saved unchanged (new time, same bytes) was never refreshed on reopen, so the
     /// user edited stale bytes and met a conflict (LIV2-08).
     @Test func reopenRefreshesATouchedCopy() async throws {

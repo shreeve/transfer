@@ -259,8 +259,9 @@ actor LiveSync {
 
     func setPaused(_ path: RemotePath, on connection: ConnectionID, paused: Bool) {
         guard let id = find(path, on: connection), let entry = update(id, { $0.state.paused = paused }) else { return }
-        // Resume and Retry: the row goes, and a pass shows what is left to do.
-        report(entry, paused ? .paused : .succeeded)
+        // Resume and Retry: the row goes, and a pass shows what is left to do. A conflict's row
+        // stays, since no pass reports a conflict again.
+        if !paused, let kind = entry.conflict { report(entry, .failed, Self.message(kind)) } else { report(entry, paused ? .paused : .succeeded) }
         if !paused { lookAgain(id) }
         emit(entry, .liveChanged)
     }
@@ -516,7 +517,7 @@ actor LiveSync {
             case .upload(let base):
                 guard let saver = servers[entry.connection]?.server else { return park(id) }
                 switch await save(id, expecting: .file(base), settled: stamp, via: saver) {
-                case .done, .unstable, .missing, .failed: return
+                case .done, .stopped: return
                 case .retry(let reason): return retry(id, reason: reason)
                 case .serverChanged:
                     guard let found = await lookup(id) else { return }
@@ -550,33 +551,30 @@ actor LiveSync {
         schedule(id, after: .seconds(delay))
     }
 
-    private enum SaveOutcome { case done, unstable, missing, serverChanged, retry(String), failed }
+    /// `stopped` carries what the user is told: the pass waits for the next change, Keep Local says it.
+    private enum SaveOutcome { case done, serverChanged, retry(String), stopped(String) }
 
     /// One upload of the working copy as it is now. A pass passes the stamp that held still: bytes
     /// written since, as during its lookup, have not, and wait for another look. The copy must not
     /// change while it is read; the new base is what the server reports for our own bytes.
     private func save(_ id: LiveFileID, expecting: ServerExpectation, settled: LiveStamp?, via server: any LiveServer) async -> SaveOutcome {
         guard let entry = entries[id] else { return .done }
-        guard let before = Self.stamp(entry.local) else { return .missing }
-        guard settled == nil || before == settled else {
-            look(id)
-            return .unstable
-        }
+        guard let before = Self.stamp(entry.local) else { return .stopped("The working copy of \(entry.name) is missing") }
         let snapshot: URL
         do {
-            guard let taken = try await Self.snapshot(of: entry.local, holding: before) else {
+            guard settled == nil || before == settled, let taken = try await Self.snapshot(of: entry.local, holding: before) else {
                 look(id)
-                return .unstable
+                return .stopped("\(entry.name) is still being written")
             }
             snapshot = taken
         } catch {
             report(entry, .failed, error.localizedDescription)
-            return .failed
+            return .stopped(error.localizedDescription)
         }
         defer { try? FileManager.default.removeItem(at: snapshot) }
         guard let digest = await Self.readDigest(snapshot) else {
             report(entry, .failed, "Could not read \(entry.name)")
-            return .failed
+            return .stopped("Could not read \(entry.name)")
         }
         mark(id) {
             $0.uploading = true
@@ -612,7 +610,7 @@ actor LiveSync {
             if error is LiveRemoteChanged { return .serverChanged }
             if RetryPolicy.isRetryable(error) || (error as? TransferError) == .notConnected { return .retry(error.localizedDescription) }
             report(entry, .failed, error.localizedDescription)
-            return .failed
+            return .stopped(error.localizedDescription)
         }
     }
 
@@ -635,17 +633,21 @@ actor LiveSync {
             try? FileManager.default.removeItem(at: entry.serverCopy)
             return
         }
-        let message = switch kind {
+        let hasCopy = FileManager.default.fileExists(atPath: conflicted.serverCopy.path)
+        let comparable = kind.server != nil && FileManager.default.isExecutableFile(atPath: "/usr/bin/opendiff")
+            && Self.isUTF8(conflicted.local) && (!hasCopy || Self.isUTF8(conflicted.serverCopy))
+        report(conflicted, .failed, Self.message(kind))
+        emit(conflicted, .conflict(conflicted.path, comparable: comparable))
+        emit(conflicted, .liveChanged)
+    }
+
+    /// A conflict's row on the shelf.
+    private static func message(_ kind: LiveConflictKind) -> String {
+        switch kind {
         case .changed: "Changed on the server"
         case .removed: "Removed from the server"
         case .notAFile: "Replaced on the server by something that is not a file"
         }
-        let hasCopy = FileManager.default.fileExists(atPath: conflicted.serverCopy.path)
-        let comparable = kind.server != nil && FileManager.default.isExecutableFile(atPath: "/usr/bin/opendiff")
-            && Self.isUTF8(conflicted.local) && (!hasCopy || Self.isUTF8(conflicted.serverCopy))
-        report(conflicted, .failed, message)
-        emit(conflicted, .conflict(conflicted.path, comparable: comparable))
-        emit(conflicted, .liveChanged)
     }
 
     // MARK: Commands
@@ -755,10 +757,7 @@ actor LiveSync {
                     await raiseConflict(id, kind: kind, item: item)
                 }
                 throw TransferError.failed("\(entry.name) changed on the server again")
-            case .unstable: throw TransferError.failed("\(entry.name) is still being written")
-            case .missing: throw TransferError.failed("The working copy of \(entry.name) is missing")
-            case .retry(let reason): throw TransferError.failed(reason)
-            case .failed: throw TransferError.failed("Could not upload \(entry.name)")
+            case .retry(let message), .stopped(let message): throw TransferError.failed(message)
             }
         case .keepRemote:
             try await takeServerCopy(id, ifStill: before, via: try loggedIn(connection))
@@ -1020,8 +1019,10 @@ actor LiveSync {
         await Task.detached(priority: .utility) { digest(of: url) }.value
     }
 
+    /// Compare is offered only for text opendiff can take: a conflict must not read a huge file whole.
     private static func isUTF8(_ url: URL) -> Bool {
-        (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) } != nil
+        guard let size = stamp(url)?.size, size <= 16 << 20 else { return false }
+        return (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) } != nil
     }
 
     /// A copy of the working file with the same mtime, or nil when the file no longer has `stamp`
