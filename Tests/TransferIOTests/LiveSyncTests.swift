@@ -1013,6 +1013,172 @@ struct LiveSyncTests {
         }
     }
 
+    // MARK: Round 2 (LIV2)
+
+    /// A row's stored absolute path was trusted: a clean row whose copy was gone had that path's
+    /// parent folder removed recursively at launch, wherever it was (LIV2-02).
+    @Test func aRowNamingAnotherPlaceNeverReachesOutsideTheLiveFolder() async throws {
+        let h = try Self.harness("outside")
+        defer { try? FileManager.default.removeItem(at: h.base) }
+        let victim = h.base.appendingPathComponent("Documents", isDirectory: true)
+        try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+        try Data("precious".utf8).write(to: victim.appendingPathComponent("thesis.txt"))
+        await h.live.closeAll()
+        for name in ["gone.txt", ".."] {
+            h.store.saveLive(LiveRow(id: LiveFileID(), connection: h.connection, path: note, baseSize: 1, baseMtime: 1,
+                                     localPath: victim.appendingPathComponent(name).path, dirty: false))
+        }
+        let again = LiveSync(store: h.store, watches: false)
+        #expect(read(victim.appendingPathComponent("thesis.txt")) == "precious")
+        #expect(await again.files(on: h.connection).isEmpty)
+        #expect(h.store.liveFiles().isEmpty)
+        await again.closeAll()
+    }
+
+    /// A library that moved (a renamed home folder, a restored copy) kept rows with the old
+    /// absolute paths, so an unsynced copy that moved with it read as gone and was forgotten (LIV2-03).
+    @Test func aMovedLibraryKeepsItsUnsyncedCopies() async throws {
+        let base = TestCaches.fresh("livesync-moved")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        let connection = ConnectionID()
+        let copy: String
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let store = try Store(root: root)
+            let h = Harness(base: base, store: store, live: LiveSync(store: store, watches: false), fake: FakeServer(), connection: connection)
+            await h.live.connected(connection, server: h.fake)
+            let (local, _) = try await openLive(h, note, "first")
+            await h.live.setPaused(note, on: connection, paused: true)
+            try Data("unsynced edit".utf8).write(to: local)
+            await h.live.closeAll()
+            copy = String(local.path.dropFirst(root.path.count))
+        }
+        let moved = base.appendingPathComponent("moved", isDirectory: true)
+        try FileManager.default.moveItem(at: root, to: moved)
+
+        let live = LiveSync(store: try Store(root: moved), watches: false)
+        let fake = FakeServer()
+        await live.connected(connection, server: fake)
+        let files = await live.files(on: connection)
+        #expect(files.map(\.path) == [note])
+        #expect(files.first?.dirty == true)
+        #expect(fake.events.allSatisfy { if case .notice = $0 { false } else { true } })
+        #expect(read(URL(fileURLWithPath: moved.path + copy)) == "unsynced edit")
+        await live.closeAll()
+        withExtendedLifetime(fake) {}
+    }
+
+    /// The upload's coordinated read asked an NSDocument editor holding the copy to save first, so
+    /// the text it had not saved uploaded over the save the user made (LIV2-04).
+    @Test func anUploadNeverAsksAnEditorToSaveItsUnsavedText() async throws {
+        try await withLive("no-ask") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let editor = UnsavedEditor(local)
+            NSFileCoordinator.addFilePresenter(editor)
+            defer { NSFileCoordinator.removeFilePresenter(editor) }
+            try await edit(h, local, id, "saved by the user")
+            #expect(await waitUntil { await h.fake.contents(note) == "saved by the user" })
+            #expect(await settled(h))
+            #expect(editor.asked.value == 0)
+            #expect(read(local) == "saved by the user")
+            #expect(await h.fake.savedContents == ["saved by the user"])
+        }
+    }
+
+    /// An editor slow to let a refresh in held the actor's thread, and with it every server's Live
+    /// work and the Live list (LIV2-07).
+    @Test func anEditorSlowToLetARefreshInStallsNothingElse() async throws {
+        try await withLive("slow-editor") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            await h.fake.changeBehind(note, "newer on server")
+            let editor = SlowEditor(local)
+            NSFileCoordinator.addFilePresenter(editor)
+            defer { NSFileCoordinator.removeFilePresenter(editor) }
+            let reopening = Task { try await h.live.open(note, on: h.connection) }
+            #expect(await waitUntil { editor.asked.value })
+            let start = ContinuousClock.now
+            #expect(await h.files().count == 1)
+            #expect(ContinuousClock.now - start < .milliseconds(500))
+            _ = try await reopening.value
+            #expect(read(local) == "newer on server")
+        }
+    }
+
+    /// A save whose reply was lost and was adopted is a save a move's check must see: the original
+    /// it landed on is newer than a copy made before it (LIV2-01).
+    @Test func anAdoptedSaveCountsForAMovesMark() async throws {
+        try await withLive("adopt-mark") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let mark = await h.live.saveMark()
+            await h.fake.landNextSaveThenFail()
+            try await edit(h, local, id, "mine")
+            #expect(await waitUntil { await h.file().map { !$0.dirty && !$0.conflict } == true })
+            #expect(await h.fake.saves == 1)
+            #expect(await h.live.saved(under: note, on: h.connection, since: mark))
+        }
+    }
+
+    /// A save refused because the server changed left its stamp pending, so a lookalike of that
+    /// stamp's size and second on the server was adopted as our own upload, and the edit was
+    /// marked synced without ever landing (LIV2-06).
+    @Test func aRefusedSaveIsNeverAdoptedLater() async throws {
+        try await withLive("refused") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let second = floor(Date().timeIntervalSince1970)
+            try Data("mine!".utf8).write(to: local)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: second + 0.3)], ofItemAtPath: local.path)
+            await h.fake.setBeforeSave { await h.fake.put(note, "their", mtime: UInt32(second)) }
+            await h.live.localChanged(id)
+            #expect(await waitUntil { await raised(h) })
+            #expect(await h.fake.saves == 0)
+            #expect(await h.fake.contents(note) == "their")
+            #expect(await h.file()?.dirty == true)
+            #expect(read(local) == "mine!")
+        }
+    }
+
+    /// Retry on a conflict's row reported it succeeded, and no pass reports a conflict again, so
+    /// the shelf lost it (LIV2-11).
+    @Test func retryOnAConflictsRowKeepsIt() async throws {
+        try await withLive("retry-conflict") { h in
+            _ = try await conflicted(h, server: "theirs", local: "mine")
+            await h.live.setPaused(note, on: h.connection, paused: false)
+            #expect(await settled(h))
+            #expect(shelf(h) == .failed)
+            #expect(h.fake.failures.last == "Changed on the server")
+            #expect(await h.file()?.conflict == true)
+        }
+    }
+
+    /// Compare read both copies whole on the actor to tell whether they are text; it is offered
+    /// only up to 16 MB now (LIV2-09).
+    @Test func aHugeConflictIsNotOfferedCompare() async throws {
+        try await withLive("huge") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.fake.changeBehind(note, "theirs")
+            try await edit(h, local, id, String(repeating: "a", count: (16 << 20) + 1))
+            #expect(await waitUntil { await raised(h) })
+            let comparable = h.fake.events.compactMap { if case .conflict(_, let comparable) = $0 { comparable } else { nil } }
+            #expect(comparable == [false])
+        }
+    }
+
+    /// A copy re-saved unchanged (new time, same bytes) was never refreshed on reopen, so the
+    /// user edited stale bytes and met a conflict (LIV2-08).
+    @Test func reopenRefreshesATouchedCopy() async throws {
+        try await withLive("reopen-touched") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: local.path)
+            await h.fake.changeBehind(note, "newer on server")
+            #expect(try await h.live.open(note, on: h.connection) == local)
+            #expect(read(local) == "newer on server")
+            #expect(await h.file().map { !$0.dirty && !$0.conflict } == true)
+            #expect(await settled(h))
+            #expect(await h.fake.saves == 0)
+        }
+    }
+
     // MARK: The worker and the watcher
 
     @Test func closingCancelsQueuedCommands() async throws {
@@ -1062,6 +1228,36 @@ private final class SavingEditor: NSObject, NSFilePresenter, @unchecked Sendable
     }
 }
 
+/// An NSDocument-like editor with unsaved text that it saves when a coordinated reader asks.
+private final class UnsavedEditor: NSObject, NSFilePresenter, @unchecked Sendable {
+    let presentedItemURL: URL?
+    let presentedItemOperationQueue = OperationQueue()
+    let asked = Locked(0)
+
+    init(_ url: URL) { presentedItemURL = url }
+
+    func savePresentedItemChanges(completionHandler: @escaping @Sendable (Error?) -> Void) {
+        asked.withLock { $0 += 1 }
+        if let url = presentedItemURL { try? Data("unsaved typing".utf8).write(to: url) }
+        completionHandler(nil)
+    }
+}
+
+/// An editor that takes a second and a half to let a writer in.
+private final class SlowEditor: NSObject, NSFilePresenter, @unchecked Sendable {
+    let presentedItemURL: URL?
+    let presentedItemOperationQueue = OperationQueue()
+    let asked = Locked(false)
+
+    init(_ url: URL) { presentedItemURL = url }
+
+    func relinquishPresentedItem(toWriter writer: @escaping @Sendable ((@Sendable () -> Void)?) -> Void) {
+        asked.value = true
+        Thread.sleep(forTimeInterval: 1.5)
+        writer(nil)
+    }
+}
+
 // MARK: - Fake server
 
 /// An in-memory server keyed by path. Files carry whole-second mtimes, as SFTP does.
@@ -1085,6 +1281,7 @@ actor FakeServer: LiveServer {
     private var saveError: Error?
     private var landThenFail = false
     private var onSave: (@Sendable (RemotePath) async -> Void)?
+    private var beforeSave: (@Sendable () async -> Void)?
     private var onLookup: (@Sendable () async -> Void)?
     private var holding = false
     private var held: [CheckedContinuation<Void, Never>] = []
@@ -1111,6 +1308,9 @@ actor FakeServer: LiveServer {
 
     /// Runs inside each save attempt, after it landed if it lands.
     func setOnSave(_ hook: (@Sendable (RemotePath) async -> Void)?) { onSave = hook }
+
+    /// Runs inside each save attempt, before the server is checked against the expectation.
+    func setBeforeSave(_ hook: (@Sendable () async -> Void)?) { beforeSave = hook }
 
     /// Runs inside each lookup, before it answers.
     func setOnLookup(_ hook: (@Sendable () async -> Void)?) { onLookup = hook }
@@ -1187,6 +1387,7 @@ actor FakeServer: LiveServer {
             await onSave?(path)
             throw saveError
         }
+        await beforeSave?()
         let data = try Data(contentsOf: snapshot)
         let date = try FileManager.default.attributesOfItem(atPath: snapshot.path)[.modificationDate] as? Date ?? Date()
         let written = File(data: data, mtime: UInt32(date.timeIntervalSince1970))

@@ -64,6 +64,12 @@ actor LiveSync {
         var name: String { path.name }
         var folder: URL { local.deletingLastPathComponent() }
 
+        /// How a copy with `stamp` compares with the last sync, from the digest measured at that
+        /// stamp if there is one: `.needDigest` when its bytes must be read to tell.
+        func change(at stamp: LiveStamp) -> LiveLocalChange {
+            LiveDecision.localChange(state, stamp, digest: measured.flatMap { $0.stamp == stamp ? $0.digest : nil })
+        }
+
         /// The working copy with `stamp` and `digest` holds what the server holds as `print`.
         mutating func recordSync(_ print: Fingerprint, _ stamp: LiveStamp?, _ digest: String?) {
             state.base = print
@@ -116,49 +122,57 @@ actor LiveSync {
         self.watches = watches
         root = store.root.appendingPathComponent("Live", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        (entries, notices) = Self.load(store.liveFiles(), store: store)
+        (entries, notices) = Self.load(store.liveFiles(), store: store, root: root)
     }
 
     /// Records from their rows, reading only stamps; whether a copy holds edits is worked out when
-    /// asked. A gone copy takes its record, and its folder unless edits were known (the user hears
-    /// of those). A copy idle for a day expires unless it holds edits; its last activity is the
-    /// later of its and its folder's mtime, as a download gives the file the server's older time.
-    private static func load(_ rows: [LiveRow], store: Store) -> ([LiveFileID: Entry], [ConnectionID: [String]]) {
+    /// asked. Only a row's file name is read back: its copy is always in its own folder under
+    /// `root`, so a moved library keeps its copies and a row naming another place never reaches
+    /// outside the Live folder. A gone copy takes its record, and its folder unless edits were
+    /// known (the user hears of those). A copy idle for a day expires unless it holds edits; its
+    /// last activity is the later of its and its folder's mtime, as a download gives the file the
+    /// server's older time.
+    private static func load(_ rows: [LiveRow], store: Store, root: URL) -> ([LiveFileID: Entry], [ConnectionID: [String]]) {
         var loaded: [LiveFileID: Entry] = [:]
         var gone: [ConnectionID: [String]] = [:]
         for row in rows {
-            var entry = entry(from: row, local: URL(fileURLWithPath: row.localPath))
-            guard let stamp = stamp(entry.local) else {
+            let folder = folder(root, row.connection, row.id)
+            let local = try? LocalPlacement.child(folder, name: URL(fileURLWithPath: row.localPath).lastPathComponent)
+            var entry = entry(from: row, local: local ?? folder)
+            guard local != nil, let stamp = stamp(entry.local) else {
                 if LiveDecision.isUnsynced(entry.state, nil) {
                     gone[row.connection, default: []].append("The Live copy of \(row.path.display) is gone; its edits were not uploaded")
                 } else {
-                    try? FileManager.default.removeItem(at: entry.folder)
+                    try? FileManager.default.removeItem(at: folder)
                 }
                 store.deleteLive(row.id)
                 continue
             }
             entry.observed = stamp
-            let folderTime = (try? FileManager.default.attributesOfItem(atPath: entry.folder.path)[.modificationDate] as? Date) ?? .distantPast
-            if Date().timeIntervalSince(max(stamp.mtime, folderTime)) > expiry,
-               !LiveDecision.isUnsynced(entry.state, localChange(entry.state, entry.local, stamp)) {
-                store.deleteLive(row.id)
-                try? FileManager.default.removeItem(at: entry.folder)
-                continue
+            let folderTime = (try? FileManager.default.attributesOfItem(atPath: folder.path)[.modificationDate] as? Date) ?? .distantPast
+            if Date().timeIntervalSince(max(stamp.mtime, folderTime)) > expiry {
+                var change = entry.change(at: stamp)
+                if change == .needDigest { change = LiveDecision.localChange(entry.state, stamp, digest: digest(of: entry.local) ?? unreadable) }
+                if !LiveDecision.isUnsynced(entry.state, change) {
+                    store.deleteLive(row.id)
+                    try? FileManager.default.removeItem(at: folder)
+                    continue
+                }
             }
             loaded[row.id] = entry
         }
         return (loaded, gone)
     }
 
+    /// A Live file's own folder, `<root>/<connection>/<id>`, which holds its working copy.
+    private static func folder(_ root: URL, _ connection: ConnectionID, _ id: LiveFileID) -> URL {
+        root.appendingPathComponent("\(connection.rawValue.uuidString)/\(id.rawValue.uuidString)", isDirectory: true)
+    }
+
     // MARK: Connections
 
     /// A connection logged in: its files are looked at again, and passes waiting for the server run.
     func connected(_ connection: ConnectionID, server: any LiveServer) {
-        if !entries.values.contains(where: { $0.connection == connection }) {
-            let (loaded, gone) = Self.load(store.liveFiles(connection: connection), store: store)
-            entries.merge(loaded) { current, _ in current }
-            notices.merge(gone) { current, _ in current }
-        }
         servers[connection] = ServerRef(server)
         ready.insert(connection)
         startWatching()
@@ -245,8 +259,9 @@ actor LiveSync {
 
     func setPaused(_ path: RemotePath, on connection: ConnectionID, paused: Bool) {
         guard let id = find(path, on: connection), let entry = update(id, { $0.state.paused = paused }) else { return }
-        // Resume and Retry: the row goes, and a pass shows what is left to do.
-        report(entry, paused ? .paused : .succeeded)
+        // Resume and Retry: the row goes, and a pass shows what is left to do. A conflict's row
+        // stays, since no pass reports a conflict again.
+        if !paused, let kind = entry.conflict { report(entry, .failed, Self.message(kind)) } else { report(entry, paused ? .paused : .succeeded) }
         if !paused { lookAgain(id) }
         emit(entry, .liveChanged)
     }
@@ -463,7 +478,7 @@ actor LiveSync {
         while let entry = entries[id] {
             let local: LiveLocal = stamp.map { .present($0, digest: digest) } ?? .missing(again: entry.missingSeen)
             switch LiveDecision.decide(entry.state, local: local, server: server) {
-            case .none, .refreshLocal: return
+            case .none: return
             case .markClean: return change(id) { $0.state.dirty = false }
             case .markDirty: return change(id) { $0.state.dirty = true }
             case .restamp:
@@ -483,12 +498,8 @@ actor LiveSync {
                 return report(entry, .failed, "The working copy disappeared before its edits were uploaded")
             case .forget: return drop(entry)
             case .needDigest:
-                // Deleted since its stamp was read: look again, as a missing file.
-                guard let read = await Self.readDigest(entry.local) else {
-                    if Self.stamp(entry.local) == nil { return look(id) }
-                    digest = Self.unreadable
-                    continue
-                }
+                // Moved or deleted during the read: look again.
+                guard let stamp, let read = await measure(entry, at: stamp) else { return look(id) }
                 digest = read
             case .needServer:
                 if !entry.state.dirty { change(id) { $0.state.dirty = true } }
@@ -497,13 +508,16 @@ actor LiveSync {
             case .adopt(let print):
                 // Only if nothing was saved during the lookup: those bytes would go unsent.
                 guard Self.stamp(entry.local) == stamp else { return look(id) }
+                // A save that landed, as far as a move's check is concerned.
+                saves += 1
+                lastSave[id] = saves
                 return change(id) { $0.recordSync(print, stamp, $0.pendingDigest) }
             case .failRetryable(let reason): return retry(id, reason: reason)
             case .conflict(let kind): return await raiseConflict(id, kind: kind, item: item)
             case .upload(let base):
                 guard let saver = servers[entry.connection]?.server else { return park(id) }
                 switch await save(id, expecting: .file(base), settled: stamp, via: saver) {
-                case .done, .unstable, .missing, .failed: return
+                case .done, .stopped: return
                 case .retry(let reason): return retry(id, reason: reason)
                 case .serverChanged:
                     guard let found = await lookup(id) else { return }
@@ -537,31 +551,30 @@ actor LiveSync {
         schedule(id, after: .seconds(delay))
     }
 
-    private enum SaveOutcome { case done, unstable, missing, serverChanged, retry(String), failed }
+    /// `stopped` carries what the user is told: the pass waits for the next change, Keep Local says it.
+    private enum SaveOutcome { case done, serverChanged, retry(String), stopped(String) }
 
     /// One upload of the working copy as it is now. A pass passes the stamp that held still: bytes
     /// written since, as during its lookup, have not, and wait for another look. The copy must not
     /// change while it is read; the new base is what the server reports for our own bytes.
     private func save(_ id: LiveFileID, expecting: ServerExpectation, settled: LiveStamp?, via server: any LiveServer) async -> SaveOutcome {
         guard let entry = entries[id] else { return .done }
-        guard let before = Self.stamp(entry.local) else { return .missing }
-        guard settled == nil || before == settled else {
-            look(id)
-            return .unstable
-        }
+        guard let before = Self.stamp(entry.local) else { return .stopped("The working copy of \(entry.name) is missing") }
         let snapshot: URL
-        do { snapshot = try Self.snapshot(of: entry.local) } catch {
+        do {
+            guard settled == nil || before == settled, let taken = try await Self.snapshot(of: entry.local, holding: before) else {
+                look(id)
+                return .stopped("\(entry.name) is still being written")
+            }
+            snapshot = taken
+        } catch {
             report(entry, .failed, error.localizedDescription)
-            return .failed
+            return .stopped(error.localizedDescription)
         }
         defer { try? FileManager.default.removeItem(at: snapshot) }
-        guard Self.stamp(entry.local) == before else {
-            look(id)
-            return .unstable
-        }
         guard let digest = await Self.readDigest(snapshot) else {
             report(entry, .failed, "Could not read \(entry.name)")
-            return .failed
+            return .stopped("Could not read \(entry.name)")
         }
         mark(id) {
             $0.uploading = true
@@ -588,12 +601,16 @@ actor LiveSync {
             if saved.state.dirty { look(id) }
             return .done
         } catch {
-            mark(id) { $0.uploading = false }
+            mark(id) {
+                $0.uploading = false
+                // Refused before its rename: nothing of ours is on the server to adopt later.
+                if error is LiveRemoteChanged { ($0.state.pending, $0.pendingDigest) = (nil, nil) }
+            }
             emit(entry, .liveChanged)
             if error is LiveRemoteChanged { return .serverChanged }
             if RetryPolicy.isRetryable(error) || (error as? TransferError) == .notConnected { return .retry(error.localizedDescription) }
             report(entry, .failed, error.localizedDescription)
-            return .failed
+            return .stopped(error.localizedDescription)
         }
     }
 
@@ -616,17 +633,21 @@ actor LiveSync {
             try? FileManager.default.removeItem(at: entry.serverCopy)
             return
         }
-        let message = switch kind {
+        let hasCopy = FileManager.default.fileExists(atPath: conflicted.serverCopy.path)
+        let comparable = kind.server != nil && FileManager.default.isExecutableFile(atPath: "/usr/bin/opendiff")
+            && Self.isUTF8(conflicted.local) && (!hasCopy || Self.isUTF8(conflicted.serverCopy))
+        report(conflicted, .failed, Self.message(kind))
+        emit(conflicted, .conflict(conflicted.path, comparable: comparable))
+        emit(conflicted, .liveChanged)
+    }
+
+    /// A conflict's row on the shelf.
+    private static func message(_ kind: LiveConflictKind) -> String {
+        switch kind {
         case .changed: "Changed on the server"
         case .removed: "Removed from the server"
         case .notAFile: "Replaced on the server by something that is not a file"
         }
-        let hasCopy = FileManager.default.fileExists(atPath: conflicted.serverCopy.path)
-        let comparable = kind.server != nil && FileManager.default.isExecutableFile(atPath: "/usr/bin/opendiff")
-            && Self.isUTF8(conflicted.local) && (!hasCopy || Self.isUTF8(conflicted.serverCopy))
-        report(conflicted, .failed, message)
-        emit(conflicted, .conflict(conflicted.path, comparable: comparable))
-        emit(conflicted, .liveChanged)
     }
 
     // MARK: Commands
@@ -637,15 +658,14 @@ actor LiveSync {
         guard item.kind == .file, let print = Fingerprint(item: item) else { throw TransferError.typeMismatch(path.display) }
         if let id = find(path, on: connection), let entry = entries[id] {
             if let stamp = Self.stamp(entry.local) {
-                let digest = await Self.digestIfNeeded(entry.state, entry.local, stamp)
-                let action = LiveDecision.decide(entry.state, local: .present(stamp, digest: digest), server: .file(print), intent: .open)
-                if case .refreshLocal = action {
+                let change = await localChange(of: entry)
+                if LiveDecision.refreshesOnOpen(entry.state, change, server: print) {
                     if try await placeServerBytes(item, print, for: id, ifStill: stamp, via: server, interactive: true), let refreshed = entries[id] {
                         emit(refreshed, .liveChanged)
                     } else {
                         look(id)
                     }
-                } else if LiveDecision.localChange(entry.state, stamp, digest: digest) == .changed {
+                } else if change == .changed || change == .needDigest {
                     look(id)
                 }
                 return entry.local
@@ -654,7 +674,7 @@ actor LiveSync {
             if LiveDecision.isUnsynced(entry.state, nil) { forget(id) } else { drop(entry) }
         }
         let id = LiveFileID()
-        let folder = root.appendingPathComponent("\(connection.rawValue.uuidString)/\(id.rawValue.uuidString)", isDirectory: true)
+        let folder = Self.folder(root, connection, id)
         let file = try LocalPlacement.child(folder, name: item.name)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
@@ -688,7 +708,8 @@ actor LiveSync {
     /// Replaces the working copy with the server's bytes, only if it still has the stamp `expected`
     /// (nil: still missing), so an editor's save is never overwritten. The bytes are downloaded
     /// beside it and measured there, then renamed over it in a coordinated write, which tells an
-    /// NSDocument editor that has it open. Returns false, changing nothing, when the copy moved.
+    /// NSDocument editor that has it open, off the actor, as an editor may be slow to answer.
+    /// Returns false, changing nothing, when the copy moved.
     private func placeServerBytes(_ item: RemoteItem, _ print: Fingerprint, for id: LiveFileID, ifStill expected: LiveStamp?,
                                   via server: any LiveServer, interactive: Bool) async throws -> Bool {
         guard let entry = entries[id] else { return false }
@@ -699,12 +720,15 @@ actor LiveSync {
         // A rename keeps both, and an editor saving just after it cannot slip its bytes into the record.
         let stamp = Self.stamp(fresh)
         let digest = await Self.readDigest(fresh)
-        var placed = false
-        var coordinatorError: NSError?
-        NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: entry.local, options: .forReplacing, error: &coordinatorError) { url in
-            guard Self.stamp(url) == expected else { return }
-            placed = Darwin.rename(fresh.path, url.path) == 0
-        }
+        let placed = await Task.detached { [local = entry.local] in
+            var placed = false
+            var coordinatorError: NSError?
+            NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: local, options: .forReplacing, error: &coordinatorError) { url in
+                guard Self.stamp(url) == expected else { return }
+                placed = Darwin.rename(fresh.path, url.path) == 0
+            }
+            return placed
+        }.value
         guard placed else { return false }
         adopt(id, server: print, stamp: stamp, digest: digest)
         return true
@@ -733,19 +757,15 @@ actor LiveSync {
                     await raiseConflict(id, kind: kind, item: item)
                 }
                 throw TransferError.failed("\(entry.name) changed on the server again")
-            case .unstable: throw TransferError.failed("\(entry.name) is still being written")
-            case .missing: throw TransferError.failed("The working copy of \(entry.name) is missing")
-            case .retry(let reason): throw TransferError.failed(reason)
-            case .failed: throw TransferError.failed("Could not upload \(entry.name)")
+            case .retry(let message), .stopped(let message): throw TransferError.failed(message)
             }
         case .keepRemote:
             try await takeServerCopy(id, ifStill: before, via: try loggedIn(connection))
         case .keepBoth:
             let server = try loggedIn(connection)
             guard let before = try await stillStamp(entry) else { throw TransferError.failed("The working copy of \(entry.name) is missing") }
-            let snapshot = try Self.snapshot(of: entry.local)
+            guard let snapshot = try await Self.snapshot(of: entry.local, holding: before) else { throw TransferError.failed("\(entry.name) is still being written") }
             defer { try? FileManager.default.removeItem(at: snapshot) }
-            guard Self.stamp(entry.local) == before else { throw TransferError.failed("\(entry.name) is still being written") }
             let parent = entry.path.parent ?? RemotePath(string: "/")
             let name = KeepBothName.fromThisMac(existing: try await server.liveNames(in: parent), original: entry.name)
             do {
@@ -948,19 +968,24 @@ actor LiveSync {
         LiveDecision.isUnsynced(entry.state, await localChange(of: entry))
     }
 
-    /// How the copy compares with the last sync, nil when it is missing; bytes are read off the
-    /// actor, only when the stamp alone cannot tell, and once per stamp (`measured`).
+    /// How the copy compares with the last sync, nil when it is missing; bytes are read only when
+    /// the stamp alone cannot tell. `.needDigest` when it moved while they were read.
     private func localChange(of entry: Entry) async -> LiveLocalChange? {
         guard let stamp = Self.stamp(entry.local) else { return nil }
-        let change = LiveDecision.localChange(entry.state, stamp, digest: nil)
-        guard change == .needDigest else { return change }
-        if let measured = entries[entry.id]?.measured, measured.stamp == stamp {
-            return LiveDecision.localChange(entry.state, stamp, digest: measured.digest)
-        }
-        let digest = await Self.readDigest(entry.local) ?? Self.unreadable
-        // Bytes saved during the read are not the bytes of `stamp`.
-        if Self.stamp(entry.local) == stamp { mark(entry.id) { $0.measured = (stamp, digest) } }
+        let change = (entries[entry.id] ?? entry).change(at: stamp)
+        guard change == .needDigest, let digest = await measure(entry, at: stamp) else { return change }
         return LiveDecision.localChange(entry.state, stamp, digest: digest)
+    }
+
+    /// The working copy's digest while it has `stamp`, read off the actor once per stamp and kept
+    /// (`measured`). Unreadable bytes count as an edit. Nil when the copy moved during the read:
+    /// those are not the bytes of `stamp`.
+    private func measure(_ entry: Entry, at stamp: LiveStamp) async -> String? {
+        if let measured = entries[entry.id]?.measured, measured.stamp == stamp { return measured.digest }
+        let digest = await Self.readDigest(entry.local) ?? Self.unreadable
+        guard Self.stamp(entry.local) == stamp else { return nil }
+        mark(entry.id) { $0.measured = (stamp, digest) }
+        return digest
     }
 
     /// `unsyncedCount` from what is known now, reading no bytes: nil when a copy's stamp has no
@@ -968,11 +993,8 @@ actor LiveSync {
     private func unsyncedNow(on connection: ConnectionID) -> Int? {
         var count = 0
         for entry in entries.values where entry.connection == connection {
-            var change = Self.stamp(entry.local).map { LiveDecision.localChange(entry.state, $0, digest: nil) }
-            if change == .needDigest {
-                guard let measured = entry.measured, measured.stamp == Self.stamp(entry.local) else { return nil }
-                change = LiveDecision.localChange(entry.state, measured.stamp, digest: measured.digest)
-            }
+            let change = Self.stamp(entry.local).map(entry.change(at:))
+            if change == .needDigest { return nil }
             if LiveDecision.isUnsynced(entry.state, change) { count += 1 }
         }
         return count
@@ -987,19 +1009,6 @@ actor LiveSync {
         return LiveStamp(size: size, mtime: mtime)
     }
 
-    /// `localChange`, for launch, where the actor does not exist yet.
-    private static func localChange(_ state: LiveState, _ url: URL, _ stamp: LiveStamp) -> LiveLocalChange {
-        let change = LiveDecision.localChange(state, stamp, digest: nil)
-        return change == .needDigest ? LiveDecision.localChange(state, stamp, digest: digest(of: url) ?? unreadable) : change
-    }
-
-    /// The copy's digest when the stamp alone cannot tell whether it changed, else nil. Bytes that
-    /// cannot be read count as an edit, which the upload then reports.
-    private static func digestIfNeeded(_ state: LiveState, _ url: URL, _ stamp: LiveStamp) async -> String? {
-        guard LiveDecision.localChange(state, stamp, digest: nil) == .needDigest else { return nil }
-        return await readDigest(url) ?? unreadable
-    }
-
     static func digest(of url: URL) -> String? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -1010,25 +1019,35 @@ actor LiveSync {
         await Task.detached(priority: .utility) { digest(of: url) }.value
     }
 
+    /// Compare is offered only for text opendiff can take: a conflict must not read a huge file whole.
     private static func isUTF8(_ url: URL) -> Bool {
-        (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) } != nil
+        guard let size = stamp(url)?.size, size <= 16 << 20 else { return false }
+        return (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) } != nil
     }
 
-    /// A copy of the working file taken under an `NSFileCoordinator` read, with the same mtime.
-    private static func snapshot(of file: URL) throws -> URL {
-        let snapshot = FileManager.default.temporaryDirectory.appendingPathComponent("live-\(UUID().uuidString)")
-        var coordinatorError: NSError?
-        var copyError: Error?
-        NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: file, options: [], error: &coordinatorError) { url in
-            do {
-                try FileManager.default.copyItem(at: url, to: snapshot)
-                if let date = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date {
-                    try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: snapshot.path)
-                }
-            } catch { copyError = error }
-        }
-        if let error = coordinatorError ?? copyError { throw TransferError.failed(error.localizedDescription) }
-        return snapshot
+    /// A copy of the working file with the same mtime, or nil when the file no longer has `stamp`
+    /// after it was read. It is read under an `NSFileCoordinator` read that waits for a coordinated
+    /// writer but asks no editor to save: an NSDocument editor asked would save text the user has
+    /// not saved, and that would upload. It runs off the actor, as an editor may be slow to answer.
+    private static func snapshot(of file: URL, holding stamp: LiveStamp) async throws -> URL? {
+        try await Task.detached {
+            let snapshot = FileManager.default.temporaryDirectory.appendingPathComponent("live-\(UUID().uuidString)")
+            var coordinatorError: NSError?
+            var copyError: Error?
+            NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: file, options: .withoutChanges, error: &coordinatorError) { url in
+                do {
+                    try FileManager.default.copyItem(at: url, to: snapshot)
+                    if let date = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date {
+                        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: snapshot.path)
+                    }
+                } catch { copyError = error }
+            }
+            let error = coordinatorError ?? copyError
+            if error == nil, Self.stamp(file) == stamp { return snapshot }
+            try? FileManager.default.removeItem(at: snapshot)
+            if let error { throw TransferError.failed(error.localizedDescription) }
+            return nil
+        }.value
     }
 }
 

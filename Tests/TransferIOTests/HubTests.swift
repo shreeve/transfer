@@ -62,11 +62,12 @@ struct HubTests {
         let store = try Store(root: root)
         let saved = SavedConnection(name: "box", host: "box.invalid", user: "u", port: "", identityFile: "", remotePath: "")
         store.save(saved)
-        let folder = root.appendingPathComponent("Live/\(saved.id.rawValue.uuidString)/one", isDirectory: true)
+        let id = LiveFileID()
+        let folder = root.appendingPathComponent("Live/\(saved.id.rawValue.uuidString)/\(id.rawValue.uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let copy = folder.appendingPathComponent("notes.txt")
         try Data("edited".utf8).write(to: copy)
-        store.saveLive(LiveRow(id: LiveFileID(), connection: saved.id, path: RemotePath(string: "/notes.txt"), baseSize: 1, baseMtime: 1, localPath: copy.path, dirty: true))
+        store.saveLive(LiveRow(id: id, connection: saved.id, path: RemotePath(string: "/notes.txt"), baseSize: 1, baseMtime: 1, localPath: copy.path, dirty: true))
 
         let hub = try TransferHub(root: root)
         await #expect(throws: TransferError.liveUnsynced(1)) { try await hub.removeConnection(saved.id) }
