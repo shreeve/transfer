@@ -354,20 +354,20 @@ public enum ListingSort {
 
 public enum SyntaxPreview {
     /// A page for Quick Look, or when `compact`, a small unwrapped listing that follows the
-    /// system appearance for the inspector pane.
-    public static func html(text: String, fileName: String, compact: Bool = false, wraps: Bool = false) -> String {
+    /// system appearance for the inspector pane. `fileName` is unused: the page has no title,
+    /// since Quick Look shows the file's own name and a server's name would go in unescaped.
+    public static func html(text: String, fileName _: String = "", compact: Bool = false, wraps: Bool = false) -> String {
         let escaped = text
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
         let colored = color(escaped)
-        let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
         let body = compact
             ? "body{margin:6px 8px;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:\(wraps ? "pre-wrap" : "pre");overflow-wrap:anywhere;color:#1d1d1f;background:transparent;-webkit-user-select:text}"
                 + "@media(prefers-color-scheme:dark){body{color:#e5e5e7}.k{color:#6cb3ff}.s{color:#7ed49a}.c{color:#98989d}}"
             : "body{margin:24px;font:13px ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#1d1d1f;background:#fff}"
         return """
-        <!doctype html><html><head><meta charset="utf-8"><title>\(ext)</title>
+        <!doctype html><html><head><meta charset="utf-8">
         <style>
         \(body)
         .k{color:#0b4f9c;font-weight:600}.s{color:#0b6b3a}.c{color:#6e6e73}

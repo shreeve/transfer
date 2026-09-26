@@ -181,15 +181,17 @@ import Testing
 }
 
 @Test func syntaxPreviewKeepsItsOwnMarkupOutOfStrings() {
-    let html = SyntaxPreview.html(text: "const a = 'x' // note\nlet b = \"k\"", fileName: "a.js")
+    let html = SyntaxPreview.html(text: "const a = 'x' // note\nlet b = \"k\"")
     #expect(html.contains("<span class=\"k\">const</span> a = <span class=\"s\">'x'</span> <span class=\"c\">// note</span>"))
     #expect(html.contains("<span class=\"k\">let</span> b = <span class=\"s\">\"k\"</span>"))
     #expect(html.components(separatedBy: "<span").count == 6)
 }
 
 @Test func syntaxPreviewEscapesAndLeavesStringsWhole() {
-    let html = SyntaxPreview.html(text: "if (a < b) { return \"// not a comment\" }", fileName: "a.js")
+    let html = SyntaxPreview.html(text: "if (a < b) { return \"// not a comment\" }")
     #expect(html.contains("(a &lt; b)"))
+    // No title: it held the name's extension, a server's text, unescaped (SEC2-12).
+    #expect(!SyntaxPreview.html(text: "", fileName: "x.a<b").contains("<title>"))
     #expect(html.contains("<span class=\"s\">\"// not a comment\"</span>"))
     #expect(!html.contains("class=\"c\""))
 }
