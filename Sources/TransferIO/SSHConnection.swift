@@ -544,8 +544,10 @@ public actor SSHConnection: RemoteSession {
     /// has not refused one in the last 10 s.
     private var canOpen: Bool {
         pool.count + opening < Self.dataChannels && master?.isRunning == true
-            && refusedAt.map { ContinuousClock.now - $0 > .seconds(10) } ?? true
+            && refusedAt.map { ContinuousClock.now - $0 > Self.refusalBackoff } ?? true
     }
+
+    private static let refusalBackoff = Duration.seconds(10)
 
     /// The pool channel `share` goes on: an idle one, else, when `sharing`, the least loaded with room.
     private func fitting(_ share: Int, sharing: Bool) -> SFTPChannel? {
@@ -584,6 +586,12 @@ public actor SSHConnection: RemoteSession {
             }
             // The server allows no more sessions for now (MaxSessions); share what is open.
             refusedAt = .now
+            // Room opens again after the backoff, when callers may still be waiting and every
+            // channel still held, so nothing is given back to hand it on.
+            Task { [weak self] in
+                try? await Task.sleep(for: Self.refusalBackoff + .milliseconds(50))
+                await self?.dispatch(ifStill: generation)
+            }
             if nothingLeft {
                 for waiter in waiters { waiter.continuation.resume(throwing: error) }
                 waiters.removeAll()
@@ -635,6 +643,10 @@ public actor SSHConnection: RemoteSession {
             if let link { load[ObjectIdentifier(link), default: 0] += first.share } else { opening += 1 }
             first.continuation.resume(returning: link)
         }
+    }
+
+    private func dispatch(ifStill generation: Int) {
+        if generation == self.generation { dispatch() }
     }
 
     private func drop(_ link: SFTPChannel) {
