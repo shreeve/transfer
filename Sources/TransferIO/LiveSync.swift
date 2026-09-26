@@ -502,6 +502,9 @@ actor LiveSync {
             case .adopt(let print):
                 // Only if nothing was saved during the lookup: those bytes would go unsent.
                 guard Self.stamp(entry.local) == stamp else { return look(id) }
+                // A save that landed, as far as a move's check is concerned.
+                saves += 1
+                lastSave[id] = saves
                 return change(id) { $0.recordSync(print, stamp, $0.pendingDigest) }
             case .failRetryable(let reason): return retry(id, reason: reason)
             case .conflict(let kind): return await raiseConflict(id, kind: kind, item: item)
@@ -595,7 +598,11 @@ actor LiveSync {
             if saved.state.dirty { look(id) }
             return .done
         } catch {
-            mark(id) { $0.uploading = false }
+            mark(id) {
+                $0.uploading = false
+                // Refused before its rename: nothing of ours is on the server to adopt later.
+                if error is LiveRemoteChanged { ($0.state.pending, $0.pendingDigest) = (nil, nil) }
+            }
             emit(entry, .liveChanged)
             if error is LiveRemoteChanged { return .serverChanged }
             if RetryPolicy.isRetryable(error) || (error as? TransferError) == .notConnected { return .retry(error.localizedDescription) }

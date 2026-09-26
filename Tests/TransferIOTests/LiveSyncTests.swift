@@ -1105,6 +1105,39 @@ struct LiveSyncTests {
         }
     }
 
+    /// A save whose reply was lost and was adopted is a save a move's check must see: the original
+    /// it landed on is newer than a copy made before it (LIV2-01).
+    @Test func anAdoptedSaveCountsForAMovesMark() async throws {
+        try await withLive("adopt-mark") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let mark = await h.live.saveMark()
+            await h.fake.landNextSaveThenFail()
+            try await edit(h, local, id, "mine")
+            #expect(await waitUntil { await h.file().map { !$0.dirty && !$0.conflict } == true })
+            #expect(await h.fake.saves == 1)
+            #expect(await h.live.saved(under: note, on: h.connection, since: mark))
+        }
+    }
+
+    /// A save refused because the server changed left its stamp pending, so a lookalike of that
+    /// stamp's size and second on the server was adopted as our own upload, and the edit was
+    /// marked synced without ever landing (LIV2-06).
+    @Test func aRefusedSaveIsNeverAdoptedLater() async throws {
+        try await withLive("refused") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let second = floor(Date().timeIntervalSince1970)
+            try Data("mine!".utf8).write(to: local)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: second + 0.3)], ofItemAtPath: local.path)
+            await h.fake.setBeforeSave { await h.fake.put(note, "their", mtime: UInt32(second)) }
+            await h.live.localChanged(id)
+            #expect(await waitUntil { await raised(h) })
+            #expect(await h.fake.saves == 0)
+            #expect(await h.fake.contents(note) == "their")
+            #expect(await h.file()?.dirty == true)
+            #expect(read(local) == "mine!")
+        }
+    }
+
     // MARK: The worker and the watcher
 
     @Test func closingCancelsQueuedCommands() async throws {
@@ -1207,6 +1240,7 @@ actor FakeServer: LiveServer {
     private var saveError: Error?
     private var landThenFail = false
     private var onSave: (@Sendable (RemotePath) async -> Void)?
+    private var beforeSave: (@Sendable () async -> Void)?
     private var onLookup: (@Sendable () async -> Void)?
     private var holding = false
     private var held: [CheckedContinuation<Void, Never>] = []
@@ -1233,6 +1267,9 @@ actor FakeServer: LiveServer {
 
     /// Runs inside each save attempt, after it landed if it lands.
     func setOnSave(_ hook: (@Sendable (RemotePath) async -> Void)?) { onSave = hook }
+
+    /// Runs inside each save attempt, before the server is checked against the expectation.
+    func setBeforeSave(_ hook: (@Sendable () async -> Void)?) { beforeSave = hook }
 
     /// Runs inside each lookup, before it answers.
     func setOnLookup(_ hook: (@Sendable () async -> Void)?) { onLookup = hook }
@@ -1309,6 +1346,7 @@ actor FakeServer: LiveServer {
             await onSave?(path)
             throw saveError
         }
+        await beforeSave?()
         let data = try Data(contentsOf: snapshot)
         let date = try FileManager.default.attributesOfItem(atPath: snapshot.path)[.modificationDate] as? Date ?? Date()
         let written = File(data: data, mtime: UInt32(date.timeIntervalSince1970))
