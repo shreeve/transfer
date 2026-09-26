@@ -418,7 +418,7 @@ struct TransferServerTests {
             try Data("a".utf8).write(to: tree.appendingPathComponent("a.txt"))
             let held = h.remote.appendingPathComponent("dir")
             try FileManager.default.createSymbolicLink(atPath: held.path, withDestinationPath: "elsewhere")
-            let swapping = ReplacingAfter {
+            let swapping = TestPrompts {
                 try? FileManager.default.removeItem(at: held)
                 try? Data("precious".utf8).write(to: held)
             }
@@ -511,23 +511,6 @@ struct TransferServerTests {
             }
             #expect(try Data(contentsOf: local) == Data("local".utf8))
         }
-    }
-}
-
-/// Answers every collision with Replace, once `meanwhile` has run: someone else changing the
-/// server while the question is up.
-private final class ReplacingAfter: PromptSink {
-    let meanwhile: @Sendable () -> Void
-
-    init(_ meanwhile: @escaping @Sendable () -> Void) {
-        self.meanwhile = meanwhile
-    }
-
-    func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
-    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
-        meanwhile()
-        return .replace
     }
 }
 

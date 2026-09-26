@@ -45,17 +45,17 @@ struct MoveServerTests {
                 for path in ["from/report.txt", "to/report.txt"] { try h.setTime(path, 1_700_000_000) }
                 let request = TransferRequest(.server(alias.connection.id, [source.appending("report.txt")]), into: destination, on: h.session.connection.id, moving: true)
 
-                let skip = Choosing(.skip)
+                let skip = TestPrompts(collision: .skip)
                 await #expect(throws: TransferKept([.init("report.txt", .alreadyThere)], moving: true, place: "on the other server")) {
                     try await OperationPrompts.$current.withValue(skip) { try await run(request, on: h.session, from: alias) }
                 }
-                #expect(skip.asked == 1)
+                #expect(skip.collisions == 1)
                 #expect(try h.read("from/report.txt") == "AAAA")
                 #expect(try h.read("to/report.txt") == "BBBB")
 
-                let replace = Choosing(.replace)
+                let replace = TestPrompts(collision: .replace)
                 try await OperationPrompts.$current.withValue(replace) { try await run(request, on: h.session, from: alias) }
-                #expect(replace.asked == 1)
+                #expect(replace.collisions == 1)
                 #expect(try h.read("to/report.txt") == "AAAA")
                 #expect(try h.names("from").isEmpty)
             }
@@ -81,12 +81,12 @@ struct MoveServerTests {
                     try? h.setTime("to/report.txt", 1_700_000_000)
                     scratch.value = (try? Store(root: h.root).localTemps()) ?? []
                 }
-                let skip = Choosing(.skip)
+                let skip = TestPrompts(collision: .skip)
                 await #expect(throws: TransferKept([.init("report.txt", .alreadyThere)], moving: true, place: "on the other server")) {
                     try await OperationPrompts.$current.withValue(skip) { try await engine.run(from: alias) }
                 }
                 #expect(planted.value)
-                #expect(skip.asked == 1)
+                #expect(skip.collisions == 1)
                 #expect(try h.read("from/report.txt") == "AAAA")
                 #expect(try h.read("to/report.txt") == "BBBB")
                 // The scratch folder on this Mac was recorded, so a crash leaves it to the next
@@ -105,10 +105,10 @@ struct MoveServerTests {
                 let source = try h.folder("from", files: ["k.txt": "new", "dir/x.txt": "new x"])
                 let destination = try h.folder("to", files: ["k.txt": "old", "dir": nil])
                 try FileManager.default.createSymbolicLink(atPath: h.remote.appendingPathComponent("to/dir/x.txt").path, withDestinationPath: "elsewhere")
-                let keepBoth = Choosing(.keepBoth)
+                let keepBoth = TestPrompts(collision: .keepBoth)
                 let request = TransferRequest(.server(alias.connection.id, [source.appending("k.txt"), source.appending("dir")]), into: destination, on: h.session.connection.id, moving: true)
                 try await OperationPrompts.$current.withValue(keepBoth) { try await run(request, on: h.session, from: alias) }
-                #expect(keepBoth.asked == 2)
+                #expect(keepBoth.collisions == 2)
                 #expect(try h.read("to/k.txt") == "old")
                 #expect(try h.read("to/k 2.txt") == "new")
                 #expect(try h.read("to/dir/x 2.txt") == "new x")
@@ -129,11 +129,11 @@ struct MoveServerTests {
                 for path in ["from/p/VERSION", "from/q/VERSION"] { try h.setTime(path, 1_700_000_000) }
                 let destination = try h.folder("to")
                 let request = TransferRequest(.server(alias.connection.id, [from.appending("p").appending("VERSION"), from.appending("q").appending("VERSION")]), into: destination, on: h.session.connection.id, moving: true)
-                let skip = Choosing(.skip)
+                let skip = TestPrompts(collision: .skip)
                 await #expect(throws: TransferKept([.init("VERSION", .alreadyThere)], moving: true, place: "on the other server")) {
                     try await OperationPrompts.$current.withValue(skip) { try await run(request, on: h.session, from: alias) }
                 }
-                #expect(skip.asked == 1)
+                #expect(skip.collisions == 1)
                 #expect(try h.read("to/VERSION") == "one")
                 #expect(try h.names("from/p").isEmpty)
                 #expect(try h.read("from/q/VERSION") == "two")
@@ -148,13 +148,13 @@ struct MoveServerTests {
             }
             let sources = ["p", "q"].map { mac.appendingPathComponent($0).appendingPathComponent("VERSION") }
             let trashed = Locked<[URL]>([])
-            let skip = Choosing(.skip)
+            let skip = TestPrompts(collision: .skip)
             await #expect(throws: TransferKept([.init("VERSION", .alreadyThere)], moving: true, place: "on this Mac")) {
                 try await OperationPrompts.$current.withValue(skip) {
                     try await run(TransferRequest(.mac(sources), into: try h.folder("fromMac"), on: h.session.connection.id, moving: true), on: h.session, trash: { url in trashed.withLock { $0.append(url) } })
                 }
             }
-            #expect(skip.asked == 1)
+            #expect(skip.collisions == 1)
             #expect(trashed.value == [sources[0]])
             #expect(try h.read("fromMac/VERSION") == "one")
         }
@@ -169,10 +169,10 @@ struct MoveServerTests {
                 let from = try h.folder("from", files: ["p/k.txt": "p", "q/k.txt": "q"])
                 for path in ["from/p/k.txt", "from/q/k.txt"] { try h.setTime(path, 1_700_000_000) }
                 let destination = try h.folder("to", files: ["k.txt": "old"])
-                let keepBoth = Choosing(.keepBoth)
+                let keepBoth = TestPrompts(collision: .keepBoth)
                 let request = TransferRequest(.server(alias.connection.id, [from.appending("p").appending("k.txt"), from.appending("q").appending("k.txt")]), into: destination, on: h.session.connection.id, moving: true)
                 try await OperationPrompts.$current.withValue(keepBoth) { try await run(request, on: h.session, from: alias) }
-                #expect(keepBoth.asked == 2)
+                #expect(keepBoth.collisions == 2)
                 #expect(try h.read("to/k.txt") == "old")
                 #expect(try h.read("to/k 2.txt") == "p")
                 #expect(try h.read("to/k 3.txt") == "q")
@@ -216,13 +216,13 @@ struct MoveServerTests {
             try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: locked.path)
             let keep = try h.folder("keep", files: ["dir/x.txt": "other"])
             let merge = TransferRequest(.server(h.session.connection.id, [site.appending("dir")]), into: keep, on: h.session.connection.id, moving: false)
-            let keepBoth = Choosing(.keepBoth)
+            let keepBoth = TestPrompts(collision: .keepBoth)
             await #expect(throws: TransferError.self) {
                 try await OperationPrompts.$current.withValue(keepBoth) { try await run(merge, on: h.session) }
             }
             try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: locked.path)
             try await OperationPrompts.$current.withValue(keepBoth) { try await run(merge, on: h.session) }
-            #expect(keepBoth.asked == 1)
+            #expect(keepBoth.collisions == 1)
             #expect(try h.names("keep/dir") == ["locked.txt", "x 2.txt", "x.txt"])
         }
     }
@@ -409,17 +409,17 @@ struct MoveServerTests {
             let to = try h.folder("to", files: ["a.txt": "old", "dir/y.txt": "y"])
             let file = TransferRequest(.server(id, [from.appending("a.txt")]), into: to, on: id, moving: true)
 
-            let skip = Choosing(.skip)
+            let skip = TestPrompts(collision: .skip)
             await #expect(throws: TransferKept([.init("a.txt", .alreadyThere)], moving: true, place: "on the server")) {
                 try await OperationPrompts.$current.withValue(skip) { try await run(file, on: h.session) }
             }
-            #expect(skip.asked == 1)
+            #expect(skip.collisions == 1)
             #expect(try h.read("from/a.txt") == "new")
             #expect(try h.read("to/a.txt") == "old")
 
-            let keepBoth = Choosing(.keepBoth)
+            let keepBoth = TestPrompts(collision: .keepBoth)
             try await OperationPrompts.$current.withValue(keepBoth) { try await run(TransferRequest(file.sources, into: to, on: id, moving: true), on: h.session) }
-            #expect(keepBoth.asked == 1)
+            #expect(keepBoth.collisions == 1)
             #expect(try h.read("to/a.txt") == "old")
             #expect(try h.read("to/a 2.txt") == "new")
             #expect(try h.names("from") == ["dir"])
@@ -430,7 +430,7 @@ struct MoveServerTests {
 
             try h.write("from/b.txt", "new b")
             try h.write("to/b.txt", "old b")
-            let replace = Choosing(.replace)
+            let replace = TestPrompts(collision: .replace)
             try await OperationPrompts.$current.withValue(replace) {
                 try await run(TransferRequest(.server(id, [from.appending("b.txt")]), into: to, on: id, moving: true), on: h.session)
             }
@@ -447,13 +447,13 @@ struct MoveServerTests {
             let site = try h.folder("site", files: ["a.txt": "a"])
             try FileManager.default.createSymbolicLink(atPath: h.remote.appendingPathComponent("alias").path, withDestinationPath: "site")
             let id = h.session.connection.id
-            let replace = Choosing(.replace)
+            let replace = TestPrompts(collision: .replace)
             await #expect(throws: TransferError.self) {
                 try await OperationPrompts.$current.withValue(replace) {
                     try await run(TransferRequest(.server(id, [site.appending("a.txt")]), into: h.remotePath.appending("alias"), on: id, moving: true), on: h.session)
                 }
             }
-            #expect(replace.asked == 0)
+            #expect(replace.collisions == 0)
             #expect(try h.names("site") == ["a.txt"])
             #expect(try h.read("site/a.txt") == "a")
         }
@@ -560,25 +560,6 @@ private func withAlias(_ h: ServerHarness, _ body: (SSHConnection) async throws 
         throw error
     }
     await alias.disconnect()
-}
-
-/// Answers every collision with one choice and counts them.
-private final class Choosing: PromptSink {
-    let choice: NameCollisionChoice
-    private let count = Locked(0)
-
-    init(_ choice: NameCollisionChoice) {
-        self.choice = choice
-    }
-
-    var asked: Int { count.value }
-
-    func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
-    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
-        count.withLock { $0 += 1 }
-        return choice
-    }
 }
 
 private extension ServerHarness {

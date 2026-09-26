@@ -121,12 +121,12 @@ struct SessionUnitTests {
 struct SessionServerTests {
     @Test func concurrentConnectsShareOneLogin() async throws {
         try await withHarness("single", knownHost: false) { h in
-            let prompts = RecordingPrompts(.trustOnce)
+            let prompts = TestPrompts(.trustOnce)
             async let first = h.session.connect(prompts: prompts)
             async let second = h.session.connect(prompts: prompts)
             let (a, b) = try await (first, second)
             #expect(a == b)
-            #expect(prompts.events.count == 1)
+            #expect(prompts.hostKeyEvents.count == 1)
             #expect(try await processes(h, "-N").count == 1)
             await h.session.disconnect()
             #expect(try await processes(h, "").isEmpty)
@@ -166,9 +166,9 @@ struct SessionServerTests {
             let first = Task { try await h.session.connect(prompts: stalled) }
             #expect(await waitUntil { stalled.asked.value > 0 })
             first.cancel()
-            let prompts = RecordingPrompts(.trustOnce)
+            let prompts = TestPrompts(.trustOnce)
             _ = try await h.session.connect(prompts: prompts)
-            #expect(prompts.events.count == 1)
+            #expect(prompts.hostKeyEvents.count == 1)
             await #expect(throws: TransferError.cancelled) { _ = try await first.value }
         }
     }
@@ -180,14 +180,14 @@ struct SessionServerTests {
             let leaving = StalledPrompts()
             let first = Task { try await h.session.connect(prompts: leaving) }
             #expect(await waitUntil { leaving.asked.value > 0 })
-            let staying = RecordingPrompts(.trustOnce)
+            let staying = TestPrompts(.trustOnce)
             let second = Task { try await h.session.connect(prompts: staying) }
             try await Task.sleep(for: .milliseconds(200))
             first.cancel()
             try await Task.sleep(for: .milliseconds(100))
             leaving.released.value = true
             _ = try await second.value
-            #expect(staying.events.count == 1)
+            #expect(staying.hostKeyEvents.count == 1)
             #expect(await h.session.isConnected)
             _ = await first.result
         }
@@ -232,14 +232,14 @@ struct SessionServerTests {
     /// Trust Once writes no known-hosts file, and the next login asks again.
     @Test func trustOnceIsForOneLogin() async throws {
         try await withHarness("once", knownHost: false) { h in
-            let prompts = RecordingPrompts(.trustOnce)
+            let prompts = TestPrompts(.trustOnce)
             _ = try await h.session.connect(prompts: prompts)
             _ = try await h.session.stat(h.remotePath)
             #expect(!FileManager.default.fileExists(atPath: knownHosts(h).path))
             await h.session.disconnect()
             #expect(try loginScratch(h).isEmpty)
             _ = try await h.session.connect(prompts: prompts)
-            #expect(prompts.events.map(\.situation) == [.firstSeen, .firstSeen])
+            #expect(prompts.hostKeyEvents.map(\.situation) == [.firstSeen, .firstSeen])
         }
     }
 
@@ -263,11 +263,11 @@ struct SessionServerTests {
             try await connectKnown(h)
             let replacement = SSHConnection(connection: h.session.connection, store: try Store(root: h.root), editableExtensions: [],
                                             live: h.live, sshConfigFile: h.configFile.path, replacing: h.session)
-            _ = try await replacement.connect(prompts: RecordingPrompts(.cancel))
+            _ = try await replacement.connect(prompts: TestPrompts(.cancel))
             #expect(await h.session.isConnected == false)
             // The old session, which a window may still hold, never logs in again: that login
             // would take the socket and end the replacement's master.
-            await #expect(throws: SSHConnection.retiredError) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            await #expect(throws: SSHConnection.retiredError) { _ = try await h.session.connect(prompts: TestPrompts(.cancel)) }
             #expect(!RetryPolicy.isRetryable(SSHConnection.retiredError))
             #expect(await replacement.isConnected)
             await h.session.disconnect()
@@ -286,18 +286,18 @@ struct SessionServerTests {
             let global = h.base.appendingPathComponent("global_known_hosts")
             try "\(try hostPattern()) \(try ServerHarness.hostKey())\n".write(to: global, atomically: true, encoding: .utf8)
             try writeConfig(h, global: global.path)
-            let prompts = RecordingPrompts(.cancel)
+            let prompts = TestPrompts(.cancel)
             _ = try await h.session.connect(prompts: prompts)
-            #expect(prompts.events.isEmpty)
+            #expect(prompts.hostKeyEvents.isEmpty)
         }
     }
 
     @Test func alwaysTrustHashesWhenAskedAndIsNotAskedAgain() async throws {
         try await withHarness("hashed", knownHost: false) { h in
             try writeConfig(h, extra: "HashKnownHosts yes")
-            let prompts = RecordingPrompts(.alwaysTrust)
+            let prompts = TestPrompts(.alwaysTrust)
             _ = try await h.session.connect(prompts: prompts)
-            let event = try #require(prompts.events.first)
+            let event = try #require(prompts.hostKeyEvents.first)
             #expect(event.situation == .firstSeen)
             let listed = try await Subprocess.run("/usr/bin/ssh-keygen", ["-lf", ServerHarness.hostKeyFile().path], timeout: .seconds(5))
             #expect(event.fingerprint == listed.stdout.split(separator: " ")[1].description)
@@ -306,9 +306,9 @@ struct SessionServerTests {
             #expect(!known.contains("127.0.0.1"))
             await h.session.disconnect()
 
-            let again = RecordingPrompts(.cancel)
+            let again = TestPrompts(.cancel)
             _ = try await h.session.connect(prompts: again)
-            #expect(again.events.isEmpty)
+            #expect(again.hostKeyEvents.isEmpty)
         }
     }
 
@@ -316,9 +316,9 @@ struct SessionServerTests {
         try await withHarness("changed") { h in
             let other = try await otherKey(h)
             try "\(try hostPattern()) \(other)\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
-            let prompts = RecordingPrompts(.replace)
+            let prompts = TestPrompts(.replace)
             _ = try await h.session.connect(prompts: prompts)
-            #expect(prompts.events.map(\.situation) == [.changed])
+            #expect(prompts.hostKeyEvents.map(\.situation) == [.changed])
             let known = try String(contentsOf: knownHosts(h), encoding: .utf8)
             #expect(!known.contains(other))
             #expect(known.contains(try ServerHarness.hostKey()))
@@ -328,9 +328,9 @@ struct SessionServerTests {
     /// Cancel on a first contact's key is a plain Cancel; Cancel on a changed key refuses it.
     @Test func cancellingAHostKeyQuestion() async throws {
         try await withHarness("hkcancel", knownHost: false) { h in
-            await #expect(throws: TransferError.cancelled) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            await #expect(throws: TransferError.cancelled) { _ = try await h.session.connect(prompts: TestPrompts(.cancel)) }
             try "\(try hostPattern()) \(try await otherKey(h))\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
-            await #expect(throws: TransferError.hostKeyRejected) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            await #expect(throws: TransferError.hostKeyRejected) { _ = try await h.session.connect(prompts: TestPrompts(.cancel)) }
             #expect(try await processes(h, "").isEmpty)
             #expect(try loginScratch(h).isEmpty)
         }
@@ -339,9 +339,9 @@ struct SessionServerTests {
     @Test func aRevokedKeyIsRefusedWithoutAQuestion() async throws {
         try await withHarness("revoked") { h in
             try "@revoked \(try hostPattern()) \(try ServerHarness.hostKey())\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
-            let prompts = RecordingPrompts(.alwaysTrust)
+            let prompts = TestPrompts(.alwaysTrust)
             await #expect(throws: TransferError.hostKeyRejected) { _ = try await h.session.connect(prompts: prompts) }
-            #expect(prompts.events.isEmpty)
+            #expect(prompts.hostKeyEvents.isEmpty)
             #expect(try await processes(h, "").isEmpty)
         }
     }
@@ -542,22 +542,6 @@ struct SessionServerTests {
 
 // MARK: Helpers
 
-/// Records every host-key question and gives one answer to all of them.
-private final class RecordingPrompts: PromptSink {
-    private let decision: HostKeyDecision
-    private let seen = Locked<[HostKeyEvent]>([])
-    var events: [HostKeyEvent] { seen.value }
-
-    init(_ decision: HostKeyDecision) { self.decision = decision }
-
-    func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        seen.withLock { $0.append(event) }
-        return decision
-    }
-    func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
-}
-
 /// A host-key sheet nobody answers, taken back when its question is cancelled or when `released`
 /// is set, as a window's is when it moves away.
 private final class StalledPrompts: PromptSink {
@@ -614,9 +598,9 @@ private func otherKey(_ h: ServerHarness) async throws -> String {
 
 /// Logs in with the server's key already in known_hosts, asking nothing.
 private func connectKnown(_ h: ServerHarness) async throws {
-    let prompts = RecordingPrompts(.cancel)
+    let prompts = TestPrompts(.cancel)
     _ = try await h.session.connect(prompts: prompts)
-    #expect(prompts.events.isEmpty)
+    #expect(prompts.hostKeyEvents.isEmpty)
 }
 
 /// Rewrites the harness's ssh config: its own known_hosts, a global file, and `extra` lines.
