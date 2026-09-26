@@ -107,7 +107,7 @@ extension TransferModel {
         let provider = provider
         // A row for one item names it and is matched to it.
         let one = names.count == 1 ? folder.appending(name: names[0]) : nil
-        enqueue(title: one.map { "\(verb) \($0.name)" } ?? "\(verb) \(names.count) items", path: one ?? folder, on: context) { [login] progress in
+        enqueue(title: one.map { "\(verb) \($0.name)" } ?? "\(verb) \(names.count) items", path: one ?? folder, on: context) { [login] _, progress in
             if let (id, sink) = login {
                 let source = try await provider.session(for: id)
                 if !(await source.isConnected) { _ = try await source.connect(prompts: sink) }

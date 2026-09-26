@@ -954,11 +954,6 @@ public final class TransferModel {
         await open(item)
     }
 
-    public func openLiveSelection() async {
-        guard let item = primaryItem, item.kind == .file else { return }
-        await open(item, forceLive: true)
-    }
-
     // MARK: Preview
 
     public func togglePreview() {
@@ -1170,11 +1165,6 @@ public final class TransferModel {
         owners[id] = context.connection
         showsShelf = true
         start(id)
-    }
-
-    /// As above, for a body that reaches its servers through the library itself.
-    func enqueue(title: String, path: RemotePath, on context: ServerContext? = nil, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
-        enqueue(title: title, path: path, on: context) { _, progress in try await body(progress) }
     }
 
     private func start(_ id: String) {
