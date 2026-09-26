@@ -164,6 +164,46 @@ import TransferCore
         await server.stop()
     }
 
+    /// WIR-10: a file cut short on the server while it downloaded answered EOF before its listed
+    /// size and was placed as complete. An early EOF checks the file again: one that changed fails
+    /// as changed, which is retried; one still as listed (a pseudo-file) ends there.
+    @Test(arguments: [100_000, 200_000]) func anEarlyEndIsCheckedAgainstTheListing(sizeAtEnd: Int) async throws {
+        let content = Self.content(100_000)
+        let fstats = Locked(0)
+        let server = try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.open: return ScriptedServer.handle(request.id)
+            case SFTPCode.close: return ScriptedServer.ok(request.id)
+            case SFTPCode.fstat:
+                let size = fstats.withLock { count in
+                    defer { count += 1 }
+                    return count == 0 ? 200_000 : sizeAtEnd
+                }
+                return ScriptedServer.attrs(request.id, SFTPAttrs(size: UInt64(size), permissions: 0o100644, atime: 9, mtime: 9))
+            case SFTPCode.read:
+                var reader = ByteReader(request.body)
+                _ = try? reader.blob()
+                let offset = Int((try? reader.u64()) ?? 0)
+                let length = Int((try? reader.u32()) ?? 0)
+                return offset < content.count
+                    ? ScriptedServer.data(request.id, content.subdata(in: offset..<min(offset + length, content.count)))
+                    : ScriptedServer.status(request.id, SFTPCode.eof)
+            default: return nil
+            }
+        }
+        let file = Self.scratchFile()
+        defer { try? FileManager.default.removeItem(at: file) }
+        let download = { try await server.channel.download(Self.path, to: file, size: 200_000, matching: Fingerprint(size: 200_000, mtime: 9)) { _ in } }
+        if sizeAtEnd == 200_000 {
+            try await download()
+            #expect(try Data(contentsOf: file) == content)
+        } else {
+            await #expect(throws: TransferError.changedOnServer("file")) { try await download() }
+        }
+        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        await server.stop()
+    }
+
     /// An upload's close, and its mode and time before that, go out right behind the last write,
     /// not a round trip later: this server answers nothing until it has the close. The stamp
     /// comes after every write, so no write lands after the time is set.

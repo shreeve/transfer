@@ -583,7 +583,7 @@ extension SSHConnection {
     var asides: SFTPChannel.AsideLog {
         let (store, id) = (store, connection.id)
         return SFTPChannel.AsideLog(
-            remember: { store.rememberTemp(Self.asideRecord($0, $1), connection: id) },
+            remember: { store.rememberTemp(Self.asideRecord($0, $1), connection: id, aside: true) },
             forget: { store.forgetTemp(Self.asideRecord($0, $1)) }
         )
     }

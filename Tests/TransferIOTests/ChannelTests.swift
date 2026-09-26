@@ -6,24 +6,6 @@ import TransferCore
 /// `SFTPChannel` against a scripted server: what it does with names, renames, and handles that a
 /// real server would rarely or never send.
 @Suite struct ChannelTests {
-    /// A listing whose first READDIR page holds `names` and whose next pages say EOF.
-    private static func folder(_ names: [[UInt8]]) -> @Sendable (ScriptedServer.Request) -> Data? {
-        let pages = Locked(0)
-        return { request in
-            switch request.type {
-            case SFTPCode.opendir: return ScriptedServer.handle(request.id)
-            case SFTPCode.readdir:
-                let page = pages.withLock { count in
-                    count += 1
-                    return count
-                }
-                return page == 1 ? ScriptedServer.names(request.id, names) : ScriptedServer.status(request.id, SFTPCode.eof)
-            case SFTPCode.close: return ScriptedServer.ok(request.id)
-            default: return ScriptedServer.status(request.id, SFTPCode.failure)
-            }
-        }
-    }
-
     /// A server's name becomes a path component under the listed folder, so a name that is not
     /// exactly one (a slash could climb out of a download's folder) never leaves the channel.
     @Test func aListingDropsNamesThatAreNotOneComponent() async throws {
@@ -31,7 +13,7 @@ import TransferCore
             Array("good".utf8), [], Array(".".utf8), Array("..".utf8), Array("a/b".utf8),
             Array("../../../Documents/".utf8), Array("trailing/".utf8), [0x6E, 0x00, 0x6C], Array(".hidden".utf8),
         ]
-        let server = try await ScriptedServer(answer: Self.folder(hostile))
+        let server = try await ScriptedServer(answer: ScriptedServer.listing([hostile]))
         var names: [[UInt8]] = []
         for try await item in await server.channel.list(RemotePath(string: "/srv")) {
             names.append(item.path.nameBytes)
@@ -45,21 +27,8 @@ import TransferCore
     /// and a one-page folder asks for at most four pages past its end.
     @Test func listingsArriveWholeAndInOrder() async throws {
         for pageCount in [1, 25] {
-            let pages = Locked(0)
-            let server = try await ScriptedServer { request in
-                switch request.type {
-                case SFTPCode.opendir: return ScriptedServer.handle(request.id)
-                case SFTPCode.close: return ScriptedServer.ok(request.id)
-                case SFTPCode.readdir:
-                    let page = pages.withLock { count in
-                        count += 1
-                        return count
-                    }
-                    guard page <= pageCount else { return ScriptedServer.status(request.id, SFTPCode.eof) }
-                    return ScriptedServer.names(request.id, (0..<100).map { "f\((page - 1) * 100 + $0)" })
-                default: return nil
-                }
-            }
+            let pages = (0..<pageCount).map { page in (0..<100).map { Array("f\(page * 100 + $0)".utf8) } }
+            let server = try await ScriptedServer(answer: ScriptedServer.listing(pages))
             var names: [String] = []
             for try await item in await server.channel.list(RemotePath(string: "/srv")) { names.append(item.name) }
             #expect(names == (0..<(pageCount * 100)).map { "f\($0)" })
@@ -89,11 +58,46 @@ import TransferCore
         await server.stop()
     }
 
+    /// WIR-03: a page whose every name was dropped ended the listing, and the pages after it,
+    /// beyond those already asked for, went unlisted: a folder copy missed files.
+    @Test func aPageOfOnlyDroppedNamesDoesNotEndTheListing() async throws {
+        let pages = [[Array(".".utf8), Array("..".utf8)]] + (2...8).map { [Array("n\($0)".utf8)] }
+        let server = try await ScriptedServer(answer: ScriptedServer.listing(pages))
+        var names: [String] = []
+        for try await item in await server.channel.list(RemotePath(string: "/srv")) { names.append(item.name) }
+        #expect(names == (2...8).map { "n\($0)" })
+        await server.stop()
+    }
+
     /// A reader that stops early, as a lookup for one name does, also closes the handle.
     @Test func aListingLeftEarlyClosesItsHandle() async throws {
-        let server = try await ScriptedServer(answer: Self.folder([Array("a".utf8), Array("b".utf8)]))
+        let server = try await ScriptedServer(answer: ScriptedServer.listing([[Array("a".utf8), Array("b".utf8)]]))
         for try await _ in await server.channel.list(RemotePath(string: "/srv")) { break }
         #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        await server.stop()
+    }
+
+    /// WIR-01: a listing or download cancelled while its OPENDIR or OPEN was at the server dropped
+    /// the handle the reply named, and the server kept it open until the channel died.
+    @Test(arguments: [SFTPCode.opendir, SFTPCode.open]) func aCancelledOpenClosesTheHandleItGets(type: UInt8) async throws {
+        let server = try await ScriptedServer { $0.type == SFTPCode.close ? ScriptedServer.ok($0.id) : nil }
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("open-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let path = RemotePath(string: "/srv/f")
+        let reader = Task {
+            if type == SFTPCode.opendir {
+                for try await _ in await server.channel.list(path) {}
+            } else {
+                try await server.channel.download(path, to: file, size: 10) { _ in }
+            }
+        }
+        #expect(await eventually { !server.sent(type).isEmpty })
+        reader.cancel()
+        try await Task.sleep(for: .milliseconds(50))
+        server.send(ScriptedServer.handle(server.sent(type)[0].id, "late"))
+        _ = try? await reader.value
+        #expect(await eventually { server.sent(SFTPCode.close).map(\.paths) == [["late"]] })
+        #expect(server.sent(SFTPCode.readdir).isEmpty && server.sent(SFTPCode.read).isEmpty)
         await server.stop()
     }
 
@@ -196,16 +200,17 @@ import TransferCore
     }
 
     /// A server whose folder /srv lists `names`, where LSTAT finds what `lookup` says, and which
-    /// has posix-rename.
-    private static func renaming(_ names: [String], lookup: @escaping @Sendable (String) -> UInt32?) async throws -> ScriptedServer {
-        let listing = folder(names.map { Array($0.utf8) })
+    /// has posix-rename, answering it with `posixRename`.
+    private static func renaming(_ names: [String], posixRename: UInt32 = SFTPCode.ok, lookup: @escaping @Sendable (String) -> UInt32?) async throws -> ScriptedServer {
+        let listing = ScriptedServer.listing([names.map { Array($0.utf8) }])
         return try await ScriptedServer(extensions: ["posix-rename@openssh.com"]) { request in
             switch request.type {
             case SFTPCode.lstat:
                 let path = request.paths[0]
                 if let code = lookup(path) { return ScriptedServer.status(request.id, code) }
                 return ScriptedServer.attrs(request.id)
-            case SFTPCode.rename, SFTPCode.extended: return ScriptedServer.ok(request.id)
+            case SFTPCode.rename: return ScriptedServer.ok(request.id)
+            case SFTPCode.extended: return ScriptedServer.status(request.id, posixRename, "Permission denied")
             default: return listing(request)
             }
         }
@@ -234,12 +239,40 @@ import TransferCore
         await server.stop()
     }
 
+    /// WIR-09: a case-only rename whose posix-rename failed for a real reason fell through to a
+    /// plain RENAME, and the user saw its "Failure" instead of the reason.
+    @Test func aCaseOnlyRenameReportsWhyPosixRenameFailed() async throws {
+        let server = try await Self.renaming(["notes.txt"], posixRename: SFTPCode.permission) { _ in nil }
+        await #expect(throws: TransferError.permissionDenied("Permission denied")) {
+            try await server.channel.rename(RemotePath(string: "/srv/notes.txt"), to: RemotePath(string: "/srv/Notes.txt"))
+        }
+        #expect(server.sent(SFTPCode.rename).isEmpty)
+        await server.stop()
+    }
+
     /// With nothing at the new name, a case-only rename is a plain RENAME, like any other.
     @Test func aCaseOnlyRenameToAFreeNameIsAPlainRename() async throws {
         let server = try await Self.renaming(["notes.txt"]) { $0 == "/srv/Notes.txt" ? SFTPCode.noSuchFile : nil }
         try await server.channel.rename(RemotePath(string: "/srv/notes.txt"), to: RemotePath(string: "/srv/Notes.txt"))
         #expect(server.sent(SFTPCode.rename).first?.paths == ["/srv/notes.txt", "/srv/Notes.txt"])
         #expect(server.sent(SFTPCode.extended).isEmpty)
+        await server.stop()
+    }
+
+    /// WIR-06, WIR-07: a server's status reaches the message bar only as text fit to show. EOF
+    /// where nothing ends read as a private type's name; a message kept its line breaks and bidi
+    /// overrides, at any length.
+    @Test func aServersStatusReadsAsTextFitToShow() async throws {
+        let server = try await ScriptedServer { request in
+            request.paths.first == "/eof"
+                ? ScriptedServer.status(request.id, SFTPCode.eof, "eof")
+                : ScriptedServer.status(request.id, SFTPCode.failure, "Disk\n\u{202E}full " + String(repeating: "x", count: 300))
+        }
+        let eof = await #expect(throws: (any Error).self) { try await server.channel.lstat(RemotePath(string: "/eof")) }
+        #expect(eof?.localizedDescription == "The server answered “end of file” where no file ends")
+        await #expect(throws: TransferError.failed("Diskfull " + String(repeating: "x", count: 191) + "…")) {
+            try await server.channel.lstat(RemotePath(string: "/full"))
+        }
         await server.stop()
     }
 
