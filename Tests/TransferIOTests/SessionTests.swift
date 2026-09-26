@@ -162,6 +162,26 @@ struct SessionServerTests {
         }
     }
 
+    /// A window that leaves a login takes its question back with the safe answer. That is not a
+    /// Cancel from the window still waiting for the same login, which is asked in its place.
+    @Test func aQuestionTakenBackGoesToTheCallerStillWaiting() async throws {
+        try await withHarness("handover", knownHost: false) { h in
+            let leaving = StalledPrompts()
+            let first = Task { try await h.session.connect(prompts: leaving) }
+            #expect(await waitUntil { leaving.asked.value > 0 })
+            let staying = RecordingPrompts(.trustOnce)
+            let second = Task { try await h.session.connect(prompts: staying) }
+            try await Task.sleep(for: .milliseconds(200))
+            first.cancel()
+            try await Task.sleep(for: .milliseconds(100))
+            leaving.released.value = true
+            _ = try await second.value
+            #expect(staying.events.count == 1)
+            #expect(await h.session.isConnected)
+            _ = await first.result
+        }
+    }
+
     /// Cancel on a question a ProxyJump host asks during the host-key probe stops the login at
     /// once. The probe's askpass helper, still waiting for a reply, used to hold the probe's
     /// stderr open, and the login hung until the helper gave up minutes later (R-S1).
@@ -475,15 +495,17 @@ private final class RecordingPrompts: PromptSink {
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
 }
 
-/// A host-key sheet nobody answers, taken back when its question is cancelled.
+/// A host-key sheet nobody answers, taken back when its question is cancelled or when `released`
+/// is set, as a window's is when it moves away.
 private final class StalledPrompts: PromptSink {
     let asked = Locked(0)
     let withdrawn = Locked(0)
+    let released = Locked(false)
 
     func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
         asked.withLock { $0 += 1 }
-        do { try await Task.sleep(for: .seconds(120)) } catch { withdrawn.withLock { $0 += 1 } }
+        do { while !released.value { try await Task.sleep(for: .milliseconds(20)) } } catch { withdrawn.withLock { $0 += 1 } }
         return .cancel
     }
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }

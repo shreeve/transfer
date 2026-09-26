@@ -738,7 +738,9 @@ public actor SSHConnection: RemoteSession {
             throw TransferError.failed("Could not read the host key: \(reason.isEmpty ? "no reply" : reason)")
         }
         let event = HostKeyEvent(situation: failure == .changed ? .changed : .firstSeen, keyType: offered.keyType, fingerprint: Self.fingerprint(offered.key), line: offered.text)
-        let decision = try await Self.untilCancelled({ await prompts.decideHostKey(event) })
+        let decision = await prompts.decideHostKey(event)
+        // A sink whose task is cancelled gives the safe answer at once; any answer is then dropped.
+        try Task.checkCancellation()
         // Declining a new server's key is a Cancel like any other; declining to replace a key
         // that changed is a refusal of that key.
         if decision == .cancel { throw failure == .changed ? TransferError.hostKeyRejected : TransferError.cancelled }
@@ -806,31 +808,6 @@ public actor SSHConnection: RemoteSession {
     static func fingerprint(_ key: String) -> String {
         guard let blob = Data(base64Encoded: key) else { return key }
         return "SHA256:" + Data(SHA256.hash(data: blob)).base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "="))
-    }
-
-    /// `body`'s answer, or `.cancelled` as soon as the calling task is cancelled. Cancelling also
-    /// cancels `body`, which withdraws the window's sheet; an answer it gives anyway is dropped.
-    private static func untilCancelled<T: Sendable>(_ body: @escaping @Sendable () async -> T) async throws -> T {
-        let slot = Locked<CheckedContinuation<T, Error>?>(nil)
-        let asking = Locked<Task<Void, Never>?>(nil)
-        let take: @Sendable () -> CheckedContinuation<T, Error>? = { slot.withLock { waiting in defer { waiting = nil }; return waiting } }
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                slot.value = continuation
-                asking.value = Task {
-                    let answer = await body()
-                    take()?.resume(returning: answer)
-                }
-                if Task.isCancelled {
-                    take()?.resume(throwing: TransferError.cancelled)
-                    asking.value?.cancel()
-                }
-            }
-        } onCancel: {
-            // Cancelled first, then asked to stop: `body` may answer at once, and that answer is dropped.
-            take()?.resume(throwing: TransferError.cancelled)
-            asking.value?.cancel()
-        }
     }
 
     // MARK: Askpass
@@ -916,8 +893,8 @@ public actor SSHConnection: RemoteSession {
                     storedTried.insert(kind)
                     answer = PromptReply(text: stored)
                 } else {
-                    guard let asked = try? await Self.untilCancelled({ await prompts.answer(PromptRequest(text: text, offerKeychain: kind != nil)) }) else { return }
-                    answer = asked
+                    answer = await prompts.answer(PromptRequest(text: text, offerKeychain: kind != nil))
+                    if Task.isCancelled { return }
                 }
                 guard let text = answer.text else { return cancelLogin(prompts) }
                 if answer.saveInKeychain, let kind { KeychainStore.save(text, for: connection.id, kind) }
@@ -1024,7 +1001,9 @@ final class EventPipe: Sendable {
 
 /// Who answers a login's questions: the caller that joined it last and still waits, so a window
 /// that joined a login another window started, and then gave up on, is the one asked. A question
-/// already on screen stays with the window showing it.
+/// already on screen stays with the window showing it. When that window leaves (it moved away or
+/// closed, which takes its sheet back with the safe answer), the next caller still waiting is
+/// asked, so a login stops only for the Cancel of someone who still waits for it.
 final class LoginPrompts: PromptSink {
     private let callers = Locked<[(id: UUID, sink: any PromptSink)]>([])
 
@@ -1040,14 +1019,20 @@ final class LoginPrompts: PromptSink {
         }
     }
 
-    private var asked: (any PromptSink)? { callers.value.last?.sink }
-
     func answer(_ request: PromptRequest) async -> PromptReply {
-        await asked?.answer(request) ?? PromptReply(text: nil)
+        await ask(safe: PromptReply(text: nil), isSafe: { $0.text == nil }) { await $0.answer(request) }
     }
 
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        await asked?.decideHostKey(event) ?? .cancel
+        await ask(safe: .cancel, isSafe: { $0 == .cancel }) { await $0.decideHostKey(event) }
+    }
+
+    private func ask<Answer>(safe: Answer, isSafe: (Answer) -> Bool, _ question: (any PromptSink) async -> Answer) async -> Answer {
+        while let caller = callers.value.last {
+            let answer = await question(caller.sink)
+            if !isSafe(answer) || callers.value.contains(where: { $0.id == caller.id }) { return answer }
+        }
+        return safe
     }
 
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
