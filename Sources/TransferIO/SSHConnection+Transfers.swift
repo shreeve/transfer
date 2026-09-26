@@ -743,7 +743,7 @@ extension SSHConnection {
             guard let text = (0...cut).lazy.compactMap({ String(validating: data.dropLast($0), as: UTF8.self) }).first else {
                 return try await cachedCopy(item, lane: .preview)
             }
-            let html = SyntaxPreview.html(text: text, fileName: item.name)
+            let html = SyntaxPreview.html(text: text)
             try html.write(to: file, atomically: true, encoding: .utf8)
             trimPreviewCache()
             return file

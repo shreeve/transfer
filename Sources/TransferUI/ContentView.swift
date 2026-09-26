@@ -552,7 +552,7 @@ struct InspectorColumn: View {
             QuickLookPreview(url: url)
         case .text(let text):
             VStack(alignment: .trailing, spacing: 4) {
-                SourcePreview(text: text, fileName: item.name, wraps: wrapsPreview)
+                SourcePreview(text: text, wraps: wrapsPreview)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
                 Toggle("Wrap lines", isOn: $wrapsPreview)
@@ -780,10 +780,9 @@ struct QuickLookPreview: NSViewRepresentable {
 }
 
 /// Highlighted source in a web view, scrollable, with the pane's own background. The page is
-/// built only when the text, name, or wrapping changes, never on every redraw of the pane.
+/// built only when the text or wrapping changes, never on every redraw of the pane.
 struct SourcePreview: NSViewRepresentable {
     let text: String
-    let fileName: String
     let wraps: Bool
 
     func makeNSView(context: Context) -> WKWebView {
@@ -801,16 +800,16 @@ struct SourcePreview: NSViewRepresentable {
     }
 
     private func load(into view: WKWebView, context: Context) {
-        let page = (text: text, fileName: fileName, wraps: wraps)
+        let page = (text: text, wraps: wraps)
         if let shown = context.coordinator.page, shown == page { return }
         context.coordinator.page = page
-        view.loadHTMLString(SyntaxPreview.html(text: text, fileName: fileName, compact: true, wraps: wraps), baseURL: nil)
+        view.loadHTMLString(SyntaxPreview.html(text: text, compact: true, wraps: wraps), baseURL: nil)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
-        var page: (text: String, fileName: String, wraps: Bool)?
+        var page: (text: String, wraps: Bool)?
     }
 }
 

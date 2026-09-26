@@ -215,7 +215,7 @@ import Testing
     let html = SyntaxPreview.html(text: "if (a < b) { return \"// not a comment\" }")
     #expect(html.contains("(a &lt; b)"))
     // No title: it held the name's extension, a server's text, unescaped (SEC2-12).
-    #expect(!SyntaxPreview.html(text: "", fileName: "x.a<b").contains("<title>"))
+    #expect(!html.contains("<title>"))
     #expect(html.contains("<span class=\"s\">\"// not a comment\"</span>"))
     #expect(!html.contains("class=\"c\""))
 }

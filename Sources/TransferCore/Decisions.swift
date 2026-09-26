@@ -353,9 +353,9 @@ public enum ListingSort {
 
 public enum SyntaxPreview {
     /// A page for Quick Look, or when `compact`, a small unwrapped listing that follows the
-    /// system appearance for the inspector pane. `fileName` is unused: the page has no title,
-    /// since Quick Look shows the file's own name and a server's name would go in unescaped.
-    public static func html(text: String, fileName _: String = "", compact: Bool = false, wraps: Bool = false) -> String {
+    /// system appearance for the inspector pane. The page has no title: Quick Look shows the
+    /// file's own name, and a server's name would go in unescaped.
+    public static func html(text: String, compact: Bool = false, wraps: Bool = false) -> String {
         let escaped = text
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
