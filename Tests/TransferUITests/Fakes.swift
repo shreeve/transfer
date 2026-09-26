@@ -114,8 +114,9 @@ final class FakeProvider: SessionProvider, @unchecked Sendable {
     func connection(matching link: SFTPURL) async -> SavedConnection? { nil }
     var unsyncedLiveCount: Int { get async { 0 } }
     func disconnectAll() async {}
-    func editableExtensions() async -> [String] { [] }
-    func setEditableExtensions(_ extensions: [String]) async throws {}
+    let extensions = Locked(["md"])
+    func editableExtensions() async -> [String] { extensions.value }
+    func setEditableExtensions(_ extensions: [String]) async throws { self.extensions.value = extensions }
     func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {}
 }
 

@@ -30,7 +30,6 @@ public struct ContentView: View {
         .ignoresSafeArea()
         .focusedSceneValue(\.transferModel, model)
         .onChange(of: model.snapshot.selection) { model.selectionChanged() }
-        .onChange(of: model.sidebarSelection) { _, item in Task { await model.sidebarSelected(item) } }
         .task { model.start() }
         .frame(minWidth: 640, idealWidth: 960, minHeight: 400, idealHeight: 640)
     }
@@ -43,7 +42,12 @@ struct SidebarColumn: View {
     // MARK: Sidebar
 
     var body: some View {
-        List(selection: $model.sidebarSelection) {
+        // Only a click acts: the model setting the selection back to the server shown is not a
+        // click on that server, which would stop a login to another.
+        List(selection: Binding(get: { model.sidebarSelection }, set: { item in
+            model.sidebarSelection = item
+            Task { await model.sidebarSelected(item) }
+        })) {
             Section("Servers") {
                 ForEach(model.connections) { connection in
                     Label(connection.displayName, systemImage: "server.rack")
