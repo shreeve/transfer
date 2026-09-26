@@ -157,20 +157,7 @@ struct DetailColumn: View {
         case .connection:
             ConnectionForm(model: model)
         case .prompt(let request, let server, _):
-            let reply = { PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret) }
-            let cancel = { model.finishPrompt(PromptReply(text: nil), offered: false) }
-            SheetForm(title: server ?? "Log In", width: 380, cancelKey: .cancelAction, onCancel: cancel) {
-                Text(request.text)
-                SecureField("Password", text: $model.promptSecure)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.finishPrompt(reply(), offered: request.offerKeychain) }
-                if request.offerKeychain {
-                    Toggle("Save in Keychain", isOn: $model.saveSecret)
-                }
-            } actions: {
-                Button("Continue") { model.finishPrompt(reply(), offered: request.offerKeychain) }
-                    .keyboardShortcut(.defaultAction)
-            }
+            PasswordSheet(request: request, server: server) { model.prompts.finish(.login($0)) }
         case .hostKey(let event, let server, _):
             SheetForm(
                 title: event.situation == .changed ? "The host key changed" : "First time connecting to this server",
@@ -178,7 +165,7 @@ struct DetailColumn: View {
                     ? "The server now presents a different key. Someone could be intercepting the connection."
                     : "Check this fingerprint against one you got from the server's owner.",
                 width: 460,
-                onCancel: { model.finishHost(.cancel) }
+                onCancel: { model.prompts.finish(.hostKey(.cancel)) }
             ) {
                 LabeledContent("Server", value: hostKeyServer(server, event))
                 LabeledContent("Key type", value: event.keyType)
@@ -187,10 +174,10 @@ struct DetailColumn: View {
                     .textSelection(.enabled)
             } actions: {
                 if event.situation == .firstSeen {
-                    Button("Trust Once") { model.finishHost(.trustOnce) }
-                    Button("Always Trust") { model.finishHost(.alwaysTrust) }
+                    Button("Trust Once") { model.prompts.finish(.hostKey(.trustOnce)) }
+                    Button("Always Trust") { model.prompts.finish(.hostKey(.alwaysTrust)) }
                 } else {
-                    Button("Replace Trusted Key") { model.finishHost(.replace) }
+                    Button("Replace Trusted Key") { model.prompts.finish(.hostKey(.replace)) }
                 }
             }
         case .delete:
@@ -208,13 +195,7 @@ struct DetailColumn: View {
                 }
             }
         case .collision(let name, _):
-            let skip = { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
-            SheetForm(title: "“\(name)” already exists", detail: "Keep Both saves the new file with a number before its extension.", cancel: "Skip", onCancel: skip) {
-                Toggle("Apply to all in this operation", isOn: $model.applyCollisionToAll)
-            } actions: {
-                Button("Keep Both") { model.finishCollision(.keepBoth, applyToAll: model.applyCollisionToAll) }
-                Button("Replace") { model.finishCollision(.replace, applyToAll: model.applyCollisionToAll) }
-            }
+            CollisionSheet(name: name) { model.prompts.finish(.collision($0, toAll: $1)) }
         case .conflict(let path, let comparable):
             conflictSheet(path, comparable: comparable)
         case .goToFolder:
@@ -291,6 +272,53 @@ struct DetailColumn: View {
         let text = model.folderText
         model.sheet = nil
         Task { await model.goToFolder(text) }
+    }
+}
+
+/// A login question. What is typed lives in this sheet alone, so nothing typed for one server can
+/// fill in the next sheet, which may be another server's.
+private struct PasswordSheet: View {
+    let request: PromptRequest
+    let server: String?
+    let finish: (PromptReply) -> Void
+    @State private var secret = ""
+    @State private var save = false
+
+    var body: some View {
+        // Keychain saving applies only where the sheet offered it: a later question in the same
+        // login, such as a one-time code, never replaces the saved password.
+        let reply = { finish(PromptReply(text: secret, saveInKeychain: save && request.offerKeychain)) }
+        SheetForm(title: server ?? "Log In", width: 380, cancelKey: .cancelAction, onCancel: { finish(PromptReply(text: nil)) }) {
+            Text(request.text)
+                .lineLimit(8)
+                .textSelection(.enabled)
+            SecureField("Password", text: $secret)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(reply)
+            if request.offerKeychain {
+                Toggle("Save in Keychain", isOn: $save)
+            }
+        } actions: {
+            Button("Continue", action: reply)
+                .keyboardShortcut(.defaultAction)
+        }
+    }
+}
+
+/// A name already taken. Apply to All starts off for each question and holds for its operation.
+private struct CollisionSheet: View {
+    let name: String
+    let finish: (NameCollisionChoice, Bool) -> Void
+    @State private var toAll = false
+
+    var body: some View {
+        SheetForm(title: "“\(name)” already exists", detail: "Keep Both keeps both, naming the new one with the next free number.",
+                  cancel: "Skip", onCancel: { finish(.skip, toAll) }) {
+            Toggle("Apply to all in this operation", isOn: $toAll)
+        } actions: {
+            Button("Keep Both") { finish(.keepBoth, toAll) }
+            Button("Replace") { finish(.replace, toAll) }
+        }
     }
 }
 

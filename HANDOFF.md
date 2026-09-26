@@ -73,7 +73,7 @@ The window is an AppKit frame with SwiftUI columns, in `WindowChrome.swift`. `Ch
 
 Without a server `swift test` takes seconds and reports the server suites skipped. With one (`AGENTS.md` has the command) the full run takes about 75 s, about as long as `EditorMatrix` alone. `Scripts/local-sshd.sh [port]` starts an unprivileged `sshd` on 127.0.0.1 (port 2222 by default) with its own keys, prints its exports only once it listens, turns off `PerSourcePenalties` and raises `MaxStartups`, and removes its keys when `$TRANSFER_TEST_SSHD` is killed; it never touches Remote Login. `ServerHarness` gives each test its own library under `~/Library/Caches/TransferTests`, an ssh config passed with `-F` (never the developer's config, known hosts, or agent), and the sshd's key already known, except in the tests of the host-key questions. Each test awaits its own cleanup through `withHarness`, which runs on a throw too; a `defer { Task { … } }` cleanup never runs before the process exits. Folders there older than an hour, from a run that crashed, are removed by the next run (`TestCaches`).
 
-TransferUI has no test target: its pure decisions live in Core (`PasteRules`, `ColumnTrail`, `ListingSort`, `QuitQuestion`, `RemotePath.typed`), and the rest is checked by hand in a packaged build.
+`TransferUITests` drives the real window model against fake sessions and a fake library (`Fakes.swift`), with no server and no window: its sheets, selection, and connects. Pure decisions still live in Core (`PasteRules`, `ColumnTrail`, `ListingSort`, `QuitQuestion`, `RemotePath.typed`), and the views are checked by hand in a packaged build.
 
 ## Still open
 

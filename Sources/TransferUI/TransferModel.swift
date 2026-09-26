@@ -182,13 +182,10 @@ public final class TransferModel {
     /// The window's own sheets that came while another was up, shown in turn.
     @ObservationIgnored private var waitingSheets: [AppSheet] = []
     @ObservationIgnored private var restoringSheet = false
-    public var promptSecure = ""
-    public var saveSecret = false
     public var renaming = false
     public var renameText = ""
     /// What the rename bar renames, fixed when it opens.
     @ObservationIgnored private var renameTarget: RemotePath?
-    public var applyCollisionToAll = false
     public var sidebarSelection: SidebarItem?
     public var inspectorLinkTarget: String?
     /// Whether Terminal, iTerm2, or Ghostty is installed, learned in `start`.
@@ -1916,7 +1913,6 @@ public final class SheetPrompts {
     private func presentIfIdle() {
         guard let model, model.sheet == nil, shown == nil, let first = queue.first else { return }
         shown = first.id
-        model.applyCollisionToAll = false
         model.sheet = first.sheet
     }
 
@@ -2031,26 +2027,6 @@ final class OperationPrompt: PromptSink {
         let answer = await withTaskCancellationHandler { await question.value } onCancel: { question.cancel() }
         if asking == question { asking = nil }
         return answer?.choice
-    }
-}
-
-extension TransferModel {
-    /// Keychain saving applies only where the sheet offered it; a later question in the same
-    /// login, such as a one-time code, never replaces the saved password.
-    func finishPrompt(_ reply: PromptReply, offered: Bool) {
-        var reply = reply
-        reply.saveInKeychain = reply.saveInKeychain && offered
-        promptSecure = ""
-        saveSecret = false
-        prompts.finish(.login(reply))
-    }
-
-    func finishHost(_ decision: HostKeyDecision) {
-        prompts.finish(.hostKey(decision))
-    }
-
-    func finishCollision(_ choice: NameCollisionChoice, applyToAll: Bool) {
-        prompts.finish(.collision(choice, toAll: applyToAll))
     }
 }
 
