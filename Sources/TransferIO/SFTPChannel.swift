@@ -173,10 +173,11 @@ actor SFTPChannel {
     }
 
     /// A rename or move the user asked for. It never replaces what is already at `destination`:
-    /// `posix-rename` would, and plain RENAME refuses a file there but on OpenSSH replaces an empty
-    /// folder, so the destination is looked up first. A change of case alone within one folder
-    /// needs `posix-rename` on a case-insensitive disk, where the lookup finds the source itself;
-    /// the folder's listing tells that apart from a second file on a case-sensitive disk.
+    /// OpenSSH's plain RENAME refuses a name in use (but for a link onto a dangling link), other
+    /// servers may replace, as the draft allows, so the destination is looked up first. A change
+    /// of case alone within one folder needs `posix-rename` on a case-insensitive disk, where the
+    /// lookup finds the source itself; the folder's listing tells that apart from a second file
+    /// on a case-sensitive disk.
     func rename(_ source: RemotePath, to destination: RemotePath) async throws {
         if try await lookup(destination) != nil {
             let caseOnly = source.parent == destination.parent && source != destination
@@ -184,7 +185,7 @@ actor SFTPChannel {
             guard caseOnly, let folder = destination.parent, try await !hasEntry(named: destination.name, in: folder) else {
                 throw TransferError.failed("“\(destination.name)” already exists there")
             }
-            if (try? await posixRename(source, to: destination)) != nil { return }
+            if extensions.contains("posix-rename@openssh.com") { return try await posixRename(source, to: destination) }
         }
         try await plainRename(source, to: destination)
     }
@@ -252,7 +253,7 @@ actor SFTPChannel {
         try await plainRename(temp, to: placed)
     }
 
-    /// SSH_FXP_RENAME, which on OpenSSH never replaces a file but does replace an empty folder.
+    /// SSH_FXP_RENAME, which on OpenSSH never replaces anything but a dangling link.
     private func plainRename(_ source: RemotePath, to destination: RemotePath) async throws {
         _ = try await call(SFTPCode.rename) {
             $0.appendPath(source)
@@ -544,14 +545,9 @@ actor SFTPChannel {
     }
 
     /// Sends one request and waits for the reply. A failure status throws, EOF as `EndOfFile`.
-    private func call(
-        _ type: UInt8,
-        capacity: Int = 64,
-        long: Bool = false,
-        _ fields: (inout Data) -> Void
-    ) async throws -> SFTPMessage {
+    private func call(_ type: UInt8, _ fields: (inout Data) -> Void) async throws -> SFTPMessage {
         try Task.checkCancellation()
-        return try await reply(send(type, capacity: capacity, long: long, fields))
+        return try await reply(send(type, fields))
     }
 
     /// Sends one request now and returns its id for `reply`. Requests reach the server in the order
@@ -596,7 +592,8 @@ actor SFTPChannel {
         if message.type == SFTPCode.status {
             var reader = ByteReader(message.rest)
             let code = (try? reader.u32()) ?? SFTPCode.failure
-            let text = (try? reader.utf8()) ?? "SFTP error \(code)"
+            // The server's words go to the message bar: one line, no bidi overrides, short.
+            let text = SFTPWire.printable((try? reader.utf8()) ?? "SFTP error \(code)", limit: 200)
             if code == SFTPCode.ok { return message }
             if code == SFTPCode.eof { throw EndOfFile() }
             if code == SFTPCode.noSuchFile { throw TransferError.noSuchFile(text) }
@@ -606,8 +603,11 @@ actor SFTPChannel {
         return message
     }
 
-    /// The server's EOF status: the end of a directory or a file, not a failure.
-    private struct EndOfFile: Error {}
+    /// The server's EOF status: the end of a directory or a file, not a failure. To any other
+    /// request it is one, and reads as one.
+    private struct EndOfFile: LocalizedError {
+        var errorDescription: String? { "The server answered “end of file” where no file ends" }
+    }
 
     /// Stops waiting for request `id`: its reply, when it comes, is dropped.
     private func abandon(_ id: UInt32) {

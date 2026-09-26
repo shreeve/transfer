@@ -200,8 +200,8 @@ import TransferCore
     }
 
     /// A server whose folder /srv lists `names`, where LSTAT finds what `lookup` says, and which
-    /// has posix-rename.
-    private static func renaming(_ names: [String], lookup: @escaping @Sendable (String) -> UInt32?) async throws -> ScriptedServer {
+    /// has posix-rename, answering it with `posixRename`.
+    private static func renaming(_ names: [String], posixRename: UInt32 = SFTPCode.ok, lookup: @escaping @Sendable (String) -> UInt32?) async throws -> ScriptedServer {
         let listing = ScriptedServer.listing([names.map { Array($0.utf8) }])
         return try await ScriptedServer(extensions: ["posix-rename@openssh.com"]) { request in
             switch request.type {
@@ -209,7 +209,8 @@ import TransferCore
                 let path = request.paths[0]
                 if let code = lookup(path) { return ScriptedServer.status(request.id, code) }
                 return ScriptedServer.attrs(request.id)
-            case SFTPCode.rename, SFTPCode.extended: return ScriptedServer.ok(request.id)
+            case SFTPCode.rename: return ScriptedServer.ok(request.id)
+            case SFTPCode.extended: return ScriptedServer.status(request.id, posixRename, "Permission denied")
             default: return listing(request)
             }
         }
@@ -238,12 +239,40 @@ import TransferCore
         await server.stop()
     }
 
+    /// WIR-09: a case-only rename whose posix-rename failed for a real reason fell through to a
+    /// plain RENAME, and the user saw its "Failure" instead of the reason.
+    @Test func aCaseOnlyRenameReportsWhyPosixRenameFailed() async throws {
+        let server = try await Self.renaming(["notes.txt"], posixRename: SFTPCode.permission) { _ in nil }
+        await #expect(throws: TransferError.permissionDenied("Permission denied")) {
+            try await server.channel.rename(RemotePath(string: "/srv/notes.txt"), to: RemotePath(string: "/srv/Notes.txt"))
+        }
+        #expect(server.sent(SFTPCode.rename).isEmpty)
+        await server.stop()
+    }
+
     /// With nothing at the new name, a case-only rename is a plain RENAME, like any other.
     @Test func aCaseOnlyRenameToAFreeNameIsAPlainRename() async throws {
         let server = try await Self.renaming(["notes.txt"]) { $0 == "/srv/Notes.txt" ? SFTPCode.noSuchFile : nil }
         try await server.channel.rename(RemotePath(string: "/srv/notes.txt"), to: RemotePath(string: "/srv/Notes.txt"))
         #expect(server.sent(SFTPCode.rename).first?.paths == ["/srv/notes.txt", "/srv/Notes.txt"])
         #expect(server.sent(SFTPCode.extended).isEmpty)
+        await server.stop()
+    }
+
+    /// WIR-06, WIR-07: a server's status reaches the message bar only as text fit to show. EOF
+    /// where nothing ends read as a private type's name; a message kept its line breaks and bidi
+    /// overrides, at any length.
+    @Test func aServersStatusReadsAsTextFitToShow() async throws {
+        let server = try await ScriptedServer { request in
+            request.paths.first == "/eof"
+                ? ScriptedServer.status(request.id, SFTPCode.eof, "eof")
+                : ScriptedServer.status(request.id, SFTPCode.failure, "Disk\n\u{202E}full " + String(repeating: "x", count: 300))
+        }
+        let eof = await #expect(throws: (any Error).self) { try await server.channel.lstat(RemotePath(string: "/eof")) }
+        #expect(eof?.localizedDescription == "The server answered “end of file” where no file ends")
+        await #expect(throws: TransferError.failed("Diskfull " + String(repeating: "x", count: 191) + "…")) {
+            try await server.channel.lstat(RemotePath(string: "/full"))
+        }
         await server.stop()
     }
 

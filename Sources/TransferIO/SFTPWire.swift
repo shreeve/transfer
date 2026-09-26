@@ -192,14 +192,19 @@ enum SFTPWire {
     /// shell printed text as it started (an `echo` in .bashrc), and its first four characters read
     /// as a length of hundreds of megabytes. A real frame's first byte is zero.
     static func notSFTP(_ bytes: Data) -> String {
-        let firstLine = String(decoding: bytes.prefix(200), as: UTF8.self)
-            .split(whereSeparator: \.isNewline).first ?? ""
-        let printable = String(String.UnicodeScalarView(firstLine.unicodeScalars.filter {
-            $0.properties.generalCategory != .control
-        })).trimmingCharacters(in: .whitespaces)
-        guard bytes.first != 0, !printable.isEmpty else { return "The server did not answer in SFTP" }
-        let shown = printable.count > 60 ? printable.prefix(60) + "…" : printable
+        let firstLine = String(decoding: bytes.prefix(200), as: UTF8.self).split(whereSeparator: \.isNewline).first ?? ""
+        let shown = printable(firstLine, limit: 60)
+        guard bytes.first != 0, !shown.isEmpty else { return "The server did not answer in SFTP" }
         return "The server printed “\(shown)” before SFTP started. Remove that output from the shell startup files on the server, such as .bashrc."
+    }
+
+    /// A server's `text` fit to show: without control or format characters (line breaks, bidi
+    /// overrides), trimmed, and cut to `limit` characters.
+    static func printable(_ text: some StringProtocol, limit: Int) -> String {
+        let kept = String(String.UnicodeScalarView(text.unicodeScalars.filter {
+            ![.control, .format].contains($0.properties.generalCategory)
+        })).trimmingCharacters(in: .whitespaces)
+        return kept.count > limit ? kept.prefix(limit) + "…" : kept
     }
 }
 
