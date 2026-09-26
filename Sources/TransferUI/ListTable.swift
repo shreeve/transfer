@@ -356,23 +356,14 @@ enum Format {
         Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .abbreviated, time: .shortened)
     }
 
-    /// The inspector's date, `2026-08-31`, and its time, `2:44:07 PM`.
+    /// The inspector's date, `2026-08-31` in this Mac's time zone, and its time as the locale
+    /// writes it: `2:44:07 PM`, or `14:44:07`.
     static func day(_ mtime: UInt32) -> String {
-        dayFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(mtime)))
+        Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(Date.ISO8601FormatStyle(timeZone: .current).year().month().day())
     }
 
     static func clock(_ mtime: UInt32) -> String {
-        clockFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(mtime)))
-    }
-
-    private static let dayFormatter = fixed("yyyy-MM-dd")
-    private static let clockFormatter = fixed("h:mm:ss a")
-
-    private static func fixed(_ format: String) -> DateFormatter {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = format
-        return formatter
+        Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .omitted, time: .standard)
     }
 }
 
