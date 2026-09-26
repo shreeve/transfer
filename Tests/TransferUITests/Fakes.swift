@@ -41,7 +41,6 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
         return home
     }
 
-    func disconnect() async { loggedIn.value = false }
 
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         let items = folders.value[path] ?? []
@@ -70,7 +69,6 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         record("download \(path.display)")
     }
-    func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {}
     func openKind(fileName: String) async -> OpenKind { .view }
     func prepareLiveFile(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
     func prepareViewFile(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }

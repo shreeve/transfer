@@ -8,7 +8,7 @@ import TransferCore
 extension SSHConnection {
     // MARK: Remove
 
-    public func remove(_ path: RemotePath, force: Bool) async throws {
+    public func remove(_ path: RemotePath, force: Bool = false) async throws {
         try await live.remove(path, on: connection.id, force: force) {
             let link = try await self.walkerLink()
             _ = try await self.removeTree(path, as: TreeEntry(try await link.lstat(path)), link: link)
@@ -656,6 +656,13 @@ extension SSHConnection {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// The whole tree `walkTree` streams, by key.
+    func tree(_ root: RemotePath) async throws -> [TreeKey: TreeEntry] {
+        var entries: [TreeKey: TreeEntry] = [:]
+        for try await (key, entry) in walkTree(root) { entries[key] = entry }
+        return entries
     }
 
     private func walk(_ folder: RemotePath, key parent: TreeKey, link: SFTPChannel, visit: @escaping @Sendable (TreeKey, TreeEntry) -> Void) async throws {
