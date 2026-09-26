@@ -366,11 +366,8 @@ struct ColumnBrowser: NSViewRepresentable {
         }
 
         func browser(_ browser: NSBrowser, acceptDrop info: any NSDraggingInfo, atRow row: Int, column: Int, dropOperation: NSBrowser.DropOperation) -> Bool {
-            guard let folder = dropFolder(row: row, column: column),
-                  let action = dropAction(for: info, onto: folder, model: model) else { return false }
-            let model = model
-            Task { await model.perform(action) }
-            return true
+            guard let folder = dropFolder(row: row, column: column) else { return false }
+            return performDrop(info, onto: folder, model: model)
         }
 
         /// A folder row, else the column's folder. Beyond every column it is the location, the

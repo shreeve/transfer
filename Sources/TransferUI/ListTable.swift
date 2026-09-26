@@ -231,10 +231,7 @@ struct ListTable: NSViewRepresentable {
         }
 
         func tableView(_ tableView: NSTableView, acceptDrop info: any NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
-            guard let action = dropAction(for: info, onto: dropFolder(row: row, operation: dropOperation), model: model) else { return false }
-            let model = model
-            Task { await model.perform(action) }
-            return true
+            performDrop(info, onto: dropFolder(row: row, operation: dropOperation), model: model)
         }
 
         // MARK: Context menu

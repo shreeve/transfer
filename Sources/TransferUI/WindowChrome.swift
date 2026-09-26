@@ -725,12 +725,7 @@ enum ContentKeys {
 
     /// A list or column view, or inside one (a column's table), or the icon grid.
     private static func isBrowser(_ view: NSView) -> Bool {
-        var current: NSView? = view
-        while let candidate = current {
-            if candidate is NSTableView || candidate is NSBrowser || candidate is IconItemView || candidate is IconGridBackgroundView { return true }
-            current = candidate.superview
-        }
-        return false
+        sequence(first: view, next: \.superview).contains { $0 is NSTableView || $0 is NSBrowser || $0 is DropTargetView }
     }
 }
 
