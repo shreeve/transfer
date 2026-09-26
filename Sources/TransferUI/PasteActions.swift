@@ -69,7 +69,9 @@ extension TransferModel {
 
     /// Queues a paste, a drop, or an upload as one operation into `folder` on `context`'s server,
     /// the one the user chose it on. Items on another server log in there first, with sheets that
-    /// name that server, not this window's. `done` runs once it has succeeded.
+    /// name that server, not this window's. Each attempt asks the provider for that session anew:
+    /// one kept from before the server's settings changed would log in a second master for it.
+    /// `done` runs once it has succeeded.
     func transfer(
         _ sources: TransferRequest.Sources,
         into folder: RemotePath,
@@ -81,13 +83,13 @@ extension TransferModel {
         let session = context.session
         let names: [[UInt8]]
         var verb = moving ? "Move" : "Copy"
-        var source: (any RemoteSession)?
+        var login: (ConnectionID, OperationPrompt)?
         switch sources {
         case .server(let id, let paths):
             names = paths.map(\.nameBytes)
             if id != session.connection.id {
                 do {
-                    source = try await provider.session(for: id)
+                    login = (id, prompts.login(try await provider.session(for: id).connection))
                 } catch TransferError.noSuchFile {
                     status = "The server these items were copied from is no longer in the library."
                     return
@@ -101,13 +103,15 @@ extension TransferModel {
             names = urls.map { Array($0.lastPathComponent.utf8) }
             if !moving { verb = "Upload" }
         }
-        let login = source.map { ($0, prompts.login($0.connection)) }
         let request = TransferRequest(sources, into: folder, on: session.connection.id, moving: moving, bytes: bytes)
         let provider = provider
         // A row for one item names it and is matched to it.
         let one = names.count == 1 ? folder.appending(name: names[0]) : nil
-        enqueue(title: one.map { "\(verb) \($0.name)" } ?? "\(verb) \(names.count) items", path: one ?? folder, on: context) { progress in
-            if let (source, sink) = login, !(await source.isConnected) { _ = try await source.connect(prompts: sink) }
+        enqueue(title: one.map { "\(verb) \($0.name)" } ?? "\(verb) \(names.count) items", path: one ?? folder, on: context) { [login] progress in
+            if let (id, sink) = login {
+                let source = try await provider.session(for: id)
+                if !(await source.isConnected) { _ = try await source.connect(prompts: sink) }
+            }
             try await provider.transfer(request, progress: progress)
             await done()
         }
