@@ -27,7 +27,7 @@ public struct SFTPURL: Hashable, Sendable {
               Self.isPlainName(host) else { return nil }
         let user = url.user(percentEncoded: false).flatMap { $0.isEmpty ? nil : $0 }
         if let user, !Self.isPlainName(user) { return nil }
-        guard let path = Self.decode(url.path(percentEncoded: true)), !Self.hasControl(path) else { return nil }
+        guard let path = Self.decode(url.path(percentEncoded: true)), !RemotePath.hasControl(path) else { return nil }
         self.host = host
         self.user = user
         port = url.port.map(String.init)
@@ -56,12 +56,6 @@ public struct SFTPURL: Hashable, Sendable {
         case UInt8(ascii: "A")...UInt8(ascii: "F"): byte - UInt8(ascii: "A") + 10
         default: nil
         }
-    }
-
-    /// C0 controls, DEL, and C1 controls as UTF-8 writes them (C2 80 to C2 9F).
-    private static func hasControl(_ bytes: [UInt8]) -> Bool {
-        bytes.contains { $0 < 0x20 || $0 == 0x7F }
-            || zip(bytes, bytes.dropFirst()).contains { $0 == 0xC2 && (0x80...0x9F).contains($1) }
     }
 
     private static func isPlainName(_ name: String) -> Bool {

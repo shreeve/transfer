@@ -47,6 +47,15 @@ struct RemotePathTests {
         #expect(go("   ") == nil)
     }
 
+    /// A pasted NUL reached the server, whose SFTP server exits on one, ending the channel (COR-2).
+    @Test func aTypedPathWithAControlCharacterGoesNowhere() {
+        let current = RemotePath(string: "/srv/site")
+        for text in ["/tmp/a\0b", "a\0", "~/x\ny", "/a\tb", "/a\u{7F}", "/a\u{85}b"] {
+            #expect(RemotePath.typed(text, from: current, home: current) == nil, "\(text.debugDescription)")
+        }
+        #expect(RemotePath.typed("/tmp/a b\n", from: current, home: current)?.display == "/tmp/a b")
+    }
+
     @Test func appendingNeverMakesADoubleSlash() {
         let root = RemotePath(string: "/")
         #expect(root.appending("etc").display == "/etc")
