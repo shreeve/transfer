@@ -46,6 +46,8 @@ final class ServerContext {
     var listener: Task<Void, Never>?
     /// The listing running for each folder, at most one per folder.
     var jobs: [RemotePath: ListingJob] = [:]
+    /// Events that came during the login, handled once it lands.
+    var early: [SessionEvent] = []
 
     init(connection: SavedConnection, session: any RemoteSession, generation: Int) {
         self.connection = connection
@@ -182,13 +184,10 @@ public final class TransferModel {
     /// The window's own sheets that came while another was up, shown in turn.
     @ObservationIgnored private var waitingSheets: [AppSheet] = []
     @ObservationIgnored private var restoringSheet = false
-    public var promptSecure = ""
-    public var saveSecret = false
     public var renaming = false
     public var renameText = ""
     /// What the rename bar renames, fixed when it opens.
     @ObservationIgnored private var renameTarget: RemotePath?
-    public var applyCollisionToAll = false
     public var sidebarSelection: SidebarItem?
     public var inspectorLinkTarget: String?
     /// Whether Terminal, iTerm2, or Ghostty is installed, learned in `start`.
@@ -202,25 +201,26 @@ public final class TransferModel {
     private var forwardStack: [RemotePath] = []
     private var previewTask: Task<Void, Never>?
     @ObservationIgnored private var runners: [String: Runner] = [:]
+    /// The server each shelf row runs on: a transfer's is the one it was queued for, and a Live
+    /// row's the one whose events put it there, so Retry, Pause, and Resume reach that server
+    /// whatever the window shows now.
+    @ObservationIgnored private var owners: [String: SavedConnection] = [:]
     /// Rows whose move kept originals (`keep`).
     private var keptRows: Set<String> = []
     /// Transfer tasks running in every window, open or closed.
     private(set) static var running = 0
-    /// The session behind each Live row on the shelf, which the session's own events put there,
-    /// so Pause and Resume reach that server whatever the window shows now.
-    @ObservationIgnored private var liveRowSessions: [String: any RemoteSession] = [:]
     @ObservationIgnored private var sidebarReload: Task<Void, Never>?
     @ObservationIgnored private var sidebarReloadAgain = false
     @ObservationIgnored private var observers: [any NSObjectProtocol] = []
 
-    /// One queued transfer. It keeps the server it was queued for: a retry, a Restart, or a
-    /// Retry after a failure runs there even when the window has moved to another server.
+    typealias Body = @Sendable (any RemoteSession, @escaping @Sendable (TransferProgress) -> Void) async throws -> Void
+
+    /// One queued transfer. Each attempt asks the library for its server's session, since an edit
+    /// can replace the one it was queued with.
     private struct Runner {
-        var body: @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void
+        var body: Body
         /// This operation's own prompts, kept across retries and Restart.
         var prompts: OperationPrompt
-        let connection: SavedConnection
-        let session: any RemoteSession
         var task: Task<Void, Never>?
     }
 
@@ -267,9 +267,7 @@ public final class TransferModel {
         observers.removeAll()
         // A connect still logging in lands nowhere.
         connectGeneration &+= 1
-        loginPrompt?.retire()
-        loginPrompt = nil
-        loginTask?.cancel()
+        stopLogin()
         context?.close()
         sidebarReload?.cancel()
         previewTask?.cancel()
@@ -279,10 +277,7 @@ public final class TransferModel {
 
     /// As `close`, for a model released without it.
     isolated deinit {
-        for observer in observers { NotificationCenter.default.removeObserver(observer) }
-        context?.close()
-        sidebarReload?.cancel()
-        prompts.cancelAll()
+        close()
     }
 
     /// Reads the global preferences at launch and whenever they change. Hidden files and the sort
@@ -347,6 +342,13 @@ public final class TransferModel {
             displayedIndexCache = nil
         }
         if filteredColumn != column { filteredColumn = column }
+        // In list and icon view the selection keeps only what is shown, as in Finder, so nothing
+        // the filter or hidden files took away is copied, dragged, or deleted unseen. A listing
+        // still arriving keeps it whole.
+        if snapshot.viewMode != .columns, listing?.complete == true {
+            let shownSelection = snapshot.selection.filter { displayedIndex[$0] != nil }
+            if shownSelection.count != snapshot.selection.count { snapshot.selection = shownSelection }
+        }
     }
 
     // MARK: Servers
@@ -356,7 +358,24 @@ public final class TransferModel {
         guard let loaded = try? await provider.savedConnections() else { return }
         Self.lastConnections = loaded
         if connections != loaded { connections = loaded }
-        if let id = snapshot.connectionID, !loaded.contains(where: { $0.id == id }) { uninstall() }
+        guard let context else { return }
+        if let saved = loaded.first(where: { $0.id == context.connection.id }) {
+            if saved != context.connection { _ = try? await currentContext() }
+        } else {
+            uninstall()
+        }
+    }
+
+    /// The window's server with the session the library has for it now. An edit can replace a
+    /// session that is not logged in, and the old one never logs in again, so the window moves to
+    /// the new one, at the same folder. Nil when the window shows no server or moved on meanwhile.
+    private func currentContext() async throws -> ServerContext? {
+        guard let context else { return nil }
+        let session = try await provider.session(for: context.connection.id)
+        guard isCurrent(context) else { return nil }
+        if session as AnyObject === context.session as AnyObject { return context }
+        await connect(currentConnection ?? context.connection, landing: snapshot.path)
+        return self.context === context ? nil : self.context
     }
 
     public var currentConnection: SavedConnection? {
@@ -407,8 +426,7 @@ public final class TransferModel {
         if let current = loginPrompt, current.serverID == connection.id {
             login = current
         } else {
-            loginPrompt?.retire()
-            loginTask?.cancel()
+            stopLogin()
             login = prompts.login(connection)
             loginPrompt = login
         }
@@ -430,8 +448,9 @@ public final class TransferModel {
             pending = fresh
             // Listening before the login catches the notices the login itself raises.
             listen(fresh)
-            // Its own task, so `abandonConnect` can end the wait even when the caller's task goes on.
-            let attempt = Task { try await session.connect(prompts: login) }
+            // Its own task, so `abandonConnect` can end the wait even when the caller's task goes
+            // on; a second connect to the same server waits on the same one.
+            let attempt = loginTask ?? Task { try await session.connect(prompts: login) }
             loginTask = attempt
             let start = try await withTaskCancellationHandler { try await attempt.value } onCancel: { attempt.cancel() }
             var path = start
@@ -448,7 +467,7 @@ public final class TransferModel {
             install(fresh, path: path, selection: selection)
             await refresh()
             scheduleSidebarReload()
-            if let missing { status = "No such file or folder: \(missing.display)" }
+            if let missing, isCurrent(fresh) { status = "No such file or folder: \(missing.display)" }
         } catch {
             // A login the user cancelled, at a password or a host key, fails quietly.
             guard generation == connectGeneration, !login.declined else { return }
@@ -462,6 +481,11 @@ public final class TransferModel {
     private func abandonConnect() {
         connectGeneration &+= 1
         connectingTo = nil
+        stopLogin()
+    }
+
+    /// Takes back the login's sheets and stops waiting for it.
+    private func stopLogin() {
         loginPrompt?.retire()
         loginPrompt = nil
         loginTask?.cancel()
@@ -470,8 +494,12 @@ public final class TransferModel {
 
     /// Makes `fresh` the window's server in one step: its session, listener, location, and
     /// empty caches. The old server's listener and listings stop; its queued transfers go on.
+    /// The login is over, so the title names the server while its first listing arrives.
     private func install(_ fresh: ServerContext, path: RemotePath, selection: Set<RemotePath>) {
         leaveServer(keepingRowsOf: fresh.connection.id)
+        connectingTo = nil
+        loginPrompt = nil
+        loginTask = nil
         context = fresh
         snapshot.connectionID = fresh.connection.id
         snapshot.path = path
@@ -480,6 +508,8 @@ public final class TransferModel {
         loadPreferences(for: fresh.connection.id)
         refreshItems()
         syncSidebarSelection()
+        for event in fresh.early { handle(event, from: fresh) }
+        fresh.early = []
     }
 
     /// Leaves the window showing no server.
@@ -514,10 +544,10 @@ public final class TransferModel {
     /// Live rows arrive from the shown server's events; once the window leaves that server
     /// nothing would update or remove them.
     private func dropLiveRows(keeping id: ConnectionID?) {
-        let gone = operations.filter { $0.livePath != nil && liveRowSessions[$0.id]?.connection.id != id }.map(\.id)
+        let gone = operations.filter { $0.livePath != nil && owners[$0.id]?.id != id }.map(\.id)
         guard !gone.isEmpty else { return }
         operations.removeAll { gone.contains($0.id) }
-        for id in gone { liveRowSessions[id] = nil }
+        for id in gone { owners[id] = nil }
     }
 
     private func isCurrent(_ context: ServerContext) -> Bool {
@@ -765,17 +795,17 @@ public final class TransferModel {
     }
 
     public func goHome() async {
-        guard let context else { return }
         await reporting {
+            guard let context = try await currentContext() else { return }
             let path = try await context.session.connect(prompts: prompts.login(context.connection))
             if isCurrent(context) { await navigate(path) }
         }
     }
 
     public func goToFolder(_ text: String) async {
-        guard let context else { return }
         let from = snapshot.path
         await reporting {
+            guard let context = try await currentContext() else { return }
             let home = try await context.session.connect(prompts: prompts.login(context.connection))
             guard isCurrent(context), let path = RemotePath.typed(text, from: from, home: home) else { return }
             // A file opens its folder with the file selected, as a link to one does. When nothing
@@ -791,29 +821,31 @@ public final class TransferModel {
         snapshot.showsHidden ? items : items.filter { !$0.isHidden }
     }
 
-    /// A selected item the location does not list. In column view a selected folder is the
-    /// location itself, so it is in its parent's listing.
+    /// An item in its folder's cached listing.
     private func listedItem(_ path: RemotePath) -> RemoteItem? {
         guard let parent = path.parent else { return nil }
         return listings[parent]?.items.first { $0.path == path }
     }
 
-    public var primaryItem: RemoteItem? {
-        let shown = displayedItems
-        guard !snapshot.selection.isEmpty else { return nil }
-        if let index = snapshot.selection.compactMap({ displayedIndex[$0] }).min() { return shown[index] }
-        return snapshot.selection.compactMap(listedItem).min { $0.path.display < $1.path.display }
-    }
+    public var primaryItem: RemoteItem? { selectedItems.first }
 
     /// Menu items whose shortcut is a plain key stay out of the way of text entry.
     public var plainKeysAvailable: Bool { !textEditing && sheet == nil }
 
+    /// The selected items shown, in list order, then any others by path: in column view a selected
+    /// folder is the location itself, found in its parent's listing. One pass per folder, since
+    /// the menus and the inspector read this on every change.
     public var selectedItems: [RemoteItem] {
-        let shown = displayedItems
         guard !snapshot.selection.isEmpty else { return [] }
-        let indexes = snapshot.selection.compactMap { displayedIndex[$0] }
-        if indexes.count == snapshot.selection.count { return indexes.sorted().map { shown[$0] } }
-        return snapshot.selection.compactMap(listedItem).sorted { $0.path.display < $1.path.display }
+        var rows: [Int] = []
+        var unshown: Set<RemotePath> = []
+        for path in snapshot.selection {
+            if let row = displayedIndex[path] { rows.append(row) } else { unshown.insert(path) }
+        }
+        let shown = rows.sorted().map { displayedItems[$0] }
+        guard !unshown.isEmpty else { return shown }
+        let listed = Set(unshown.compactMap(\.parent)).flatMap { listings[$0]?.items.filter { unshown.contains($0.path) } ?? [] }
+        return shown + listed.sorted { $0.path.display < $1.path.display }
     }
 
     /// A single selected folder becomes the location, as in Finder, and stays selected; files and
@@ -870,7 +902,7 @@ public final class TransferModel {
 
     /// The operation that moves `path`, if one is queued or running.
     public func operation(for path: RemotePath) -> TransferOperation? {
-        operations.first { $0.path == path || $0.livePath == path }
+        operations.first { ($0.path == path || $0.livePath == path) && owners[$0.id]?.id == snapshot.connectionID }
     }
 
     public func toggleHidden() {
@@ -887,6 +919,7 @@ public final class TransferModel {
         snapshot.viewMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: Preferences.viewMode)
         if mode == .columns { columnRoot = snapshot.path }
+        refreshItems()
     }
 
     // MARK: Open
@@ -1093,11 +1126,10 @@ public final class TransferModel {
         panel.canCreateDirectories = true
         panel.prompt = "Download"
         guard panel.runModal() == .OK, let directory = panel.url, stillShows(context) else { return }
-        let session = context.session
         for item in items {
             let destination = directory.appendingPathComponent(item.name)
             let path = item.path
-            enqueue(title: "Download \(item.name)", path: path, on: context) { progress in
+            enqueue(title: "Download \(item.name)", path: path, on: context) { session, progress in
                 try await session.download(path, to: destination, progress: progress)
             }
         }
@@ -1130,23 +1162,29 @@ public final class TransferModel {
 
     /// Queues `body` against `context`'s server, or the one the window shows now; it stays with
     /// that server.
-    func enqueue(title: String, path: RemotePath, on context: ServerContext? = nil, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
+    func enqueue(title: String, path: RemotePath, on context: ServerContext? = nil, body: @escaping Body) {
         guard let context = context ?? self.context else { return }
         let id = UUID().uuidString
         operations.append(TransferOperation(id: id, title: title, state: .queued, path: path))
-        runners[id] = Runner(body: body, prompts: operationPrompts(), connection: context.connection, session: context.session, task: nil)
+        runners[id] = Runner(body: body, prompts: operationPrompts(), task: nil)
+        owners[id] = context.connection
         showsShelf = true
         start(id)
     }
 
+    /// As above, for a body that reaches its servers through the library itself.
+    func enqueue(title: String, path: RemotePath, on context: ServerContext? = nil, body: @escaping @Sendable (@escaping @Sendable (TransferProgress) -> Void) async throws -> Void) {
+        enqueue(title: title, path: path, on: context) { _, progress in try await body(progress) }
+    }
+
     private func start(_ id: String) {
-        guard let runner = runners[id] else { return }
+        guard let runner = runners[id], let server = owners[id] else { return }
         runner.task?.cancel()
         keptRows.remove(id)
         update(id) { $0.state = .active; $0.message = nil }
         let body = runner.body
-        let session = runner.session
-        let login = prompts.login(runner.connection)
+        let provider = provider
+        let prompts = prompts
         let operationPrompts = runner.prompts
         // IO reports every 64 KB, thousands of times a second. The latest report waits in a box
         // and reaches the shelf at most every 100 ms, as one main-actor task.
@@ -1173,10 +1211,14 @@ public final class TransferModel {
             var attempt = 0
             while true {
                 do {
-                    if !(await session.isConnected) {
-                        _ = try await session.connect(prompts: login)
+                    guard let session = try? await provider.session(for: server.id) else {
+                        self?.finish(id, state: .failed, message: "“\(server.displayName)” is no longer in the library.")
+                        return
                     }
-                    try await OperationPrompts.$current.withValue(operationPrompts) { try await body(report) }
+                    if !(await session.isConnected) {
+                        _ = try await session.connect(prompts: prompts.login(session.connection))
+                    }
+                    try await OperationPrompts.$current.withValue(operationPrompts) { try await body(session, report) }
                     self?.finish(id, state: .succeeded, message: nil)
                     return
                 } catch {
@@ -1214,6 +1256,17 @@ public final class TransferModel {
         operation.state == .failed && keptRows.contains(operation.id)
     }
 
+    /// A row's state in the words the shelf and the inspector share; nil while it runs.
+    public func stateLabel(_ operation: TransferOperation) -> String? {
+        switch operation.state {
+        case .queued: "Waiting"
+        case .active: nil
+        case .paused: operation.livePath == nil ? "Stopped" : "Paused"
+        case .failed: isKept(operation) ? "Kept" : "Failed"
+        case .succeeded: "Done"
+        }
+    }
+
     private func update(_ id: String, _ change: (inout TransferOperation) -> Void) {
         guard let index = operations.firstIndex(where: { $0.id == id }) else { return }
         change(&operations[index])
@@ -1226,6 +1279,7 @@ public final class TransferModel {
         if state == .succeeded {
             operations.removeAll { $0.id == id }
             runners[id] = nil
+            owners[id] = nil
         } else if let message {
             status = message
         }
@@ -1239,34 +1293,32 @@ public final class TransferModel {
 
     /// The server a shelf row belongs to, named when it is not the one the window shows.
     public func otherServerName(for operation: TransferOperation) -> String? {
-        let owner = runners[operation.id]?.connection ?? liveRowSessions[operation.id]?.connection
-        guard let owner, owner.id != snapshot.connectionID else { return nil }
+        guard let owner = owners[operation.id], owner.id != snapshot.connectionID else { return nil }
         return connections.first { $0.id == owner.id }?.displayName ?? owner.displayName
     }
 
     /// Pauses a Live file's sync, or stops a transfer: a stopped transfer's temp is removed, so
     /// `resume` restarts it from its first byte.
     public func pause(_ operation: TransferOperation) async {
-        if let path = operation.livePath {
-            await (liveRowSessions[operation.id] ?? session)?.setLivePaused(path, paused: true)
-            return
-        }
+        guard operation.livePath == nil else { return await setLivePaused(operation, true) }
         update(operation.id) { $0.state = .paused; $0.message = nil }
         runners[operation.id]?.task?.cancel()
     }
 
     public func resume(_ operation: TransferOperation) async {
-        if let path = operation.livePath {
-            await (liveRowSessions[operation.id] ?? session)?.setLivePaused(path, paused: false)
-            return
-        }
+        guard operation.livePath == nil else { return await setLivePaused(operation, false) }
         start(operation.id)
+    }
+
+    private func setLivePaused(_ operation: TransferOperation, _ paused: Bool) async {
+        guard let path = operation.livePath, let owner = owners[operation.id] else { return }
+        await (try? await provider.session(for: owner.id))?.setLivePaused(path, paused: paused)
     }
 
     public func remove(_ operation: TransferOperation) {
         runners[operation.id]?.task?.cancel()
         runners[operation.id] = nil
-        liveRowSessions[operation.id] = nil
+        owners[operation.id] = nil
         keptRows.remove(operation.id)
         operations.removeAll { $0.id == operation.id }
     }
@@ -1386,6 +1438,7 @@ public final class TransferModel {
                 }
             } else {
                 await refresh()
+                guard isCurrent(context) else { return }
                 snapshot.selection = [destination]
                 // The icon view makes a new cell for the new name; the old one had the keyboard.
                 DispatchQueue.main.async { [weak self] in
@@ -1397,7 +1450,6 @@ public final class TransferModel {
 
     /// Copies each selected item beside itself on the server as "name copy", progress on the shelf.
     public func duplicateSelection() async {
-        guard let session else { return }
         var taken: [RemotePath: Set<String>] = [:]
         for item in selectedItems {
             guard let parent = item.path.parent else { continue }
@@ -1407,7 +1459,7 @@ public final class TransferModel {
             taken[parent] = existing
             let source = item.path
             let destination = parent.appending(name: Array(name.utf8))
-            enqueue(title: "Duplicate \(item.name)", path: destination) { progress in
+            enqueue(title: "Duplicate \(item.name)", path: destination) { session, progress in
                 try await session.copy(source, to: destination, progress: progress)
             }
         }
@@ -1642,13 +1694,19 @@ public final class TransferModel {
     }
 
     public func reveal(_ path: RemotePath) async {
-        guard let parent = path.parent else { return }
+        guard let context, let parent = path.parent else { return }
         if parent != snapshot.path { await navigate(parent) }
-        snapshot.selection = [path]
+        if isCurrent(context) { snapshot.selection = [path] }
     }
 
     public func openTerminal() async {
-        guard let session, let command = await session.terminalCommand(directory: snapshot.path) else { return }
+        guard let session else { return }
+        guard let command = await session.terminalCommand(directory: snapshot.path) else {
+            status = await session.isConnected
+                ? "Open in Terminal refused: this folder's path or the server's settings hold a control character."
+                : TransferError.notConnected.localizedDescription
+            return
+        }
         if let problem = await TerminalLauncher.open(command: command) { status = problem }
     }
 
@@ -1706,8 +1764,10 @@ public final class TransferModel {
 
     private func handle(_ event: SessionEvent, from source: ServerContext) {
         guard isCurrent(source) else {
-            // Before its login lands, a server's notices still matter to the window that asked.
-            if case .notice(let text) = event, source.generation == connectGeneration { status = text }
+            // Before its login lands, a server's notices still matter to the window that asked, and
+            // the rest, such as a Live conflict found as Live sync resumes, wait for it to land.
+            guard source.generation == connectGeneration else { return }
+            if case .notice(let text) = event { status = text } else { source.early.append(event) }
             return
         }
         switch event {
@@ -1723,10 +1783,10 @@ public final class TransferModel {
             // complete; any other is listed again when it is next shown.
             if isShown(path) { relist(path) }
         case .operation(let operation):
-            liveRowSessions[operation.id] = source.session
+            owners[operation.id] = source.connection
             if operation.state == .succeeded {
                 operations.removeAll { $0.id == operation.id }
-                liveRowSessions[operation.id] = nil
+                owners[operation.id] = nil
             } else if let index = operations.firstIndex(where: { $0.id == operation.id }) {
                 operations[index] = operation
             } else {
@@ -1801,7 +1861,7 @@ public enum AppSheet: Identifiable {
         case .conflict(let path, _): "conflict-\(path.display)"
         case .goToFolder: "goto"
         case .removeServer: "remove"
-        case .discardLive: "discard"
+        case .discardLive(let path, _): "discard-\(path.display)"
         }
     }
 
@@ -1916,7 +1976,6 @@ public final class SheetPrompts {
     private func presentIfIdle() {
         guard let model, model.sheet == nil, shown == nil, let first = queue.first else { return }
         shown = first.id
-        model.applyCollisionToAll = false
         model.sheet = first.sheet
     }
 
@@ -2019,6 +2078,8 @@ final class OperationPrompt: PromptSink {
             _ = await current.value
             if asking == current { asking = nil }
         }
+        // Cancelled while waiting its turn: no question flickers up only to be withdrawn.
+        if Task.isCancelled { return nil }
         if let applyToAll { return applyToAll }
         let window = window
         // The question records Apply to All itself, before anyone waiting on it looks.
@@ -2034,28 +2095,8 @@ final class OperationPrompt: PromptSink {
     }
 }
 
-extension TransferModel {
-    /// Keychain saving applies only where the sheet offered it; a later question in the same
-    /// login, such as a one-time code, never replaces the saved password.
-    func finishPrompt(_ reply: PromptReply, offered: Bool) {
-        var reply = reply
-        reply.saveInKeychain = reply.saveInKeychain && offered
-        promptSecure = ""
-        saveSecret = false
-        prompts.finish(.login(reply))
-    }
-
-    func finishHost(_ decision: HostKeyDecision) {
-        prompts.finish(.hostKey(decision))
-    }
-
-    func finishCollision(_ choice: NameCollisionChoice, applyToAll: Bool) {
-        prompts.finish(.collision(choice, toAll: applyToAll))
-    }
-}
-
 enum TerminalLauncher {
-    private static let apps: [(name: String, bundle: String)] = [
+    static let apps: [(name: String, bundle: String)] = [
         ("Terminal", "com.apple.Terminal"),
         ("iTerm2", "com.googlecode.iterm2"),
         ("Ghostty", "com.mitchellh.ghostty"),
