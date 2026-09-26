@@ -32,7 +32,7 @@ struct SFTPURLTests {
         #expect(SFTPURL(url: URL(string: "sftp://me-too@my-host/")!)?.user == "me-too")
     }
 
-    @Test func sftpURLOmitsThePassword() {
+    @Test func copyRemoteURLNamesUserPortAndEscapedPath() {
         let connection = SavedConnection(name: "Box", host: "example.com", user: "ada", port: "22")
         let url = SFTPURL.string(connection: connection, path: RemotePath(string: "/work/a b.txt"))
         #expect(url == "sftp://ada@example.com:22/work/a%20b.txt")
@@ -96,6 +96,34 @@ struct SFTPURLTests {
         #expect(SFTPURL(url: URL(string: "sftp://live/tmp/a%C2%85b")!) == nil)
         // Format characters are not controls: emoji sequences join with U+200D.
         #expect(SFTPURL(url: URL(string: "sftp://live/tmp/%F0%9F%91%A9%E2%80%8D%F0%9F%92%BB.txt")!)?.path == RemotePath(string: "/tmp/👩‍💻.txt"))
+    }
+
+    /// Any path's bytes, on any kind of saved server, come back from the link Copy Remote URL
+    /// writes, or the link is refused when they hold a control character.
+    @Test func everyPathRoundTripsOrIsRefused() throws {
+        var random = SeededRandom(state: 2)
+        let pieces: [[UInt8]] = [[0x2F], [0x2F], [0x2E], [0x2E, 0x2E], Array("a".utf8), Array("é".utf8), [0xE9], [0xFF], [0x25], [0x20], [0x3F], [0x23], [0x40], [0x3A], [0x00], [0x0A], [0xC2, 0x85], [0x7F]]
+        let servers = [
+            live,
+            SavedConnection(name: "Six", host: "::1", user: "ab", port: "2222"),
+            SavedConnection(name: "Odd", host: "h", user: "x!$&'()*+,;=:@y"),
+            SavedConnection(name: "Books", host: "bücher.example", user: "ü"),
+        ]
+        for _ in 0..<10_000 {
+            var bytes: [UInt8] = [0x2F]
+            for _ in 0..<random.next() % 8 { bytes += pieces[Int(random.next() % UInt64(pieces.count))] }
+            let path = RemotePath(bytes: bytes)
+            let server = servers[Int(random.next() % UInt64(servers.count))]
+            let text = SFTPURL.string(connection: server, path: path)
+            let link = SFTPURL(url: try #require(URL(string: text)))
+            if bytes.contains(where: { $0 < 0x20 || $0 == 0x7F }) || text.contains("%C2%85") {
+                #expect(link == nil, "\(text)")
+                continue
+            }
+            #expect(link?.path == path, "\(text)")
+            #expect(link?.host == server.host, "\(text)")
+            #expect((link?.user ?? "") == server.user, "\(text)")
+        }
     }
 
     private let live = SavedConnection(name: "Live", host: "live")

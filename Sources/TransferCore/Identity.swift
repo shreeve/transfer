@@ -113,10 +113,10 @@ public struct RemotePath: Hashable, Sendable {
     /// Where Go to Remote Folder goes for `text`: `/…` is absolute, `~` and `~/…` start at `home`,
     /// the server's start folder (the saved server's folder, else the login's home), and anything
     /// else is relative to `current`. `.` and `..` are taken lexically, as `normalized` does. Nil
-    /// when `text` is blank.
+    /// when `text` is blank or holds a control character.
     public static func typed(_ text: String, from current: RemotePath, home: RemotePath) -> RemotePath? {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
+        guard !text.isEmpty, !hasControl(Array(text.utf8)) else { return nil }
         let path: RemotePath
         if text.hasPrefix("/") {
             path = RemotePath(string: text)
@@ -126,6 +126,13 @@ public struct RemotePath: Hashable, Sendable {
             path = current.appending(text)
         }
         return path.normalized
+    }
+
+    /// C0 controls, DEL, and C1 controls as UTF-8 writes them (C2 80 to C2 9F). A NUL on the wire
+    /// ends OpenSSH's SFTP server, and with it the channel.
+    static func hasControl(_ bytes: [UInt8]) -> Bool {
+        bytes.contains { $0 < 0x20 || $0 == 0x7F }
+            || zip(bytes, bytes.dropFirst()).contains { $0 == 0xC2 && (0x80...0x9F).contains($1) }
     }
 }
 

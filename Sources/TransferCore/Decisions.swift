@@ -30,8 +30,10 @@ public enum EditableFile {
     /// How much of a text file the inspector shows, and so all of it that is fetched.
     public static let previewHead = 64 << 10
 
+    /// The extension is what follows the last dot: "README" and "notes." have none, so they open
+    /// View whatever the list holds; ".env"'s is "env".
     public static func openKind(fileName: String, extensions: Set<String>) -> OpenKind {
-        let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
+        guard let dot = fileName.lastIndex(of: "."), case let ext = fileName[fileName.index(after: dot)...].lowercased(), !ext.isEmpty else { return .view }
         if extensions.contains(ext) { return .live }
         if let type = UTType(filenameExtension: ext), type.conforms(to: .plainText) || type.conforms(to: .sourceCode) { return .live }
         return .view
@@ -352,20 +354,20 @@ public enum ListingSort {
 
 public enum SyntaxPreview {
     /// A page for Quick Look, or when `compact`, a small unwrapped listing that follows the
-    /// system appearance for the inspector pane.
-    public static func html(text: String, fileName: String, compact: Bool = false, wraps: Bool = false) -> String {
+    /// system appearance for the inspector pane. `fileName` is unused: the page has no title,
+    /// since Quick Look shows the file's own name and a server's name would go in unescaped.
+    public static func html(text: String, fileName _: String = "", compact: Bool = false, wraps: Bool = false) -> String {
         let escaped = text
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
         let colored = color(escaped)
-        let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
         let body = compact
             ? "body{margin:6px 8px;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:\(wraps ? "pre-wrap" : "pre");overflow-wrap:anywhere;color:#1d1d1f;background:transparent;-webkit-user-select:text}"
                 + "@media(prefers-color-scheme:dark){body{color:#e5e5e7}.k{color:#6cb3ff}.s{color:#7ed49a}.c{color:#98989d}}"
             : "body{margin:24px;font:13px ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#1d1d1f;background:#fff}"
         return """
-        <!doctype html><html><head><meta charset="utf-8"><title>\(ext)</title>
+        <!doctype html><html><head><meta charset="utf-8">
         <style>
         \(body)
         .k{color:#0b4f9c;font-weight:600}.s{color:#0b6b3a}.c{color:#6e6e73}
@@ -395,33 +397,21 @@ public enum SyntaxPreview {
     }
 }
 
-/// Values in three characters, a space, and the unit with its SI prefix: `959 B`, `1.2 kB`,
-/// ` 14 kB`, `2.5 ms`. Sizes, rates, and times read the same way everywhere.
+/// Sizes in three characters, a space, and the unit with its SI prefix: `959 B`, `1.2 kB`,
+/// ` 14 kB`, the same everywhere.
 public enum Units {
-    public static func scale(_ value: Double, unit: String) -> String {
-        if value > 0, value.isFinite {
-            let span = ["T", "G", "M", "k", "", "m", "µ", "n", "p"]
-            var value = value
-            var slot = 4
-            while value < 0.995, slot < 8 {
-                value *= 1000
-                slot += 1
-            }
-            while value >= 999.5, slot > 0 {
-                value /= 1000
-                slot -= 1
-            }
+    public static func bytes(_ size: UInt64) -> String {
+        guard size > 0 else { return "  0 B" }
+        var value = Double(size)
+        for prefix in ["", "k", "M", "G", "T"] {
             if value < 999.5 {
                 let tenth = (value * 10).rounded() / 10
                 let digits = tenth >= 10 ? String(Int(value.rounded())) : String(format: "%.1f", tenth)
-                return String(repeating: " ", count: max(0, 3 - digits.count)) + digits + " " + span[slot] + unit
+                return String(repeating: " ", count: 3 - digits.count) + digits + " " + prefix + "B"
             }
+            value /= 1000
         }
-        return value == 0 ? "  0 \(unit)" : "??? \(unit)"
-    }
-
-    public static func bytes(_ size: UInt64) -> String {
-        scale(Double(size), unit: "B")
+        return "??? B"
     }
 }
 
