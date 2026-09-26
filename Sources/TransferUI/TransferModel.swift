@@ -103,8 +103,9 @@ public final class TransferModel {
     @ObservationIgnored private var connectGeneration = 0
     /// The sheets of the login a connect is waiting on, until it lands or fails.
     @ObservationIgnored private var loginPrompt: OperationPrompt?
-    /// That login itself, so a window that goes back to the server it shows can stop it.
-    @ObservationIgnored private var loginTask: Task<RemotePath, Error>?
+    /// That login itself and the session it runs on, so a window that goes back to the server it
+    /// shows can stop it.
+    @ObservationIgnored private var loginTask: (task: Task<RemotePath, Error>, session: AnyObject)?
     /// Seeded from the last window's list, so a new window or tab has servers in its first frame.
     public var connections: [SavedConnection] = TransferModel.lastConnections
     private static var lastConnections: [SavedConnection] = []
@@ -455,9 +456,16 @@ public final class TransferModel {
             // Listening before the login catches the notices the login itself raises.
             listen(fresh)
             // Its own task, so `abandonConnect` can end the wait even when the caller's task goes
-            // on; a second connect to the same server waits on the same one.
-            let attempt = loginTask ?? Task { try await session.connect(prompts: login) }
-            loginTask = attempt
+            // on; a second connect to the same session waits on the same one. One to a session an
+            // edit replaced stops waiting on the old one, which would log in with the old settings.
+            let attempt: Task<RemotePath, Error>
+            if let current = loginTask, current.session === session as AnyObject {
+                attempt = current.task
+            } else {
+                loginTask?.task.cancel()
+                attempt = Task { try await session.connect(prompts: login) }
+                loginTask = (attempt, session as AnyObject)
+            }
             let start = try await withTaskCancellationHandler { try await attempt.value } onCancel: { attempt.cancel() }
             var path = start
             var selection: Set<RemotePath> = []
@@ -494,7 +502,7 @@ public final class TransferModel {
     private func stopLogin() {
         loginPrompt?.retire()
         loginPrompt = nil
-        loginTask?.cancel()
+        loginTask?.task.cancel()
         loginTask = nil
     }
 
