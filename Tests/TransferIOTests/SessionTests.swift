@@ -4,8 +4,19 @@ import TransferCore
 @testable import TransferIO
 
 /// The session layer's pure parts: how ssh's host-key refusals are read, known_hosts lines,
-/// fingerprints, which prompts a stored secret may answer, and the process runner.
+/// fingerprints, which prompts a stored secret may answer, the process runner, and the text of
+/// the link Tools/xfer prints.
 struct SessionUnitTests {
+    /// xfer showed a name's C1 controls (UTF-8 C2 80 to C2 9F, such as CSI) to the terminal as
+    /// they were (SEC2-09).
+    @Test func xferShowsNoControlCharacters() async throws {
+        let xfer = URL(fileURLWithPath: #filePath).appendingPathComponent("../../../Tools/xfer").standardized.path
+        let host = "box\u{1B}\u{9B}31m\u{9C}\u{A0}é"
+        let result = try await Subprocess.run("/bin/sh", [xfer, "/"], environment: ["LC_TRANSFER_HOST": host, "PATH": "/usr/bin:/bin"], timeout: .seconds(10))
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("\u{1B}\\box??31m?\u{A0}é:/\u{1B}]8;;"))
+    }
+
     @Test func hostKeyFailuresAreReadFromSsh() {
         #expect(HostKeyFailure(sshErrors: """
             No ED25519 host key is known for [127.0.0.1]:2241 and you have requested strict checking.
