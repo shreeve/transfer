@@ -149,11 +149,11 @@ enum SFTPWire {
         return "The server printed “\(shown)” before SFTP started. Remove that output from the shell startup files on the server, such as .bashrc."
     }
 
-    /// A server's `text` fit to show: without control or format characters (line breaks, bidi
-    /// overrides), trimmed, and cut to `limit` characters.
+    /// A server's `text` fit to show: without control, format, or separator characters (line and
+    /// paragraph breaks, bidi overrides), trimmed, and cut to `limit` characters.
     static func printable(_ text: some StringProtocol, limit: Int) -> String {
         let kept = String(String.UnicodeScalarView(text.unicodeScalars.filter {
-            ![.control, .format].contains($0.properties.generalCategory)
+            ![.control, .format, .lineSeparator, .paragraphSeparator].contains($0.properties.generalCategory)
         })).trimmingCharacters(in: .whitespaces)
         return kept.count > limit ? kept.prefix(limit) + "…" : kept
     }

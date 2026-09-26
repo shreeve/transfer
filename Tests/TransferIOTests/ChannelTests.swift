@@ -266,7 +266,7 @@ import TransferCore
         let server = try await ScriptedServer { request in
             request.paths.first == "/eof"
                 ? ScriptedServer.status(request.id, SFTPCode.eof, "eof")
-                : ScriptedServer.status(request.id, SFTPCode.failure, "Disk\n\u{202E}full " + String(repeating: "x", count: 300))
+                : ScriptedServer.status(request.id, SFTPCode.failure, "Disk\n\u{202E}\u{2028}fu\u{2029}ll " + String(repeating: "x", count: 300))
         }
         let eof = await #expect(throws: (any Error).self) { try await server.channel.lstat(RemotePath(string: "/eof")) }
         #expect(eof?.localizedDescription == "The server answered “end of file” where no file ends")
