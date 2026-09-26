@@ -25,9 +25,17 @@ public actor TransferHub: SessionProvider {
         config = ConfigLoader.load(root: store.root)
         live = LiveSync(store: store)
         for temp in store.localTemps() {
-            try? FileManager.default.removeItem(at: temp)
+            // One file, and only by a download temp's name: the path is whatever the library
+            // holds, which may have been copied from another library or edited.
+            if Self.isTempName(temp.lastPathComponent) { unlink(temp.path) }
             store.forgetTemp(local: temp)
         }
+    }
+
+    /// `CopyRules.tempName`'s shape, `.<name>.transfer-<UUID>`, as every Transfer has named them.
+    static func isTempName(_ name: String) -> Bool {
+        guard name.hasPrefix("."), let marker = name.range(of: ".transfer-", options: .backwards) else { return false }
+        return UUID(uuidString: String(name[marker.upperBound...])) != nil
     }
 
     deinit { close(libraryLock) }

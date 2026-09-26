@@ -6,18 +6,17 @@ import TransferCore
 /// `TransferHub` with no server.
 struct HubTests {
     /// A crash or force-quit leaves a login's askpass folder, host-key probe, and fingerprint scratch
-    /// under the library root. The next launch removes them all, whatever process id a name
-    /// carries (the library lock means no other copy is mid-login), and nothing else.
+    /// under the library root. The next launch removes them all (the library lock means no other
+    /// copy is mid-login), and nothing else.
     @Test func launchRemovesLeftoverLoginScratch() throws {
         let base = TestCaches.fresh("hub")
         defer { try? FileManager.default.removeItem(at: base) }
         let root = base.appendingPathComponent("library", isDirectory: true)
-        let ask = root.appendingPathComponent("ask-999999-\(UUID().uuidString)", isDirectory: true)
+        let ask = root.appendingPathComponent("ask-\(UUID().uuidString)", isDirectory: true)
         let probe = root.appendingPathComponent("hostkey-\(UUID().uuidString)", isDirectory: true)
         let key = root.appendingPathComponent("key-\(UUID().uuidString)")
         let kept = root.appendingPathComponent("Live/\(UUID().uuidString)", isDirectory: true)
-        let running = root.appendingPathComponent("ask-\(getppid())-\(UUID().uuidString)", isDirectory: true)
-        for folder in [ask, probe, kept, running] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+        for folder in [ask, probe, kept] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
         try Data("#!/bin/sh\n".utf8).write(to: ask.appendingPathComponent("askpass.sh"))
         try Data("host ssh-ed25519 AAAA\n".utf8).write(to: probe.appendingPathComponent("known_hosts"))
         try Data("host ssh-ed25519 AAAA\n".utf8).write(to: key)
@@ -28,20 +27,46 @@ struct HubTests {
         #expect(!FileManager.default.fileExists(atPath: probe.path))
         #expect(!FileManager.default.fileExists(atPath: key.path))
         #expect(FileManager.default.fileExists(atPath: kept.path))
-        #expect(!FileManager.default.fileExists(atPath: running.path))
         #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("transfer.sqlite").path))
+    }
+
+    /// A download's temp left by a crash goes at the next launch. The recorded path is removed only
+    /// when it names a file by a temp's name, never a folder, and every record is forgotten.
+    @Test func launchRemovesOnlyLeftoverTempFiles() throws {
+        let base = TestCaches.fresh("hubtemp")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        let store = try Store(root: root)
+        let temp = base.appendingPathComponent(CopyRules.tempName(for: "a.txt", transferID: UUID().uuidString))
+        let folder = base.appendingPathComponent(CopyRules.tempName(for: "b", transferID: UUID().uuidString), isDirectory: true)
+        let document = base.appendingPathComponent("notes.txt")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for file in [temp, folder.appendingPathComponent("inside"), document] { try Data("x".utf8).write(to: file) }
+        for recorded in [temp, folder, document] { store.rememberTemp(local: recorded) }
+
+        _ = try TransferHub(root: root)
+
+        #expect(!FileManager.default.fileExists(atPath: temp.path))
+        #expect(FileManager.default.fileExists(atPath: folder.appendingPathComponent("inside").path))
+        #expect(FileManager.default.fileExists(atPath: document.path))
+        #expect(store.localTemps().isEmpty)
+        #expect(!TransferHub.isTempName(".a.transfer-1"))
+        #expect(!TransferHub.isTempName("a.transfer-\(UUID().uuidString)"))
     }
 
     /// Two copies on one library would sweep each other's login scratch, temps, and control
     /// sockets, so the second copy is refused until the first lets go.
-    @Test func oneCopyOfTransferPerLibrary() throws {
+    @Test func oneCopyOfTransferPerLibrary() async throws {
         let root = TestCaches.fresh("lock")
         defer { try? FileManager.default.removeItem(at: root) }
         var first: TransferHub? = try TransferHub(root: root)
-        #expect(throws: TransferError.self) { _ = try TransferHub(root: root) }
-        #expect(first != nil)
+        _ = withExtendedLifetime(first) {
+            #expect(throws: TransferError.self) { _ = try TransferHub(root: root) }
+        }
         first = nil
-        _ = try TransferHub(root: root)
+        // A process another test is starting at this moment holds a copy of every descriptor
+        // until it runs its program, the lock's too, so the lock can take a moment to come free.
+        #expect(await waitUntil(2) { (try? TransferHub(root: root)) != nil })
     }
 
     /// A library at a custom root, as in tests and development builds, keeps its caches inside
