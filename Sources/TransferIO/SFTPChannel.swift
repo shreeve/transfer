@@ -409,6 +409,9 @@ actor SFTPChannel {
                 let chunk = try reader.blob()
                 try parts.write(chunk, offset: read.offset, length: read.length)
             } catch is EndOfFile {
+                // Short of the listed size: the file was cut while it was read, unless it is
+                // still the one listed, as a pseudo-file with a nominal size is.
+                if let print, try await fstat(handle) != print { throw TransferError.changedOnServer(path.name) }
                 parts.endOfFile()
             }
         }
