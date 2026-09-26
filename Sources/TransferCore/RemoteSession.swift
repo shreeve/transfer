@@ -175,6 +175,8 @@ public protocol SessionProvider: Sendable {
     /// from this Mac in the Trash, only after checking that this move wrote a complete copy of it,
     /// and throws `TransferKept` for any it kept. Call again with the same request to retry.
     func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
+    /// Removes every server's cached previews and viewed copies.
+    func clearPreviewCache() async
 }
 
 /// One saved server. Views reach the server only through this protocol.
@@ -208,7 +210,6 @@ public protocol RemoteSession: Sendable {
     /// The inspector's copy, also used to prefetch; a newer preview cancels its fetch. For a text
     /// file larger than `EditableFile.previewHead`, only that much of it.
     func prepareInspectorPreview(_ path: RemotePath) async throws -> URL
-    func clearPreviewCache() async
     func discardLiveFile(_ path: RemotePath, force: Bool) async throws
     func setLivePaused(_ path: RemotePath, paused: Bool) async
     func liveFiles() async -> [LiveFile]

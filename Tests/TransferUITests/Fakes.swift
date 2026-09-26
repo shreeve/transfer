@@ -76,7 +76,6 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     func prepareViewFile(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
     func preparePreview(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
     func prepareInspectorPreview(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
-    func clearPreviewCache() async {}
     func discardLiveFile(_ path: RemotePath, force: Bool) async throws {
         if refusesDiscard.value, !force { throw TransferError.liveUnsynced(1) }
         record("discard \(path.display)")
@@ -124,6 +123,7 @@ final class FakeProvider: SessionProvider, @unchecked Sendable {
     func editableExtensions() async -> [String] { extensions.value }
     func setEditableExtensions(_ extensions: [String]) async throws { self.extensions.value = extensions }
     func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {}
+    func clearPreviewCache() async {}
 }
 
 func files(_ count: Int, in folder: String) -> [RemotePath: [RemoteItem]] {

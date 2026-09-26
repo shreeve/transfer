@@ -139,7 +139,7 @@ struct TransferApp: App {
                 }
                 .keyboardShortcut("t", modifiers: [.command, .control])
                 .disabled(!connected)
-                Button("Clear Preview Cache") { Task { await model?.clearPreviewCache() } }
+                Button("Clear Preview Cache") { Task { await delegate.provider?.clearPreviewCache() } }
             }
         }
         // Settings adds "Settings…" to the app menu with Command-Comma.

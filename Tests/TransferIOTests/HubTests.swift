@@ -79,6 +79,19 @@ struct HubTests {
         #expect(store.cacheRoot == root.appendingPathComponent("Caches", isDirectory: true))
     }
 
+    /// Clear Preview Cache once belonged to a server's session, so a window with none did nothing.
+    @Test func theHubClearsEveryServersPreviews() async throws {
+        let base = TestCaches.fresh("clear")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        let hub = try TransferHub(root: root)
+        let page = root.appendingPathComponent("Caches/Preview/box/notes.html")
+        try FileManager.default.createDirectory(at: page.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("<p>".utf8).write(to: page)
+        await hub.clearPreviewCache()
+        #expect(!FileManager.default.fileExists(atPath: page.path))
+    }
+
     /// Remove Server refuses while a Live copy holds unsynced edits, and leaves the copy alone.
     @Test func removeServerRefusesWhileLiveEditsAreUnsynced() async throws {
         let base = TestCaches.fresh("hubrm")

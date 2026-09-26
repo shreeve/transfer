@@ -744,20 +744,12 @@ extension SSHConnection {
         return try await cachedCopy(item, lane: .preview)
     }
 
-    public func clearPreviewCache() async {
-        try? FileManager.default.removeItem(at: previewCacheDirectory)
-    }
-
-    private var previewCacheDirectory: URL {
-        store.cacheRoot.appendingPathComponent("Preview", isDirectory: true)
-    }
-
     /// The cache file for `path` on this server: the remote file's own name (plus `suffix`, cut to
     /// fit), in a folder named for the server, the path, and `version`, since two servers can hold
     /// different files at one path. The name is what Quick Look's Open With and an app viewing the
     /// copy show and open, where a digest meant nothing.
     private func previewURL(_ path: RemotePath, name: String, suffix: String = "", version: String = "") throws -> URL {
-        var cache = previewCacheDirectory
+        var cache = store.previewCache
         try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
@@ -773,9 +765,9 @@ extension SSHConnection {
     /// Evicts whole entries, each a file's folder (or a digest-named file from before names were
     /// kept), by the last use of what it holds, in one walk of the cache.
     private func trimPreviewCache() {
-        let root = previewCacheDirectory.path
+        let root = store.previewCache.path
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentAccessDateKey, .contentModificationDateKey]
-        guard let walker = FileManager.default.enumerator(at: previewCacheDirectory, includingPropertiesForKeys: Array(keys)) else { return }
+        guard let walker = FileManager.default.enumerator(at: store.previewCache, includingPropertiesForKeys: Array(keys)) else { return }
         var entries: [String: CacheEntry] = [:]
         for case let url as URL in walker {
             guard let values = try? url.resourceValues(forKeys: keys) else { continue }

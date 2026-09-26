@@ -73,6 +73,10 @@ public actor TransferHub: SessionProvider {
         await sessions.removeValue(forKey: id)?.retire()
     }
 
+    public func clearPreviewCache() async {
+        try? FileManager.default.removeItem(at: store.previewCache)
+    }
+
     public func session(for id: ConnectionID) async throws -> any RemoteSession {
         try await sshSession(for: id)
     }

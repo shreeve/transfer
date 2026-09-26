@@ -1560,10 +1560,6 @@ public final class TransferModel {
         liveByPath[path]
     }
 
-    public func clearPreviewCache() async {
-        await session?.clearPreviewCache()
-    }
-
     /// Puts `sftp://` links on the pasteboard: for `paths` when given, as for the folder of an
     /// empty-area menu, else for the selection, or the location with nothing selected.
     public func copyRemoteURL(_ paths: [RemotePath]? = nil) {

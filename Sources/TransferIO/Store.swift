@@ -36,6 +36,8 @@ final class Store: @unchecked Sendable {
     /// Rebuildable caches (previews): `~/Library/Caches/Transfer` for the default library, else
     /// `Caches` under the custom root, so a test or dev build never reads or evicts the user's.
     let cacheRoot: URL
+    /// Previews and viewed copies, for every server.
+    var previewCache: URL { cacheRoot.appendingPathComponent("Preview", isDirectory: true) }
 
     /// `~/Library/Application Support/Transfer`, the library when no other root is given.
     static var standardRoot: URL {
