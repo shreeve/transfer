@@ -175,6 +175,8 @@ public protocol SessionProvider: Sendable {
     /// from this Mac in the Trash, only after checking that this move wrote a complete copy of it,
     /// and throws `TransferKept` for any it kept. Call again with the same request to retry.
     func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
+    /// Removes every server's cached previews and viewed copies.
+    func clearPreviewCache() async
 }
 
 /// One saved server. Views reach the server only through this protocol.
@@ -183,7 +185,6 @@ public protocol RemoteSession: Sendable {
     var isConnected: Bool { get async }
     /// Logs in, or returns the start path at once when already logged in.
     func connect(prompts: any PromptSink) async throws -> RemotePath
-    func disconnect() async
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error>
     func stat(_ path: RemotePath) async throws -> RemoteItem
     func readlink(_ path: RemotePath) async throws -> String
@@ -198,7 +199,6 @@ public protocol RemoteSession: Sendable {
     /// only after the server's delete succeeded, so a failed delete keeps every edit.
     func remove(_ path: RemotePath, force: Bool) async throws
     func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
-    func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws
     func openKind(fileName: String) async -> OpenKind
     func prepareLiveFile(_ path: RemotePath) async throws -> URL
     /// A cached copy of a file the user opened to view; no preview cancels its fetch.
@@ -208,7 +208,6 @@ public protocol RemoteSession: Sendable {
     /// The inspector's copy, also used to prefetch; a newer preview cancels its fetch. For a text
     /// file larger than `EditableFile.previewHead`, only that much of it.
     func prepareInspectorPreview(_ path: RemotePath) async throws -> URL
-    func clearPreviewCache() async
     func discardLiveFile(_ path: RemotePath, force: Bool) async throws
     func setLivePaused(_ path: RemotePath, paused: Bool) async
     func liveFiles() async -> [LiveFile]
@@ -234,18 +233,4 @@ public enum SessionEvent: Sendable {
     case liveChanged
     case directoryChanged(RemotePath)
     case disconnected(String)
-}
-
-public extension RemoteSession {
-    /// A removal that never discards unsynced Live edits.
-    func remove(_ path: RemotePath) async throws {
-        try await remove(path, force: false)
-    }
-
-    /// The whole tree `walkTree` streams, by key.
-    func tree(_ root: RemotePath) async throws -> [TreeKey: TreeEntry] {
-        var entries: [TreeKey: TreeEntry] = [:]
-        for try await (key, entry) in walkTree(root) { entries[key] = entry }
-        return entries
-    }
 }

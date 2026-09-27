@@ -20,7 +20,6 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Framewor
 cp "$bin_dir/Transfer" "$app/Contents/MacOS/Transfer"
 cp "$root/Support/Info.plist" "$app/Contents/Info.plist"
 cp "$root/Support/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
-cp "$root/Support/config.json" "$app/Contents/Resources/config.json"
 
 # Sparkle is a binary framework. SwiftPM links it from the build directory, so the app needs
 # its own copy and an rpath that finds it.

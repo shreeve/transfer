@@ -51,8 +51,10 @@ case $host in
   *) authority=$(encode "$host") ;;
 esac
 url="sftp://$(encode "$(id -un)")@$authority$(encode "$target" /)"
-# The text shown is for people: control characters in a name would drive the terminal.
-shown=$(printf '%s:%s' "$host" "$target" | LC_ALL=C tr '\001-\037\177' '?')
+# The text shown is for people: control characters in a name would drive the terminal, C1 ones
+# (UTF-8 C2 80 to C2 9F, such as CSI) too.
+c1=$(printf '\302[\200-\237]')
+shown=$(printf '%s:%s' "$host" "$target" | LC_ALL=C tr '\001-\037\177' '?' | LC_ALL=C sed "s/$c1/?/g")
 link=$(printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$shown")
 
 # tmux before 3.4 drops OSC 8, so the link goes through tmux's passthrough, which 3.3 allows only

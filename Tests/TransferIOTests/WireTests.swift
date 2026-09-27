@@ -24,15 +24,12 @@ import TransferCore
     }
 }
 
-@Test func attributesRoundTripSizeAndTime() throws {
-    var attrs = SFTPAttrs()
-    attrs.size = 99
-    attrs.permissions = 0o100644
-    attrs.atime = 10
-    attrs.mtime = 20
+/// Every field round-trips, in the draft's order; the owner and the times go only as pairs.
+@Test func attributesRoundTrip() throws {
+    let attrs = SFTPAttrs(size: 99, uid: 501, gid: 20, permissions: 0o100644, atime: 10, mtime: 20)
     var reader = ByteReader(attrs.encoded())
-    let decoded = try reader.attrs()
-    #expect(decoded.size == 99)
-    #expect(decoded.mtime == 20)
-    #expect(decoded.kind == .file)
+    #expect(try reader.attrs() == attrs)
+    #expect(Array(attrs.encoded().prefix(4)) == [0, 0, 0, 0x0F])
+    #expect(SFTPAttrs(uid: 501, mtime: 20).encoded() == Data([0, 0, 0, 0]))
+    #expect(attrs.kind == .file)
 }

@@ -72,7 +72,7 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
         let prompts = prompts
         let finish = Locked(completionHandler)
         // Published so Finder draws progress on the icon it is filling in, and can cancel it.
-        let progress = Progress(totalUnitCount: item.kind == .directory ? -1 : Int64(item.size ?? 0))
+        let progress = Progress(totalUnitCount: item.kind == .directory ? -1 : Int64(clamping: item.size ?? 0))
         progress.kind = .file
         progress.fileOperationKind = .downloading
         progress.fileURL = url
@@ -82,7 +82,7 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
             do {
                 try await OperationPrompts.$current.withValue(prompts) {
                     try await session.download(path, to: url) { done in
-                        progress.completedUnitCount = Int64(done.completed)
+                        progress.completedUnitCount = Int64(clamping: done.completed)
                     }
                 }
                 finish.value(nil)
@@ -92,6 +92,8 @@ final class RemoteItemPromise: NSFilePromiseProvider, NSFilePromiseProviderDeleg
             progress.unpublish()
         }
         progress.cancellationHandler = { task.cancel() }
+        // A cancel from Finder before the handler was set.
+        if progress.isCancelled { task.cancel() }
     }
 
     static func providers(for items: [RemoteItem], session: any RemoteSession, prompts: any PromptSink) -> [RemoteItemPromise] {
@@ -131,6 +133,46 @@ func dropAction(for info: any NSDraggingInfo, onto folder: RemotePath, model: Tr
     return DropAction(sources: .server(source, paths), folder: folder, destination: connection, moving: moving)
 }
 
+/// Queues the drop `dropAction` accepts onto `folder`; false when it refuses it.
+@MainActor
+func performDrop(_ info: any NSDraggingInfo, onto folder: RemotePath, model: TransferModel) -> Bool {
+    guard let action = dropAction(for: info, onto: folder, model: model) else { return false }
+    Task { await model.perform(action) }
+    return true
+}
+
+/// An icon view's AppKit view: it takes focus when clicked, as a table does, so the Edit menu
+/// reaches the window through the responder chain, and it takes drops into `dropFolder`.
+class DropTargetView: NSView {
+    weak var model: TransferModel?
+
+    /// The folder shown, unless a subclass names another.
+    var dropFolder: RemotePath? { model?.snapshot.path }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL, remoteDragType])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard let model, let dropFolder else { return [] }
+        return dropAction(for: sender, onto: dropFolder, model: model)?.operation ?? []
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        draggingEntered(sender)
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        guard let model, let dropFolder else { return false }
+        return performDrop(sender, onto: dropFolder, model: model)
+    }
+}
+
 /// One icon-grid cell, hosting its AppKit view.
 struct FilePromiseLabel: NSViewRepresentable {
     var item: RemoteItem
@@ -151,13 +193,14 @@ struct FilePromiseLabel: NSViewRepresentable {
 /// right-click menu, and drops live here too: onto a folder into it, onto a file into the folder
 /// shown. The view covers the cell's whole highlight, so no click or drop on it falls between
 /// the cell and the grid's background.
-final class IconItemView: NSView, NSDraggingSource {
+final class IconItemView: DropTargetView, NSDraggingSource {
     /// The cell with its highlight's margin.
     static let size = NSSize(width: 108, height: 100)
     private static let inset: CGFloat = 6
     private(set) var item = RemoteItem(path: RemotePath(string: "/"), kind: .other)
-    private weak var model: TransferModel?
     private var down: NSPoint = .zero
+    /// A plain click on one of several selected cells narrows to it on mouse-up, unless it dragged.
+    private var narrowsOnUp = false
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
 
@@ -191,7 +234,6 @@ final class IconItemView: NSView, NSDraggingSource {
             label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.inset),
             label.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -Self.inset),
         ])
-        registerForDraggedTypes([.fileURL, remoteDragType])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -203,18 +245,26 @@ final class IconItemView: NSView, NSDraggingSource {
         label.stringValue = item.name
     }
 
-    /// A clicked cell takes focus, as a table row does, so the Edit menu reaches the window through
-    /// the responder chain.
-    override var acceptsFirstResponder: Bool { true }
+    override var dropFolder: RemotePath? { item.kind == .directory ? item.path : super.dropFolder }
 
+    /// The glyph and name are the cell's to click: in a background window too, a click selects
+    /// and a drag starts, as in Finder, rather than only bringing the window forward.
+    override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) == nil ? nil : self }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// Command or Shift adds or removes the cell, as in Finder's icon view.
     override func mouseDown(with event: NSEvent) {
         down = event.locationInWindow
+        narrowsOnUp = false
         guard let model else { return }
         window?.makeFirstResponder(self)
-        if event.modifierFlags.contains(.command) {
+        if !event.modifierFlags.intersection([.command, .shift]).isEmpty {
             model.snapshot.selection.formSymmetricDifference([item.path])
         } else if !model.snapshot.selection.contains(item.path) {
             model.snapshot.selection = [item.path]
+        } else {
+            narrowsOnUp = event.clickCount == 1 && model.snapshot.selection.count > 1
         }
         if event.clickCount == 2 {
             let item = item
@@ -231,9 +281,15 @@ final class IconItemView: NSView, NSDraggingSource {
         return ItemMenu.fill(item: item, model: model)
     }
 
+    override func mouseUp(with event: NSEvent) {
+        if narrowsOnUp { model?.snapshot.selection = [item.path] }
+        narrowsOnUp = false
+    }
+
     override func mouseDragged(with event: NSEvent) {
         let moved = hypot(event.locationInWindow.x - down.x, event.locationInWindow.y - down.y)
         guard moved > 4, let model, let session = model.session else { return }
+        narrowsOnUp = false
         let roots = model.dragItems(including: item)
         let providers = RemoteItemPromise.providers(for: roots, session: session, prompts: model.operationPrompts())
         let dragging = providers.enumerated().map { index, provider -> NSDraggingItem in
@@ -247,25 +303,6 @@ final class IconItemView: NSView, NSDraggingSource {
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
         context == .outsideApplication ? .copy : [.copy, .move]
-    }
-
-    private func drop(_ info: any NSDraggingInfo) -> DropAction? {
-        guard let model else { return nil }
-        return dropAction(for: info, onto: item.kind == .directory ? item.path : model.snapshot.path, model: model)
-    }
-
-    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        drop(sender)?.operation ?? []
-    }
-
-    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        draggingEntered(sender)
-    }
-
-    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        guard let model, let action = drop(sender) else { return false }
-        Task { await model.perform(action) }
-        return true
     }
 }
 
@@ -286,19 +323,7 @@ struct IconGridBackground: NSViewRepresentable {
     }
 }
 
-final class IconGridBackgroundView: NSView {
-    weak var model: TransferModel?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL, remoteDragType])
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    /// Takes focus as a click on a table's empty area does, so the Edit menu reaches the window.
-    override var acceptsFirstResponder: Bool { true }
-
+final class IconGridBackgroundView: DropTargetView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         model?.snapshot.selection = []
@@ -309,20 +334,5 @@ final class IconGridBackgroundView: NSView {
         window?.makeFirstResponder(self)
         model.snapshot.selection = []
         return ItemMenu.fill(item: nil, model: model)
-    }
-
-    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        guard let model else { return [] }
-        return dropAction(for: sender, onto: model.snapshot.path, model: model)?.operation ?? []
-    }
-
-    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        draggingEntered(sender)
-    }
-
-    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        guard let model, let action = dropAction(for: sender, onto: model.snapshot.path, model: model) else { return false }
-        Task { await model.perform(action) }
-        return true
     }
 }

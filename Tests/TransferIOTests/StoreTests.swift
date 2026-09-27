@@ -206,6 +206,38 @@ struct StoreTests {
         #expect(store.remoteTemps(connection: alpha) == [RemotePath(string: "/srv/.b.transfer-2")])
     }
 
+    /// WIR-02: a file a replace set aside was recorded as a temp that 0.1.7 read up to its NUL,
+    /// as the aside itself, and removed at its next login: the old file's only copy. 0.1.7's
+    /// reads never see an aside record now, nor one 0.2.0 wrote under the server's own key, which
+    /// the next open moves to the aside key (FR-5) without a schema change, so 0.2.0 still opens
+    /// the library. This build reads both forms, and Remove drops both.
+    @Test func olderTransferNeverSeesAFileSetAside() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Raw.fixture(.released, at: root)
+        let store = try Store(root: root)
+        let alpha = ConnectionID(rawValue: Self.alpha)
+        let aside = SSHConnection.asideRecord(RemotePath(string: "/srv/.transfer-old-1"), RemotePath(string: "/srv/a.txt"))
+        let written020 = SSHConnection.asideRecord(RemotePath(string: "/srv/.transfer-old-2"), RemotePath(string: "/srv/b.txt"))
+        store.rememberTemp(aside, connection: alpha, aside: true)
+        store.rememberTemp(written020, connection: alpha)
+        for _ in 0..<2 { _ = try Store(root: root) }
+
+        let old = try Raw(root)
+        #expect(old.value("PRAGMA user_version") == String(Store.schemaVersion))
+        #expect(old.value("SELECT count(*) FROM temps WHERE connection_id = '\(Self.alpha) aside'") == "2")
+        old.launchAs017()
+        #expect(old.values("SELECT path FROM temps WHERE connection_id = '\(Self.alpha)'").sorted() == ["/srv/.b.transfer-2"])
+        #expect(old.values("SELECT path FROM temps WHERE connection_id IS NULL OR connection_id = ''").sorted() == ["/tmp/.a.transfer-1", "/tmp/.c.transfer-3"])
+        #expect(Set(store.remoteTemps(connection: alpha)) == [aside, written020, RemotePath(string: "/srv/.b.transfer-2")])
+        #expect(SSHConnection.aside(in: aside)?.placed == RemotePath(string: "/srv/a.txt"))
+        store.forgetTemp(aside)
+        #expect(Set(store.remoteTemps(connection: alpha)) == [written020, RemotePath(string: "/srv/.b.transfer-2")])
+        store.rememberTemp(aside, connection: alpha, aside: true)
+        store.remove(alpha)
+        #expect(old.value("SELECT count(*) FROM temps WHERE connection_id LIKE '\(Self.alpha)%'") == "0")
+    }
+
     /// Stars and remote temps were stored as text decoded from the path, so a name that is not
     /// UTF-8 came back as a different path: a star that opened nothing, a temp never removed.
     @Test func aNonUTF8StarAndTempRoundTripExactly() throws {
@@ -242,19 +274,19 @@ struct StoreTests {
         #expect(read.map(\.path.bytes) == [bytes])
     }
 
-    /// A library from a newer Transfer is refused, with a reason, and left as it was.
-    @Test func aNewerLibraryIsRefusedAndUntouched() throws {
+    /// A library from a newer Transfer is refused, with a reason, and left as it was; so is one
+    /// with a negative version, which no Transfer wrote and which crashed at launch (WIR-04).
+    @Test(arguments: [Store.schemaVersion + 1, -1]) func aNewerOrForeignLibraryIsRefusedAndUntouched(version: Int) throws {
         let root = TestCaches.fresh("store")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let future = Store.schemaVersion + 1
-        try Raw(root).run("CREATE TABLE future (x); PRAGMA user_version = \(future)")
+        try Raw(root).run("CREATE TABLE future (x); PRAGMA user_version = \(version)")
 
         let error = #expect(throws: TransferError.self) { try Store(root: root) }
-        #expect(error?.localizedDescription.contains("newer version of Transfer") == true)
+        #expect(error?.localizedDescription.contains(version < 0 ? "not a Transfer library" : "newer version of Transfer") == true)
 
         let raw = try Raw(root)
-        #expect(raw.value("PRAGMA user_version") == "\(future)")
+        #expect(raw.value("PRAGMA user_version") == "\(version)")
         #expect(raw.value("PRAGMA journal_mode") == "delete")
         #expect(raw.value("SELECT count(*) FROM sqlite_master WHERE name = 'future'") == "1")
     }
@@ -272,6 +304,19 @@ struct StoreTests {
 
         #expect(stars(store, Self.alpha) == ["/waited"])
         #expect(stars(store, Self.beta) == ["/held"])
+    }
+
+    /// Saved servers read in Finder's order, not byte order ("Zeta" before "alpha"), and a row
+    /// whose id is not a UUID, which could never be edited or removed, is left out (WIR-11, WIR-12).
+    @Test func savedServersReadInFinderOrderWithoutRowsLackingAnID() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try Store(root: root)
+        for name in ["Zeta", "server 10", "éclair", "alpha", "server 9"] {
+            store.save(SavedConnection(id: ConnectionID(rawValue: UUID()), name: name, host: "h"))
+        }
+        try Raw(root).run("INSERT INTO connections (id, name) VALUES ('not-a-uuid', 'Ghost')")
+        #expect(store.connections().map(\.name) == ["alpha", "éclair", "server 9", "server 10", "Zeta"])
     }
 
     /// Removing a server drops its rows from every table and nobody else's.
@@ -361,11 +406,16 @@ private final class Raw: @unchecked Sendable {
 
     /// The first column of the first row, as text.
     func value(_ sql: String) -> String? {
+        values(sql).first
+    }
+
+    /// The first column of every row, read as 0.1.7 read text: up to the first NUL.
+    func values(_ sql: String) -> [String] {
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
-              sqlite3_step(statement) == SQLITE_ROW,
-              let text = sqlite3_column_text(statement, 0) else { return nil }
-        return String(cString: text)
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        var rows: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW { rows.append(sqlite3_column_text(statement, 0).map { String(cString: $0) } ?? "") }
+        return rows
     }
 }

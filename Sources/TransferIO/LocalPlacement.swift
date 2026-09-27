@@ -47,22 +47,9 @@ enum Placement: Equatable {
         }
     }
 
-    /// A name as a disk that ignores case and Unicode form sees it, folding case fully as APFS
-    /// does (`ß` as `ss`, `ﬁ` as `fi`, every sigma alike): two names that fold the same may be one
-    /// item there.
-    static func fold(_ name: String) -> String {
-        name.precomposedStringWithCanonicalMapping.folding(options: .caseInsensitive, locale: nil)
-    }
-
-    /// Keep Both's name for `name`: the next that no name in `names` folds to.
+    /// Keep Both's name for `name`: the next that no name in `names` folds to (`diskFolded`).
     static func keepBoth(_ name: String, among names: Set<String>, isFolder: Bool = false) -> String {
-        let folded = Set(names.map(fold))
-        var taken = names
-        while true {
-            let next = KeepBothName.next(existing: taken, original: name, isFolder: isFolder)
-            if !folded.contains(fold(next)) { return next }
-            taken.insert(next)
-        }
+        KeepBothName.next(existing: Set(names.map(\.diskFolded)), original: name, isFolder: isFolder, key: \.diskFolded)
     }
 }
 
@@ -147,7 +134,7 @@ enum LocalPlacement {
             guard symlink(target, url.path) == 0 else { throw posixError(url).error }
             return
         }
-        let temp = url.deletingLastPathComponent().appendingPathComponent(CopyRules.tempName(for: url.lastPathComponent, transferID: UUID().uuidString))
+        let temp = url.deletingLastPathComponent().appendingPathComponent(KeepBothName.temp(for: url.lastPathComponent))
         guard symlink(target, temp.path) == 0 else { throw posixError(url).error }
         guard rename(temp.path, url.path) == 0 else {
             let failure = posixError(url)

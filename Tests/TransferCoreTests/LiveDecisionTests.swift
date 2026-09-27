@@ -95,11 +95,23 @@ private func present(size: UInt64 = 10, at date: Date = t0, digest: String? = ni
 
 @Test func anUnchangedCopyIsRefreshedOnlyOnOpen() {
     #expect(LiveDecision.decide(state(), local: present(), server: .file(other)) == .none)
-    #expect(LiveDecision.decide(state(), local: present(), server: .file(other), intent: .open) == .refreshLocal(other))
-    #expect(LiveDecision.decide(state(), local: present(), server: .notChecked, intent: .open) == .needServer)
-    #expect(LiveDecision.decide(state(), local: present(), server: .file(base), intent: .open) == .none)
-    #expect(LiveDecision.decide(state(), local: present(), server: .missing, intent: .open) == .none)
-    #expect(LiveDecision.decide(state(conflict: true), local: present(), server: .file(other), intent: .open) == .none)
+    #expect(LiveDecision.refreshesOnOpen(state(), .same, server: other))
+    #expect(!LiveDecision.refreshesOnOpen(state(), .same, server: base))
+    #expect(!LiveDecision.refreshesOnOpen(state(conflict: true), .same, server: other))
+    #expect(!LiveDecision.refreshesOnOpen(state(), .changed, server: other))
+    #expect(!LiveDecision.refreshesOnOpen(state(), .needDigest, server: other))
+    #expect(!LiveDecision.refreshesOnOpen(state(), nil, server: other))
+    // Refreshing wins over marking clean or paused: the bytes are the synced ones either way.
+    #expect(LiveDecision.refreshesOnOpen(state(dirty: true), .same, server: other))
+    #expect(LiveDecision.refreshesOnOpen(state(paused: true), .same, server: other))
+}
+
+/// LIV2-08: a copy an editor re-saved unchanged (new mtime, same bytes) was never refreshed on
+/// reopen, so the user edited stale bytes and met a conflict.
+@Test func aTouchedCopyIsRefreshedOnOpenToo() {
+    #expect(LiveDecision.refreshesOnOpen(state(), .touched, server: other))
+    #expect(!LiveDecision.refreshesOnOpen(state(), .touched, server: base))
+    #expect(!LiveDecision.refreshesOnOpen(state(conflict: true), .touched, server: other))
 }
 
 /// LIVE-09: only our own unconfirmed upload is adopted. Another writer's file of the same size and
@@ -129,12 +141,11 @@ private func present(size: UInt64 = 10, at date: Date = t0, digest: String? = ni
     #expect(LiveDecision.decide(state(paused: true), local: .missing(again: true), server: .notChecked) == .forget)
 }
 
-@Test func aTouchIsRestampedWhateverTheFlagsAndIntent() {
+@Test func aTouchIsRestampedWhateverTheFlags() {
     let touched = present(at: t0.addingTimeInterval(30), digest: "d0")
     for flags in [state(dirty: true), state(conflict: true), state(paused: true)] {
         #expect(LiveDecision.decide(flags, local: touched, server: .notChecked) == .restamp)
     }
-    #expect(LiveDecision.decide(state(), local: touched, server: .file(other), intent: .open) == .restamp)
 }
 
 @Test func withoutASyncedDigestAnyNewMtimeIsAChange() {
@@ -143,22 +154,17 @@ private func present(size: UInt64 = 10, at date: Date = t0, digest: String? = ni
     #expect(LiveDecision.decide(noDigest, local: present(at: t0.addingTimeInterval(30)), server: .notChecked) == .needServer)
 }
 
-@Test func anUnchangedCopyAcrossFlagsAndIntents() {
+@Test func anUnchangedCopyAcrossFlags() {
     #expect(LiveDecision.decide(state(conflict: true), local: present(), server: .notChecked) == .none)
-    #expect(LiveDecision.decide(state(dirty: true), local: present(), server: .file(base), intent: .open) == .markClean)
-    // Refreshing wins over marking clean: the bytes are the synced ones either way.
-    #expect(LiveDecision.decide(state(dirty: true), local: present(), server: .file(other), intent: .open) == .refreshLocal(other))
-    #expect(LiveDecision.decide(state(), local: present(), server: .unreachable("down"), intent: .open) == .none)
-    #expect(LiveDecision.decide(state(), local: present(), server: .notFile(.directory), intent: .open) == .none)
-    #expect(LiveDecision.decide(state(paused: true), local: present(), server: .file(other), intent: .open) == .refreshLocal(other))
+    #expect(LiveDecision.decide(state(dirty: true), local: present(), server: .file(base)) == .markClean)
+    #expect(LiveDecision.decide(state(), local: present(), server: .unreachable("down")) == .none)
+    #expect(LiveDecision.decide(state(), local: present(), server: .notFile(.directory)) == .none)
 }
 
-@Test func aChangedCopyAcrossFlagsAndIntents() {
+@Test func aChangedCopyAcrossFlags() {
     let edited = present(size: 11)
     #expect(LiveDecision.decide(state(paused: true, conflict: true), local: edited, server: .notChecked) == .markDirty)
     #expect(LiveDecision.decide(state(dirty: true, paused: true, conflict: true), local: edited, server: .file(base)) == .none)
-    #expect(LiveDecision.decide(state(), local: edited, server: .notChecked, intent: .open) == .needServer)
-    #expect(LiveDecision.decide(state(), local: edited, server: .file(base), intent: .open) == .upload(expecting: base))
 }
 
 @Test func theBaseWinsOverAdoptingWhenBothMatch() {

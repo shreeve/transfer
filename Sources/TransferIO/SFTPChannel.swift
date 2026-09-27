@@ -36,7 +36,6 @@ actor SFTPChannel {
     /// A server silent this long while requests wait has hung: the channel closes and its requests
     /// fail with a timeout, which a transfer retries on a new channel.
     private let stallLimit: Duration
-    /// How long the server has to answer INIT.
     private let handshakeLimit: Duration
     private var lastHeard = ContinuousClock.now
     private var handshakeStarted: ContinuousClock.Instant?
@@ -120,14 +119,14 @@ actor SFTPChannel {
         Fingerprint(item: try item(path: RemotePath(string: "/"), message: await call(SFTPCode.fstat) { $0.appendBlob(handle) }))
     }
 
-    /// Keeps several READDIR requests in flight. OpenSSH answers each with at most a hundred names,
-    /// so a large folder does not pay a round trip per page. A listing its reader abandons stops at
-    /// once and still closes its handle on the server.
+    /// Keeps several READDIR requests in flight, as OpenSSH answers each with at most a hundred
+    /// names. A listing its reader abandons stops at once and still closes its handle.
     func list(_ path: RemotePath) -> AsyncThrowingStream<RemoteItem, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let handle = try self.handle(in: await call(SFTPCode.opendir) { $0.appendPath(path) })
+                    try Task.checkCancellation()
+                    let handle = try await handles(opening: [send(SFTPCode.opendir) { $0.appendPath(path) }])[0]
                     var inFlight: [Task<[RemoteItem]?, Error>] = []
                     defer {
                         for page in inFlight { page.cancel() }
@@ -136,9 +135,8 @@ actor SFTPChannel {
                     var finished = false
                     var pages = 0
                     while !finished || !inFlight.isEmpty {
-                        // Four pages at first, so a small folder asks for at most three pages
-                        // past its end; sixteen once four have come, so a large one pays about
-                        // one round trip per 1,600 names.
+                        // Four pages at first, so a small folder asks for at most three past
+                        // its end; sixteen once four have come, a round trip per 1,600 names.
                         while !finished, inFlight.count < (pages < 4 ? 4 : 16) {
                             inFlight.append(Task { try await self.readDirectory(handle, parent: path) })
                         }
@@ -148,7 +146,7 @@ actor SFTPChannel {
                         } onCancel: {
                             next.cancel()
                         }
-                        guard let page, !page.isEmpty else {
+                        guard let page else {
                             finished = true
                             continue
                         }
@@ -168,15 +166,16 @@ actor SFTPChannel {
     func mkdir(_ path: RemotePath) async throws {
         _ = try await call(SFTPCode.mkdir) {
             $0.appendPath(path)
-            $0.append(SFTPAttrs().encoded())
+            $0.appendAttrs(SFTPAttrs())
         }
     }
 
     /// A rename or move the user asked for. It never replaces what is already at `destination`:
-    /// `posix-rename` would, and plain RENAME refuses a file there but on OpenSSH replaces an empty
-    /// folder, so the destination is looked up first. A change of case alone within one folder
-    /// needs `posix-rename` on a case-insensitive disk, where the lookup finds the source itself;
-    /// the folder's listing tells that apart from a second file on a case-sensitive disk.
+    /// OpenSSH's plain RENAME refuses a name in use (but for a link onto a dangling link), other
+    /// servers may replace, as the draft allows, so the destination is looked up first. A change
+    /// of case alone within one folder needs `posix-rename` on a case-insensitive disk, where the
+    /// lookup finds the source itself; the folder's listing tells that apart from a second file
+    /// on a case-sensitive disk.
     func rename(_ source: RemotePath, to destination: RemotePath) async throws {
         if try await lookup(destination) != nil {
             let caseOnly = source.parent == destination.parent && source != destination
@@ -184,7 +183,7 @@ actor SFTPChannel {
             guard caseOnly, let folder = destination.parent, try await !hasEntry(named: destination.name, in: folder) else {
                 throw TransferError.failed("“\(destination.name)” already exists there")
             }
-            if (try? await posixRename(source, to: destination)) != nil { return }
+            if extensions.contains("posix-rename@openssh.com") { return try await posixRename(source, to: destination) }
         }
         try await plainRename(source, to: destination)
     }
@@ -213,11 +212,10 @@ actor SFTPChannel {
         let forget: @Sendable (_ aside: RemotePath, _ placed: RemotePath) -> Void
     }
 
-    /// Puts `temp` in place of `placed`. With `posix-rename@openssh.com` the swap is atomic and a
-    /// failure leaves `placed` untouched. Without it, SFTP v3 rename will not replace a file, so
+    /// Puts `temp` in place of `placed`: atomically with `posix-rename@openssh.com`. Without it,
     /// `placed` steps aside under a hidden name first, recorded in `log`, and comes back if `temp`
-    /// cannot take its place: a failure never leaves the server with neither the old file nor the
-    /// new one. A folder is never replaced, as posix-rename would refuse it.
+    /// cannot take its place, so a failure never leaves the server with neither file. A folder is
+    /// never replaced, as posix-rename would refuse it.
     func replace(_ temp: RemotePath, onto placed: RemotePath, log: AsideLog? = nil) async throws {
         if extensions.contains("posix-rename@openssh.com") {
             try await posixRename(temp, to: placed)
@@ -252,7 +250,7 @@ actor SFTPChannel {
         try await plainRename(temp, to: placed)
     }
 
-    /// SSH_FXP_RENAME, which on OpenSSH never replaces a file but does replace an empty folder.
+    /// SSH_FXP_RENAME, which on OpenSSH never replaces anything but a dangling link.
     private func plainRename(_ source: RemotePath, to destination: RemotePath) async throws {
         _ = try await call(SFTPCode.rename) {
             $0.appendPath(source)
@@ -283,9 +281,9 @@ actor SFTPChannel {
     }
 
     /// Copies a file on the server with OpenSSH's `copy-data` extension, which callers check for
-    /// first. Two round trips: both OPENs, then `copy-data`, `stamp` on the new file's handle, and
-    /// both CLOSEs, which the server carries out in order. The written file's CLOSE is awaited,
-    /// since it can report a failed last write; a `stamp` that did not take is not an error.
+    /// first. Two round trips: both OPENs, then `copy-data`, `stamp`, and both CLOSEs, which the
+    /// server carries out in order. The written file's CLOSE is awaited, since it can report a
+    /// failed last write; a `stamp` that did not take is not an error.
     func copyData(_ source: RemotePath, to destination: RemotePath, stamp: SFTPAttrs? = nil) async throws {
         try Task.checkCancellation()
         let opens = try [
@@ -318,10 +316,11 @@ actor SFTPChannel {
         _ = try await reply(finishing[finishing.count - 1])
     }
 
-    /// The handles OPEN requests already sent return, in order. The replies are awaited even when
-    /// the caller is cancelled: an OPEN may create a temp, whose removal, sent on another channel
-    /// once the cancel lands, must not reach the server first and leave the temp behind. When any
-    /// fails, or the caller was cancelled, those that opened are closed and it throws.
+    /// The handles OPEN or OPENDIR requests already sent return, in order. The replies are awaited
+    /// even when the caller is cancelled, so every handle the server opens is closed: an OPEN may
+    /// also create a temp, whose removal, sent on another channel once the cancel lands, must not
+    /// reach the server first. When any fails, or the caller was cancelled, those that opened are
+    /// closed and it throws.
     private func handles(opening ids: [UInt32]) async throws -> [Data] {
         var handles: [Data] = []
         var failure: (any Error)?
@@ -343,7 +342,7 @@ actor SFTPChannel {
     func setstat(_ path: RemotePath, _ stamp: SFTPAttrs) async throws {
         _ = try await call(SFTPCode.setstat) {
             $0.appendPath(path)
-            $0.append(stamp.encoded())
+            $0.appendAttrs(stamp)
         }
     }
 
@@ -351,7 +350,7 @@ actor SFTPChannel {
     private func setstatRequest(handle: Data, _ stamp: SFTPAttrs) throws -> UInt32 {
         try send(SFTPCode.fsetstat) {
             $0.appendBlob(handle)
-            $0.append(stamp.encoded())
+            $0.appendAttrs(stamp)
         }
     }
 
@@ -363,12 +362,10 @@ actor SFTPChannel {
         try parts.finish()
     }
 
-    /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight, until nothing is
-    /// left to ask for. With `matching`, the file opened must still be the one listed: the plan
-    /// stops at the listed size, so a file that grew would arrive cut short and look complete.
-    /// The channel that owns the download throws when it is not, checking with its first READs
-    /// and before writing a byte; one `helping` leaves it alone, so a file replaced meanwhile is
-    /// never read in pieces from two versions.
+    /// Reads what `parts` hands out of the file at `path`, keeping 2 MB in flight. With `matching`,
+    /// the file opened must still be the one listed, as the plan stops at the listed size: the
+    /// owning channel throws when it is not, checking with its first READs and before writing a
+    /// byte; one `helping` leaves it alone, so a file is never read in pieces of two versions.
     func receive(_ path: RemotePath, into parts: DownloadParts, matching print: Fingerprint? = nil, helping: Bool = false) async throws {
         let handle = try await openFile(path, flags: SFTPCode.fxRead)
         defer { closeSoon([handle]) }
@@ -407,6 +404,9 @@ actor SFTPChannel {
                 let chunk = try reader.blob()
                 try parts.write(chunk, offset: read.offset, length: read.length)
             } catch is EndOfFile {
+                // Short of the listed size: the file was cut while it was read, unless it is
+                // still the one listed, as a pseudo-file with a nominal size is.
+                if let print, try await fstat(handle) != print { throw TransferError.changedOnServer(path.name) }
                 parts.endOfFile()
             }
         }
@@ -426,8 +426,7 @@ actor SFTPChannel {
 
     /// Opens `path` for writing, creating it or cutting it to nothing.
     func create(_ path: RemotePath) async throws -> Data {
-        try Task.checkCancellation()
-        return try await handles(opening: [send(SFTPCode.open) { $0.openFields(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc) }])[0]
+        try await openFile(path, flags: SFTPCode.fxWrite | SFTPCode.fxCreat | SFTPCode.fxTrunc)
     }
 
     /// Writes what `parts` hands out into `path`, which another channel created.
@@ -436,9 +435,9 @@ actor SFTPChannel {
     }
 
     /// Writes what `parts` hands out to `handle`, keeping 2 MB in flight, then closes it, awaiting
-    /// the close: a server may report a failed last write only there. `stamp` and the close go out
-    /// right behind the last write, costing no round trip; the server carries out a file's
-    /// requests in order, so no write lands after the stamp. A stamp that did not take is no error.
+    /// the close, where a server may report a failed last write. `stamp` and the close go right
+    /// behind the last write; the server carries out a file's requests in order, so no write lands
+    /// after the stamp. A stamp that did not take is no error.
     func send(_ parts: UploadParts, to handle: Data, stamp: SFTPAttrs? = nil) async throws {
         var writes: [(id: UInt32, count: UInt64)] = []
         var finishing: [UInt32] = []
@@ -506,29 +505,27 @@ actor SFTPChannel {
         }
     }
 
-    /// One page of `parent`'s entries, nil at the end. A name the server sends is used as a path
-    /// component, so anything that is not exactly one is dropped: `.` and `..`, an empty name, and
-    /// a name with a slash or NUL, which a hostile server could send to reach outside the folder.
+    /// One page of `parent`'s entries, nil at the end: EOF, or a page of no names. A name the
+    /// server sends is used as a path component, so anything that is not exactly one is dropped:
+    /// `.` and `..`, an empty name, and a name with a slash or NUL, which a hostile server could
+    /// send to reach outside the folder. A page of only such names is empty, not the end.
     private func readDirectory(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem]? {
-        let message: SFTPMessage
+        let names: [(filename: Data, attrs: SFTPAttrs)]
         do {
-            message = try await call(SFTPCode.readdir) { $0.appendBlob(handle) }
+            names = try self.names(in: await call(SFTPCode.readdir) { $0.appendBlob(handle) })
         } catch is EndOfFile {
             return nil
         }
-        return try names(in: message).compactMap { name in
-            guard Self.isSingleComponent(name.filename) else { return nil }
+        guard !names.isEmpty else { return nil }
+        return names.compactMap { name in
+            guard RemotePath.isSingleName(bytes: name.filename) else { return nil }
             return item(path: parent.appending(name: Array(name.filename)), attrs: name.attrs)
         }
     }
 
-    static func isSingleComponent(_ name: Data) -> Bool {
-        !name.isEmpty && name != Data([0x2E]) && name != Data([0x2E, 0x2E])
-            && !name.contains(0x2F) && !name.contains(0)
-    }
-
     private func openFile(_ path: RemotePath, flags: UInt32) async throws -> Data {
-        try handle(in: await call(SFTPCode.open) { $0.openFields(path, flags: flags) })
+        try Task.checkCancellation()
+        return try await handles(opening: [send(SFTPCode.open) { $0.openFields(path, flags: flags) }])[0]
     }
 
     /// Sends CLOSE for each handle and forgets the replies. Cleanup after a cancellation must
@@ -541,14 +538,9 @@ actor SFTPChannel {
     }
 
     /// Sends one request and waits for the reply. A failure status throws, EOF as `EndOfFile`.
-    private func call(
-        _ type: UInt8,
-        capacity: Int = 64,
-        long: Bool = false,
-        _ fields: (inout Data) -> Void
-    ) async throws -> SFTPMessage {
+    private func call(_ type: UInt8, _ fields: (inout Data) -> Void) async throws -> SFTPMessage {
         try Task.checkCancellation()
-        return try await reply(send(type, capacity: capacity, long: long, fields))
+        return try await reply(send(type, fields))
     }
 
     /// Sends one request now and returns its id for `reply`. Requests reach the server in the order
@@ -593,7 +585,8 @@ actor SFTPChannel {
         if message.type == SFTPCode.status {
             var reader = ByteReader(message.rest)
             let code = (try? reader.u32()) ?? SFTPCode.failure
-            let text = (try? reader.utf8()) ?? "SFTP error \(code)"
+            // The server's words go to the message bar: one line, no bidi overrides, short.
+            let text = SFTPWire.printable((try? reader.utf8()) ?? "SFTP error \(code)", limit: 200)
             if code == SFTPCode.ok { return message }
             if code == SFTPCode.eof { throw EndOfFile() }
             if code == SFTPCode.noSuchFile { throw TransferError.noSuchFile(text) }
@@ -603,8 +596,11 @@ actor SFTPChannel {
         return message
     }
 
-    /// The server's EOF status: the end of a directory or a file, not a failure.
-    private struct EndOfFile: Error {}
+    /// The server's EOF status: the end of a directory or a file, not a failure. To any other
+    /// request it is one, and reads as one.
+    private struct EndOfFile: LocalizedError {
+        var errorDescription: String? { "The server answered “end of file” where no file ends" }
+    }
 
     /// Stops waiting for request `id`: its reply, when it comes, is dropped.
     private func abandon(_ id: UInt32) {

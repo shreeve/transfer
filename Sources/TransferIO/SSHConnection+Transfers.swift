@@ -8,7 +8,7 @@ import TransferCore
 extension SSHConnection {
     // MARK: Remove
 
-    public func remove(_ path: RemotePath, force: Bool) async throws {
+    public func remove(_ path: RemotePath, force: Bool = false) async throws {
         try await live.remove(path, on: connection.id, force: force) {
             let link = try await self.walkerLink()
             _ = try await self.removeTree(path, as: TreeEntry(try await link.lstat(path)), link: link)
@@ -19,7 +19,7 @@ extension SSHConnection {
     /// Removes a moved original: only what the move verified of it, `verified` by key as it was
     /// then. A file changed or added since stays, with the folders holding it, and so does all of
     /// it when a Live file under it was saved since `mark` (`LiveSync.saveMark`, read before the
-    /// walk): the copy lacks those bytes. Returns whether all of it went.
+    /// copy): the copy may lack those bytes. Returns whether all of it went.
     func removeMoved(_ path: RemotePath, verified: [TreeKey: TreeEntry], savedSince mark: UInt64) async throws -> Bool {
         defer { if let parent = path.parent { pipe.emit(.directoryChanged(parent)) } }
         do {
@@ -85,30 +85,36 @@ extension SSHConnection {
         try tally.check()
     }
 
-    /// Temp-and-rename onto the local disk. No collision check, but without `replacing` the
-    /// rename refuses a name that something took since it was looked up. The file takes the
-    /// server's permissions without setuid, setgid, or sticky, which an untrusted server must not
-    /// grant. `quarantine` marks it for Gatekeeper, as a browser marks its downloads; a Live
-    /// working copy is not marked, since it only ever opens in an editor.
+    /// Temp-and-rename into `destination`'s folder, which the caller made. No collision check, but
+    /// without `replacing` the rename refuses a name that something took since it was looked up.
+    /// The file takes the server's permissions under this process's umask, as `sftp get` does,
+    /// without setuid, setgid, or sticky, which an untrusted server must not grant; `readOnly`
+    /// drops the write bits too, and a `live` working copy is private (0600) as it lands. Every
+    /// download is quarantined as a browser's is, a Live working copy too, as the app it opens in may
+    /// run it (D2), except a Live Terminal script, which Gatekeeper lets no editor open
+    /// (`EditableFile.quarantinesLiveCopy`); being 0600, it runs nowhere.
     func fetch(
         _ path: RemotePath,
         info: RemoteItem,
         to destination: URL,
         replacing: Bool = true,
-        quarantine: Bool = false,
+        readOnly: Bool = false,
+        live: Bool = false,
+        interactive: Bool = false,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let folder = destination.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let temp = folder.appendingPathComponent(CopyRules.tempName(for: destination.lastPathComponent, transferID: UUID().uuidString))
+        let temp = folder.appendingPathComponent(KeepBothName.temp(for: destination.lastPathComponent))
         store.rememberTemp(local: temp)
         do {
-            try await receive(path, info: info, into: temp, progress: progress)
-            var attributes: [FileAttributeKey: Any] = [:]
-            if let mode = info.mode { attributes[.posixPermissions] = Int(mode & 0o777) }
+            try await receive(path, info: info, into: temp, interactive: interactive, progress: progress)
+            // Marked first: a file without write bits takes no extended attribute. The channel
+            // created it with 0o666 under the umask, which no mode listed keeps.
+            if !live || EditableFile.quarantinesLiveCopy(fileName: path.name) { LocalPlacement.quarantine(temp) }
+            let mode = live ? 0o600 : (info.mode ?? 0o666) & (readOnly ? 0o555 : 0o777) & ~Self.fileMask
+            var attributes: [FileAttributeKey: Any] = [.posixPermissions: Int(mode)]
             if let mtime = info.mtime { attributes[.modificationDate] = Date(timeIntervalSince1970: TimeInterval(mtime)) }
-            if !attributes.isEmpty { try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path) }
-            if quarantine { LocalPlacement.quarantine(temp) }
+            try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path)
             // One rename replaces the destination, so a watched Live copy is never briefly missing.
             let placed = replacing ? Darwin.rename(temp.path, destination.path) : renamex_np(temp.path, destination.path, UInt32(RENAME_EXCL))
             guard placed == 0 else {
@@ -121,6 +127,14 @@ extension SSHConnection {
             throw error
         }
     }
+
+    /// This process's umask. Read once: reading it means setting it, which races with any file
+    /// another thread creates meanwhile.
+    private static let fileMask: UInt32 = {
+        let mask = umask(0o022)
+        umask(mask)
+        return UInt32(mask)
+    }()
 
     public func upload(_ source: URL, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         try await upload(source, to: destination, tally: CopyTally(progress))
@@ -141,7 +155,7 @@ extension SSHConnection {
             // The temp is renamed on the channel that wrote it, once every write is acknowledged.
             try await withData(DataShare(size: local?.size)) { link in
                 try await self.send(source, size: local?.size, to: temp, on: link, stamp: stamp, progress: progress)
-                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
+                try await self.place(temp, onto: placed, replacing: replacing, on: link)
             }
         }
     }
@@ -160,15 +174,13 @@ extension SSHConnection {
             try await withInteractive { link in try await link.upload(source, to: temp, stamp: stamp, progress: progress) }
             let link = try await metadataLink()
             let written = Fingerprint(item: try await link.lstat(temp))
-            let found = try await existing(placed, on: link)
-            let now = found.flatMap(Fingerprint.init(item:))
+            let found = try await link.lookup(placed)
             // "Absent" means nothing at all there: a folder or a link is not absent.
             let matches = switch expecting {
-            case .file(let print): now == print
+            case .file(let print): found.flatMap(Fingerprint.init(item:)) == print
             case .absent: found == nil
             }
-            // A save that runs again after it already landed finds its own bytes there.
-            if !matches, now == nil || now != written { throw LiveRemoteChanged() }
+            if !matches { throw LiveRemoteChanged() }
             // A new file keeps the mode the server gave the temp when it was created.
             if let kept = found?.mode { try? await link.setstat(temp, SFTPAttrs(permissions: kept & 0o7777)) }
             try await link.replace(temp, onto: placed, log: asides)
@@ -183,22 +195,29 @@ extension SSHConnection {
 
     /// Reads the server's file into `file` over one data channel, which a small file shares with
     /// others, and a large one also over the channels free now. Every channel checks that the file
-    /// it opened is still the one `info` lists, whose size says where to stop.
-    private func receive(_ path: RemotePath, info: RemoteItem, into file: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    /// it opened is still the one `info` lists, whose size says where to stop. An `interactive`
+    /// file, one the user waits on, starts on the interactive channel: the data pool serves its
+    /// waiters in order, behind every job of a folder copy (SES2-02).
+    private func receive(_ path: RemotePath, info: RemoteItem, into file: URL, interactive: Bool, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let print = Fingerprint(item: info)
         guard let size = info.size, size >= Self.stripeSize, let print else {
             // The channel creates the file, off this actor, once the job holds the channel.
-            return try await withData(DataShare(size: info.size)) { link in
+            return try await withChannel(interactive: interactive, DataShare(size: info.size)) { link in
                 try await link.download(path, to: file, size: info.size, matching: print, progress: progress)
             }
         }
-        try await withData(.whole) { link in
+        try await withChannel(interactive: interactive, .whole) { link in
             let parts = try DownloadParts(file, size: size, progress: progress)
             try await striped({ try await link.receive(path, into: parts, matching: print) }) {
                 try await $0.receive(path, into: parts, matching: print, helping: true)
             }
             try parts.finish()
         }
+    }
+
+    private func withChannel<T>(interactive: Bool, _ share: DataShare, _ body: (SFTPChannel) async throws -> T) async throws -> T {
+        if interactive { return try await withInteractive(body) }
+        return try await withData(share, body)
     }
 
     /// Runs `first`, and `helper` on each of up to three more data channels free now, each taking
@@ -234,10 +253,15 @@ extension SSHConnection {
         parts.finish()
     }
 
-    /// `SFTPChannel.lookup` on `link`, else on the metadata channel.
-    func existing(_ path: RemotePath, on link: SFTPChannel? = nil) async throws -> RemoteItem? {
-        if let link { return try await link.lookup(path) }
-        return try await metadataLink().lookup(path)
+    /// `SFTPChannel.lookup` on the metadata channel.
+    func existing(_ path: RemotePath) async throws -> RemoteItem? {
+        try await metadataLink().lookup(path)
+    }
+
+    /// Whether any of `folders` holds `name`.
+    func holds(_ name: String, inAny folders: Set<RemotePath>) async throws -> Bool {
+        for folder in folders where try await existing(folder.appending(name)) != nil { return true }
+        return false
     }
 
     // MARK: Directory copy
@@ -265,7 +289,7 @@ extension SSHConnection {
             var used: Set<String> = []
             for try await child in await link.list(item.path) {
                 try Task.checkCancellation()
-                let taken = !used.insert(Placement.fold(child.name)).inserted
+                let taken = !used.insert(child.name.diskFolded).inserted
                 do {
                     try await placeDown(child, named: child.name, in: local.url, taken: taken, link: link, group: &group, tally: tally)
                 } catch {
@@ -285,7 +309,7 @@ extension SSHConnection {
             if tally.addingJob() { _ = try await group.next() }
             group.addTask {
                 do {
-                    try await self.fetch(item.path, info: item, to: placed.url, replacing: placed.found != nil, quarantine: true, progress: tally.file())
+                    try await self.fetch(item.path, info: item, to: placed.url, replacing: placed.found != nil, progress: tally.file())
                     tally.finished()
                 } catch {
                     try tally.failed(name, error)
@@ -519,17 +543,30 @@ extension SSHConnection {
             let onServer = try await withData(DataShare(size: item.size)) { link in
                 guard await link.extensions.contains("copy-data") else { return false }
                 try await link.copyData(item.path, to: temp, stamp: stamp)
-                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
+                try await self.place(temp, onto: placed, replacing: replacing, on: link)
                 return true
             }
             guard !onServer else { return }
-            let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let scratch = try store.makeScratch()
             defer { try? FileManager.default.removeItem(at: scratch) }
-            try await fetch(item.path, info: item, to: scratch) { _ in }
+            let file = scratch.appendingPathComponent("file")
+            try await fetch(item.path, info: item, to: file) { _ in }
             try await withData(DataShare(size: item.size)) { link in
-                try await self.send(scratch, size: item.size, to: temp, on: link, stamp: stamp) { _ in }
-                try await link.place(temp, onto: placed, replacing: replacing, log: self.asides)
+                try await self.send(file, size: item.size, to: temp, on: link, stamp: stamp) { _ in }
+                try await self.place(temp, onto: placed, replacing: replacing, on: link)
             }
+        }
+    }
+
+    /// Renames the finished `temp` onto `placed` on `link`, the channel that wrote it. Without
+    /// `replacing` the rename refuses a name taken since it was looked up, which is said so rather
+    /// than with the server's bare "Failure" (XFR-06).
+    private func place(_ temp: RemotePath, onto placed: RemotePath, replacing: Bool, on link: SFTPChannel) async throws {
+        do {
+            try await link.place(temp, onto: placed, replacing: replacing, log: asides)
+        } catch where !replacing && !CopyTally.ends(error) {
+            guard try await link.lookup(placed) != nil else { throw error }
+            throw TransferError.failed("“\(placed.name)” appeared at the destination while it was being copied, and was not replaced")
         }
     }
 
@@ -537,7 +574,7 @@ extension SSHConnection {
     /// run cannot. `body` writes the temp and renames it into place.
     private func withRemoteTemp<T>(for placed: RemotePath, _ body: (RemotePath) async throws -> T) async throws -> T {
         let parent = placed.parent ?? RemotePath(string: "/")
-        let temp = parent.appending(name: Array(CopyRules.tempName(for: placed.name, transferID: UUID().uuidString).utf8))
+        let temp = parent.appending(name: Array(KeepBothName.temp(for: placed.name).utf8))
         store.rememberTemp(temp, connection: connection.id)
         do {
             let result = try await body(temp)
@@ -583,7 +620,7 @@ extension SSHConnection {
     var asides: SFTPChannel.AsideLog {
         let (store, id) = (store, connection.id)
         return SFTPChannel.AsideLog(
-            remember: { store.rememberTemp(Self.asideRecord($0, $1), connection: id) },
+            remember: { store.rememberTemp(Self.asideRecord($0, $1), connection: id, aside: true) },
             forget: { store.forgetTemp(Self.asideRecord($0, $1)) }
         )
     }
@@ -619,6 +656,13 @@ extension SSHConnection {
         }
     }
 
+    /// The whole tree `walkTree` streams, by key.
+    func tree(_ root: RemotePath) async throws -> [TreeKey: TreeEntry] {
+        var entries: [TreeKey: TreeEntry] = [:]
+        for try await (key, entry) in walkTree(root) { entries[key] = entry }
+        return entries
+    }
+
     private func walk(_ folder: RemotePath, key parent: TreeKey, link: SFTPChannel, visit: @escaping @Sendable (TreeKey, TreeEntry) -> Void) async throws {
         for try await child in await link.list(folder) {
             try Task.checkCancellation()
@@ -638,17 +682,23 @@ extension SSHConnection {
         try await cachedCopy(stat(path), lane: .view)
     }
 
+    /// The inspector previews a file that is not text only up to this size. A download reads no
+    /// more than the size listed, so the limit holds against what is read; a file listed without
+    /// one could be read without end, and is refused (SEC2-03).
+    static let inspectorLimit: UInt64 = 8 << 20
+
     public func prepareInspectorPreview(_ path: RemotePath) async throws -> URL {
         let item = try await stat(path)
         let head = UInt64(EditableFile.previewHead)
-        guard EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live,
-              let print = Fingerprint(item: item), print.size > head else {
+        guard EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live, (item.size ?? .max) > head else {
+            guard (item.size ?? .max) <= Self.inspectorLimit else { throw TransferError.failed("“\(item.name)” is too large to preview here") }
             return try await cachedCopy(item, lane: .preview)
         }
         // Only the head of a text file is shown, so only the head is fetched. The copy is named for
         // the file's size and time, so an unchanged file reuses it.
-        let file = try previewURL(path, name: item.name, version: "head \(print.size):\(print.mtime)")
-        if FileManager.default.fileExists(atPath: file.path) { return file }
+        let print = Fingerprint(item: item)
+        let file = try previewURL(path, name: item.name, version: "head " + (print.map { "\($0.size):\($0.mtime)" } ?? ""))
+        if print != nil, FileManager.default.fileExists(atPath: file.path) { return file }
         try await fetchHead(path, limit: head, to: file)
         trimPreviewCache()
         return file
@@ -657,7 +707,7 @@ extension SSHConnection {
     /// The first `limit` bytes of `path`, on the preview lane.
     private func fetchHead(_ path: RemotePath, limit: UInt64, to file: URL) async throws {
         try await lane.submit(.preview) {
-            try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: limit), to: file, quarantine: true) { _ in }
+            try await self.fetch(path, info: RemoteItem(path: path, kind: .file, size: limit), to: file, readOnly: true, interactive: true) { _ in }
         }
     }
 
@@ -668,7 +718,7 @@ extension SSHConnection {
         // The copy carries the remote size and mtime; the same pair means the same bytes.
         if let print = Fingerprint(item: item), (try? LocalPlacement.occupant(file)) == .file(print) { return file }
         try await lane.submit(kind) {
-            try await self.fetch(path, info: item, to: file, quarantine: true) { _ in }
+            try await self.fetch(path, info: item, to: file, readOnly: true, interactive: true) { _ in }
         }
         trimPreviewCache()
         return file
@@ -686,10 +736,12 @@ extension SSHConnection {
             try await fetchHead(path, limit: min(item.size ?? limit, limit), to: part)
             defer { try? FileManager.default.removeItem(at: part) }
             let data = try Data(contentsOf: part)
-            guard let text = String(data: data, encoding: .utf8) else {
+            // A head cut short may end inside a character: up to three of its bytes are dropped.
+            let cut = (item.size ?? .max) > limit ? 3 : 0
+            guard let text = (0...cut).lazy.compactMap({ String(validating: data.dropLast($0), as: UTF8.self) }).first else {
                 return try await cachedCopy(item, lane: .preview)
             }
-            let html = SyntaxPreview.html(text: text, fileName: item.name)
+            let html = SyntaxPreview.html(text: text)
             try html.write(to: file, atomically: true, encoding: .utf8)
             trimPreviewCache()
             return file
@@ -697,20 +749,12 @@ extension SSHConnection {
         return try await cachedCopy(item, lane: .preview)
     }
 
-    public func clearPreviewCache() async {
-        try? FileManager.default.removeItem(at: previewCacheDirectory)
-    }
-
-    private var previewCacheDirectory: URL {
-        store.cacheRoot.appendingPathComponent("Preview", isDirectory: true)
-    }
-
     /// The cache file for `path` on this server: the remote file's own name (plus `suffix`, cut to
     /// fit), in a folder named for the server, the path, and `version`, since two servers can hold
     /// different files at one path. The name is what Quick Look's Open With and an app viewing the
     /// copy show and open, where a digest meant nothing.
     private func previewURL(_ path: RemotePath, name: String, suffix: String = "", version: String = "") throws -> URL {
-        var cache = previewCacheDirectory
+        var cache = store.previewCache
         try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
@@ -720,22 +764,22 @@ extension SSHConnection {
         let folder = cache.appendingPathComponent(digest, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let fits = suffix.isEmpty && name.utf8.count <= 255
-        return folder.appendingPathComponent(fits ? name : LiveDecision.siblingName(of: name, suffix: suffix))
+        return try LocalPlacement.child(folder, name: fits ? name : LiveDecision.siblingName(of: name, suffix: suffix))
     }
 
     /// Evicts whole entries, each a file's folder (or a digest-named file from before names were
     /// kept), by the last use of what it holds, in one walk of the cache.
     private func trimPreviewCache() {
-        let root = previewCacheDirectory.path
+        let root = store.previewCache.path
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentAccessDateKey, .contentModificationDateKey]
-        guard let walker = FileManager.default.enumerator(at: previewCacheDirectory, includingPropertiesForKeys: Array(keys)) else { return }
-        var entries: [String: CacheEntry] = [:]
+        guard let walker = FileManager.default.enumerator(at: store.previewCache, includingPropertiesForKeys: Array(keys)) else { return }
+        var entries: [String: (id: String, size: UInt64, lastUsed: Date)] = [:]
         for case let url as URL in walker {
             guard let values = try? url.resourceValues(forKeys: keys) else { continue }
             let used = values.contentAccessDate ?? values.contentModificationDate ?? .distantPast
             let parent = url.deletingLastPathComponent().path
             let id = values.isDirectory == true || parent == root ? url.path : parent
-            var entry = entries[id] ?? CacheEntry(id: id, size: 0, lastUsed: .distantPast)
+            var entry = entries[id] ?? (id, 0, .distantPast)
             if values.isDirectory != true { entry.size += UInt64(values.fileSize ?? 0) }
             entry.lastUsed = max(entry.lastUsed, used)
             entries[id] = entry
@@ -795,9 +839,8 @@ final class CopyTally: Sendable {
 
     /// Twice what the data channels carry at once (seven, sixteen small files each): as many jobs
     /// again have settled their names and wait, so a channel never idles while the walk finds the
-    /// next. Only a job holding a channel has a file open. 2,000 small files at 20 ms, files/s
-    /// down / up / server copy: 16 jobs 339 / 226 / 199; 112 jobs 1,590 / 1,578 / 1,269; 224 jobs
-    /// 2,194 / 1,624 / 1,482.
+    /// next. Only a job holding a channel has a file open. At 20 ms, 224 jobs moved 2,000
+    /// small files fastest of 16, 112, and 224 in every direction (2,194 files/s down).
     static let jobLimit = 2 * SSHConnection.dataChannels * SSHConnection.DataShare.whole.rawValue
 
     init(_ report: @escaping @Sendable (TransferProgress) -> Void, memo: Locked<TransferMemo>? = nil, item: Int = 0, moving: Bool = false) {
@@ -861,8 +904,10 @@ final class CopyTally: Sendable {
     }
 
     /// Whether `error` ends a whole copy or paste, not just one item: a cancel, a dropped
-    /// connection, or a timeout, on which it stops or is retried.
+    /// connection, or a timeout, on which it stops or is retried. A file that changed on the
+    /// server is that file's fault: the others go on, and a retry fetches only it (XFR-05).
     static func ends(_ error: any Error) -> Bool {
+        if case .changedOnServer? = error as? TransferError { return false }
         if error is CancellationError || RetryPolicy.isRetryable(error) { return true }
         guard let error = error as? TransferError else { return false }
         return error == .cancelled || error == .notConnected
@@ -880,7 +925,7 @@ final class CopyTally: Sendable {
 
     private func add(bytes: UInt64, items: Int) {
         let progress = state.withLock { state in
-            state.bytes += bytes
+            state.bytes = state.bytes.saturatingAdd(bytes)
             state.items += items
             return TransferProgress(completed: state.bytes, itemsCompleted: state.items)
         }
@@ -896,14 +941,14 @@ private struct Holdings: Sendable {
 
     mutating func add(_ item: RemoteItem) {
         items[item.path.nameBytes] = item
-        folded.insert(Placement.fold(item.name))
+        folded.insert(item.name.diskFolded)
     }
 
     /// The item named `name`. A name the listing holds only in another case or Unicode form is
     /// looked up, since the server's disk may take the two for one.
     func item(named name: [UInt8], at path: RemotePath, on session: SSHConnection) async throws -> RemoteItem? {
         if let item = items[name] { return item }
-        guard folded.contains(Placement.fold(String(decoding: name, as: UTF8.self))) else { return nil }
+        guard folded.contains(String(decoding: name, as: UTF8.self).diskFolded) else { return nil }
         return try await session.existing(path)
     }
 }

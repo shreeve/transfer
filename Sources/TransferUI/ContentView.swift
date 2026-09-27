@@ -30,7 +30,6 @@ public struct ContentView: View {
         .ignoresSafeArea()
         .focusedSceneValue(\.transferModel, model)
         .onChange(of: model.snapshot.selection) { model.selectionChanged() }
-        .onChange(of: model.sidebarSelection) { _, item in Task { await model.sidebarSelected(item) } }
         .task { model.start() }
         .frame(minWidth: 640, idealWidth: 960, minHeight: 400, idealHeight: 640)
     }
@@ -43,7 +42,12 @@ struct SidebarColumn: View {
     // MARK: Sidebar
 
     var body: some View {
-        List(selection: $model.sidebarSelection) {
+        // Only a click acts: the model setting the selection back to the server shown is not a
+        // click on that server, which would stop a login to another.
+        List(selection: Binding(get: { model.sidebarSelection }, set: { item in
+            model.sidebarSelection = item
+            Task { await model.sidebarSelected(item) }
+        })) {
             Section("Servers") {
                 ForEach(model.connections) { connection in
                     Label(connection.displayName, systemImage: "server.rack")
@@ -126,7 +130,8 @@ struct DetailColumn: View {
             if model.snapshot.connectionID != nil { ClipSlot() }
             if model.showsShelf { Shelf(model: model) }
         }
-        .sheet(item: $model.sheet) { sheet in sheetView(sheet) }
+        // A question that replaces another in the same sheet starts with fresh fields.
+        .sheet(item: $model.sheet) { sheet in sheetView(sheet).id(sheet.id) }
         .scrollEdgeEffectHidden(true, for: .top)
     }
 
@@ -157,40 +162,29 @@ struct DetailColumn: View {
         case .connection:
             ConnectionForm(model: model)
         case .prompt(let request, let server, _):
-            let reply = { PromptReply(text: model.promptSecure, saveInKeychain: model.saveSecret) }
-            let cancel = { model.finishPrompt(PromptReply(text: nil), offered: false) }
-            SheetForm(title: server ?? "Log In", width: 380, cancelKey: .cancelAction, onCancel: cancel) {
-                Text(request.text)
-                SecureField("Password", text: $model.promptSecure)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.finishPrompt(reply(), offered: request.offerKeychain) }
-                if request.offerKeychain {
-                    Toggle("Save in Keychain", isOn: $model.saveSecret)
-                }
-            } actions: {
-                Button("Continue") { model.finishPrompt(reply(), offered: request.offerKeychain) }
-                    .keyboardShortcut(.defaultAction)
-            }
+            PasswordSheet(request: request, server: server) { model.prompts.finish(.login($0)) }
         case .hostKey(let event, let server, _):
             SheetForm(
                 title: event.situation == .changed ? "The host key changed" : "First time connecting to this server",
                 detail: event.situation == .changed
                     ? "The server now presents a different key. Someone could be intercepting the connection."
                     : "Check this fingerprint against one you got from the server's owner.",
-                width: 460,
-                onCancel: { model.finishHost(.cancel) }
+                width: 520,
+                onCancel: { model.prompts.finish(.hostKey(.cancel)) }
             ) {
                 LabeledContent("Server", value: hostKeyServer(server, event))
                 LabeledContent("Key type", value: event.keyType)
-                LabeledContent("SHA256", value: event.fingerprint)
-                    .font(.body.monospaced())
+                // A SHA-256 fingerprint is always 43 characters of base64: one line at this size.
+                LabeledContent("Fingerprint", value: event.fingerprint)
+                    .font(.callout.monospaced())
+                    .lineLimit(1)
                     .textSelection(.enabled)
             } actions: {
                 if event.situation == .firstSeen {
-                    Button("Trust Once") { model.finishHost(.trustOnce) }
-                    Button("Always Trust") { model.finishHost(.alwaysTrust) }
+                    Button("Trust Once") { model.prompts.finish(.hostKey(.trustOnce)) }
+                    Button("Always Trust") { model.prompts.finish(.hostKey(.alwaysTrust)) }
                 } else {
-                    Button("Replace Trusted Key") { model.finishHost(.replace) }
+                    Button("Replace Trusted Key") { model.prompts.finish(.hostKey(.replace)) }
                 }
             }
         case .delete:
@@ -208,13 +202,7 @@ struct DetailColumn: View {
                 }
             }
         case .collision(let name, _):
-            let skip = { model.finishCollision(.skip, applyToAll: model.applyCollisionToAll) }
-            SheetForm(title: "“\(name)” already exists", detail: "Keep Both saves the new file with a number before its extension.", cancel: "Skip", onCancel: skip) {
-                Toggle("Apply to all in this operation", isOn: $model.applyCollisionToAll)
-            } actions: {
-                Button("Keep Both") { model.finishCollision(.keepBoth, applyToAll: model.applyCollisionToAll) }
-                Button("Replace") { model.finishCollision(.replace, applyToAll: model.applyCollisionToAll) }
-            }
+            CollisionSheet(name: name) { model.prompts.finish(.collision($0, toAll: $1)) }
         case .conflict(let path, let comparable):
             conflictSheet(path, comparable: comparable)
         case .goToFolder:
@@ -246,12 +234,9 @@ struct DetailColumn: View {
     /// The server's name, and the host its key line names when that says more.
     private func hostKeyServer(_ server: String?, _ event: HostKeyEvent) -> String {
         let host = HostKeyLine(line: event.line)?.host
-        switch (server, host) {
-        case let (server?, host?) where host != server: return "\(server) (\(host))"
-        case let (server?, _): return server
-        case let (nil, host?): return host
-        case (nil, nil): return "Unknown"
-        }
+        guard let server else { return host ?? "Unknown" }
+        guard let host, host != server else { return server }
+        return "\(server) (\(host))"
     }
 
     /// "Delete “notes.txt”?" for one item, "Delete 3 items?" for more, so the sheet says what
@@ -291,6 +276,53 @@ struct DetailColumn: View {
         let text = model.folderText
         model.sheet = nil
         Task { await model.goToFolder(text) }
+    }
+}
+
+/// A login question. What is typed lives in this sheet alone, so nothing typed for one server can
+/// fill in the next sheet, which may be another server's.
+private struct PasswordSheet: View {
+    let request: PromptRequest
+    let server: String?
+    let finish: (PromptReply) -> Void
+    @State private var secret = ""
+    @State private var save = false
+
+    var body: some View {
+        // Keychain saving applies only where the sheet offered it: a later question in the same
+        // login, such as a one-time code, never replaces the saved password.
+        let reply = { finish(PromptReply(text: secret, saveInKeychain: save && request.offerKeychain)) }
+        SheetForm(title: server ?? "Log In", width: 380, cancelKey: .cancelAction, onCancel: { finish(PromptReply(text: nil)) }) {
+            Text(request.text)
+                .lineLimit(8)
+                .textSelection(.enabled)
+            SecureField("Password", text: $secret)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(reply)
+            if request.offerKeychain {
+                Toggle("Save in Keychain", isOn: $save)
+            }
+        } actions: {
+            Button("Continue", action: reply)
+                .keyboardShortcut(.defaultAction)
+        }
+    }
+}
+
+/// A name already taken. Apply to All starts off for each question and holds for its operation.
+private struct CollisionSheet: View {
+    let name: String
+    let finish: (NameCollisionChoice, Bool) -> Void
+    @State private var toAll = false
+
+    var body: some View {
+        SheetForm(title: "“\(name)” already exists", detail: "Keep Both keeps both, naming the new one with the next free number.",
+                  cancel: "Skip", onCancel: { finish(.skip, toAll) }) {
+            Toggle("Apply to all in this operation", isOn: $toAll)
+        } actions: {
+            Button("Keep Both") { finish(.keepBoth, toAll) }
+            Button("Replace") { finish(.replace, toAll) }
+        }
     }
 }
 
@@ -363,18 +395,16 @@ private struct Shelf: View {
                     Text(progressText(operation.progress)).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if let label = stateLabel(operation) {
+            if let label = model.stateLabel(operation) {
                 Text(label).font(.caption).foregroundStyle(.secondary)
             }
             // A Live file's sync pauses and resumes. A transfer can only stop: it restarts from its
             // first byte, since a stopped transfer's temp is removed.
             let live = operation.livePath != nil
             switch operation.state {
-            case .active:
+            case .active, .queued:
                 Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
-            case .queued:
-                Button(live ? "Pause" : "Stop") { Task { await model.pause(operation) } }
-                if !live { Button("Remove") { model.remove(operation) } }
+                if operation.state == .queued, !live { Button("Remove") { model.remove(operation) } }
             case .paused:
                 Button(live ? "Resume" : "Restart") { Task { await model.resume(operation) } }
                 if !live { Button("Remove") { model.remove(operation) } }
@@ -401,16 +431,6 @@ private struct Shelf: View {
         if let message = operation.message, operation.state != .active { parts.append(message) }
         if let server = model.otherServerName(for: operation) { parts.append("on \(server)") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    private func stateLabel(_ operation: TransferOperation) -> String? {
-        switch operation.state {
-        case .queued: "Waiting"
-        case .active: nil
-        case .paused: operation.livePath == nil ? "Stopped" : "Paused"
-        case .failed: model.isKept(operation) ? "Kept" : "Failed"
-        case .succeeded: "Done"
-        }
     }
 
     private func progressText(_ progress: TransferProgress) -> String {
@@ -535,7 +555,7 @@ struct InspectorColumn: View {
             QuickLookPreview(url: url)
         case .text(let text):
             VStack(alignment: .trailing, spacing: 4) {
-                SourcePreview(text: text, fileName: item.name, wraps: wrapsPreview)
+                SourcePreview(text: text, wraps: wrapsPreview)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
                 Toggle("Wrap lines", isOn: $wrapsPreview)
@@ -572,7 +592,7 @@ struct InspectorColumn: View {
             if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
             if let live = model.liveFile(for: item.path) { line(live.status.label) }
             if let operation = model.operation(for: item.path) {
-                line(operation.message ?? operation.state.rawValue.capitalized)
+                line(operation.message ?? model.stateLabel(operation) ?? "Active")
             }
         }
         .font(.subheadline)
@@ -707,6 +727,7 @@ private func closeButton(help: LocalizedStringKey, label: LocalizedStringKey, ac
 private struct RenameBar: View {
     @Bindable var model: TransferModel
     @FocusState private var focused: Bool
+    @State private var stemSelected = false
 
     var body: some View {
         HStack {
@@ -727,7 +748,18 @@ private struct RenameBar: View {
             focused = true
             DispatchQueue.main.async { focused = true }
         }
-        .onChange(of: focused) { model.textEditing = focused }
+        // Command-F takes the keyboard from this field to the search field, which edits text too.
+        .onChange(of: focused) {
+            model.textEditing = focused || NSApp.keyWindow?.firstResponder is NSText
+            // The field selects all of the name as it takes focus; Finder leaves the extension out.
+            guard focused, !stemSelected else { return }
+            stemSelected = true
+            let (name, stem) = (model.renameText, model.renameStem)
+            DispatchQueue.main.async {
+                guard let editor = NSApp.keyWindow?.firstResponder as? NSTextView, editor.string == name else { return }
+                editor.setSelectedRange(NSRange(location: 0, length: stem))
+            }
+        }
         .onDisappear {
             model.textEditing = false
             // Escape or Return leaves the keyboard with the window itself; it goes back to the
@@ -762,10 +794,9 @@ struct QuickLookPreview: NSViewRepresentable {
 }
 
 /// Highlighted source in a web view, scrollable, with the pane's own background. The page is
-/// built only when the text, name, or wrapping changes, never on every redraw of the pane.
+/// built only when the text or wrapping changes, never on every redraw of the pane.
 struct SourcePreview: NSViewRepresentable {
     let text: String
-    let fileName: String
     let wraps: Bool
 
     func makeNSView(context: Context) -> WKWebView {
@@ -783,22 +814,16 @@ struct SourcePreview: NSViewRepresentable {
     }
 
     private func load(into view: WKWebView, context: Context) {
-        let page = Coordinator.Page(text: text, fileName: fileName, wraps: wraps)
-        guard context.coordinator.page != page else { return }
+        let page = (text: text, wraps: wraps)
+        if let shown = context.coordinator.page, shown == page { return }
         context.coordinator.page = page
-        view.loadHTMLString(SyntaxPreview.html(text: text, fileName: fileName, compact: true, wraps: wraps), baseURL: nil)
+        view.loadHTMLString(SyntaxPreview.html(text: text, compact: true, wraps: wraps), baseURL: nil)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
-        struct Page: Equatable {
-            var text: String
-            var fileName: String
-            var wraps: Bool
-        }
-
-        var page: Page?
+        var page: (text: String, wraps: Bool)?
     }
 }
 

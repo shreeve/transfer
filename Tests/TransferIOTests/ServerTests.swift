@@ -151,6 +151,41 @@ struct ServerTests {
         }
     }
 
+    /// Quick Look's head of a UTF-8 text file that ended inside a character was not UTF-8, so the
+    /// whole file was fetched instead (XFR-03). The inspector's limit for a file that is not text
+    /// was checked only against the listing the window had (SEC2-03): IO holds it too.
+    @Test func previewsFetchOnlyWhatTheyShow() async throws {
+        try await withHarness("cut", connected: true) { h in
+            // One ASCII byte, then three-byte characters: 512 KB never ends on a boundary.
+            try Data(("x" + String(repeating: "\u{65E5}", count: 1 << 20)).utf8).write(to: h.remote.appendingPathComponent("cjk.txt"))
+            let page = try await h.session.preparePreview(h.remotePath.appending("cjk.txt"))
+            #expect(page.lastPathComponent == "cjk.txt.html")
+
+            let blob = h.remote.appendingPathComponent("large.bin")
+            #expect(FileManager.default.createFile(atPath: blob.path, contents: nil))
+            try FileHandle(forWritingTo: blob).truncate(atOffset: SSHConnection.inspectorLimit + 1)
+            await #expect(throws: TransferError.self) { try await h.session.prepareInspectorPreview(h.remotePath.appending("large.bin")) }
+        }
+    }
+
+    /// Deleting a folder removes a link it holds, never what the link points to, and deleting a
+    /// link to a folder removes only the link (SPEC: links are removed, not followed; TD2-05).
+    @Test func removeNeverFollowsALink() async throws {
+        try await withHarness("unlink", connected: true) { h in
+            let fm = FileManager.default
+            try fm.createDirectory(at: h.remote.appendingPathComponent("keep"), withIntermediateDirectories: true)
+            try Data("kept".utf8).write(to: h.remote.appendingPathComponent("keep/file.txt"))
+            try fm.createDirectory(at: h.remote.appendingPathComponent("dir"), withIntermediateDirectories: true)
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("dir/out").path, withDestinationPath: "../keep")
+            try fm.createSymbolicLink(atPath: h.remote.appendingPathComponent("top").path, withDestinationPath: "keep")
+
+            try await h.session.remove(h.remotePath.appending("dir"), force: false)
+            try await h.session.remove(h.remotePath.appending("top"), force: false)
+            #expect(try fm.contentsOfDirectory(atPath: h.remote.path).sorted() == ["keep"])
+            #expect(try Data(contentsOf: h.remote.appendingPathComponent("keep/file.txt")) == Data("kept".utf8))
+        }
+    }
+
     /// Links were followed one hop, so a chain such as /usr/bin/java → /etc/alternatives/java →
     /// the JDK's binary would not open (UIM-19). The server's REALPATH follows the whole chain;
     /// a loop or a dangling link fails with an error rather than hanging.
@@ -249,7 +284,7 @@ struct ServerTests {
             #expect(try Data(contentsOf: copyURL.appendingPathComponent("a/big.bin")) == big)
             #expect(try FileManager.default.destinationOfSymbolicLink(atPath: copyURL.appendingPathComponent("link").path) == "one.txt")
             let copied = try await h.session.tree(copy)
-            #expect(try await MoveCheck.verdict(source: h.session.tree(site), before: [:], after: copied) == .remove)
+            #expect(try await MoveCheck.verdict(source: h.session.tree(site), after: copied, written: Set(copied.keys)) == .remove)
             let sourceTime = try FileManager.default.attributesOfItem(atPath: tree.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
             let copyTime = try FileManager.default.attributesOfItem(atPath: copyURL.appendingPathComponent("a/big.bin").path)[.modificationDate] as? Date
             #expect(sourceTime.map { Int($0.timeIntervalSince1970) } == copyTime.map { Int($0.timeIntervalSince1970) })
@@ -298,7 +333,7 @@ struct ServerTests {
             #expect(uploaded)
             let clean = await waitUntil { await h.session.liveFiles().first?.dirty == false }
             #expect(clean)
-            #expect(await h.session.unsyncedLiveCount == 0)
+            #expect(await h.live.unsyncedCount(on: h.session.connection.id) == 0)
 
             // Someone else changes the server copy; the next local edit becomes a conflict.
             try Data("remote-edit".utf8).write(to: remoteFile)
@@ -357,6 +392,28 @@ struct ServerTests {
             #expect(mode == 0o755)
 
             try await h.session.discardLiveFile(path, force: true)
+            await h.session.disconnect()
+        }
+    }
+
+    /// A Live save once replaced another writer's file that had its size and whole-second time
+    /// (LIV2-05): only the base it expects lets the rename happen.
+    @Test func liveSaveNeverReplacesAFileWithItsOwnFingerprint() async throws {
+        try await withHarness("ownprint") { h in
+            _ = try await h.session.connect(prompts: h.prompts)
+            let when = Date(timeIntervalSince1970: 1_700_000_000)
+            let remoteFile = h.remote.appendingPathComponent("notes.txt")
+            try Data("theirs".utf8).write(to: remoteFile)
+            try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: remoteFile.path)
+            let snapshot = h.staging.appendingPathComponent("notes.txt")
+            try Data("mine!!".utf8).write(to: snapshot)
+            try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: snapshot.path)
+            let path = h.remotePath.appending(name: Array("notes.txt".utf8))
+
+            await #expect(throws: LiveRemoteChanged.self) {
+                _ = try await h.session.liveSave(snapshot, to: path, expecting: .file(Fingerprint(size: 1, mtime: 1))) { _ in }
+            }
+            #expect(try Data(contentsOf: remoteFile) == Data("theirs".utf8))
             await h.session.disconnect()
         }
     }

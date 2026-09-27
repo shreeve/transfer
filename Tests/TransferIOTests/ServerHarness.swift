@@ -132,10 +132,19 @@ func withHarness(_ name: String, connected: Bool = false, knownHost: Bool = true
     await h.cleanUp()
 }
 
-/// Trusts host keys once unless told otherwise, answers no password, and replaces on every
-/// collision, counting them.
+/// Answers no password, gives every host-key question `hostDecision` (Trust Once unless told
+/// otherwise) and every collision `choice` (Replace), and records both. `meanwhile` runs before
+/// each collision is answered: someone else changing the server while the question is up.
 final class TestPrompts: PromptSink {
-    private let state = Locked((hostDecision: HostKeyDecision.trustOnce, collisions: 0))
+    private let state: Locked<(hostDecision: HostKeyDecision, collisions: Int, hostKeyEvents: [HostKeyEvent])>
+    private let choice: NameCollisionChoice
+    private let meanwhile: @Sendable () -> Void
+
+    init(_ hostDecision: HostKeyDecision = .trustOnce, collision choice: NameCollisionChoice = .replace, meanwhile: @escaping @Sendable () -> Void = {}) {
+        state = Locked((hostDecision, 0, []))
+        self.choice = choice
+        self.meanwhile = meanwhile
+    }
 
     var hostDecision: HostKeyDecision {
         get { state.value.hostDecision }
@@ -143,12 +152,19 @@ final class TestPrompts: PromptSink {
     }
 
     var collisions: Int { state.value.collisions }
+    var hostKeyEvents: [HostKeyEvent] { state.value.hostKeyEvents }
 
     func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { hostDecision }
+    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
+        state.withLock {
+            $0.hostKeyEvents.append(event)
+            return $0.hostDecision
+        }
+    }
     func resolveCollision(fileName: String) async -> NameCollisionChoice? {
+        meanwhile()
         state.withLock { $0.collisions += 1 }
-        return .replace
+        return choice
     }
 }
 
@@ -168,12 +184,28 @@ final class EventRecorder: Sendable {
     }
 }
 
-/// Polls `condition` every 50 ms until it holds or `seconds` pass.
+/// Polls `condition` every 20 ms until it holds or `seconds` pass.
 func waitUntil(_ seconds: Double = 8, _ condition: () async -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(seconds)
     while Date() < deadline {
         if await condition() { return true }
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        try? await Task.sleep(nanoseconds: 20_000_000)
     }
     return await condition()
+}
+
+func socketPath(_ h: ServerHarness) -> String {
+    h.root.appendingPathComponent("ssh/\(h.session.connection.id.socketName)").path
+}
+
+/// The ssh processes on this harness's control socket whose command line contains `marker`.
+func processes(_ h: ServerHarness, _ marker: String) async throws -> [(pid: pid_t, command: String)] {
+    let socket = socketPath(h)
+    let listed = try await Subprocess.run("/bin/ps", ["-axwwo", "pid=,command="], timeout: .seconds(5))
+    return listed.stdout.split(separator: "\n").compactMap { line in
+        let text = line.trimmingCharacters(in: .whitespaces)
+        guard text.contains(socket), text.contains("/usr/bin/ssh"), marker.isEmpty || text.contains(marker),
+              let space = text.firstIndex(of: " "), let pid = pid_t(text[..<space]) else { return nil }
+        return (pid, String(text[space...]))
+    }
 }

@@ -51,9 +51,41 @@ import Testing
     }
 }
 
+/// Gatekeeper refuses to open a quarantined `.command` or `.tool` in any app, so a Live copy of one
+/// could not be edited (E2E): only those Live copies go unquarantined; a `.sh` stays quarantined.
+@Test func onlyTerminalScriptLiveCopiesGoUnquarantined() {
+    for name in ["run.command", "RUN.COMMAND", "build.tool", "a.sh.command"] {
+        #expect(!EditableFile.quarantinesLiveCopy(fileName: name), "\(name)")
+    }
+    for name in ["run.sh", "run.zsh", "tool.py", "notes.txt", "Makefile", "command", "run.command.txt", "run.", "App.app"] {
+        #expect(EditableFile.quarantinesLiveCopy(fileName: name), "\(name)")
+    }
+}
+
+/// Only what follows the last dot is the extension (COR-1), and a trailing dot leaves none. A name
+/// with no dot matches the list by its whole name, so a user's "makefile" entry opens Makefile
+/// Live (FR-2); the built-in list holds no such name, and an empty entry matches nothing.
+@Test func anExtensionIsWhatFollowsTheLastDot() {
+    func kind(_ name: String, _ extensions: Set<String>) -> OpenKind { EditableFile.openKind(fileName: name, extensions: extensions) }
+    for name in ["README", "Makefile", "LICENSE", "notes.", "..", ".bashrc", "a.tar.gz"] {
+        #expect(kind(name, TransferConfig.builtIn.extensionSet) == .view, "\(name)")
+    }
+    #expect(kind("README", ["readme"]) == .live)
+    #expect(kind("Makefile", ["makefile"]) == .live)
+    #expect(kind("Makefile", ["make"]) == .view)
+    #expect(kind("notes.", ["notes"]) == .view)
+    #expect(kind("Notes", [""]) == .view)
+    #expect(kind(".env", ["env"]) == .live)
+    #expect(kind("a.tar.gz", ["gz"]) == .live)
+    #expect(kind("a.tar.gz", ["tar"]) == .view)
+    #expect(kind("NOTES.TXT", TransferConfig.builtIn.extensionSet) == .live)
+}
+
 @Test func keepBothInsertsANumberBeforeTheExtension() {
     let name = KeepBothName.next(existing: ["report.pdf", "report 2.pdf"], original: "report.pdf")
     #expect(name == "report 3.pdf")
+    // Compared as the disk folds names, in one pass.
+    #expect(KeepBothName.next(existing: ["report.pdf", "report 2.pdf"], original: "Report.pdf", key: { $0.lowercased() }) == "Report 3.pdf")
 }
 
 @Test func duplicateUsesCopySuffix() {
@@ -68,9 +100,9 @@ import Testing
 /// than 208 (R-T5). The name in it is cut to fit, never inside a character.
 @Test func aTempNameFitsTheNameLimit() {
     let id = UUID().uuidString
-    #expect(CopyRules.tempName(for: "notes.txt", transferID: id) == ".notes.txt.transfer-\(id)")
+    #expect(KeepBothName.temp(for: "notes.txt", id: id) == ".notes.txt.transfer-\(id)")
     for name in [String(repeating: "a", count: 255), String(repeating: "é", count: 127), String(repeating: "😀", count: 63)] {
-        let temp = CopyRules.tempName(for: name, transferID: id)
+        let temp = KeepBothName.temp(for: name, id: id)
         #expect(temp.utf8.count <= 255 && temp.utf8.count > 250)
         #expect(temp.hasSuffix(".transfer-\(id)"))
         #expect(name.hasPrefix(temp.dropFirst().dropLast(".transfer-\(id)".count)))
@@ -96,7 +128,17 @@ import Testing
     #expect(KeepBothName.firstFree(existing: ["a0", "a1"], from: 0) { "a\($0)" } == "a2")
 }
 
-@Test func retriesOnlyDroppedConnectionsAndTimeouts() {
+/// A server's own message already says what went wrong; the label is not said twice, as
+/// "Permission denied: Permission denied" was.
+@Test func aServersMessageIsNotLabeledTwice() {
+    #expect(TransferError.permissionDenied("Permission denied").localizedDescription == "Permission denied")
+    #expect(TransferError.permissionDenied("").localizedDescription == "Permission denied")
+    #expect(TransferError.permissionDenied("notes.txt: Operation not permitted").localizedDescription == "Permission denied: notes.txt: Operation not permitted")
+    #expect(TransferError.noSuchFile("No such file").localizedDescription == "No such file")
+    #expect(TransferError.noSuchFile("/srv/gone").localizedDescription == "No such file: /srv/gone")
+}
+
+@Test func retriesOnlyDroppedConnectionsTimeoutsAndFilesThatChanged() {
     #expect(RetryPolicy.isRetryable(TransferError.connectionLost("closed")))
     #expect(RetryPolicy.isRetryable(TransferError.timeout("stat")))
     #expect(RetryPolicy.isRetryable(TransferError.changedOnServer("grows.bin")))
@@ -109,14 +151,26 @@ import Testing
 }
 
 @Test func cacheEvictionDropsTheOldestFirst() {
-    let entries = [
-        CacheEntry(id: "new", size: 40, lastUsed: Date(timeIntervalSince1970: 300)),
-        CacheEntry(id: "old", size: 40, lastUsed: Date(timeIntervalSince1970: 100)),
-        CacheEntry(id: "mid", size: 40, lastUsed: Date(timeIntervalSince1970: 200)),
+    let entries: [(id: String, size: UInt64, lastUsed: Date)] = [
+        ("new", 40, Date(timeIntervalSince1970: 300)),
+        ("old", 40, Date(timeIntervalSince1970: 100)),
+        ("mid", 40, Date(timeIntervalSince1970: 200)),
     ]
     #expect(CacheEviction.victims(entries, limit: 100) == ["old"])
     #expect(CacheEviction.victims(entries, limit: 50) == ["old", "mid"])
     #expect(CacheEviction.victims(entries, limit: 200).isEmpty)
+}
+
+/// The line a host-key probe reads back: hosts, key type, and key. A marker is skipped; a
+/// comment or a short line is no key.
+@Test func aKnownHostsLineReadsHostsTypeAndKey() {
+    let line = HostKeyLine(line: "  [box.example]:2200,10.0.0.9 ssh-ed25519  AAAAC3Nz comment ")
+    #expect(line == HostKeyLine(host: "[box.example]:2200,10.0.0.9", keyType: "ssh-ed25519", key: "AAAAC3Nz"))
+    #expect(line?.text == "[box.example]:2200,10.0.0.9 ssh-ed25519 AAAAC3Nz")
+    #expect(HostKeyLine(line: "@revoked box ssh-rsa AAAA")?.host == "box")
+    #expect(HostKeyLine(line: "# box ssh-rsa AAAA") == nil)
+    #expect(HostKeyLine(line: "box ssh-rsa") == nil)
+    #expect(HostKeyLine(line: " ") == nil)
 }
 
 @Test func socketNameIsShortAndStable() {
@@ -164,15 +218,17 @@ import Testing
 }
 
 @Test func syntaxPreviewKeepsItsOwnMarkupOutOfStrings() {
-    let html = SyntaxPreview.html(text: "const a = 'x' // note\nlet b = \"k\"", fileName: "a.js")
+    let html = SyntaxPreview.html(text: "const a = 'x' // note\nlet b = \"k\"")
     #expect(html.contains("<span class=\"k\">const</span> a = <span class=\"s\">'x'</span> <span class=\"c\">// note</span>"))
     #expect(html.contains("<span class=\"k\">let</span> b = <span class=\"s\">\"k\"</span>"))
     #expect(html.components(separatedBy: "<span").count == 6)
 }
 
 @Test func syntaxPreviewEscapesAndLeavesStringsWhole() {
-    let html = SyntaxPreview.html(text: "if (a < b) { return \"// not a comment\" }", fileName: "a.js")
+    let html = SyntaxPreview.html(text: "if (a < b) { return \"// not a comment\" }")
     #expect(html.contains("(a &lt; b)"))
+    // No title: it held the name's extension, a server's text, unescaped (SEC2-12).
+    #expect(!html.contains("<title>"))
     #expect(html.contains("<span class=\"s\">\"// not a comment\"</span>"))
     #expect(!html.contains("class=\"c\""))
 }
@@ -185,10 +241,30 @@ import Testing
     #expect(Units.bytes(999_499) == "999 kB")
     #expect(Units.bytes(999_500) == "1.0 MB")
     #expect(Units.bytes(1_500_000_000) == "1.5 GB")
-    #expect(Units.scale(0.0025, unit: "s") == "2.5 ms")
-    #expect(Units.scale(0.000_000_4, unit: "s") == "400 ns")
-    #expect(Units.scale(.infinity, unit: "B") == "??? B")
-    #expect(Units.scale(1e16, unit: "B") == "??? B")
+    #expect(Units.bytes(5) == "5.0 B")
+    #expect(Units.bytes(999_499_999_999_999) == "999 TB")
+    #expect(Units.bytes(10_000_000_000_000_000) == "??? B")
+    #expect(Units.bytes(.max) == "??? B")
+}
+
+@Test func everySizeReadsAsThreeCharactersWithinSixPercent() {
+    var random = SeededRandom(state: 3)
+    let scales: [Substring: Double] = ["B": 1, "kB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12]
+    for _ in 0..<20_000 {
+        let size = random.next() >> (random.next() % 64)
+        let text = Units.bytes(size)
+        guard !text.hasPrefix("???") else {
+            #expect(Double(size) >= 999.5e12, "\(size)")
+            continue
+        }
+        let parts = text.split(separator: " ")
+        #expect(text.prefix(3).count == 3 && text.dropFirst(3).first == " ", "\(size) \(text)")
+        guard let number = Double(parts[0]), let scale = scales[parts[1]] else {
+            Issue.record("\(size) reads \(text)")
+            continue
+        }
+        #expect(abs(number * scale - Double(size)) <= 0.06 * max(1, Double(size)), "\(size) \(text)")
+    }
 }
 
 @Test func clipTextNamesASingleItem() {
@@ -239,13 +315,14 @@ import Testing
 
 @Test func moveCheckFindsWhatAMoveWouldLose() {
     let source: [TreeKey: TreeEntry] = ["": .directory, "a.txt": .file(size: 4, mtime: 9), "sub": .directory, "sub/b": .link]
-    #expect(MoveCheck.verdict(source: source, before: [:], after: source) == .remove)
+    let written: Set<TreeKey> = ["a.txt", "sub/b"]
+    #expect(MoveCheck.verdict(source: source, after: source, written: written) == .remove)
     var partial = source
     partial["a.txt"] = .file(size: 3, mtime: 9)
     partial["sub/b"] = nil
     partial["extra"] = .file(size: 1)
-    #expect(MoveCheck.verdict(source: source, before: [:], after: partial) == .incomplete(["a.txt", "sub/b"]))
-    #expect(MoveCheck.verdict(source: [:], before: [:], after: [:]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: partial, written: written) == .incomplete(["a.txt", "sub/b"]))
+    #expect(MoveCheck.verdict(source: [:], after: [:], written: []) == .incomplete([""]))
 }
 
 /// A FIFO, socket, or device walked as a plain empty file once let a move pass the check with
@@ -253,9 +330,9 @@ import Testing
 @Test func moveCheckNeverCountsASpecialFileAsCopied() {
     #expect(TreeEntry(RemoteItem(path: RemotePath(string: "/srv/fifo"), kind: .other, size: 0, mtime: 1)) == .other)
     let source: [TreeKey: TreeEntry] = ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .other]
-    #expect(MoveCheck.verdict(source: source, before: [:], after: source) == .incomplete(["fifo"]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .file(size: 0)]) == .incomplete(["fifo"]))
-    #expect(MoveCheck.verdict(source: ["": .other], before: [:], after: ["": .other]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: source, written: Set(source.keys)) == .incomplete(["fifo"]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .directory, "a.txt": .file(size: 4, mtime: 9), "fifo": .file(size: 0)], written: ["a.txt", "fifo"]) == .incomplete(["fifo"]))
+    #expect(MoveCheck.verdict(source: ["": .other], after: ["": .other], written: []) == .incomplete([""]))
     var tally = ClipTally()
     tally.add(root: .other)
     tally.add(root: .directory)
@@ -270,15 +347,15 @@ import Testing
 @Test func moveCheckTellsAFileAlreadyThereFromTheCopy() {
     let source: [TreeKey: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
     let copy: [TreeKey: TreeEntry] = ["": .file(size: 4, mtime: 1_700_000_000)]
-    #expect(MoveCheck.verdict(source: source, before: [:], after: copy) == .remove)
-    #expect(MoveCheck.verdict(source: source, before: copy, after: copy) == .alreadyThere([""]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4, mtime: 1_600_000_000)]) == .incomplete([""]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 4)]) == .incomplete([""]))
-    #expect(MoveCheck.verdict(source: source, before: [:], after: ["": .file(size: 5, mtime: 1_700_000_000)]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: copy, written: [""]) == .remove)
+    #expect(MoveCheck.verdict(source: source, after: copy, written: []) == .alreadyThere([""]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .file(size: 4, mtime: 1_600_000_000)], written: [""]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .file(size: 4)], written: [""]) == .incomplete([""]))
+    #expect(MoveCheck.verdict(source: source, after: ["": .file(size: 5, mtime: 1_700_000_000)], written: [""]) == .incomplete([""]))
     // A folder that was already there may be merged into; a file inside it that was there may not.
     let tree: [TreeKey: TreeEntry] = ["": .directory, "a": .file(size: 1, mtime: 2)]
-    #expect(MoveCheck.verdict(source: tree, before: ["": .directory], after: tree) == .remove)
-    #expect(MoveCheck.verdict(source: tree, before: tree, after: tree) == .alreadyThere(["a"]))
+    #expect(MoveCheck.verdict(source: tree, after: tree, written: ["a"]) == .remove)
+    #expect(MoveCheck.verdict(source: tree, after: tree, written: []) == .alreadyThere(["a"]))
 }
 
 /// Quit asks whenever it could lose something, including when the Live count never arrived.

@@ -6,8 +6,8 @@ import TransferCore
 /// Pastes and drops through `TransferEngine` against the local sshd, above all the moves, which
 /// delete: an original goes only once this move is proven to have written a complete copy of it.
 /// A second saved server for the same sshd stands in for an alias, an address, or a second host
-/// on a shared disk. Serialized for the same reason as `TransferServerTests`.
-@Suite(.serialized, .enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
+/// on a shared disk.
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct MoveServerTests {
     /// Move Item Here into the folder the items came from, copied through a second saved server
     /// for the same host, found each item "already there" and deleted the only copy (CLIP-01).
@@ -45,19 +45,56 @@ struct MoveServerTests {
                 for path in ["from/report.txt", "to/report.txt"] { try h.setTime(path, 1_700_000_000) }
                 let request = TransferRequest(.server(alias.connection.id, [source.appending("report.txt")]), into: destination, on: h.session.connection.id, moving: true)
 
-                let skip = Choosing(.skip)
+                let skip = TestPrompts(collision: .skip)
                 await #expect(throws: TransferKept([.init("report.txt", .alreadyThere)], moving: true, place: "on the other server")) {
                     try await OperationPrompts.$current.withValue(skip) { try await run(request, on: h.session, from: alias) }
                 }
-                #expect(skip.asked == 1)
+                #expect(skip.collisions == 1)
                 #expect(try h.read("from/report.txt") == "AAAA")
                 #expect(try h.read("to/report.txt") == "BBBB")
 
-                let replace = Choosing(.replace)
+                let replace = TestPrompts(collision: .replace)
                 try await OperationPrompts.$current.withValue(replace) { try await run(request, on: h.session, from: alias) }
-                #expect(replace.asked == 1)
+                #expect(replace.collisions == 1)
                 #expect(try h.read("to/report.txt") == "AAAA")
                 #expect(try h.names("from").isEmpty)
+            }
+        }
+    }
+
+    /// A lookalike that reached the destination during the copy, after the move's snapshot of it,
+    /// was answered Skip and then passed for the move's copy: the original was removed and only
+    /// the lookalike was left (XFR-01). Only what the move wrote counts now.
+    @Test func aLookalikeArrivingDuringTheCopyNeverPassesForIt() async throws {
+        try await withHarness("late", connected: true) { h in
+            try await withAlias(h) { alias in
+                let from = try h.folder("from", files: ["report.txt": "AAAA"])
+                try h.setTime("from/report.txt", 1_700_000_000)
+                let to = try h.folder("to")
+                let planted = Locked(false)
+                let scratch = Locked<[String]>([])
+                let scratchRoot = try Store(root: h.root).scratch.path
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("report.txt")]), into: to, on: h.session.connection.id, moving: true)
+                // During the download, someone else writes a file of the same size and time.
+                let engine = TransferEngine(request: request, destination: h.session) { _ in
+                    guard !planted.withLock({ defer { $0 = true }; return $0 }) else { return }
+                    try? h.write("to/report.txt", "BBBB")
+                    try? h.setTime("to/report.txt", 1_700_000_000)
+                    scratch.value = (try? FileManager.default.contentsOfDirectory(atPath: scratchRoot)) ?? []
+                }
+                let skip = TestPrompts(collision: .skip)
+                await #expect(throws: TransferKept([.init("report.txt", .alreadyThere)], moving: true, place: "on the other server")) {
+                    try await OperationPrompts.$current.withValue(skip) { try await engine.run(from: alias) }
+                }
+                #expect(planted.value)
+                #expect(skip.collisions == 1)
+                #expect(try h.read("from/report.txt") == "AAAA")
+                #expect(try h.read("to/report.txt") == "BBBB")
+                // The copy passed through the library's scratch folder, which the next launch
+                // empties if a crash leaves anything there (XFR-07, FR-1), and was removed.
+                #expect(scratch.value.count == 1)
+                #expect(try FileManager.default.contentsOfDirectory(atPath: scratchRoot).isEmpty)
+                #expect(try Store(root: h.root).localTemps().isEmpty)
             }
         }
     }
@@ -70,10 +107,10 @@ struct MoveServerTests {
                 let source = try h.folder("from", files: ["k.txt": "new", "dir/x.txt": "new x"])
                 let destination = try h.folder("to", files: ["k.txt": "old", "dir": nil])
                 try FileManager.default.createSymbolicLink(atPath: h.remote.appendingPathComponent("to/dir/x.txt").path, withDestinationPath: "elsewhere")
-                let keepBoth = Choosing(.keepBoth)
+                let keepBoth = TestPrompts(collision: .keepBoth)
                 let request = TransferRequest(.server(alias.connection.id, [source.appending("k.txt"), source.appending("dir")]), into: destination, on: h.session.connection.id, moving: true)
                 try await OperationPrompts.$current.withValue(keepBoth) { try await run(request, on: h.session, from: alias) }
-                #expect(keepBoth.asked == 2)
+                #expect(keepBoth.collisions == 2)
                 #expect(try h.read("to/k.txt") == "old")
                 #expect(try h.read("to/k 2.txt") == "new")
                 #expect(try h.read("to/dir/x 2.txt") == "new x")
@@ -94,11 +131,11 @@ struct MoveServerTests {
                 for path in ["from/p/VERSION", "from/q/VERSION"] { try h.setTime(path, 1_700_000_000) }
                 let destination = try h.folder("to")
                 let request = TransferRequest(.server(alias.connection.id, [from.appending("p").appending("VERSION"), from.appending("q").appending("VERSION")]), into: destination, on: h.session.connection.id, moving: true)
-                let skip = Choosing(.skip)
+                let skip = TestPrompts(collision: .skip)
                 await #expect(throws: TransferKept([.init("VERSION", .alreadyThere)], moving: true, place: "on the other server")) {
                     try await OperationPrompts.$current.withValue(skip) { try await run(request, on: h.session, from: alias) }
                 }
-                #expect(skip.asked == 1)
+                #expect(skip.collisions == 1)
                 #expect(try h.read("to/VERSION") == "one")
                 #expect(try h.names("from/p").isEmpty)
                 #expect(try h.read("from/q/VERSION") == "two")
@@ -113,13 +150,13 @@ struct MoveServerTests {
             }
             let sources = ["p", "q"].map { mac.appendingPathComponent($0).appendingPathComponent("VERSION") }
             let trashed = Locked<[URL]>([])
-            let skip = Choosing(.skip)
+            let skip = TestPrompts(collision: .skip)
             await #expect(throws: TransferKept([.init("VERSION", .alreadyThere)], moving: true, place: "on this Mac")) {
                 try await OperationPrompts.$current.withValue(skip) {
                     try await run(TransferRequest(.mac(sources), into: try h.folder("fromMac"), on: h.session.connection.id, moving: true), on: h.session, trash: { url in trashed.withLock { $0.append(url) } })
                 }
             }
-            #expect(skip.asked == 1)
+            #expect(skip.collisions == 1)
             #expect(trashed.value == [sources[0]])
             #expect(try h.read("fromMac/VERSION") == "one")
         }
@@ -134,10 +171,10 @@ struct MoveServerTests {
                 let from = try h.folder("from", files: ["p/k.txt": "p", "q/k.txt": "q"])
                 for path in ["from/p/k.txt", "from/q/k.txt"] { try h.setTime(path, 1_700_000_000) }
                 let destination = try h.folder("to", files: ["k.txt": "old"])
-                let keepBoth = Choosing(.keepBoth)
+                let keepBoth = TestPrompts(collision: .keepBoth)
                 let request = TransferRequest(.server(alias.connection.id, [from.appending("p").appending("k.txt"), from.appending("q").appending("k.txt")]), into: destination, on: h.session.connection.id, moving: true)
                 try await OperationPrompts.$current.withValue(keepBoth) { try await run(request, on: h.session, from: alias) }
-                #expect(keepBoth.asked == 2)
+                #expect(keepBoth.collisions == 2)
                 #expect(try h.read("to/k.txt") == "old")
                 #expect(try h.read("to/k 2.txt") == "p")
                 #expect(try h.read("to/k 3.txt") == "q")
@@ -181,13 +218,13 @@ struct MoveServerTests {
             try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: locked.path)
             let keep = try h.folder("keep", files: ["dir/x.txt": "other"])
             let merge = TransferRequest(.server(h.session.connection.id, [site.appending("dir")]), into: keep, on: h.session.connection.id, moving: false)
-            let keepBoth = Choosing(.keepBoth)
+            let keepBoth = TestPrompts(collision: .keepBoth)
             await #expect(throws: TransferError.self) {
                 try await OperationPrompts.$current.withValue(keepBoth) { try await run(merge, on: h.session) }
             }
             try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: locked.path)
             try await OperationPrompts.$current.withValue(keepBoth) { try await run(merge, on: h.session) }
-            #expect(keepBoth.asked == 1)
+            #expect(keepBoth.collisions == 1)
             #expect(try h.names("keep/dir") == ["locked.txt", "x 2.txt", "x.txt"])
         }
     }
@@ -306,6 +343,172 @@ struct MoveServerTests {
         }
     }
 
+    /// The save mark was read after the copy, so a Live save that landed while the item was being
+    /// copied, keeping its size and whole-second time, was in neither the copy nor the mark: the
+    /// original holding it was removed, and the edit was nowhere (XFR-04, LIV2-01).
+    @Test func aLiveSaveDuringTheCopyKeepsTheOriginal() async throws {
+        try await withHarness("lcopy", connected: true) { h in
+            try await withAlias(h) { alias in
+                let dir = try h.folder("from", files: ["dir/note.txt": "first"])
+                try h.setTime("from/dir/note.txt", 1_700_000_000)
+                let local = try await h.session.prepareLiveFile(dir.appending("dir").appending("note.txt"))
+                let saved = Locked(false)
+                let request = TransferRequest(.server(h.session.connection.id, [dir.appending("dir")]), into: try h.folder("to"), on: alias.connection.id, moving: true)
+                // The download's first progress holds the copy until the save is on the server.
+                let engine = TransferEngine(request: request, destination: alias) { _ in
+                    guard !saved.withLock({ defer { $0 = true }; return $0 }) else { return }
+                    let landed = DispatchSemaphore(value: 0)
+                    Task {
+                        let next = h.staging.appendingPathComponent("note.txt")
+                        try? Data("FIRST".utf8).write(to: next)
+                        try? FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000.5)], ofItemAtPath: next.path)
+                        _ = rename(next.path, local.path)
+                        _ = await waitUntil { (try? h.read("from/dir/note.txt")) == "FIRST" }
+                        _ = await waitUntil { await h.session.liveFiles().first?.dirty == false }
+                        landed.signal()
+                    }
+                    _ = landed.wait(timeout: .now() + 10)
+                }
+                await #expect(throws: TransferKept([.init("dir", .changed)], moving: true, place: "on the other server")) {
+                    try await engine.run(from: h.session)
+                }
+                #expect(saved.value)
+                #expect(try h.read("from/dir/note.txt") == "FIRST")
+                #expect(try Data(contentsOf: local) == Data("FIRST".utf8))
+                #expect(await h.session.liveFiles().count == 1)
+            }
+        }
+    }
+
+    /// A move on one server is one rename per item, which never replaces, and a folder is never
+    /// moved into itself (TD2-04).
+    @Test func aMoveOnOneServerRenamesAndNeverReplaces() async throws {
+        try await withHarness("rename", connected: true) { h in
+            let from = try h.folder("from", files: ["a.txt": "a", "dir/c.txt": "c"])
+            let to = try h.folder("to")
+            let id = h.session.connection.id
+            try await run(TransferRequest(.server(id, [from.appending("a.txt"), from.appending("dir")]), into: to, on: id, moving: true), on: h.session)
+            #expect(try h.names("from").isEmpty)
+            #expect(try h.read("to/a.txt") == "a")
+            #expect(try h.read("to/dir/c.txt") == "c")
+            #expect(h.prompts.collisions == 0)
+
+            let into = to.appending("dir")
+            await #expect(throws: TransferError.self) { try await run(TransferRequest(.server(id, [into]), into: into, on: id, moving: true), on: h.session) }
+            await #expect(throws: TransferError.self) { try await run(TransferRequest(.server(id, [to]), into: into, on: id, moving: true), on: h.session) }
+            #expect(try h.names("to") == ["a.txt", "dir"])
+            #expect(try h.names("to/dir") == ["c.txt"])
+        }
+    }
+
+    /// A rename whose reply was lost did its work, and the retry of the paste found the name taken
+    /// and went on to copy an original that was gone (FR-15). The retry now counts the item moved.
+    @Test func aRetryAfterALostRenameReplyFindsTheItemMoved() async throws {
+        try await withHarness("lost", connected: true) { h in
+            let id = h.session.connection.id
+            let from = try h.folder("from", files: ["a.txt": "a"])
+            let to = try h.folder("to")
+            try FileManager.default.moveItem(at: h.remote.appendingPathComponent("from/a.txt"), to: h.remote.appendingPathComponent("to/a.txt"))
+            try await run(TransferRequest(.server(id, [from.appending("a.txt")]), into: to, on: id, moving: true), on: h.session)
+            #expect(try h.names("from").isEmpty)
+            #expect(try h.names("to") == ["a.txt"])
+            #expect(try h.read("to/a.txt") == "a")
+            #expect(h.prompts.collisions == 0)
+        }
+    }
+
+    /// A move on one server onto a name the folder held failed red with "already exists" instead
+    /// of asking (UIB-02). It now asks, as every other route does: Skip keeps both, Keep Both and
+    /// Replace move it, and a folder merges; the original goes only once its copy is verified.
+    @Test func aMoveOnOneServerOntoATakenNameAsks() async throws {
+        try await withHarness("taken", connected: true) { h in
+            let id = h.session.connection.id
+            let from = try h.folder("from", files: ["a.txt": "new", "dir/x.txt": "x"])
+            let to = try h.folder("to", files: ["a.txt": "old", "dir/y.txt": "y"])
+            let file = TransferRequest(.server(id, [from.appending("a.txt")]), into: to, on: id, moving: true)
+
+            let skip = TestPrompts(collision: .skip)
+            await #expect(throws: TransferKept([.init("a.txt", .alreadyThere)], moving: true, place: "on the server")) {
+                try await OperationPrompts.$current.withValue(skip) { try await run(file, on: h.session) }
+            }
+            #expect(skip.collisions == 1)
+            #expect(try h.read("from/a.txt") == "new")
+            #expect(try h.read("to/a.txt") == "old")
+
+            let keepBoth = TestPrompts(collision: .keepBoth)
+            try await OperationPrompts.$current.withValue(keepBoth) { try await run(TransferRequest(file.sources, into: to, on: id, moving: true), on: h.session) }
+            #expect(keepBoth.collisions == 1)
+            #expect(try h.read("to/a.txt") == "old")
+            #expect(try h.read("to/a 2.txt") == "new")
+            #expect(try h.names("from") == ["dir"])
+
+            try await run(TransferRequest(.server(id, [from.appending("dir")]), into: to, on: id, moving: true), on: h.session)
+            #expect(try h.names("to/dir") == ["x.txt", "y.txt"])
+            #expect(try h.names("from").isEmpty)
+
+            try h.write("from/b.txt", "new b")
+            try h.write("to/b.txt", "old b")
+            let replace = TestPrompts(collision: .replace)
+            try await OperationPrompts.$current.withValue(replace) {
+                try await run(TransferRequest(.server(id, [from.appending("b.txt")]), into: to, on: id, moving: true), on: h.session)
+            }
+            #expect(try h.read("to/b.txt") == "new b")
+            #expect(try h.names("from").isEmpty)
+            #expect(h.prompts.collisions == 0)
+        }
+    }
+
+    /// Two paths on one server can be one folder: moving an item into a link to its own folder
+    /// would copy it onto itself and remove the only copy. The probe folder refuses it.
+    @Test func aMoveOnOneServerIntoALinkToItsOwnFolderRemovesNothing() async throws {
+        try await withHarness("onelink", connected: true) { h in
+            let site = try h.folder("site", files: ["a.txt": "a"])
+            try FileManager.default.createSymbolicLink(atPath: h.remote.appendingPathComponent("alias").path, withDestinationPath: "site")
+            let id = h.session.connection.id
+            let replace = TestPrompts(collision: .replace)
+            await #expect(throws: TransferError.self) {
+                try await OperationPrompts.$current.withValue(replace) {
+                    try await run(TransferRequest(.server(id, [site.appending("a.txt")]), into: h.remotePath.appending("alias"), on: id, moving: true), on: h.session)
+                }
+            }
+            #expect(replace.collisions == 0)
+            #expect(try h.names("site") == ["a.txt"])
+            #expect(try h.read("site/a.txt") == "a")
+        }
+    }
+
+    /// A folder already at an item's name can be the item itself, reached another way: a bind
+    /// mount or one share at two paths, whose parents are different folders. Replace would copy
+    /// each file onto itself and the removal take the only copy (FR-14). A probe made in that
+    /// folder and found under the item refuses it, on one server and between two. Without root
+    /// there is no bind mount here: the item is a link to the folder, which the probe finds the
+    /// same way.
+    @Test func aMoveOntoAFolderThatIsTheItemItselfRemovesNothing() async throws {
+        try await withHarness("sameitem", connected: true) { h in
+            try await withAlias(h) { alias in
+                let to = try h.folder("to", files: ["x/f.txt": "f"])
+                _ = try h.folder("from")
+                let link = h.remote.appendingPathComponent("from/x").path
+                try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: "../to/x")
+                let item = h.remotePath.appending("from").appending("x")
+                let refused = TransferKept.Reason.failed("the folder of that name at the destination is this item itself, reached another way")
+                let replace = TestPrompts(collision: .replace)
+                for (source, place) in [(nil, "on the server"), (alias, "on the other server")] {
+                    let request = TransferRequest(.server((source ?? h.session).connection.id, [item]), into: to, on: h.session.connection.id, moving: true)
+                    await #expect(throws: TransferKept([.init("x", refused)], moving: true, place: place)) {
+                        try await OperationPrompts.$current.withValue(replace) { try await run(request, on: h.session, from: source) }
+                    }
+                    #expect(try h.names("to") == ["x"])
+                    #expect(try h.names("to/x") == ["f.txt"])
+                    #expect(try h.read("to/x/f.txt") == "f")
+                    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link) == "../to/x")
+                }
+                #expect(replace.collisions == 0)
+                #expect(try Store(root: h.root).remoteTemps(connection: h.session.connection.id).isEmpty)
+            }
+        }
+    }
+
     /// Files from this Mac go to the Trash only once their copy is verified; a folder holding a
     /// FIFO, which no copy can hold, stays. Moving a Mac folder onto itself on the server, which
     /// the local sshd serves from this very disk, removes nothing.
@@ -337,6 +540,23 @@ struct MoveServerTests {
             }
             #expect(trashed.value == [pack])
             #expect(try h.names("site") == ["s.txt"])
+        }
+    }
+
+    /// A folder from this Mac pasted into a folder inside itself, on a server that reaches this
+    /// Mac's disk (a NAS mounted in Finder, or here the local sshd), copied its own output about a
+    /// hundred levels deep before failing (XFR-02). It is refused, and a copy elsewhere goes ahead.
+    @Test func aFolderFromThisMacIsNeverCopiedIntoItself() async throws {
+        try await withHarness("macself", connected: true) { h in
+            _ = try h.folder("site", files: ["a.txt": "a", "sub/b.txt": "b"])
+            let site = h.remote.appendingPathComponent("site")
+            let id = h.session.connection.id
+            await #expect(throws: TransferError.failed("“site” cannot be pasted into itself.")) {
+                try await run(TransferRequest(.mac([site]), into: h.remotePath.appending("site").appending("sub"), on: id, moving: false), on: h.session)
+            }
+            #expect(try h.names("site/sub") == ["b.txt"])
+            try await run(TransferRequest(.mac([site]), into: try h.folder("elsewhere"), on: id, moving: false), on: h.session)
+            #expect(try h.read("elsewhere/site/sub/b.txt") == "b")
         }
     }
 
@@ -390,25 +610,6 @@ private func withAlias(_ h: ServerHarness, _ body: (SSHConnection) async throws 
         throw error
     }
     await alias.disconnect()
-}
-
-/// Answers every collision with one choice and counts them.
-private final class Choosing: PromptSink {
-    let choice: NameCollisionChoice
-    private let count = Locked(0)
-
-    init(_ choice: NameCollisionChoice) {
-        self.choice = choice
-    }
-
-    var asked: Int { count.value }
-
-    func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
-    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
-        count.withLock { $0 += 1 }
-        return choice
-    }
 }
 
 private extension ServerHarness {

@@ -56,6 +56,8 @@ public struct ExtensionSettings: View {
                         try? await Task.sleep(for: .milliseconds(400))
                         if !Task.isCancelled { save() }
                     }
+                    // Leaving the tab or closing Settings cancels that pause; what was typed is saved still.
+                    .onDisappear { if let saved, text != saved { save() } }
             } header: {
                 Text("Editable extensions")
             } footer: {

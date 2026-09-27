@@ -9,7 +9,7 @@ import TransferCore
 /// events and from renames onto the server file (inode changes), and every distinct content the
 /// server held along the way. A tool that fails prints one `MATRIX` line. Waits are on the Live
 /// worker going idle, not on fixed sleeps, except where the timing is the scenario.
-@Suite(.serialized, .enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct EditorMatrix {
     private struct LiveCase {
         let local: URL
@@ -76,28 +76,15 @@ struct EditorMatrix {
 
     static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
-    @discardableResult
-    private func run(_ tool: String, _ arguments: [String], sourceLocation: SourceLocation = #_sourceLocation) throws -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: tool)
-        process.arguments = arguments
-        process.standardInput = FileHandle.nullDevice
-        let errors = Pipe()
-        process.standardError = errors
-        process.standardOutput = FileHandle.nullDevice
-        try process.run()
-        let deadline = Date().addingTimeInterval(20)
-        while process.isRunning, Date() < deadline { usleep(10_000) }
-        if process.isRunning { process.terminate() }
-        process.waitUntilExit()
-        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        if process.terminationStatus != 0 { print("MATRIX tool \(tool) \(arguments) exited \(process.terminationStatus): \(stderr)") }
-        #expect(process.terminationStatus == 0, "\(tool) failed: \(stderr)", sourceLocation: sourceLocation)
-        return process.terminationStatus
+    /// Awaits the tool without holding a thread, as the matrix runs its cases side by side.
+    private func run(_ tool: String, _ arguments: [String], sourceLocation: SourceLocation = #_sourceLocation) async throws {
+        let result = try await Subprocess.run(tool, arguments, timeout: .seconds(20))
+        if result.status != 0 { print("MATRIX tool \(tool) \(arguments) exited \(result.status): \(result.stderr)") }
+        #expect(result.status == 0, "\(tool) failed: \(result.stderr)", sourceLocation: sourceLocation)
     }
 
-    private func python(_ script: String, _ arguments: [String]) throws {
-        try run("/usr/bin/python3", ["-c", script] + arguments)
+    private func python(_ script: String, _ arguments: [String]) async throws {
+        try await run("/usr/bin/python3", ["-c", script] + arguments)
     }
 
     private let vimText = Data("line one\nanother one\nnothing here\n".utf8)
@@ -112,7 +99,7 @@ struct EditorMatrix {
             var args = ["-Nu", "NONE", "-n", "-es"]
             if backupcopy != "default" { args += ["-c", "set backupcopy=\(backupcopy)"] }
             args += ["-c", "%s/one/two/", "-c", "wq", c.local.path]
-            try run("/usr/bin/vim", args)
+            try await run("/usr/bin/vim", args)
             #expect(try Data(contentsOf: c.local) == vimDone)
             await expectSynced("1 vim backupcopy=\(backupcopy)", h, c, vimDone)
             noStrays("1 vim backupcopy=\(backupcopy)", h, allowed: ["note.txt"])
@@ -125,7 +112,7 @@ struct EditorMatrix {
         try await withHarness("vimswap", connected: true) { h in
             let c = try await open(h, "note.txt", vimText)
             // No -n: vim makes .note.txt.swp itself, writes, and removes it.
-            try run("/usr/bin/vim", ["-Nu", "NONE", "-es", "-c", "set updatecount=1", "-c", "%s/one/two/", "-c", "w", "-c", "q", c.local.path])
+            try await run("/usr/bin/vim", ["-Nu", "NONE", "-es", "-c", "set updatecount=1", "-c", "%s/one/two/", "-c", "w", "-c", "q", c.local.path])
             await expectSynced("2 vim real swap", h, c, vimDone)
             noStrays("2 vim real swap", h, allowed: ["note.txt"])
         }
@@ -144,7 +131,7 @@ struct EditorMatrix {
             }
             await quiesce(h)
             #expect(h.events.succeeded(c.path) == 0, "swap churn alone uploaded the file")
-            try run("/usr/bin/vim", ["-Nu", "NONE", "-n", "-es", "-c", "%s/one/two/", "-c", "wq", c.local.path])
+            try await run("/usr/bin/vim", ["-Nu", "NONE", "-n", "-es", "-c", "%s/one/two/", "-c", "wq", c.local.path])
             try Data(repeating: 9, count: 100).write(to: swap)
             try FileManager.default.removeItem(at: swap)
             await expectSynced("2 vim fake swap", h, c, vimDone)
@@ -158,7 +145,7 @@ struct EditorMatrix {
         try await withHarness("vscode", connected: true) { h in
             let c = try await open(h, "app.js", Data("let a = 1\n".utf8))
             let final = Data("let a = 2\nlet b = 3\n".utf8)
-            try python("import sys\nopen(sys.argv[1],'w').write(sys.argv[2])", [c.local.path, String(decoding: final, as: UTF8.self)])
+            try await python("import sys\nopen(sys.argv[1],'w').write(sys.argv[2])", [c.local.path, String(decoding: final, as: UTF8.self)])
             await expectSynced("3 in-place small", h, c, final)
         }
     }
@@ -195,7 +182,7 @@ struct EditorMatrix {
             let source = h.staging.appendingPathComponent("final.bin")
             try final.write(to: source)
             // Ten chunks, 100 ms apart, each flushed and fsynced: about a second of writing.
-            try python(Self.chunkedWriter, [c.local.path, source.path, "10", "0.1", "-1", "0"])
+            try await python(Self.chunkedWriter, [c.local.path, source.path, "10", "0.1", "-1", "0"])
             await expectSynced("3 in-place 5MB chunked", h, c, final)
         }
     }
@@ -208,7 +195,7 @@ struct EditorMatrix {
             let final = bigData(5_000_000, seed: 4)
             let source = h.staging.appendingPathComponent("final.bin")
             try final.write(to: source)
-            try python(Self.chunkedWriter, [c.local.path, source.path, "10", "0.1", "4", "1.2"])
+            try await python(Self.chunkedWriter, [c.local.path, source.path, "10", "0.1", "4", "1.2"])
             let step = final.count / 10
             let chunks = Set((1..<10).map { Self.digest(final.prefix($0 * step)) })
             await expectSynced("3 in-place 5MB with a stall", h, c, final, allowed: chunks, maxUploads: nil)
@@ -222,7 +209,7 @@ struct EditorMatrix {
         try await withHarness("atomic", connected: true) { h in
             let c = try await open(h, "main.go", Data("package main\n".utf8))
             let final = Data("package main\n\nfunc main() {}\n".utf8)
-            try python("""
+            try await python("""
             import sys, os, tempfile
             path, text = sys.argv[1], sys.argv[2]
             d, n = os.path.split(path)
@@ -322,22 +309,22 @@ struct EditorMatrix {
         try await withHarness("meta", connected: true) { h in
             let c = try await open(h, "meta.txt", Data("unchanged\n".utf8))
             await quiesce(h)
-            try run("/usr/bin/touch", [c.local.path])
+            try await run("/usr/bin/touch", [c.local.path])
             await quiesce(h)
             // A pass saw the touch: it recorded the new time and uploaded nothing.
             let touched = LiveSync.stamp(c.local)?.mtime.timeIntervalSinceReferenceDate
             let rows = await h.session.store.liveFiles()
             #expect(rows.first?.syncedMtime == touched, "no pass restamped the touched copy")
-            try run("/bin/chmod", ["644", c.local.path])
+            try await run("/bin/chmod", ["644", c.local.path])
             await quiesce(h)
-            try run("/usr/bin/xattr", ["-w", "com.test", "x", c.local.path])
+            try await run("/usr/bin/xattr", ["-w", "com.test", "x", c.local.path])
             await quiesce(h)
             c.watch.stop()
             let file = await h.session.liveFiles().first
             #expect(h.events.succeeded(c.path) == 0)
             #expect(c.watch.renames == 0)
             #expect(file?.dirty == false && file?.uploading == false && file?.conflict == false)
-            #expect(await h.session.unsyncedLiveCount == 0)
+            #expect(await h.live.unsyncedCount(on: h.session.connection.id) == 0)
         }
     }
 
@@ -364,7 +351,7 @@ struct EditorMatrix {
         try await withHarness("pend", connected: true) { h in
             let c = try await open(h, "gone.txt", Data("before\n".utf8))
             try await Task.sleep(nanoseconds: 1_500_000_000)
-            try run("/usr/bin/touch", [c.local.path])
+            try await run("/usr/bin/touch", [c.local.path])
             try await Task.sleep(nanoseconds: UInt64(deleteAfter) * 1_000_000)
             try FileManager.default.removeItem(at: c.local)
             try await Task.sleep(nanoseconds: 900_000_000)
@@ -384,7 +371,7 @@ struct EditorMatrix {
             let swap = c.local.deletingLastPathComponent().appendingPathComponent(".gone.txt.swp")
             try await Task.sleep(nanoseconds: 1_500_000_000)
             let t0 = ContinuousClock.now
-            try run("/usr/bin/touch", [c.local.path])
+            try await run("/usr/bin/touch", [c.local.path])
             try await Task.sleep(until: t0 + .milliseconds(560), clock: .continuous)
             try Data(repeating: 1, count: 4096).write(to: swap)
             try await Task.sleep(until: t0 + .milliseconds(unlinkAt), clock: .continuous)
@@ -404,7 +391,10 @@ struct EditorMatrix {
         try await withHarness("conflict", connected: true) { h in
             let c = try await open(h, "note.txt", Data("first\n".utf8))
             let remoteEdit = Data("remote-edit\n".utf8)
-            try remoteEdit.write(to: c.remoteFile)
+            // In place with one longer write: truncating first let the watch see an empty file.
+            let other = try FileHandle(forWritingTo: c.remoteFile)
+            try other.write(contentsOf: remoteEdit)
+            try other.close()
             try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)], ofItemAtPath: c.remoteFile.path)
             let mine = Data("mine, saved in place\n".utf8)
             try mine.write(to: c.local)

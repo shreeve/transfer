@@ -2,6 +2,90 @@
 
 What changed in each release of Transfer. `Scripts/release.sh <version>` publishes that version's section as the GitHub release notes and as the notes Sparkle shows in the update dialog, and refuses to release a version that has no section here. Changes not yet released collect under Unreleased, whose heading becomes the version's when it ships.
 
+## 0.3.0 — 2026-09-26
+
+A second pass over the whole app. It closes a way for a server's script to run on a double-click and a way for a `ProxyJump` host to get a saved password, fixes rare ways to lose an edit or an original, and changes a few behaviors (listed below). The library's format does not change: 0.2.0 and 0.1.7 still open it.
+
+### Data safety
+
+- A move no longer removes an original when a file that looks like its copy reached the destination during the copy and you chose Skip: a file counts as the copy only where this move wrote it.
+- A Live save made while a move between servers is copying keeps the original, including a save whose reply was lost.
+- A Live upload no longer makes a document-based editor, such as TextEdit, save text you had not saved yet and upload it.
+- A Live save no longer replaces another writer's file that happens to have the edit's size and modification second; that is a conflict. An edit refused because the server's file changed can no longer be marked synced later without having uploaded.
+- Reopening a Live file that an editor re-saved unchanged picks up the server's newer version, instead of leaving you to edit old bytes into a conflict.
+- Live files survive a moved or restored library folder: unsynced edits are no longer forgotten, and a damaged record can never delete anything outside Transfer's Live folder.
+- A file a replace set aside, including one Transfer 0.2.0 set aside, is never deleted if you go back to Transfer 0.1.7.
+- A folder listing no longer stops at a page holding only names Transfer drops (such as `.` and `..`), so a folder copy no longer reports success with files missing.
+- A file shortened on the server while it downloads is read again instead of being saved short.
+- Moving a folder onto a folder of the same name that is the folder itself, reached another way (a bind mount, or one network share at two paths), is refused instead of copying it onto itself and removing the only copy.
+- Pasting a Mac folder into a folder inside itself, through a server that reaches this Mac's disk, is refused instead of copying itself about a hundred levels deep.
+
+### Security
+
+- A `.command` or script opened Live no longer runs in Terminal without Gatekeeper's check: Live copies are quarantined like every other download, and a file whose default app would run it opens in the text editor (see Behavior changes). A Live `.command` or `.tool`, which Gatekeeper lets no app open while quarantined, is instead written without the execute bit.
+- A saved password answers only the prompt ssh itself writes for that server, so a `ProxyJump` host can no longer get it by asking for it by name.
+- A password typed into a login sheet that was withdrawn, and its Save in Keychain, no longer fill in the next login sheet, which could be another server's.
+- A server that lists wrong or missing sizes can no longer fill the disk: copying for the Finder stops staging at 1 GB actually received, and the inspector previews a file only up to 8 MB whatever its listing said. A huge listed size no longer crashes a copy or a drag to the Finder.
+- The launch removes a leftover download temp only when it is a file with a temp's name, so a copied or edited library cannot make it delete a folder. Copies passing through this Mac, between servers or on a server without `copy-data`, go through a folder in Transfer's caches that each launch empties, instead of `$TMPDIR`.
+- A name holding a slash followed by a combining accent is refused as a file name, as any name with a slash is.
+- `xfer` shows C1 control characters in a file name as `?`, as it does other control characters, so a crafted name cannot drive the terminal.
+
+### Logins and reliability
+
+- A window that moves away or closes during a login no longer stops it for another window waiting on the same server; that window is asked instead.
+- After a server is edited or removed, windows, queued transfers, and pastes from it use its current settings: the old login can no longer start again and end the new one. Saving a server without changes no longer cancels a login in progress.
+- Clicking a star, Live file, or conflict while the window logs in to another server no longer cancels that login.
+- The title names the server as soon as its login lands, and a Live conflict found during the login still gets its sheet.
+- Choosing Trust after leaving a host-key question up for a long time no longer fails the login with a timeout, and Cancel during the host-key check ends the login in about a second, not two.
+- A connection that drops at the very end of a login is retried instead of failing.
+- Browsing quickly no longer leaks the server's folder and file handles until it stops listing folders.
+- Retrying a move on one server after the connection dropped or timed out during a rename no longer fails on an item that had already moved, and the timeout ends the move instead of starting a copy.
+- An item a move kept because it changed during the move says to move it again: Retry keeps it again.
+- One file that changes on the server during a folder copy fails alone and is retried, instead of restarting the whole copy.
+- A library file whose version is damaged is refused with a message instead of crashing Transfer at every launch, and a saved server with a damaged id no longer shows up as one that cannot be edited or removed.
+- Right-clicking a folder that is not selected in column view opens its menu, instead of failing and leaving the view out of step. The right-click menu's Quick Look and Rename act on the item clicked, and Open Live works on a link to a file.
+- Escape in the search field gives the keyboard back to the files, and Command-F with the search item in the toolbar's overflow no longer turns off Return and Space. Clicking back into a search field that holds text keeps Space, Return, and Command-Delete in the field instead of acting on the files.
+- Finder's Stop always stops a drag's download.
+- Choosing Keep Local again after its upload's reply was lost clears the conflict, instead of raising it again over your own bytes.
+- Retry on a Live conflict's row keeps the conflict on the shelf, and two refused Live discards each ask in turn.
+- An Extensions edit made just before closing Settings is saved.
+- View → Clear Preview Cache works in a window with no server open.
+- Go to Remote Folder refuses a path holding a control character, instead of sending a NUL that ended the server's SFTP channel.
+- A server's error message shows as one short line, and a failed case-only rename shows the real reason.
+- The inspector names a transfer's state as the shelf does.
+
+### Performance
+
+- A preview, a view, or a Live open no longer waits behind a folder copy.
+- Copies return to full speed about 10 s after the server refused an extra channel (for example, while a Terminal tab was open), instead of staying slow to the end.
+- Select All in a large folder followed by a filter keystroke no longer stalls the window.
+- An editor slow to answer no longer stalls Live sync for every server.
+- Quick Look no longer fetches a large UTF-8 text file whole when its first 512 KB end inside a character.
+
+### Behavior changes
+
+- Every download is quarantined, Live working copies included, so macOS checks an app or script from a server before it first runs. A Live `.command` or `.tool` is the exception, as macOS would let no editor open it; it is written private and not executable instead.
+- A file whose default app would run it (Terminal, iTerm2, Ghostty, Python Launcher, or Jar Launcher) opens in the default text editor instead, whether opened Live or to view. Choosing such an app when Transfer asks which app opens a type no longer makes it the Mac's default for that type.
+- Copies opened to view or preview are read-only, so an editor says the file is locked instead of saving edits that never upload and are later overwritten.
+- A move on one server onto a name the destination already holds asks Replace, Keep Both, or Skip, instead of failing.
+- Saved servers are listed in Finder's order.
+- In icon view, Shift-click adds or removes an item, and clicking one of several selected items selects just that one, as in Finder. In list and icon view, once a folder has listed, the selection keeps only the items shown, so a filter never leaves items selected out of sight.
+- A click or drag on an item in a background window selects or drags it at once, as in Finder, instead of only bringing the window forward.
+- Rename selects a file's name up to its extension, as Finder does; a folder's whole name stays selected.
+- A folder's shortcut menu no longer offers Open Live or Quick Look.
+- The inspector shows the time in the Mac's own clock format, for example 24-hour; the date stays year-month-day.
+- Command-Delete in the filter or rename field edits the text instead of offering to delete files.
+- Open in Terminal says why when it does nothing.
+- Compare is offered for a Live conflict only up to 16 MB, so a huge file is no longer read whole.
+- Downloaded files take the server's permissions under your umask, as `sftp get` does.
+- `config.json` is written from the built-in defaults on first launch; the app no longer bundles a copy.
+
+### For maintainers
+
+- A `TransferUITests` target drives the real window model against fake sessions and a fake library; `swift test` runs it without a server.
+- With the local sshd, the full test run takes about 18 s instead of about 75: `EditorMatrix`, `MoveServerTests`, and `ThroughputServerTests` run their cases in parallel.
+- A file a replace set aside is recorded in the `temps` table under the owner `<uuid> aside`, which 0.1.7 and 0.2.0 never select; records 0.2.0 wrote are still read. There is no schema change.
+
 ## 0.2.0 — 2026-09-24
 
 A revamp of the whole app. Transfer looks much the same, but what it does with your files is safer, logins are sturdier, copies are much faster, and a few behaviors change (listed below). The library upgrades itself on first launch.

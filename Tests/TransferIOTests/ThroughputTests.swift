@@ -113,7 +113,7 @@ import TransferCore
         let parts = try DownloadParts(file, size: UInt64(content.count)) { _ in }
         try await server.channel.receive(Self.path, into: parts, matching: Fingerprint(size: 200_000, mtime: 8), helping: true)
         #expect(server.sent(SFTPCode.read).isEmpty)
-        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 1 })
         #expect(parts.nextRequest()?.offset == 0)
         await server.stop()
     }
@@ -160,7 +160,47 @@ import TransferCore
         #expect(server.sent(SFTPCode.fstat).count == 1)
         // The server answers in order, so once it has the CLOSE every READ reply is out, and none
         // is written into a pipe `stop` has closed.
-        #expect(await eventually { server.sent(SFTPCode.close).count == 1 })
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 1 })
+        await server.stop()
+    }
+
+    /// WIR-10: a file cut short on the server while it downloaded answered EOF before its listed
+    /// size and was placed as complete. An early EOF checks the file again: one that changed fails
+    /// as changed, which is retried; one still as listed (a pseudo-file) ends there.
+    @Test(arguments: [100_000, 200_000]) func anEarlyEndIsCheckedAgainstTheListing(sizeAtEnd: Int) async throws {
+        let content = Self.content(100_000)
+        let fstats = Locked(0)
+        let server = try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.open: return ScriptedServer.handle(request.id)
+            case SFTPCode.close: return ScriptedServer.ok(request.id)
+            case SFTPCode.fstat:
+                let size = fstats.withLock { count in
+                    defer { count += 1 }
+                    return count == 0 ? 200_000 : sizeAtEnd
+                }
+                return ScriptedServer.attrs(request.id, SFTPAttrs(size: UInt64(size), permissions: 0o100644, atime: 9, mtime: 9))
+            case SFTPCode.read:
+                var reader = ByteReader(request.body)
+                _ = try? reader.blob()
+                let offset = Int((try? reader.u64()) ?? 0)
+                let length = Int((try? reader.u32()) ?? 0)
+                return offset < content.count
+                    ? ScriptedServer.data(request.id, content.subdata(in: offset..<min(offset + length, content.count)))
+                    : ScriptedServer.status(request.id, SFTPCode.eof)
+            default: return nil
+            }
+        }
+        let file = Self.scratchFile()
+        defer { try? FileManager.default.removeItem(at: file) }
+        let download = { try await server.channel.download(Self.path, to: file, size: 200_000, matching: Fingerprint(size: 200_000, mtime: 9)) { _ in } }
+        if sizeAtEnd == 200_000 {
+            try await download()
+            #expect(try Data(contentsOf: file) == content)
+        } else {
+            await #expect(throws: TransferError.changedOnServer("file")) { try await download() }
+        }
+        #expect(await waitUntil { server.sent(SFTPCode.close).count == 1 })
         await server.stop()
     }
 
@@ -280,7 +320,7 @@ import TransferCore
 
 /// The same against the local sshd: small files share data channels and a large one never does,
 /// a large file moves over several channels at once, and a part that fails leaves no temp.
-@Suite(.serialized, .enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
 struct ThroughputServerTests {
     /// Small jobs share a channel, up to sixteen on one; a whole-channel job shares with nobody;
     /// and there are never more than seven data channels.
@@ -314,6 +354,42 @@ struct ThroughputServerTests {
             #expect(state.value.peak > SSHConnection.dataChannels)
             #expect(!state.value.overfull)
             #expect(!state.value.mixed)
+        }
+    }
+
+    /// A Live open, a view, and a preview downloaded over the data pool, whose waiters are served
+    /// in order, so the file the user waited on queued behind every job of a folder copy while the
+    /// interactive channel sat idle (SES2-02). Each now starts on the interactive channel.
+    @Test func aFileTheUserWaitsOnNeverQueuesBehindTheDataPool() async throws {
+        try await withHarness("lanejob", connected: true) { h in
+            try Data("hello".utf8).write(to: h.remote.appendingPathComponent("open.txt"))
+            let path = h.remotePath.appending("open.txt")
+            let item = try await h.session.stat(path)
+            let release = Locked(false)
+            let held = Locked(0)
+            let holders = Task {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for _ in 0..<(SSHConnection.dataChannels + 3) {
+                        group.addTask {
+                            try await h.session.withData { _ in
+                                held.withLock { $0 += 1 }
+                                while !release.value { try await Task.sleep(for: .milliseconds(20)) }
+                            }
+                        }
+                    }
+                    try await group.waitForAll()
+                }
+            }
+            // Let go after a while in any case, so a lane job stuck behind the pool fails, not hangs.
+            Task { try? await Task.sleep(for: .seconds(3)); release.value = true }
+            #expect(await waitUntil { held.value == SSHConnection.dataChannels })
+            let started = ContinuousClock.now
+            try await h.session.liveFetch(item, to: h.staging.appendingPathComponent("open.txt"), interactive: true)
+            _ = try await h.session.prepareViewFile(path)
+            _ = try await h.session.prepareInspectorPreview(path)
+            #expect(ContinuousClock.now - started < .seconds(2))
+            release.value = true
+            try await holders.value
         }
     }
 
@@ -356,13 +432,13 @@ struct ThroughputServerTests {
             try data.write(to: local)
             let when = Date(timeIntervalSince1970: 1_600_000_000)
             try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: local.path)
-            let before = try await passengers(h).count
+            let before = try await processes(h, " sftp").count
             let remote = h.remotePath.appending(name: Array("big.bin".utf8))
             try await h.session.upload(local, to: remote) { _ in }
             #expect(try Data(contentsOf: h.remote.appendingPathComponent("big.bin")) == data)
             let attributes = try FileManager.default.attributesOfItem(atPath: h.remote.appendingPathComponent("big.bin").path)
             #expect(attributes[.modificationDate] as? Date == when)
-            #expect(try await passengers(h).count >= before + 2)
+            #expect(try await processes(h, " sftp").count >= before + 2)
             let down = h.staging.appendingPathComponent("down.bin")
             try await h.session.download(remote, to: down) { _ in }
             #expect(try Data(contentsOf: down) == data)
@@ -402,12 +478,12 @@ struct ThroughputServerTests {
             try Data(count: size).write(to: local)
             try Data(count: size).write(to: h.remote.appendingPathComponent("there.bin"))
             // Four data channels, open and idle, so a transfer's parts start on all of them at once.
-            let reserved = Set(try await passengers(h).map(\.pid))
+            let reserved = Set(try await processes(h, " sftp").map(\.pid))
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for _ in 0..<4 { group.addTask { try await h.session.withData { _ in try await Task.sleep(for: .milliseconds(300)) } } }
                 try await group.waitForAll()
             }
-            let data = try await passengers(h).map(\.pid).filter { !reserved.contains($0) }
+            let data = try await processes(h, " sftp").map(\.pid).filter { !reserved.contains($0) }
             #expect(data.count == 4)
             let down = h.staging.appendingPathComponent("down")
             try FileManager.default.createDirectory(at: down, withIntermediateDirectories: true)
@@ -420,7 +496,7 @@ struct ThroughputServerTests {
                 for _ in 0..<4 { group.addTask { try await h.session.withData { _ in try await Task.sleep(for: .milliseconds(300)) } } }
                 try await group.waitForAll()
             }
-            let alive = try await passengers(h).map(\.pid).filter { !reserved.contains($0) }
+            let alive = try await processes(h, " sftp").map(\.pid).filter { !reserved.contains($0) }
             #expect(alive.count == 4)
             await #expect(throws: TransferError.self) {
                 try await h.session.upload(local, to: h.remotePath.appending(name: Array("up.bin".utf8)), progress: killingOne(alive))
@@ -434,16 +510,4 @@ struct ThroughputServerTests {
 private func killingOne(_ pids: [pid_t]) -> @Sendable (TransferProgress) -> Void {
     let victims = Locked(pids)
     return { _ in if let pid = victims.withLock({ $0.popLast() }) { kill(pid, SIGKILL) } }
-}
-
-/// The session's SFTP passengers: its reserved channels and its data channels.
-private func passengers(_ h: ServerHarness) async throws -> [(pid: pid_t, command: String)] {
-    let socket = h.root.appendingPathComponent("ssh/\(h.session.connection.id.socketName)").path
-    let listed = try await Subprocess.run("/bin/ps", ["-axwwo", "pid=,command="], timeout: .seconds(5))
-    return listed.stdout.split(separator: "\n").compactMap { line in
-        let text = line.trimmingCharacters(in: .whitespaces)
-        guard text.contains(socket), text.contains("/usr/bin/ssh"), text.contains(" sftp"),
-              let space = text.firstIndex(of: " "), let pid = pid_t(text[..<space]) else { return nil }
-        return (pid, String(text[space...]))
-    }
 }

@@ -143,6 +143,8 @@ struct ListTable: NSViewRepresentable {
             return cell
         }
 
+        func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { FirstMouseRowView() }
+
         private func makeCell(_ id: NSUserInterfaceItemIdentifier) -> NSTableCellView {
             let cell = NSTableCellView()
             cell.identifier = id
@@ -231,10 +233,7 @@ struct ListTable: NSViewRepresentable {
         }
 
         func tableView(_ tableView: NSTableView, acceptDrop info: any NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
-            guard let action = dropAction(for: info, onto: dropFolder(row: row, operation: dropOperation), model: model) else { return false }
-            let model = model
-            Task { await model.perform(action) }
-            return true
+            performDrop(info, onto: dropFolder(row: row, operation: dropOperation), model: model)
         }
 
         // MARK: Context menu
@@ -299,6 +298,12 @@ final class RowMenuTableView: NSTableView {
     }
 }
 
+/// A click on a row's icon, or past its last column, lands on the row view. It selects and drags in
+/// a background window too, as the table itself does and as Finder's rows do.
+final class FirstMouseRowView: NSTableRowView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 /// The list and column views' right-click menu: for the clicked item, already in the selection, or
 /// with no item, for the current folder, already the location with nothing selected.
 @MainActor
@@ -318,12 +323,14 @@ enum ItemMenu {
             return menu
         }
         add("Open") { Task { await model.open(item) } }
-        add("Open Live", enabled: item.kind == .file) { Task { await model.open(item, forceLive: true) } }
-        add("Quick Look") { model.showPreview() }
+        if item.kind != .directory {
+            add("Open Live", enabled: item.kind == .file || item.kind == .symlink) { Task { await model.open(item, forceLive: true) } }
+            add("Quick Look") { model.showPreview(item) }
+        }
         menu.addItem(.separator())
         add("Download Copy…") { Task { await model.downloadCopy() } }
         add("Duplicate") { Task { await model.duplicateSelection() } }
-        add("Rename") { model.beginRename() }
+        add("Rename") { model.beginRename(item) }
         let targets = model.dragItems(including: item).map(\.path)
         add(model.starTitle(targets)) { Task { await model.toggleStar(targets) } }
         add("Copy") { model.copySelection() }
@@ -359,23 +366,14 @@ enum Format {
         Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .abbreviated, time: .shortened)
     }
 
-    /// The inspector's date, `2026-08-31`, and its time, `2:44:07 PM`.
+    /// The inspector's date, `2026-08-31` in this Mac's time zone, and its time as the locale
+    /// writes it: `2:44:07 PM`, or `14:44:07`.
     static func day(_ mtime: UInt32) -> String {
-        dayFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(mtime)))
+        Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(Date.ISO8601FormatStyle(timeZone: .current).year().month().day())
     }
 
     static func clock(_ mtime: UInt32) -> String {
-        clockFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(mtime)))
-    }
-
-    private static let dayFormatter = fixed("yyyy-MM-dd")
-    private static let clockFormatter = fixed("h:mm:ss a")
-
-    private static func fixed(_ format: String) -> DateFormatter {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = format
-        return formatter
+        Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .omitted, time: .standard)
     }
 }
 

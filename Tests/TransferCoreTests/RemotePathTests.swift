@@ -20,10 +20,12 @@ struct RemotePathTests {
 
     /// Go to Remote Folder joined anything not starting with `/` onto the location as one name, so
     /// `~` and `~/x` looked for a folder named `~`, and `..` stayed in the path (UIM-32).
-    /// Rename and every local placement take a name only when it names one entry.
+    /// Rename and every local placement take a name only when it names one entry; a slash with a
+    /// combining mark after it was one Character, not "/", and passed.
     @Test func aSingleNameCannotReachAnotherEntry() {
         for name in ["notes.txt", ".hidden", "...", "a b", "café"] { #expect(RemotePath.isSingleName(name)) }
-        for name in ["", ".", "..", "a/b", "/", "../x", "a\0b"] { #expect(!RemotePath.isSingleName(name)) }
+        for name in ["", ".", "..", "a/b", "/", "../x", "a\0b", "a/\u{301}b"] { #expect(!RemotePath.isSingleName(name)) }
+        #expect(RemotePath.isSingleName(bytes: Data("x".utf8)) && !RemotePath.isSingleName(bytes: Data([0x61, 0x2F, 0xCC, 0x81])))
     }
 
     @Test func aTypedFolderIsAbsoluteHomeOrRelative() {
@@ -45,6 +47,15 @@ struct RemotePathTests {
         #expect(go("/a//b/../c") == "/a/c")
         #expect(go("") == nil)
         #expect(go("   ") == nil)
+    }
+
+    /// A pasted NUL reached the server, whose SFTP server exits on one, ending the channel (COR-2).
+    @Test func aTypedPathWithAControlCharacterGoesNowhere() {
+        let current = RemotePath(string: "/srv/site")
+        for text in ["/tmp/a\0b", "a\0", "~/x\ny", "/a\tb", "/a\u{7F}", "/a\u{85}b"] {
+            #expect(RemotePath.typed(text, from: current, home: current) == nil, "\(text.debugDescription)")
+        }
+        #expect(RemotePath.typed("/tmp/a b\n", from: current, home: current)?.display == "/tmp/a b")
     }
 
     @Test func appendingNeverMakesADoubleSlash() {
@@ -122,9 +133,50 @@ struct RemotePathTests {
         #expect(latin1.replacing(prefix: RemotePath(string: "/srv/a"), with: RemotePath(string: "/dst"))?.bytes == Array("/dst/".utf8) + [0xE9])
     }
 
+    /// Seeded random paths of slashes, dots, and bytes that are not UTF-8.
+    @Test func pathRulesHoldForAnyBytes() {
+        var random = SeededRandom(state: 1)
+        let pieces: [[UInt8]] = [[0x2F], [0x2F], [0x2E], [0x2E, 0x2E], Array("a".utf8), Array("b".utf8), [0xE9], [0xFF], [0x20], [0x00]]
+        func path(absolute: Bool = true) -> RemotePath {
+            var bytes: [UInt8] = absolute ? [0x2F] : []
+            for _ in 0..<random.next() % 8 { bytes += pieces[Int(random.next() % UInt64(pieces.count))] }
+            return RemotePath(bytes: bytes)
+        }
+        for _ in 0..<20_000 {
+            let absolute = random.next() % 4 != 0
+            let raw = path(absolute: absolute)
+            let normal = raw.normalized
+            #expect(normal.normalized == normal, "\(raw.bytes)")
+            guard absolute else { continue }
+            #expect(normal.bytes.first == 0x2F && !normal.bytes.split(separator: 0x2F).contains { $0 == [0x2E] || $0 == [0x2E, 0x2E] }, "\(raw.bytes)")
+            if let parent = normal.parent {
+                #expect(normal.isInside(parent))
+                #expect(parent.appending(name: normal.nameBytes) == normal, "\(normal.bytes)")
+            }
+            let prefix = path().normalized
+            guard normal.isInside(prefix) else { continue }
+            let destination = path().normalized
+            #expect(normal.replacing(prefix: prefix, with: prefix) == normal)
+            #expect(normal.replacing(prefix: prefix, with: destination)?.replacing(prefix: destination, with: prefix) == normal, "\(normal.bytes) \(prefix.bytes) \(destination.bytes)")
+        }
+    }
+
     @Test func anItemsNameIsItsPathsName() {
         let item = RemoteItem(path: RemotePath(string: "/srv/.env/"), kind: .file)
         #expect(item.name == ".env")
         #expect(item.isHidden)
+    }
+}
+
+/// SplitMix64, so a property test's inputs are the same on every run.
+struct SeededRandom: RandomNumberGenerator {
+    var state: UInt64
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
     }
 }

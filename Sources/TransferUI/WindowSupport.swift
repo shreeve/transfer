@@ -12,20 +12,43 @@ public extension FocusedValues {
 /// records the choice with Launch Services, so Transfer and Finder both remember it.
 @MainActor
 enum FileOpener {
+    /// Apps that run the file they open rather than show it.
+    nonisolated static let runners = Set(TerminalLauncher.apps.map(\.bundle) + ["org.python.PythonLauncher", "com.apple.JavaLauncher"])
+
+    /// The app, by bundle identifier, that opens a server's file in place of `defaultApp`, or nil
+    /// to keep it. The user opens a file to read or edit it, so one whose default app would run
+    /// it, as Terminal runs a `.command`, opens in the plain-text editor, or TextEdit when that
+    /// runs files too.
+    nonisolated static func editor(replacing defaultApp: String?, plainText: String?) -> String? {
+        guard runs(defaultApp) else { return nil }
+        if let plainText, !runners.contains(plainText) { return plainText }
+        return "com.apple.TextEdit"
+    }
+
+    /// Whether the app, by bundle identifier, runs what it opens. Picked in the chooser, it is
+    /// not made the type's default: Finder would then run every such file on a double-click.
+    nonisolated static func runs(_ app: String?) -> Bool {
+        app.map(runners.contains) ?? false
+    }
+
     /// Throws when no app opened the file, so the window can say so.
     static func open(_ url: URL) async throws {
+        let workspace = NSWorkspace.shared
         let ext = url.pathExtension
         let type = ext.isEmpty ? nil : UTType(filenameExtension: ext)
-        if let type, NSWorkspace.shared.urlForApplication(toOpen: type) == nil {
-            guard let app = chooseApplication(for: ext) else { return }
+        func bundle(_ app: URL?) -> String? { app.flatMap { Bundle(url: $0)?.bundleIdentifier } }
+        var app = workspace.urlForApplication(toOpen: url)
+        if let type, workspace.urlForApplication(toOpen: type) == nil {
+            guard let chosen = chooseApplication(for: ext) else { return }
             // The same thing Finder's "Always Open With" does: the default for this extension.
-            try? await NSWorkspace.shared.setDefaultApplication(at: app, toOpen: type)
-            _ = try await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
-            return
+            if !runs(bundle(chosen)) { try? await workspace.setDefaultApplication(at: chosen, toOpen: type) }
+            app = chosen
         }
-        guard NSWorkspace.shared.open(url) else {
-            throw TransferError.failed("No app could open “\(url.lastPathComponent)”.")
+        if let editor = editor(replacing: bundle(app), plainText: bundle(workspace.urlForApplication(toOpen: .plainText))) {
+            app = workspace.urlForApplication(withBundleIdentifier: editor)
         }
+        guard let app else { throw TransferError.failed("No app could open “\(url.lastPathComponent)”.") }
+        _ = try await workspace.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
     }
 
     private static func chooseApplication(for ext: String) -> URL? {

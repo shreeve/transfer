@@ -4,8 +4,19 @@ import TransferCore
 @testable import TransferIO
 
 /// The session layer's pure parts: how ssh's host-key refusals are read, known_hosts lines,
-/// fingerprints, which prompts a stored secret may answer, and the process runner.
+/// fingerprints, which prompts a stored secret may answer, the process runner, and the text of
+/// the link Tools/xfer prints.
 struct SessionUnitTests {
+    /// xfer showed a name's C1 controls (UTF-8 C2 80 to C2 9F, such as CSI) to the terminal as
+    /// they were (SEC2-09).
+    @Test func xferShowsNoControlCharacters() async throws {
+        let xfer = URL(fileURLWithPath: #filePath).appendingPathComponent("../../../Tools/xfer").standardized.path
+        let host = "box\u{1B}\u{9B}31m\u{9C}\u{A0}é"
+        let result = try await Subprocess.run("/bin/sh", [xfer, "/"], environment: ["LC_TRANSFER_HOST": host, "PATH": "/usr/bin:/bin"], timeout: .seconds(10))
+        #expect(result.status == 0)
+        #expect(result.stdout.contains("\u{1B}\\box??31m?\u{A0}é:/\u{1B}]8;;"))
+    }
+
     @Test func hostKeyFailuresAreReadFromSsh() {
         #expect(HostKeyFailure(sshErrors: """
             No ED25519 host key is known for [127.0.0.1]:2241 and you have requested strict checking.
@@ -55,6 +66,11 @@ struct SessionUnitTests {
         #expect(SSHConnection.storedSecretKind("Enter passphrase for key '/Users/alice/.ssh/id_ed25519': ", user: "alice", host: "box.example") == .passphrase)
         #expect(SSHConnection.storedSecretKind("alice@jump.example's password: ", user: "alice", host: "box.example") == nil)
         #expect(SSHConnection.storedSecretKind("(alice@box.example) Verification code: ", user: "alice", host: "box.example") == nil)
+        // A jump host chooses the text of its own keyboard-interactive prompt, after its own prefix.
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) alice@box.example's password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) (alice@box.example) Password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("Enter alice@box.example's old password: ", user: "alice", host: "box.example") == nil)
+        #expect(SSHConnection.storedSecretKind("(alice@jump.example) Enter passphrase for key '/k': ", user: "alice", host: "box.example") == nil)
     }
 
     /// Always Trust saves where `ssh -G` says; when `ssh -G` failed it says so rather than
@@ -98,6 +114,21 @@ struct SessionUnitTests {
         #expect(result.stdout == "out\n")
         #expect(result.stderr == "err\n")
     }
+
+    /// A login's question asked from a cancelled task gets the safe answer without asking any
+    /// window still waiting (FR-6).
+    @Test func aCancelledLoginAsksNobody() async {
+        let prompts = LoginPrompts()
+        let window = TestPrompts(.trustOnce)
+        prompts.join(UUID(), window)
+        let event = HostKeyEvent(situation: .firstSeen, keyType: "ssh-ed25519", fingerprint: "SHA256:x", line: "box ssh-ed25519 AAAA")
+        let asked = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await prompts.decideHostKey(event)
+        }
+        #expect(await asked.value == .cancel)
+        #expect(window.hostKeyEvents.isEmpty)
+    }
 }
 
 /// Login, host keys, and channels against the local sshd (`ServerHarness`).
@@ -105,12 +136,12 @@ struct SessionUnitTests {
 struct SessionServerTests {
     @Test func concurrentConnectsShareOneLogin() async throws {
         try await withHarness("single", knownHost: false) { h in
-            let prompts = RecordingPrompts(.trustOnce)
+            let prompts = TestPrompts(.trustOnce)
             async let first = h.session.connect(prompts: prompts)
             async let second = h.session.connect(prompts: prompts)
             let (a, b) = try await (first, second)
             #expect(a == b)
-            #expect(prompts.events.count == 1)
+            #expect(prompts.hostKeyEvents.count == 1)
             #expect(try await processes(h, "-N").count == 1)
             await h.session.disconnect()
             #expect(try await processes(h, "").isEmpty)
@@ -150,10 +181,30 @@ struct SessionServerTests {
             let first = Task { try await h.session.connect(prompts: stalled) }
             #expect(await waitUntil { stalled.asked.value > 0 })
             first.cancel()
-            let prompts = RecordingPrompts(.trustOnce)
+            let prompts = TestPrompts(.trustOnce)
             _ = try await h.session.connect(prompts: prompts)
-            #expect(prompts.events.count == 1)
+            #expect(prompts.hostKeyEvents.count == 1)
             await #expect(throws: TransferError.cancelled) { _ = try await first.value }
+        }
+    }
+
+    /// A window that leaves a login takes its question back with the safe answer. That is not a
+    /// Cancel from the window still waiting for the same login, which is asked in its place.
+    @Test func aQuestionTakenBackGoesToTheCallerStillWaiting() async throws {
+        try await withHarness("handover", knownHost: false) { h in
+            let leaving = StalledPrompts()
+            let first = Task { try await h.session.connect(prompts: leaving) }
+            #expect(await waitUntil { leaving.asked.value > 0 })
+            let staying = TestPrompts(.trustOnce)
+            let second = Task { try await h.session.connect(prompts: staying) }
+            try await Task.sleep(for: .milliseconds(200))
+            first.cancel()
+            try await Task.sleep(for: .milliseconds(100))
+            leaving.released.value = true
+            _ = try await second.value
+            #expect(staying.hostKeyEvents.count == 1)
+            #expect(await h.session.isConnected)
+            _ = await first.result
         }
     }
 
@@ -196,14 +247,14 @@ struct SessionServerTests {
     /// Trust Once writes no known-hosts file, and the next login asks again.
     @Test func trustOnceIsForOneLogin() async throws {
         try await withHarness("once", knownHost: false) { h in
-            let prompts = RecordingPrompts(.trustOnce)
+            let prompts = TestPrompts(.trustOnce)
             _ = try await h.session.connect(prompts: prompts)
             _ = try await h.session.stat(h.remotePath)
             #expect(!FileManager.default.fileExists(atPath: knownHosts(h).path))
             await h.session.disconnect()
             #expect(try loginScratch(h).isEmpty)
             _ = try await h.session.connect(prompts: prompts)
-            #expect(prompts.events.map(\.situation) == [.firstSeen, .firstSeen])
+            #expect(prompts.hostKeyEvents.map(\.situation) == [.firstSeen, .firstSeen])
         }
     }
 
@@ -227,8 +278,13 @@ struct SessionServerTests {
             try await connectKnown(h)
             let replacement = SSHConnection(connection: h.session.connection, store: try Store(root: h.root), editableExtensions: [],
                                             live: h.live, sshConfigFile: h.configFile.path, replacing: h.session)
-            _ = try await replacement.connect(prompts: RecordingPrompts(.cancel))
+            _ = try await replacement.connect(prompts: TestPrompts(.cancel))
             #expect(await h.session.isConnected == false)
+            // The old session, which a window may still hold, never logs in again: that login
+            // would take the socket and end the replacement's master.
+            await #expect(throws: SSHConnection.retiredError) { _ = try await h.session.connect(prompts: TestPrompts(.cancel)) }
+            #expect(!RetryPolicy.isRetryable(SSHConnection.retiredError))
+            #expect(await replacement.isConnected)
             await h.session.disconnect()
             try await killPassengers(h)
             _ = try await replacement.stat(h.remotePath)
@@ -245,18 +301,18 @@ struct SessionServerTests {
             let global = h.base.appendingPathComponent("global_known_hosts")
             try "\(try hostPattern()) \(try ServerHarness.hostKey())\n".write(to: global, atomically: true, encoding: .utf8)
             try writeConfig(h, global: global.path)
-            let prompts = RecordingPrompts(.cancel)
+            let prompts = TestPrompts(.cancel)
             _ = try await h.session.connect(prompts: prompts)
-            #expect(prompts.events.isEmpty)
+            #expect(prompts.hostKeyEvents.isEmpty)
         }
     }
 
     @Test func alwaysTrustHashesWhenAskedAndIsNotAskedAgain() async throws {
         try await withHarness("hashed", knownHost: false) { h in
             try writeConfig(h, extra: "HashKnownHosts yes")
-            let prompts = RecordingPrompts(.alwaysTrust)
+            let prompts = TestPrompts(.alwaysTrust)
             _ = try await h.session.connect(prompts: prompts)
-            let event = try #require(prompts.events.first)
+            let event = try #require(prompts.hostKeyEvents.first)
             #expect(event.situation == .firstSeen)
             let listed = try await Subprocess.run("/usr/bin/ssh-keygen", ["-lf", ServerHarness.hostKeyFile().path], timeout: .seconds(5))
             #expect(event.fingerprint == listed.stdout.split(separator: " ")[1].description)
@@ -265,9 +321,9 @@ struct SessionServerTests {
             #expect(!known.contains("127.0.0.1"))
             await h.session.disconnect()
 
-            let again = RecordingPrompts(.cancel)
+            let again = TestPrompts(.cancel)
             _ = try await h.session.connect(prompts: again)
-            #expect(again.events.isEmpty)
+            #expect(again.hostKeyEvents.isEmpty)
         }
     }
 
@@ -275,9 +331,9 @@ struct SessionServerTests {
         try await withHarness("changed") { h in
             let other = try await otherKey(h)
             try "\(try hostPattern()) \(other)\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
-            let prompts = RecordingPrompts(.replace)
+            let prompts = TestPrompts(.replace)
             _ = try await h.session.connect(prompts: prompts)
-            #expect(prompts.events.map(\.situation) == [.changed])
+            #expect(prompts.hostKeyEvents.map(\.situation) == [.changed])
             let known = try String(contentsOf: knownHosts(h), encoding: .utf8)
             #expect(!known.contains(other))
             #expect(known.contains(try ServerHarness.hostKey()))
@@ -287,9 +343,9 @@ struct SessionServerTests {
     /// Cancel on a first contact's key is a plain Cancel; Cancel on a changed key refuses it.
     @Test func cancellingAHostKeyQuestion() async throws {
         try await withHarness("hkcancel", knownHost: false) { h in
-            await #expect(throws: TransferError.cancelled) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            await #expect(throws: TransferError.cancelled) { _ = try await h.session.connect(prompts: TestPrompts(.cancel)) }
             try "\(try hostPattern()) \(try await otherKey(h))\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
-            await #expect(throws: TransferError.hostKeyRejected) { _ = try await h.session.connect(prompts: RecordingPrompts(.cancel)) }
+            await #expect(throws: TransferError.hostKeyRejected) { _ = try await h.session.connect(prompts: TestPrompts(.cancel)) }
             #expect(try await processes(h, "").isEmpty)
             #expect(try loginScratch(h).isEmpty)
         }
@@ -298,9 +354,9 @@ struct SessionServerTests {
     @Test func aRevokedKeyIsRefusedWithoutAQuestion() async throws {
         try await withHarness("revoked") { h in
             try "@revoked \(try hostPattern()) \(try ServerHarness.hostKey())\n".write(to: knownHosts(h), atomically: true, encoding: .utf8)
-            let prompts = RecordingPrompts(.alwaysTrust)
+            let prompts = TestPrompts(.alwaysTrust)
             await #expect(throws: TransferError.hostKeyRejected) { _ = try await h.session.connect(prompts: prompts) }
-            #expect(prompts.events.isEmpty)
+            #expect(prompts.hostKeyEvents.isEmpty)
             #expect(try await processes(h, "").isEmpty)
         }
     }
@@ -405,6 +461,84 @@ struct SessionServerTests {
         }
     }
 
+    /// After a data channel fails to open, as when sshd refuses one for MaxSessions (a Terminal
+    /// tab on the master), the pool grows back once 10 s have passed, although callers never stop
+    /// waiting meanwhile. The opens fail here through a config error, so no other suite reading
+    /// sshd's log sees a refusal.
+    @Test(.timeLimit(.minutes(1))) func thePoolGrowsBackAfterARefusalWhileCallersWait() async throws {
+        try await withHarness("regrow", connected: true) { h in
+            let config = try String(contentsOf: h.configFile, encoding: .utf8)
+            let state = Locked((inUse: 0, peak: 0, early: 0))
+            let open = Locked(0)
+            let broken = Locked(false)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<3 {
+                    group.addTask {
+                        try await h.session.withData { _ in
+                            open.withLock { $0 += 1 }
+                            while !broken.value { try await Task.sleep(for: .milliseconds(20)) }
+                        }
+                    }
+                }
+                #expect(await waitUntil { open.value == 3 })
+                try (config + "  NoSuchOption yes\n").write(to: h.configFile, atomically: true, encoding: .utf8)
+                broken.value = true
+                let started = ContinuousClock.now
+                for _ in 0..<(2 * SSHConnection.dataChannels) {
+                    group.addTask {
+                        while state.value.peak < SSHConnection.dataChannels, ContinuousClock.now - started < .seconds(15) {
+                            try await h.session.withData { _ in
+                                state.withLock {
+                                    $0.inUse += 1
+                                    $0.peak = max($0.peak, $0.inUse)
+                                    if ContinuousClock.now - started < .seconds(1) { $0.early = $0.peak }
+                                }
+                                try await Task.sleep(for: .milliseconds(50))
+                                state.withLock { $0.inUse -= 1 }
+                            }
+                        }
+                    }
+                }
+                try await Task.sleep(for: .seconds(1))
+                try config.write(to: h.configFile, atomically: true, encoding: .utf8)
+                try await group.waitForAll()
+            }
+            #expect(state.value.early == 3)
+            #expect(state.value.peak == SSHConnection.dataChannels)
+        }
+    }
+
+    /// A refusal while every open channel was held left the caller behind it waiting for one to be
+    /// given back, which a long copy may not do for minutes, though room came back 10 s later
+    /// (FR-3). The first in line now opens it once the backoff passes.
+    @Test(.timeLimit(.minutes(1))) func aCallerWaitingOutARefusalOpensOnceTheBackoffPasses() async throws {
+        try await withHarness("backoff", connected: true) { h in
+            let config = try String(contentsOf: h.configFile, encoding: .utf8)
+            let open = Locked(0)
+            let done = Locked(false)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for _ in 0..<3 {
+                    group.addTask {
+                        try await h.session.withData { _ in
+                            open.withLock { $0 += 1 }
+                            while !done.value { try await Task.sleep(for: .milliseconds(20)) }
+                        }
+                    }
+                }
+                #expect(await waitUntil { open.value == 3 })
+                try (config + "  NoSuchOption yes\n").write(to: h.configFile, atomically: true, encoding: .utf8)
+                let started = ContinuousClock.now
+                let waiter = Task { try await h.session.withData { _ in ContinuousClock.now - started } }
+                try await Task.sleep(for: .seconds(1))
+                try config.write(to: h.configFile, atomically: true, encoding: .utf8)
+                let waited = try await waiter.value
+                done.value = true
+                try await group.waitForAll()
+                #expect(waited >= .seconds(10))
+            }
+        }
+    }
+
     /// Dead reserved channels are reopened, as often as every 5 s; a live master with no channel
     /// is a lost connection, which transfers retry, and the master's death is reported.
     @Test func reservedChannelsReopenAndTheMastersDeathIsReported() async throws {
@@ -454,31 +588,17 @@ struct SessionServerTests {
 
 // MARK: Helpers
 
-/// Records every host-key question and gives one answer to all of them.
-private final class RecordingPrompts: PromptSink {
-    private let decision: HostKeyDecision
-    private let seen = Locked<[HostKeyEvent]>([])
-    var events: [HostKeyEvent] { seen.value }
-
-    init(_ decision: HostKeyDecision) { self.decision = decision }
-
-    func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
-    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
-        seen.withLock { $0.append(event) }
-        return decision
-    }
-    func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
-}
-
-/// A host-key sheet nobody answers, taken back when its question is cancelled.
+/// A host-key sheet nobody answers, taken back when its question is cancelled or when `released`
+/// is set, as a window's is when it moves away.
 private final class StalledPrompts: PromptSink {
     let asked = Locked(0)
     let withdrawn = Locked(0)
+    let released = Locked(false)
 
     func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
     func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision {
         asked.withLock { $0 += 1 }
-        do { try await Task.sleep(for: .seconds(120)) } catch { withdrawn.withLock { $0 += 1 } }
+        do { while !released.value { try await Task.sleep(for: .milliseconds(20)) } } catch { withdrawn.withLock { $0 += 1 } }
         return .cancel
     }
     func resolveCollision(fileName: String) async -> NameCollisionChoice? { nil }
@@ -524,9 +644,9 @@ private func otherKey(_ h: ServerHarness) async throws -> String {
 
 /// Logs in with the server's key already in known_hosts, asking nothing.
 private func connectKnown(_ h: ServerHarness) async throws {
-    let prompts = RecordingPrompts(.cancel)
+    let prompts = TestPrompts(.cancel)
     _ = try await h.session.connect(prompts: prompts)
-    #expect(prompts.events.isEmpty)
+    #expect(prompts.hostKeyEvents.isEmpty)
 }
 
 /// Rewrites the harness's ssh config: its own known_hosts, a global file, and `extra` lines.
@@ -539,22 +659,6 @@ private func writeConfig(_ h: ServerHarness, global: String = "/dev/null", extra
       \(extra)
 
     """.write(to: h.configFile, atomically: true, encoding: .utf8)
-}
-
-private func socketPath(_ h: ServerHarness) -> String {
-    h.root.appendingPathComponent("ssh/\(h.session.connection.id.socketName)").path
-}
-
-/// The ssh processes on this harness's control socket whose command line contains `marker`.
-private func processes(_ h: ServerHarness, _ marker: String) async throws -> [(pid: pid_t, command: String)] {
-    let socket = socketPath(h)
-    let listed = try await Subprocess.run("/bin/ps", ["-axwwo", "pid=,command="], timeout: .seconds(5))
-    return listed.stdout.split(separator: "\n").compactMap { line in
-        let text = line.trimmingCharacters(in: .whitespaces)
-        guard text.contains(socket), text.contains("/usr/bin/ssh"), marker.isEmpty || text.contains(marker),
-              let space = text.firstIndex(of: " "), let pid = pid_t(text[..<space]) else { return nil }
-        return (pid, String(text[space...]))
-    }
 }
 
 /// Kills every SFTP passenger and waits until their channels notice.

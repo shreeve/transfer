@@ -165,19 +165,29 @@ final class ScriptedServer: @unchecked Sendable {
         }
     }
 
+    /// Answers a listing of one folder with `pages`, one per READDIR, then EOF, and CLOSE with OK;
+    /// anything else fails.
+    static func listing(_ pages: [[[UInt8]]]) -> @Sendable (Request) -> Data? {
+        let next = Locked(0)
+        return { request in
+            switch request.type {
+            case SFTPCode.opendir: return handle(request.id)
+            case SFTPCode.readdir:
+                let page = next.withLock { count in
+                    defer { count += 1 }
+                    return count
+                }
+                return page < pages.count ? names(request.id, pages[page]) : status(request.id, SFTPCode.eof)
+            case SFTPCode.close: return ok(request.id)
+            default: return status(request.id, SFTPCode.failure)
+            }
+        }
+    }
+
     static var file: SFTPAttrs {
         var attrs = SFTPAttrs()
         attrs.size = 1
         attrs.permissions = 0o100644
         return attrs
     }
-}
-
-/// Polls `condition` until it holds or five seconds pass.
-func eventually(_ condition: () async -> Bool) async -> Bool {
-    for _ in 0..<500 {
-        if await condition() { return true }
-        try? await Task.sleep(nanoseconds: 10_000_000)
-    }
-    return await condition()
 }

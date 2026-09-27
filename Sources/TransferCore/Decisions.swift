@@ -30,11 +30,24 @@ public enum EditableFile {
     /// How much of a text file the inspector shows, and so all of it that is fetched.
     public static let previewHead = 64 << 10
 
+    /// The extension is what follows the last dot: ".env"'s is "env", and "notes." has none. A
+    /// name with no dot, such as "Makefile", matches the list by its whole name.
     public static func openKind(fileName: String, extensions: Set<String>) -> OpenKind {
-        let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
+        guard let dot = fileName.lastIndex(of: ".") else { return extensions.contains(fileName.lowercased()) ? .live : .view }
+        let ext = fileName[fileName.index(after: dot)...].lowercased()
+        guard !ext.isEmpty else { return .view }
         if extensions.contains(ext) { return .live }
         if let type = UTType(filenameExtension: ext), type.conforms(to: .plainText) || type.conforms(to: .sourceCode) { return .live }
         return .view
+    }
+
+    /// Whether a Live working copy is quarantined, as every other download is. A Terminal script
+    /// (`.command`, `.tool`) is not: Gatekeeper refuses to open a quarantined one in any app, an
+    /// editor too, so it could never be edited Live. The copy is 0600, so nothing runs it.
+    public static func quarantinesLiveCopy(fileName: String) -> Bool {
+        guard let dot = fileName.lastIndex(of: "."), let script = UTType("com.apple.terminal.shell-script"),
+              let type = UTType(filenameExtension: String(fileName[fileName.index(after: dot)...])) else { return true }
+        return !type.conforms(to: script)
     }
 }
 
@@ -53,17 +66,25 @@ public enum LiveConflictChoice: String, Sendable {
 
 /// Every name the app makes up so as not to take an existing one.
 public enum KeepBothName {
-    /// The first of `candidate(first)`, `candidate(first + 1)`, … that `existing` lacks.
-    public static func firstFree(existing: Set<String>, from first: Int = 1, _ candidate: (Int) -> String) -> String {
+    /// The first of `candidate(first)`, `candidate(first + 1)`, … whose `key` `existing` lacks.
+    public static func firstFree(existing: Set<String>, from first: Int = 1, key: (String) -> String = { $0 }, _ candidate: (Int) -> String) -> String {
         var n = first
-        while existing.contains(candidate(n)) { n += 1 }
+        while existing.contains(key(candidate(n))) { n += 1 }
         return candidate(n)
     }
 
+    /// The hidden temp beside `basename`: ".notes.txt.transfer-<id>". The name in it is cut, never
+    /// inside a character, so the temp fits the 255 bytes a file name may take even when
+    /// `basename` nearly does.
+    public static func temp(for basename: String, id: String = UUID().uuidString) -> String {
+        LiveDecision.siblingName(of: basename, prefix: ".", suffix: ".transfer-\(id)")
+    }
+
     /// Keep Both: "report 2.pdf", "report 3.pdf", …; a folder's whole name is kept: "v1.2 2".
-    public static func next(existing: Set<String>, original: String, isFolder: Bool = false) -> String {
+    /// `existing` holds names as `key` gives them.
+    public static func next(existing: Set<String>, original: String, isFolder: Bool = false, key: (String) -> String = { $0 }) -> String {
         let split = splitExtension(original, isFolder: isFolder)
-        return firstFree(existing: existing, from: 2) { "\(split.base) \($0)\(split.ext)" }
+        return firstFree(existing: existing, from: 2, key: key) { "\(split.base) \($0)\(split.ext)" }
     }
 
     /// Duplicate: "notes copy.txt", "notes copy 2.txt", …; a folder's whole name is kept: "v1.2 copy".
@@ -91,15 +112,6 @@ public enum KeepBothName {
             return (name, "")
         }
         return (String(name[..<dot]), String(name[dot...]))
-    }
-}
-
-public enum CopyRules {
-    /// The hidden temp beside `basename`: ".notes.txt.transfer-<id>". The name in it is cut, never
-    /// inside a character, so the temp fits the 255 bytes a file name may take even when
-    /// `basename` nearly does.
-    public static func tempName(for basename: String, transferID: String) -> String {
-        LiveDecision.siblingName(of: basename, prefix: ".", suffix: ".transfer-\(transferID)")
     }
 }
 
@@ -352,20 +364,20 @@ public enum ListingSort {
 
 public enum SyntaxPreview {
     /// A page for Quick Look, or when `compact`, a small unwrapped listing that follows the
-    /// system appearance for the inspector pane.
-    public static func html(text: String, fileName: String, compact: Bool = false, wraps: Bool = false) -> String {
+    /// system appearance for the inspector pane. The page has no title: Quick Look shows the
+    /// file's own name, and a server's name would go in unescaped.
+    public static func html(text: String, compact: Bool = false, wraps: Bool = false) -> String {
         let escaped = text
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
         let colored = color(escaped)
-        let ext = fileName.split(separator: ".").last.map(String.init)?.lowercased() ?? ""
         let body = compact
             ? "body{margin:6px 8px;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:\(wraps ? "pre-wrap" : "pre");overflow-wrap:anywhere;color:#1d1d1f;background:transparent;-webkit-user-select:text}"
                 + "@media(prefers-color-scheme:dark){body{color:#e5e5e7}.k{color:#6cb3ff}.s{color:#7ed49a}.c{color:#98989d}}"
             : "body{margin:24px;font:13px ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#1d1d1f;background:#fff}"
         return """
-        <!doctype html><html><head><meta charset="utf-8"><title>\(ext)</title>
+        <!doctype html><html><head><meta charset="utf-8">
         <style>
         \(body)
         .k{color:#0b4f9c;font-weight:600}.s{color:#0b6b3a}.c{color:#6e6e73}
@@ -395,33 +407,21 @@ public enum SyntaxPreview {
     }
 }
 
-/// Values in three characters, a space, and the unit with its SI prefix: `959 B`, `1.2 kB`,
-/// ` 14 kB`, `2.5 ms`. Sizes, rates, and times read the same way everywhere.
+/// Sizes in three characters, a space, and the unit with its SI prefix: `959 B`, `1.2 kB`,
+/// ` 14 kB`, the same everywhere.
 public enum Units {
-    public static func scale(_ value: Double, unit: String) -> String {
-        if value > 0, value.isFinite {
-            let span = ["T", "G", "M", "k", "", "m", "µ", "n", "p"]
-            var value = value
-            var slot = 4
-            while value < 0.995, slot < 8 {
-                value *= 1000
-                slot += 1
-            }
-            while value >= 999.5, slot > 0 {
-                value /= 1000
-                slot -= 1
-            }
+    public static func bytes(_ size: UInt64) -> String {
+        guard size > 0 else { return "  0 B" }
+        var value = Double(size)
+        for prefix in ["", "k", "M", "G", "T"] {
             if value < 999.5 {
                 let tenth = (value * 10).rounded() / 10
                 let digits = tenth >= 10 ? String(Int(value.rounded())) : String(format: "%.1f", tenth)
-                return String(repeating: " ", count: max(0, 3 - digits.count)) + digits + " " + span[slot] + unit
+                return String(repeating: " ", count: 3 - digits.count) + digits + " " + prefix + "B"
             }
+            value /= 1000
         }
-        return value == 0 ? "  0 \(unit)" : "??? \(unit)"
-    }
-
-    public static func bytes(_ size: UInt64) -> String {
-        scale(Double(size), unit: "B")
+        return "??? B"
     }
 }
 
@@ -441,23 +441,11 @@ public enum RetryPolicy {
     }
 }
 
-public struct CacheEntry: Hashable, Sendable {
-    public var id: String
-    public var size: UInt64
-    public var lastUsed: Date
-
-    public init(id: String, size: UInt64, lastUsed: Date) {
-        self.id = id
-        self.size = size
-        self.lastUsed = lastUsed
-    }
-}
-
 public enum CacheEviction {
     public static let previewLimit: UInt64 = 1_073_741_824
 
     /// Oldest entries first, until the rest fit under `limit`.
-    public static func victims(_ entries: [CacheEntry], limit: UInt64) -> [String] {
+    public static func victims(_ entries: [(id: String, size: UInt64, lastUsed: Date)], limit: UInt64) -> [String] {
         var total = entries.reduce(UInt64(0)) { $0 + $1.size }
         guard total > limit else { return [] }
         var removed: [String] = []
