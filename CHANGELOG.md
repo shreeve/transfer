@@ -2,6 +2,10 @@
 
 What changed in each release of Transfer. `Scripts/release.sh <version>` publishes that version's section as the GitHub release notes and as the notes Sparkle shows in the update dialog, and refuses to release a version that has no section here. Changes not yet released collect under Unreleased, whose heading becomes the version's when it ships.
 
+## Unreleased
+
+- In column view, Command-click and Shift-click select several folders in a column, as in Finder, so they can be copied, dragged, or deleted together; no column opens beside them.
+
 ## 0.3.0 — 2026-09-26
 
 A second pass over the whole app. It closes a way for a server's script to run on a double-click and a way for a `ProxyJump` host to get a saved password, fixes rare ways to lose an edit or an original, and changes a few behaviors (listed below). The library's format does not change: 0.2.0 and 0.1.7 still open it.

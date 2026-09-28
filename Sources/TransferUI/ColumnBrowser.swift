@@ -18,6 +18,10 @@ struct ColumnBrowser: NSViewRepresentable {
         browser.doubleAction = #selector(Coordinator.doubleClicked(_:))
         browser.sendsActionOnArrowKeys = true
         browser.allowsMultipleSelection = true
+        // A browser made in code starts with this off (measured on macOS 27), and then a column's
+        // table extends a selection only with leaves: Command- or Shift-clicking a second folder
+        // did nothing, so several folders could not be selected, copied, or dragged together.
+        browser.allowsBranchSelection = true
         browser.columnResizingType = .userColumnResizing
         browser.minColumnWidth = 180
         browser.setDefaultColumnWidth(TiledBrowser.columnWidth)
