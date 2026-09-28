@@ -2,7 +2,7 @@
 
 What changed in each release of Transfer. `Scripts/release.sh <version>` publishes that version's section as the GitHub release notes and as the notes Sparkle shows in the update dialog, and refuses to release a version that has no section here. Changes not yet released collect under Unreleased, whose heading becomes the version's when it ships.
 
-## Unreleased
+## 0.3.1 — 2026-09-27
 
 - In column view, Command-click and Shift-click select several folders in a column, as in Finder, so they can be copied, dragged, or deleted together; no column opens beside them.
 
