@@ -26,7 +26,7 @@ A rule with a decision in it belongs in Core, with a test.
 - Drags start in the AppKit views (`IconItemView`, `ListTable`, `TiledBrowser`) with `NSFilePromiseProvider`. A drop honors remote paths only from a drag this process started (`dropAction(for:onto:model:)`).
 - Finder pastes only file URLs: copied items are staged and their URLs added when complete. No file promise or lazy URL on the general pasteboard.
 - `transfer.sqlite` and `config.json` change only with an automatic forward migration (a step in `Store.migrate`, `Store.schemaVersion` raised) and a `StoreTests` case that opens a 0.1.7 library.
-- The Traps in `HANDOFF.md` were measured on macOS 27 and stay unless something proven better replaces them: the `-s` argument order, OpenSSH's SYMLINK order, the 104-byte socket path (`ConnectionID.socketName`), `-o` quoting, FSEvents timing, `.useConstraints`, `NSScrollPocket`, safe-area pinning, `NSBrowser` width, `validateDrop` for column −1, `selectRowIndexes` opening a column, hosting each column once, frame autosave names, and `handlesExternalEvents`.
+- The Traps in `HANDOFF.md` were measured on macOS 27 and stay unless something proven better replaces them: the `-s` argument order, OpenSSH's SYMLINK order, the 104-byte socket path (`ConnectionID.socketName`), `-o` quoting, FSEvents timing, `.useConstraints`, `NSScrollPocket`, safe-area pinning, `NSBrowser` width, `validateDrop` for column −1, `selectRowIndexes` opening a column, `allowsBranchSelection`, hosting each column once, frame autosave names, and `handlesExternalEvents`.
 - Fix a bug with a test in the lowest layer that can host it (Core, then IO without a server, then the server suites; the window model in `TransferUITests`). Never weaken a test to make it pass.
 
 ## Check
