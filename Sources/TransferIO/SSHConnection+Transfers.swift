@@ -413,7 +413,11 @@ extension SSHConnection {
                 }
             }
         case .file:
-            guard let placed = try await settleRemotely(incoming, at: destination, found: found, tally: tally) else { return tally.finished() }
+            guard let placed = try await settleRemotely(incoming, at: destination, found: found, tally: tally) else {
+                // Already there, as after a retry: its bytes count, so the row reaches its total.
+                guard case .file(let print?) = incoming else { return tally.finished() }
+                return tally.finished(bytes: print.size)
+            }
             let replacing = placed.found
             if tally.addingJob() { _ = try await group.next() }
             group.addTask {

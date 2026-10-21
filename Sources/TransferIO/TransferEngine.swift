@@ -297,7 +297,10 @@ struct TransferEngine {
                 placed = (target, nil)
             } else {
                 guard let settled = try await destination.settleRemotely(.file(Fingerprint(item: item)), at: target, found: found, tally: tally, reserved: reserved) else {
-                    return tally.finished()
+                    // Already there, as after a retry: counted as both its halves, so the row
+                    // reaches its total.
+                    let size = item.size ?? 0
+                    return tally.finished(bytes: size.saturatingAdd(size))
                 }
                 placed = settled
             }

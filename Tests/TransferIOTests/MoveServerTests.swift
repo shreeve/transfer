@@ -792,12 +792,18 @@ extension MoveServerTests {
                 let inodes = try h.inodes("to/dir", before)
 
                 _ = try await alias.connect(prompts: h.prompts)
-                let moved = Locked(UInt64(0))
-                var retry = TransferEngine(request: request, destination: h.session) { moved.value = $0.completed }
+                // The originals of what landed cannot be read now: a retry that came for them
+                // again would fail.
+                let originals = before.map { h.remote.appendingPathComponent("from/dir/\($0)").path }
+                for path in originals { try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: path) }
+                defer { for path in originals { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path) } }
+                let moved = Locked(TransferProgress(completed: 0))
+                var retry = TransferEngine(request: request, destination: h.session) { moved.value = $0 }
                 retry.relayLimits = RelayLimits(bytes: 64 << 10, jobs: 2)
                 try await retry.run(from: alias)
-                // Down and up once each for the 20 files that had not landed, and only those.
-                #expect(moved.value == 2 * UInt64(20 * size))
+                // The row reaches its total: what had landed counts too, down and up.
+                #expect(moved.value.completed == 2 * UInt64(40 * size))
+                #expect(moved.value.itemsCompleted == 40)
                 #expect(try h.inodes("to/dir", before) == inodes)
                 #expect(try h.names("to/dir") == order.sorted())
                 #expect(try h.read("to/dir/\(victim)") == String(repeating: "z", count: size))
