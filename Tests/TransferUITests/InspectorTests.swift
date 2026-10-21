@@ -235,6 +235,8 @@ struct InspectorTests {
     /// The toolbar's inspector toggle does what Command-I does, the split follows, and the
     /// choice is what the next window opens with.
     @Test func theToolbarToggleShowsTheInspectorAndIsRemembered() async throws {
+        // The split view saves to the runner's own domain; start from no save, whatever ran before.
+        UserDefaults.standard.removeObject(forKey: Self.splitFrames)
         let defaults = Defaults()
         let provider = FakeProvider([FakeSession(server)])
         let model = TransferModel(provider: provider, defaults: defaults.store)
@@ -262,6 +264,27 @@ struct InspectorTests {
         #expect(!defaults.store.bool(forKey: Preferences.showsInspector))
         #expect(await eventually { inspector.isCollapsed })
         #expect(!TransferModel(provider: provider, defaults: defaults.store).showsInspector)
+    }
+
+    static let splitFrames = "NSSplitView Subview Frames Transfer.Split"
+
+    /// A window closed while its inspector collapsed saves it open at width 0; the next window
+    /// still opens its inspector from the toolbar. Before the fix this alone, run after itself,
+    /// failed every other time.
+    @Test func anInspectorSavedMidCollapseStillOpens() async throws {
+        UserDefaults.standard.set(["0.000000, 0.000000, 150.000000, 640.000000, NO, NO",
+                                   "150.000000, 0.000000, 810.000000, 640.000000, NO, NO",
+                                   "960.000000, 0.000000, 0.000000, 640.000000, NO, NO"], forKey: Self.splitFrames)
+        defer { UserDefaults.standard.removeObject(forKey: Self.splitFrames) }
+        let model = TransferModel(provider: FakeProvider([FakeSession(server)]), defaults: Defaults().store)
+        let window = await window(ContentView(model: model), style: [.titled, .resizable])
+        defer { window.close() }
+        let controller = try #require(chrome(in: window))
+        let inspector = controller.splitViewItems[2]
+        #expect(inspector.isCollapsed)
+        let item = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.inspector })
+        #expect(NSApp.sendAction(try #require(item.action), to: item.target, from: item))
+        #expect(await eventually { !inspector.isCollapsed })
     }
 
     /// Back and Forward are dim until the history has somewhere to go, and follow it.
