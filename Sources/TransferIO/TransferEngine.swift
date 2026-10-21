@@ -243,7 +243,7 @@ struct TransferEngine {
             relay.abandon(index)
             throw error
         }
-        relay.walked(index, landed: tally.landed(target)?.name, &group) { [self] in
+        try await relay.walked(index, landed: tally.landed(target)?.name, &group) { [self] in
             do {
                 destination.pipe.emit(.directoryChanged(request.folder))
                 try tally.check()
@@ -675,11 +675,15 @@ private struct Relay {
         }
     }
 
-    /// `item`'s walk is done: `check` runs once its last job has.
-    mutating func walked(_ item: Int, landed: String?, _ group: inout ThrowingTaskGroup<Event, Error>, check: @escaping @Sendable () async throws -> Outcome) {
+    /// `item`'s walk is done: `check` runs once its last job has. One that would start now waits
+    /// for room among the jobs first; one started as a job ends takes that job's place.
+    mutating func walked(_ item: Int, landed: String?, _ group: inout ThrowingTaskGroup<Event, Error>, check: @escaping @Sendable () async throws -> Outcome) async throws {
         if let landed {
             items[item]?.names.insert(landed)
             written.insert(landed.diskFolded)
+        }
+        if items[item]?.jobs == 0 {
+            while jobs >= limits.jobs { try await take(&group) }
         }
         items[item]?.check = check
         startCheck(item, &group)
