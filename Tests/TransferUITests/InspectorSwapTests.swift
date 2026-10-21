@@ -105,17 +105,23 @@ extension InspectorTests {
         let defaults = Defaults()
         defaults.store.set(true, forKey: Preferences.showsInspector)
         let model = TransferModel(provider: FakeProvider([session]), defaults: defaults.store)
+        // A clock that moves only when told: the web view may take longer than the icon's 500 ms
+        // to load on a loaded machine, and this test is about the view kept, not that deadline.
+        let time = ManualClock()
+        model.previewClock = time.clock
         let window = await window(InspectorColumn(model: model).frame(width: 320, height: 640), width: 320)
         defer { window.close() }
         await model.connect(server)
         #expect(await eventually { model.items.count == 2 })
 
+        time.advance(to: time.now + .seconds(1))
         model.snapshot.selection = [path("one.txt")]
         model.selectionChanged()
         #expect(await eventually(seconds: 10) { sourcePreview(in: window.contentView)?.swap.shown?.text == "let one = 1\n" })
         let view = try #require(sourcePreview(in: window.contentView))
         let buffers = view.buffers.map(ObjectIdentifier.init)
 
+        time.advance(to: time.now + .seconds(1))
         model.snapshot.selection = [path("two.txt")]
         model.selectionChanged()
         var waits = 0
