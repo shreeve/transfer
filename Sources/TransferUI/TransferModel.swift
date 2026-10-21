@@ -187,14 +187,20 @@ public final class TransferModel {
         }
     }
     /// The primary file's preview, if small: text's first lines, a decoded picture, or a local copy
-    /// for Quick Look. Held briefly after the selection moves so a fast fetch swaps with no gap.
-    public var inspectorPreview: InspectorPreview?
+    /// for Quick Look. Kept after the selection moves until the next one is ready, for at most
+    /// `PreviewTiming.icon`, so moving between files swaps one preview for the next with no gap.
+    public var inspectorPreview: InspectorPreview? {
+        didSet { inspectorStaleSince = nil }
+    }
     /// What the pane shows while no preview is up: nothing, the file's icon, or the icon with a
     /// spinner once the wait has grown long.
     public var inspectorWait: InspectorWait = .nothing
     @ObservationIgnored private var inspectorTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var inspectorGeneration = 0
     @ObservationIgnored private var lastSelectionChange = ContinuousClock.now - .seconds(10)
+    /// When the preview on show stopped being the selection's, so a held arrow key cannot keep
+    /// an old file's preview up past `PreviewTiming.icon`.
+    @ObservationIgnored private var inspectorStaleSince: ContinuousClock.Instant?
     public var sidebarCollapsed = false
     public var showsShelf = false
     public var draft = SavedConnection(name: "", host: "")
@@ -1105,11 +1111,11 @@ public final class TransferModel {
     }
 
     /// Starts fetching the primary file the instant the selection moves; nothing waits on an
-    /// animation. The old preview stays up for `hold` so a quick fetch swaps with no gap, then the
-    /// pane clears, the icon arrives once the wait is plainly long, and a spinner later still. A
-    /// held arrow key coalesces: only a change within `coalesce` of the last one waits. A folder,
-    /// several items, and a file the inspector cannot show (`InspectorPreviewPlan`) show their icon
-    /// at once and fetch nothing.
+    /// animation. The old preview stays up until the new one replaces it, so the area never goes
+    /// blank between two files, but for no longer than `icon` after it went stale; then the file's
+    /// icon takes its place, and a spinner joins it at `spinner`. A held arrow key coalesces: only
+    /// a change within `coalesce` of the last one waits. A folder, several items, and a file the
+    /// inspector cannot show (`InspectorPreviewPlan`) show their icon at once and fetch nothing.
     private func refreshInspectorPreview() {
         for task in inspectorTasks { task.cancel() }
         inspectorTasks.removeAll()
@@ -1119,6 +1125,8 @@ public final class TransferModel {
         let rapid = lastSelectionChange.duration(to: now) < PreviewTiming.coalesce
         lastSelectionChange = now
         inspectorWait = .nothing
+        // Read before the guards below clear the preview, which forgets when it went stale.
+        let stale = inspectorPreview == nil ? now : inspectorStaleSince ?? now
         guard showsInspector, let session, let item = primaryItem else {
             inspectorPreview = nil
             return
@@ -1128,16 +1136,16 @@ public final class TransferModel {
             inspectorWait = .icon
             return
         }
-        let timeline: [(at: Duration, step: @MainActor (TransferModel) -> Void)] = [
-            (PreviewTiming.hold, { $0.inspectorPreview = nil }),
-            (PreviewTiming.icon, { $0.inspectorWait = .icon }),
-            (PreviewTiming.spinner, { $0.inspectorWait = .spinner }),
+        inspectorStaleSince = stale
+        let timeline: [(at: ContinuousClock.Instant, step: @MainActor (TransferModel) -> Void)] = [
+            (stale + PreviewTiming.icon, { $0.inspectorPreview = nil; $0.inspectorWait = .icon }),
+            (now + PreviewTiming.spinner, { $0.inspectorWait = .spinner }),
         ]
         inspectorTasks = [
             // The wait, step by step, until the fetch lands and cancels it.
             Task { [weak self] in
                 for (at, step) in timeline {
-                    try? await Task.sleep(until: now + at)
+                    try? await Task.sleep(until: at)
                     guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
                     step(self)
                 }
@@ -2413,15 +2421,16 @@ public enum InspectorWait: Equatable {
 }
 
 /// The inspector's choreography. The fetch always starts at once; these only shape what shows
-/// while it runs. Under 100 ms reads as instant, so a swap inside `hold` needs no animation.
-/// Finder's own pane goes blank rather than showing an icon, then adds a spinner near half a
-/// second; an icon that lands and is replaced within a few frames is a flicker, so it waits.
+/// while it runs. The previous preview stays up until the next one replaces it, with no
+/// animation, so moving between files never shows an empty box; an icon that lands and is
+/// replaced within a few frames is a flicker, so the old preview gives way to the icon only once
+/// the wait is plainly long, and a spinner joins it later still. The details change at once.
 public enum PreviewTiming {
-    /// How long the previous preview stays up while the next one is on its way.
-    public static let hold: Duration = .milliseconds(100)
     /// Selection changes closer together than this are a held key; only then does the fetch wait.
     public static let coalesce: Duration = .milliseconds(120)
-    /// When the file's icon fills the empty pane, and when it gains a spinner.
+    /// When the file's icon replaces the previous preview, or fills the empty pane, and when it
+    /// gains a spinner. A preview gone stale gives way at `icon` after it went stale, however
+    /// often the selection has moved since.
     public static let icon: Duration = .milliseconds(500)
     public static let spinner: Duration = .seconds(1)
     /// The old preview leaving, and the icon or a picture arriving over what was there.

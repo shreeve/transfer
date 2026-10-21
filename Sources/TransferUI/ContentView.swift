@@ -520,7 +520,6 @@ struct InspectorColumn: View {
     @Environment(\.inspectorSlots) private var slots
     /// The view's copy of the model's phase, so each change can pick its own animation.
     @State private var shown = PreviewPhase()
-    @State private var previewID = 0
 
     static let iconSize: CGFloat = 128
     static let nameHeight: CGFloat = 18
@@ -548,19 +547,20 @@ struct InspectorColumn: View {
         .padding(.bottom, Self.bottomMargin)
         .coordinateSpace(.named(InspectorSlots.space))
         .onChange(of: phase, initial: true) { old, new in
-            if new.preview != old.preview { previewID &+= 1 }
             withAnimation(animation(from: old, to: new)) { shown = new }
         }
     }
 
     /// The preview area, everything between the facts and the foot: one file's preview once it is
     /// here, else an icon centered in it. Only the wait for one file leaves it empty, until
-    /// `PreviewTiming.icon`.
+    /// `PreviewTiming.icon`. The content keeps its identity while the kind of preview does, so
+    /// moving from one text file to the next reuses the web view, and Quick Look and pictures
+    /// change in place, instead of building a view that draws blank until it loads.
     private func area(_ facts: InspectorFacts) -> some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8).fill(.quinary)
             if facts.file != nil, let preview = shown.preview {
-                content(preview).id(previewID).transition(.opacity)
+                content(preview).transition(.opacity)
             } else if facts.file == nil || shown.wait != .nothing {
                 Image(nsImage: facts.icon)
                     .resizable()
@@ -596,8 +596,8 @@ struct InspectorColumn: View {
         .slot("foot", slots)
     }
 
-    /// No animation for a swap inside the hold (it reads as instant) or content landing in an empty
-    /// area. Old content fades out, the icon and spinner fade in, and a picture over the icon
+    /// No animation for one preview replacing another (it reads as instant) or content landing in
+    /// an empty area. Old content fades out, the icon and spinner fade in, and a picture over the icon
     /// crossfades. Web and Quick Look views draw late, so fading them shows an empty area.
     private func animation(from old: PreviewPhase, to new: PreviewPhase) -> Animation? {
         guard !reduceMotion else { return nil }
@@ -973,36 +973,139 @@ struct QuickLookPreview: NSViewRepresentable {
 }
 
 /// Highlighted source in a web view, scrollable, with the pane's own background. The page is
-/// built only when the text or wrapping changes, never on every redraw of the pane.
+/// built only when the text or wrapping changes, never on every redraw of the pane, and the view
+/// keeps showing the previous page until the next one has loaded (`SourcePreviewView`).
 struct SourcePreview: NSViewRepresentable {
     let text: String
     let wraps: Bool
 
-    func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        // The text is escaped; with scripts off, nothing from the server runs even if some slipped through.
-        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
-        let view = WKWebView(frame: .zero, configuration: configuration)
-        view.setValue(false, forKey: "drawsBackground")
-        load(into: view, context: context)
+    func makeNSView(context: Context) -> SourcePreviewView {
+        let view = SourcePreviewView()
+        view.show(SourcePage(text: text, wraps: wraps))
         return view
     }
 
-    func updateNSView(_ view: WKWebView, context: Context) {
-        load(into: view, context: context)
+    func updateNSView(_ view: SourcePreviewView, context: Context) {
+        view.show(SourcePage(text: text, wraps: wraps))
+    }
+}
+
+/// One page of highlighted source.
+struct SourcePage: Equatable {
+    var text: String
+    var wraps: Bool
+}
+
+/// Which of two buffers is on show and which load may replace it. A page loads in the buffer
+/// behind, and the two change places only when that load finishes, so the front never shows a
+/// page still loading. A newer request supersedes one in flight, whose finish is then ignored.
+struct PageSwap<Page: Equatable> {
+    /// The buffer on show, 0 or 1.
+    private(set) var front = 0
+    /// The page in front, once one has loaded.
+    private(set) var shown: Page?
+    /// The page loading behind it, and that load's number.
+    private(set) var pending: Page?
+    private(set) var pendingLoad: Int?
+    private var loads = 0
+
+    /// Where to load `page`, and the load's number; nil when it is on show or already loading.
+    /// Asking again for the page on show abandons a load in flight.
+    mutating func request(_ page: Page) -> (buffer: Int, load: Int)? {
+        if page == pending { return nil }
+        if page == shown {
+            (pending, pendingLoad) = (nil, nil)
+            return nil
+        }
+        loads &+= 1
+        (pending, pendingLoad) = (page, loads)
+        return (1 - front, loads)
     }
 
-    private func load(into view: WKWebView, context: Context) {
-        let page = (text: text, wraps: wraps)
-        if let shown = context.coordinator.page, shown == page { return }
-        context.coordinator.page = page
-        view.loadHTMLString(SyntaxPreview.html(text: text, compact: true, wraps: wraps), baseURL: nil)
+    /// The load numbered `load` has ended; true when its buffer is now the one in front.
+    mutating func finished(_ load: Int) -> Bool {
+        guard load == pendingLoad else { return false }
+        front = 1 - front
+        (shown, pending, pendingLoad) = (pending, nil, nil)
+        return true
+    }
+}
+
+/// Two web views in one place, taking turns (`PageSwap`): the next page loads in the one behind,
+/// transparent, and they trade places when its navigation ends, so moving between text files
+/// keeps the last page up instead of a web view that is empty until it loads. Only the one in
+/// front takes the mouse.
+final class SourcePreviewView: NSView, WKNavigationDelegate {
+    private(set) var buffers: [WKWebView] = []
+    private(set) var swap = PageSwap<SourcePage>()
+    private var navigation: (step: WKNavigation, load: Int)?
+
+    init() {
+        super.init(frame: .zero)
+        let configuration = WKWebViewConfiguration()
+        // The text is escaped; with scripts off, nothing from the server runs even if some slipped through.
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+        for _ in 0..<2 {
+            let view = WKWebView(frame: bounds, configuration: configuration)
+            view.setValue(false, forKey: "drawsBackground")
+            view.autoresizingMask = [.width, .height]
+            view.navigationDelegate = self
+            addSubview(view)
+            buffers.append(view)
+        }
+        showFront()
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    final class Coordinator {
-        var page: (text: String, wraps: Bool)?
+    /// The web view on show.
+    var front: WKWebView { buffers[swap.front] }
+
+    func show(_ page: SourcePage) {
+        guard let next = swap.request(page) else {
+            if swap.pending == nil { navigation = nil }
+            return
+        }
+        let html = SyntaxPreview.html(text: page.text, compact: true, wraps: page.wraps)
+        if let step = buffers[next.buffer].loadHTMLString(html, baseURL: nil) {
+            navigation = (step, next.load)
+        } else {
+            finish(next.load)
+        }
+    }
+
+    private func finish(_ load: Int) {
+        navigation = nil
+        if swap.finished(load) { showFront() }
+    }
+
+    private func showFront() {
+        for (index, view) in buffers.enumerated() { view.alphaValue = index == swap.front ? 1 : 0 }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, frame.contains(point) else { return nil }
+        return front.hitTest(convert(point, from: superview)) ?? self
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        ended(navigation)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: any Error) {
+        ended(navigation)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: any Error) {
+        ended(navigation)
+    }
+
+    /// A superseded load's end is ignored. A failed one still swaps, so the last file's page never
+    /// stays up under the next file's name.
+    private func ended(_ step: WKNavigation?) {
+        guard let navigation, navigation.step === step else { return }
+        finish(navigation.load)
     }
 }
 
