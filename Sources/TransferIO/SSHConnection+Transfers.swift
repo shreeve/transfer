@@ -682,10 +682,10 @@ extension SSHConnection {
         try await cachedCopy(stat(path), lane: .view)
     }
 
-    /// The inspector previews a file that is not text only up to this size. A download reads no
-    /// more than the size listed, so the limit holds against what is read; a file listed without
-    /// one could be read without end, and is refused (SEC2-03).
-    static let inspectorLimit: UInt64 = 8 << 20
+    /// The inspector previews a file that is not text only up to this size (10 MB). A download
+    /// reads no more than the size listed, so the limit holds against what is read; a file listed
+    /// without one could be read without end, and is refused (SEC2-03).
+    static let inspectorLimit = InspectorPreviewPlan.limit
 
     public func prepareInspectorPreview(_ path: RemotePath) async throws -> URL {
         let item = try await stat(path)

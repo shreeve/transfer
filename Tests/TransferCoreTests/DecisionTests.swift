@@ -392,3 +392,27 @@ import Testing
     #expect(PasteRules.drop([file], from: there, onto: folder, on: here, canCopy: true, canMove: true)?.moving == false)
     #expect(drop([file], from: there, copy: false, move: true) == nil)
 }
+
+/// The inspector fetches a picture or other previewable file up to 10 MB and a text file's head at
+/// any size; anything it could only show as an icon, or that is too large or listed without a
+/// size, is never fetched.
+@Test func theInspectorFetchesOnlyWhatItCanShow() {
+    let limit = InspectorPreviewPlan.limit
+    #expect(limit == 10 << 20)
+    func plan(_ name: String, _ size: UInt64?, text: Bool = false) -> InspectorPreviewPlan {
+        InspectorPreviewPlan.plan(fileName: name, size: size, isText: text)
+    }
+    #expect(plan("photo.png", limit) == .picture)
+    #expect(plan("photo.JPG", 1) == .picture)
+    #expect(plan("photo.png", limit + 1) == .icon)
+    #expect(plan("photo.png", nil) == .icon)
+    #expect(plan("notes.txt", 1 << 30, text: true) == .text)
+    #expect(plan("notes.txt", nil, text: true) == .text)
+    for name in ["paper.pdf", "clip.mov", "song.mp3", "deck.key", "sheet.xlsx", "letter.docx", "table.csv"] {
+        #expect(plan(name, 1000) == .quickLook, "\(name)")
+    }
+    #expect(plan("paper.pdf", limit + 1) == .icon)
+    for name in ["blob.xyz", "archive.zip", "a.tar.gz", "lib.dylib", "Makefile", "core", "notes."] {
+        #expect(plan(name, 1000) == .icon, "\(name)")
+    }
+}

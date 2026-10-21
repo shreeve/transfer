@@ -477,62 +477,82 @@ private struct SheetForm<Content: View, Actions: View>: View {
     }
 }
 
+/// The inspector: a preview box of one fixed size, then the facts in rows that each keep their
+/// place, the same for every selection, so nothing moves as the selection does. The box shows the
+/// file once a copy has arrived, else its icon: while it loads, when it cannot be shown, and for a
+/// folder or several items. A missing fact reads "—".
 struct InspectorColumn: View {
     let model: TransferModel
     @AppStorage(Preferences.wrapsPreview) private var wrapsPreview = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.inspectorSlots) private var slots
     /// The view's copy of the model's phase, so each change can pick its own animation.
     @State private var shown = PreviewPhase()
     @State private var previewID = 0
 
+    /// The box's height, whatever the panel's width; it fills the width.
+    static let boxHeight: CGFloat = 240
+    static let iconSize: CGFloat = 128
+    static let nameHeight: CGFloat = 18
+    static let rowHeight: CGFloat = 16
+
     // MARK: Inspector
 
     var body: some View {
-        let selected = model.selectedItems
+        let facts = InspectorFacts(model: model)
+        let phase = PreviewPhase(preview: model.inspectorPreview, wait: model.inspectorWait)
         // A plain stack, not a scroll view: hosted scroll views reach up under the toolbar.
-        return VStack(alignment: .leading, spacing: 12) {
-            if selected.count > 1 {
-                Text("\(selected.count) items selected").foregroundStyle(.secondary)
-            } else if let item = selected.first {
-                facts(item)
-                preview(item)
-            } else {
-                Text(model.snapshot.path.name.isEmpty ? "/" : model.snapshot.path.name).font(.headline)
-                Text(ClipText.count(model.items.count, "item")).font(.subheadline).foregroundStyle(.secondary)
-                line(model.snapshot.path.display).font(.subheadline).foregroundStyle(.secondary)
+        return VStack(alignment: .leading, spacing: 0) {
+            box(facts)
+            rows(facts).padding(.top, 12)
+            Spacer(minLength: 0)
+            if facts.file != nil, case .text? = shown.preview {
+                Toggle("Wrap lines", isOn: $wrapsPreview)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.horizontal, 16)
         .padding(.top, 12)
         .padding(.bottom, 16)
-    }
-
-    /// The file itself when a copy has arrived, else its icon, directly under the facts. Only
-    /// source gets a frame, as in Finder; pictures and icons stand on their own.
-    private func preview(_ item: RemoteItem) -> some View {
-        let phase = PreviewPhase(preview: model.inspectorPreview, wait: model.inspectorWait)
-        return ZStack(alignment: .top) {
-            if let preview = shown.preview {
-                content(preview, item).id(previewID).transition(.opacity)
-            } else if shown.wait != .nothing {
-                VStack(spacing: 12) {
-                    Image(nsImage: ItemIcon.image(for: item)).resizable().frame(width: 96, height: 96).accessibilityLabel(item.kindLabel)
-                    if shown.wait == .spinner { ProgressView().controlSize(.small).accessibilityLabel("Loading preview").transition(.opacity) }
-                }
-                .padding(.top, 24)
-                .transition(.opacity)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .coordinateSpace(.named(InspectorSlots.space))
         .onChange(of: phase, initial: true) { old, new in
             if new.preview != old.preview { previewID &+= 1 }
             withAnimation(animation(from: old, to: new)) { shown = new }
         }
     }
 
+    /// The fixed box: one file's preview once it is here, else an icon centered in it. Only the
+    /// wait for one file leaves it empty, until `PreviewTiming.icon`.
+    private func box(_ facts: InspectorFacts) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8).fill(.quinary)
+            if facts.file != nil, let preview = shown.preview {
+                content(preview).id(previewID).transition(.opacity)
+            } else if facts.file == nil || shown.wait != .nothing {
+                Image(nsImage: facts.icon)
+                    .resizable()
+                    .frame(width: Self.iconSize, height: Self.iconSize)
+                    .accessibilityLabel(facts.kind)
+                    .transition(.opacity)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if facts.file != nil, shown.preview == nil, shown.wait == .spinner {
+                ProgressView().controlSize(.small).accessibilityLabel("Loading preview").padding(.bottom, 16).transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: Self.boxHeight)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .slot("box", slots)
+    }
+
     /// No animation for a swap inside the hold (it reads as instant) or content landing in an empty
-    /// pane. Old content fades out, the icon and spinner fade in, and a picture over the icon
+    /// box. Old content fades out, the icon and spinner fade in, and a picture over the icon
     /// crossfades. Web and Quick Look views draw late, so fading them shows an empty box.
     private func animation(from old: PreviewPhase, to new: PreviewPhase) -> Animation? {
         guard !reduceMotion else { return nil }
@@ -545,58 +565,56 @@ struct InspectorColumn: View {
         return nil
     }
 
-    @ViewBuilder private func content(_ preview: InspectorPreview, _ item: RemoteItem) -> some View {
+    /// A picture scales to fit inside the box; text and Quick Look fill it and scroll inside it.
+    @ViewBuilder private func content(_ preview: InspectorPreview) -> some View {
         switch preview {
         case .picture(let picture):
             Image(decorative: picture, scale: 1).resizable().scaledToFit()
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .frame(maxWidth: .infinity, alignment: .top)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .padding(8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .file(let url):
             QuickLookPreview(url: url)
         case .text(let text):
-            VStack(alignment: .trailing, spacing: 4) {
-                SourcePreview(text: text, wraps: wrapsPreview)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
-                Toggle("Wrap lines", isOn: $wrapsPreview)
-                    .toggleStyle(.checkbox)
-                    .controlSize(.small)
-                    .foregroundStyle(.secondary)
-            }
+            SourcePreview(text: text, wraps: wrapsPreview)
         }
     }
 
-    /// Name, then kind against size, then the `ls -l` facts; the folder is already in the title
-    /// bar. Actions live in the context menu and on double-click, as in the browser.
-    private func facts(_ item: RemoteItem) -> some View {
+    /// Name, kind and size, modified, then access, each one line in its own place; then what is
+    /// happening to the item, below them all. Actions live in the context menu and on
+    /// double-click, as in the browser.
+    private func rows(_ facts: InspectorFacts) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(item.name).font(.headline).foregroundStyle(.primary).lineLimit(2)
-            HStack {
-                Text(item.kindLabel)
-                Spacer()
-                if item.kind == .file { Text(Format.si(item.size)).monospacedDigit() }
-            }
-            Divider().padding(.vertical, 4)
-            if let mtime = item.mtime {
-                HStack {
-                    Text(Format.day(mtime))
-                    Spacer()
-                    Text(Format.clock(mtime)).monospacedDigit()
+            Text(facts.name)
+                .font(.headline)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(facts.name)
+                .slot("nameText", slots)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: Self.nameHeight)
+                .slot("name", slots)
+            row(facts.kindAndSize, "kind")
+            row(facts.modified, "modified").monospacedDigit()
+            row(facts.access, "access")
+            if let item = facts.file {
+                if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
+                if let live = model.liveFile(for: item.path) { line(live.status.label) }
+                if let operation = model.operation(for: item.path) {
+                    line(operation.message ?? model.stateLabel(operation) ?? "Active")
                 }
-            }
-            HStack {
-                if let mode = item.mode { Text(permissions(mode)).monospaced() }
-                Spacer()
-                if let owner = item.owner { Text(item.group.map { "\(owner):\($0)" } ?? owner) }
-            }
-            if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
-            if let live = model.liveFile(for: item.path) { line(live.status.label) }
-            if let operation = model.operation(for: item.path) {
-                line(operation.message ?? model.stateLabel(operation) ?? "Active")
             }
         }
         .font(.subheadline)
         .foregroundStyle(.secondary)
+    }
+
+    private func row(_ text: String, _ key: String) -> some View {
+        line(text)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: Self.rowHeight)
+            .slot(key, slots)
     }
 
     private func line(_ text: String) -> some View {
@@ -606,11 +624,100 @@ struct InspectorColumn: View {
             .textSelection(.enabled)
             .help(text)
     }
+}
 
-    private func permissions(_ mode: UInt32) -> String {
+/// What the inspector says about the selection: one item, several, or the location when nothing
+/// is selected. Each fact is one line, "—" when it is not known.
+struct InspectorFacts {
+    static let missing = "—"
+
+    var name: String
+    var kind: String
+    var kindAndSize: String
+    var modified: String
+    var access: String
+    var icon: NSImage
+    /// The one file or link selected, whose preview may fill the box; nil for anything else.
+    var file: RemoteItem?
+
+    @MainActor init(model: TransferModel) {
+        let selected = model.selectedItems
+        if selected.count > 1 {
+            let folders = selected.count(where: { $0.kind == .directory })
+            let others = selected.filter { $0.kind != .directory }
+            var kinds: [String] = []
+            if !others.isEmpty { kinds.append(ClipText.count(others.count, "file")) }
+            if folders > 0 { kinds.append(ClipText.count(folders, "folder")) }
+            let sizes = others.compactMap(\.size)
+            let total = others.isEmpty || sizes.count < others.count ? nil : Self.size(sizes.reduce(0, +))
+            name = "\(selected.count) items selected"
+            kind = kinds.joined(separator: ", ")
+            kindAndSize = Self.pair(kind, total)
+            modified = Self.missing
+            access = Self.missing
+            icon = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
+            return
+        }
+        let item: RemoteItem
+        if let one = selected.first {
+            item = one
+        } else if model.snapshot.connectionID != nil {
+            item = model.locationItem ?? RemoteItem(path: model.snapshot.path, kind: .directory)
+        } else {
+            name = "No Server"
+            kind = Self.missing
+            kindAndSize = Self.missing
+            modified = Self.missing
+            access = Self.missing
+            icon = NSImage(systemSymbolName: "server.rack", accessibilityDescription: nil) ?? NSImage()
+            return
+        }
+        name = item.path.isRoot ? "/" : item.name
+        kind = item.kindLabel
+        let size: String? = switch item.kind {
+        case .directory: model.itemCount(of: item.path).map { ClipText.count($0, "item") }
+        case .file: item.size.map(Self.size)
+        case .symlink, .other: nil
+        }
+        kindAndSize = Self.pair(kind, size)
+        modified = item.mtime.map { "\(Format.day($0)) · \(Format.clock($0))" } ?? Self.missing
+        access = item.mode == nil && item.owner == nil ? Self.missing
+            : Self.pair(item.mode.map(Self.permissions), item.owner.map { owner in item.group.map { "\(owner):\($0)" } ?? owner })
+        icon = ItemIcon.image(for: item)
+        file = selected.first.flatMap { $0.kind == .file || $0.kind == .symlink ? $0 : nil }
+    }
+
+    /// "Plain Text · 1.2 kB", with "—" for either side that is missing.
+    static func pair(_ first: String?, _ second: String?) -> String {
+        "\(first ?? missing) · \(second ?? missing)"
+    }
+
+    static func size(_ bytes: UInt64) -> String {
+        Units.bytes(bytes).trimmingCharacters(in: .whitespaces)
+    }
+
+    static func permissions(_ mode: UInt32) -> String {
         let bits = mode & 0o777
         let letters = ["---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"]
         return letters[Int(bits >> 6 & 7)] + letters[Int(bits >> 3 & 7)] + letters[Int(bits & 7)]
+    }
+}
+
+/// Where each part of the inspector landed, in its own coordinates, for the tests that hold the
+/// box and every row still across selections. Nil, as in the app, records nothing.
+@MainActor
+final class InspectorSlots {
+    nonisolated static let space = "inspector"
+    var frames: [String: CGRect] = [:]
+}
+
+extension EnvironmentValues {
+    @Entry var inspectorSlots: InspectorSlots?
+}
+
+private extension View {
+    func slot(_ key: String, _ slots: InspectorSlots?) -> some View {
+        onGeometryChange(for: CGRect.self) { $0.frame(in: .named(InspectorSlots.space)) } action: { slots?.frames[key] = $0 }
     }
 }
 
@@ -827,7 +934,7 @@ struct SourcePreview: NSViewRepresentable {
     }
 }
 
-/// What the inspector's preview area shows: content, or a wait state while none is up.
+/// What the inspector's box shows: content, or a wait state while none is up.
 struct PreviewPhase: Equatable {
     var preview: InspectorPreview?
     var wait: InspectorWait = .nothing

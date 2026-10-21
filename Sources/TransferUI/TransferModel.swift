@@ -24,6 +24,8 @@ public enum Preferences {
     public static let libraryChanged = Notification.Name("TransferLibraryChanged")
     /// Off unless turned on: the inspector's source preview wraps long lines.
     public static let wrapsPreview = "transfer.wrapsPreview"
+    /// Whether the inspector is out: the last window's choice, which new windows open with.
+    public static let showsInspector = "transfer.showsInspector"
 }
 
 public enum SidebarItem: Hashable {
@@ -93,6 +95,8 @@ struct FolderListing {
 @Observable
 public final class TransferModel {
     public let provider: any SessionProvider
+    /// Where the window's preferences are read and written: the app's own domain, a suite in tests.
+    @ObservationIgnored let defaults: UserDefaults
     private var context: ServerContext?
     /// The server this window shows; nil before the first login and while none is chosen.
     public var session: (any RemoteSession)? { context?.session }
@@ -163,8 +167,14 @@ public final class TransferModel {
     /// What the user should know, such as what failed: shown under the toolbar until dismissed
     /// or replaced by the next message. A listing that works never clears it.
     public var status: String?
+    /// Out or in as the last window left it (`Preferences.showsInspector`); each change, from the
+    /// menu, the toolbar, or a divider drag, becomes the choice new windows open with.
     public var showsInspector = false {
-        didSet { if showsInspector != oldValue { refreshInspectorPreview() } }
+        didSet {
+            guard showsInspector != oldValue else { return }
+            defaults.set(showsInspector, forKey: Preferences.showsInspector)
+            refreshInspectorPreview()
+        }
     }
     /// The primary file's preview, if small: text's first lines, a decoded picture, or a local copy
     /// for Quick Look. Held briefly after the selection moves so a fast fetch swaps with no gap.
@@ -175,7 +185,6 @@ public final class TransferModel {
     @ObservationIgnored private var inspectorTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var inspectorGeneration = 0
     @ObservationIgnored private var lastSelectionChange = ContinuousClock.now - .seconds(10)
-    private static let inspectorPreviewLimit = 8 << 20
     public var sidebarCollapsed = false
     public var showsShelf = false
     public var draft = SavedConnection(name: "", host: "")
@@ -230,15 +239,17 @@ public final class TransferModel {
 
     /// Reads the preferences and nothing else: SwiftUI may build a window's model more than once
     /// and keep only the first, so the work waits for `start`.
-    public init(provider: any SessionProvider) {
+    public init(provider: any SessionProvider, defaults: UserDefaults = .standard) {
         self.provider = provider
+        self.defaults = defaults
         let prompts = SheetPrompts()
         self.prompts = prompts
         prompts.model = self
         applyPreferences()
-        if let stored = UserDefaults.standard.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored) {
+        if let stored = defaults.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored) {
             snapshot.viewMode = mode
         }
+        showsInspector = defaults.bool(forKey: Preferences.showsInspector)
     }
 
     /// Loads the library and follows preference and library changes, once the window is on screen.
@@ -255,7 +266,7 @@ public final class TransferModel {
             observe(UserDefaults.didChangeNotification) { $0.applyPreferences() },
             observe(Preferences.libraryChanged) { await $0.reloadConnections() },
             observe(Preferences.viewModeChosen) { model in
-                if let stored = UserDefaults.standard.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored) {
+                if let stored = model.defaults.string(forKey: Preferences.viewMode), let mode = ViewMode(rawValue: stored) {
                     model.setViewMode(mode)
                 }
             },
@@ -287,7 +298,6 @@ public final class TransferModel {
     /// Reads the global preferences at launch and whenever they change. Hidden files and the sort
     /// switches are global, as in Finder; the view mode is not, and follows `viewModeChosen`.
     private func applyPreferences() {
-        let defaults = UserDefaults.standard
         var changed = false
         let hidden = defaults.bool(forKey: Preferences.showsHidden)
         if hidden != snapshot.showsHidden {
@@ -638,7 +648,7 @@ public final class TransferModel {
         sheet = nil
         await reporting {
             try await provider.removeConnection(connection.id)
-            UserDefaults.standard.removeObject(forKey: Self.sortKey(connection.id))
+            defaults.removeObject(forKey: Self.sortKey(connection.id))
             if snapshot.connectionID == connection.id { uninstall() }
             await reloadConnections()
             NotificationCenter.default.post(name: Preferences.libraryChanged, object: nil)
@@ -844,6 +854,16 @@ public final class TransferModel {
         return listings[parent]?.items.first { $0.path == path }
     }
 
+    /// How many items a folder shows, hidden ones left out unless shown, once a complete listing
+    /// of it is cached; nil before then.
+    public func itemCount(of folder: RemotePath) -> Int? {
+        guard let listing = listings[folder], listing.complete else { return nil }
+        return visible(listing.items).count
+    }
+
+    /// The location as its parent's listing has it, for the inspector's facts when nothing is selected.
+    var locationItem: RemoteItem? { listedItem(snapshot.path) }
+
     public var primaryItem: RemoteItem? { selectedItems.first }
 
     /// Menu items whose shortcut is a plain key stay out of the way of text entry.
@@ -893,7 +913,7 @@ public final class TransferModel {
         snapshot.sort.column = column
         snapshot.sort.ascending = ascending
         if let id = snapshot.connectionID, let data = try? JSONEncoder().encode(snapshot.sort) {
-            UserDefaults.standard.set(data, forKey: Self.sortKey(id))
+            defaults.set(data, forKey: Self.sortKey(id))
         }
         resortListings(names: false)
         refreshItems()
@@ -905,9 +925,9 @@ public final class TransferModel {
     }
 
     private func loadPreferences(for id: ConnectionID) {
-        let folded = UserDefaults.standard.bool(forKey: Preferences.caseInsensitiveSort)
-        let foldersFirst = Preferences.foldersFirstValue()
-        if let data = UserDefaults.standard.data(forKey: Self.sortKey(id)),
+        let folded = defaults.bool(forKey: Preferences.caseInsensitiveSort)
+        let foldersFirst = Preferences.foldersFirstValue(defaults)
+        if let data = defaults.data(forKey: Self.sortKey(id)),
            var sort = try? JSONDecoder().decode(SortConfiguration.self, from: data) {
             sort.caseInsensitive = folded
             sort.foldersFirst = foldersFirst
@@ -924,7 +944,7 @@ public final class TransferModel {
 
     public func toggleHidden() {
         snapshot.showsHidden.toggle()
-        UserDefaults.standard.set(snapshot.showsHidden, forKey: Preferences.showsHidden)
+        defaults.set(snapshot.showsHidden, forKey: Preferences.showsHidden)
         refilterListings()
         refreshItems()
     }
@@ -934,7 +954,7 @@ public final class TransferModel {
     public func setViewMode(_ mode: ViewMode) {
         if snapshot.viewMode == .columns, mode != .columns, snapshot.selection == [snapshot.path] { snapshot.selection = [] }
         snapshot.viewMode = mode
-        UserDefaults.standard.set(mode.rawValue, forKey: Preferences.viewMode)
+        defaults.set(mode.rawValue, forKey: Preferences.viewMode)
         if mode == .columns { columnRoot = snapshot.path }
         refreshItems()
     }
@@ -1020,7 +1040,9 @@ public final class TransferModel {
     /// Starts fetching the primary file the instant the selection moves; nothing waits on an
     /// animation. The old preview stays up for `hold` so a quick fetch swaps with no gap, then the
     /// pane clears, the icon arrives once the wait is plainly long, and a spinner later still. A
-    /// held arrow key coalesces: only a change within `coalesce` of the last one waits.
+    /// held arrow key coalesces: only a change within `coalesce` of the last one waits. A folder,
+    /// several items, and a file the inspector cannot show (`InspectorPreviewPlan`) show their icon
+    /// at once and fetch nothing.
     private func refreshInspectorPreview() {
         for task in inspectorTasks { task.cancel() }
         inspectorTasks.removeAll()
@@ -1034,7 +1056,7 @@ public final class TransferModel {
             inspectorPreview = nil
             return
         }
-        guard item.kind != .directory else {
+        guard item.kind == .file || item.kind == .symlink, snapshot.selection.count == 1 else {
             inspectorPreview = nil
             inspectorWait = .icon
             return
@@ -1054,6 +1076,15 @@ public final class TransferModel {
                 }
             },
             Task { [weak self] in
+                // A file known to show only its icon skips the wait; a link is known once resolved.
+                let shows = item.kind == .symlink ? true : await Self.plan(for: item, session: session) != .icon
+                if !shows {
+                    guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
+                    for task in inspectorTasks { task.cancel() }
+                    inspectorPreview = nil
+                    inspectorWait = .icon
+                    return
+                }
                 if rapid { try? await Task.sleep(for: PreviewTiming.coalesce) }
                 guard !Task.isCancelled else { return }
                 let preview = await Self.fetchPreview(item, session: session)
@@ -1066,38 +1097,51 @@ public final class TransferModel {
         ]
     }
 
+    /// What the box can show for a file, from its name and listed size; a text file is one that
+    /// opens Live, and only its head is fetched, so a large one previews too.
+    private static func plan(for file: RemoteItem, session: any RemoteSession) async -> InspectorPreviewPlan {
+        let isText = await session.openKind(fileName: file.name) == .live
+        return InspectorPreviewPlan.plan(fileName: file.name, size: file.size, isText: isText)
+    }
+
     /// The preview for one file, ready to draw: text, a decoded picture, or the local copy for
-    /// Quick Look. Nil when it is not a small file after all. The copy is read off the main thread.
+    /// Quick Look. Nil when there is nothing to show but the icon: a file the plan leaves out, a
+    /// text file whose bytes are not text, a failed fetch. The copy is read off the main thread.
     private static func fetchPreview(_ item: RemoteItem, session: any RemoteSession) async -> InspectorPreview? {
         do {
             let target = try await Self.resolveLink(item, session: session)
-            // Only a text file's head is fetched, so a large one previews too.
-            let isText = await session.openKind(fileName: target.name) == .live
-            guard target.kind == .file, isText || (target.size ?? 0) <= inspectorPreviewLimit else { return nil }
+            guard target.kind == .file else { return nil }
+            let plan = await Self.plan(for: target, session: session)
+            guard plan != .icon else { return nil }
             let url = try await session.prepareInspectorPreview(target.path)
-            let isPicture = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true
-            let read = await Task.detached(priority: .userInitiated) { () -> InspectorPreview? in
-                if isText, let text = previewText(url) { return .text(text) }
-                if isPicture, let picture = decodePicture(url) { return .picture(picture) }
+            switch plan {
+            case .text:
+                return await Task.detached(priority: .userInitiated) { previewText(url).map(InspectorPreview.text) }.value
+            case .picture:
+                // A picture ImageIO cannot decode may still be one Quick Look can draw.
+                return await Task.detached(priority: .userInitiated) { decodePicture(url).map(InspectorPreview.picture) }.value ?? .file(url)
+            case .quickLook:
+                return .file(url)
+            case .icon:
                 return nil
-            }.value
-            return read ?? .file(url)
+            }
         } catch {
             return nil
         }
     }
 
     /// Warms the cache for the files on either side of `item`, one at a time, so an arrow key
-    /// lands on a copy that is already here. A newer selection cancels this like everything else.
+    /// lands on a copy that is already here. Only files the box can show are fetched. A newer
+    /// selection cancels this like everything else.
     private func prefetchNeighbors(of item: RemoteItem, session: any RemoteSession, generation: Int) {
         let list = displayedItems
         guard let index = displayedIndex[item.path] else { return }
-        let neighbors = [index + 1, index - 1].filter(list.indices.contains).map { list[$0] }
-            .filter { $0.kind == .file && ($0.size ?? 0) <= Self.inspectorPreviewLimit }
+        let neighbors = [index + 1, index - 1].filter(list.indices.contains).map { list[$0] }.filter { $0.kind == .file }
         guard !neighbors.isEmpty else { return }
         inspectorTasks.append(Task { [weak self] in
             for neighbor in neighbors {
                 guard !Task.isCancelled, self?.inspectorGeneration == generation else { return }
+                guard await Self.plan(for: neighbor, session: session) != .icon else { continue }
                 _ = try? await session.prepareInspectorPreview(neighbor.path)
             }
         })
