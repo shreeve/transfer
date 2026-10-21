@@ -883,6 +883,49 @@ extension MoveServerTests {
     }
 }
 
+extension MoveServerTests {
+    /// A folder and an item inside it moved together, the inner one first, landed the inner one
+    /// twice and failed with "No such file", as the folder's copy overlapped the inner one's.
+    /// An item that is, holds, or lies inside an earlier one now waits for it, as one item at a
+    /// time did: inner first, it moves and the folder follows without it; outer first, the folder
+    /// moves whole and the inner one is gone.
+    @Test(arguments: [true, false]) func aNestedItemWaitsForTheOneHoldingIt(innerFirst: Bool) async throws {
+        try await withHarness(innerFirst ? "rlin" : "rlout", connected: true) { h in
+            try await withAlias(h) { alias in
+                var files: [String: String?] = ["A/x.txt": "x"]
+                for index in 0..<30 { files["A/b/y\(index).bin"] = String(repeating: "y", count: 40_000) }
+                let from = try h.folder("from", files: files)
+                let (outer, inner) = (from.appending("A"), from.appending("A").appending("b"))
+                let request = TransferRequest(.server(alias.connection.id, innerFirst ? [inner, outer] : [outer, inner]), into: try h.folder("to"), on: h.session.connection.id, moving: true)
+                var engine = TransferEngine(request: request, destination: h.session) { _ in }
+                engine.relayLimits = Self.smallLimits
+                if innerFirst {
+                    try await engine.run(from: alias)
+                    #expect(try h.names("to") == ["A", "b"])
+                    #expect(try h.names("to/A") == ["x.txt"])
+                    #expect(try h.names("to/b").count == 30)
+                } else {
+                    await #expect(throws: TransferError.self) { try await engine.run(from: alias) }
+                    #expect(try h.names("to") == ["A"])
+                    #expect(try h.names("to/A/b").count == 30)
+                }
+                #expect(try h.names("from").isEmpty)
+                try h.expectNoLeftovers(alias)
+            }
+        }
+    }
+
+    @Test func nestingFindsEachItemsEarlierRelatives() {
+        let paths = ["/s/A/b", "/s/A", "/s/C", "/s/A/b/c", "/s/C"].map { RemotePath(string: $0) }
+        let nested = TransferEngine.nesting(paths, [0, 1, 2, 3, 4])
+        #expect(nested[0] == nil && nested[2] == nil)
+        #expect(nested[1] == [0])
+        #expect(Set(nested[3] ?? []) == [0, 1])
+        #expect(nested[4] == [2])
+        #expect(TransferEngine.nesting(paths, [1, 2, 3])[3] == [1])
+    }
+}
+
 /// Answers as a window's operation prompt does once Apply to All is checked: the first question
 /// is shown and answered for all, and the rest take that answer unasked. Counts the questions
 /// shown, the calls, and the most calls open at once.

@@ -117,6 +117,15 @@ struct TransferEngine {
         defer { try? FileManager.default.removeItem(at: scratch) }
         let ignoresCase = (try? scratch.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames != true
         let pending = paths.indices.filter { !isDone($0) }
+        let nested = request.moving ? Self.nesting(paths, pending) : [:]
+        let lookUp: @Sendable (Int) -> Task<Lookup, Error> = { [request, destination] index in
+            let (path, target) = (paths[index], request.folder.appending(name: paths[index].nameBytes))
+            return Task {
+                async let tree = RelayTree.walk(path, on: source, ignoringCase: ignoresCase)
+                async let found = destination.existing(target)
+                return Lookup(tree: try await tree, found: try await found)
+            }
+        }
         // What each item is, looked up a few items ahead: one at a time, its two round trips
         // would hold every item up, as long as a small file takes to move.
         var ahead: [Int: Task<Lookup, Error>] = [:]
@@ -124,16 +133,19 @@ struct TransferEngine {
         let outcomes = try await withThrowingTaskGroup(of: Relay.Event.self) { group in
             var relay = Relay(scratch: scratch, limits: relayLimits)
             for (position, index) in pending.enumerated() {
-                for next in pending[position..<min(position + Self.lookAhead, pending.count)] where ahead[next] == nil {
-                    let (path, target) = (paths[next], request.folder.appending(name: paths[next].nameBytes))
-                    ahead[next] = Task { [destination] in
-                        async let tree = RelayTree.walk(path, on: source, ignoringCase: ignoresCase)
-                        async let found = destination.existing(target)
-                        return Lookup(tree: try await tree, found: try await found)
-                    }
+                for next in pending[position..<min(position + Self.lookAhead, pending.count)] where ahead[next] == nil && nested[next] == nil {
+                    ahead[next] = lookUp(next)
                 }
-                let lookup = ahead.removeValue(forKey: index)!
                 do {
+                    let lookup: Task<Lookup, Error>
+                    if let earlier = nested[index] {
+                        // Inside an earlier item of this move, or holding one: that item goes
+                        // first, whole, and this one is looked at as it left it.
+                        try await relay.waitFor(earlier, &group)
+                        lookup = lookUp(index)
+                    } else {
+                        lookup = ahead.removeValue(forKey: index)!
+                    }
                     let looked = try await withTaskCancellationHandler { try await lookup.value } onCancel: { lookup.cancel() }
                     if let refused = try await relayItem(index, paths[index], looked, from: source, relay: &relay, group: &group) {
                         relay.outcomes[index] = .kept(refused)
@@ -159,6 +171,36 @@ struct TransferEngine {
 
     /// Items looked up at once ahead of the one being placed.
     static let lookAhead = 16
+
+    /// For each of the `pending` items that is, holds, or lies inside an earlier one, those earlier
+    /// items: in a move, its copy waits for theirs to be checked and removed, as one item at a
+    /// time did. Found by each item's folders, not by comparing every pair.
+    static func nesting(_ paths: [RemotePath], _ pending: [Int]) -> [Int: [Int]] {
+        var at: [RemotePath: [Int]] = [:]
+        var below: [RemotePath: [Int]] = [:]
+        for index in pending {
+            let path = paths[index].normalized
+            at[path, default: []].append(index)
+            var folder = path.parent
+            while let above = folder {
+                below[above, default: []].append(index)
+                folder = above.parent
+            }
+        }
+        var nested: [Int: [Int]] = [:]
+        for index in pending {
+            let path = paths[index].normalized
+            var related = (at[path] ?? []) + (below[path] ?? [])
+            var folder = path.parent
+            while let above = folder {
+                related += at[above] ?? []
+                folder = above.parent
+            }
+            let earlier = related.filter { $0 < index }
+            if !earlier.isEmpty { nested[index] = earlier }
+        }
+        return nested
+    }
 
     /// An item ahead: its tree on the other server, walked whole, and what holds its name at the
     /// destination then.
@@ -595,6 +637,13 @@ private struct Relay {
     mutating func waitForName(_ name: String, _ group: inout ThrowingTaskGroup<Event, Error>) async throws {
         let folded = name.diskFolded
         while items.values.contains(where: { $0.names.contains { $0.diskFolded == folded } }) {
+            try await take(&group)
+        }
+    }
+
+    /// Waits until each of `earlier` has ended, its check too.
+    mutating func waitFor(_ earlier: [Int], _ group: inout ThrowingTaskGroup<Event, Error>) async throws {
+        while earlier.contains(where: { items[$0] != nil }) {
             try await take(&group)
         }
     }
