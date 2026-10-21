@@ -39,11 +39,13 @@ struct ViewTests {
         await model.connect(a)
         let login = Task { await model.connect(b) }
         defer { login.cancel() }
-        // Waits for what it checks, not a fixed pause: under a full parallel run B's login and the
-        // star's listing can take longer than one turn.
+        // Waits for what it checks, not a fixed pause: under a full parallel run B's login, the
+        // sidebar's star row, and the star's listing can each take longer than one turn.
         #expect(await eventually { model.connectingTo?.id == b.id })
         // Servers, A, B, Add Server, Starred, and the star: a click on the star.
-        let sidebar = try #require(tables(in: window.contentView!).first { $0.numberOfRows == 6 })
+        let sidebarRows = { tables(in: window.contentView!).first { $0.numberOfRows == 6 } }
+        #expect(await eventually { sidebarRows() != nil })
+        let sidebar = try #require(sidebarRows())
         sidebar.selectRowIndexes([5], byExtendingSelection: false)
         #expect(await eventually { model.snapshot.path == star })
         #expect(model.connectingTo?.id == b.id)
