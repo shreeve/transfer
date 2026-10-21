@@ -24,7 +24,8 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         controller.install(
             sidebar: NSHostingController(rootView: AnyView(sidebar)),
             detail: NSHostingController(rootView: AnyView(detail)),
-            inspector: NSHostingController(rootView: AnyView(inspector))
+            inspector: NSHostingController(rootView: AnyView(inspector)),
+            inspectorShown: inspectorShown
         )
         context.coordinator.controller = controller
         let container = ChromeContainer(controller: controller)
@@ -68,7 +69,8 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         init(model: TransferModel) { self.model = model }
 
         func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-            [.toggleSidebar, .sidebarTrackingSeparator, ChromeItem.backForward, .flexibleSpace, ChromeItem.viewMode, ChromeItem.transfers, ChromeItem.search]
+            [.toggleSidebar, .sidebarTrackingSeparator, ChromeItem.backForward, .flexibleSpace, ChromeItem.viewMode, ChromeItem.transfers,
+             ChromeItem.inspector, ChromeItem.search]
         }
 
         func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -100,6 +102,19 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 item.isBordered = true
                 item.target = self
                 item.action = #selector(toggleShelf(_:))
+                return item
+            case ChromeItem.inspector:
+                // The system's `.toggleInspector` item looks the same, but its target cannot be set
+                // (measured on macOS 27), and up the responder chain its action misses the split
+                // view controller whenever nothing in the content holds the focus.
+                let item = NSToolbarItem(itemIdentifier: identifier)
+                item.image = symbol("sidebar.right")
+                item.label = "Inspector"
+                item.visibilityPriority = .high
+                item.toolTip = "Show or hide the inspector"
+                item.isBordered = true
+                item.target = self
+                item.action = #selector(toggleInspector(_:))
                 return item
             case ChromeItem.search:
                 // Two fixed sizes, switched only by the user. The system search item resizes
@@ -175,6 +190,11 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             model.showsShelf.toggle()
         }
 
+        /// What View > Show Inspector (Command-I) does; the split and the menu's title follow the model.
+        @objc func toggleInspector(_ sender: Any?) {
+            model.showsInspector.toggle()
+        }
+
         func controlTextDidChange(_ notification: Notification) {
             guard let field = notification.object as? NSSearchField else { return }
             model.filter = field.stringValue
@@ -210,6 +230,7 @@ enum ChromeItem {
     static let backForward = NSToolbarItem.Identifier("transfer.backForward")
     static let viewMode = NSToolbarItem.Identifier("transfer.viewMode")
     static let transfers = NSToolbarItem.Identifier("transfer.transfers")
+    static let inspector = NSToolbarItem.Identifier("transfer.inspector")
     static let search = NSToolbarItem.Identifier("transfer.search")
 }
 
@@ -233,7 +254,10 @@ final class ChromeController: NSSplitViewController {
     private var windowObservers: [any NSObjectProtocol] = []
     private var separatorObservation: NSKeyValueObservation?
 
-    func install(sidebar: NSHostingController<AnyView>, detail: NSHostingController<AnyView>, inspector: NSHostingController<AnyView>) {
+    /// `inspectorShown` is the model's: a window opens with the inspector as the last one left it
+    /// (`Preferences.showsInspector`), whatever the split view's autosave holds.
+    func install(sidebar: NSHostingController<AnyView>, detail: NSHostingController<AnyView>, inspector: NSHostingController<AnyView>,
+                 inspectorShown: Bool) {
         // The split view decides the columns' sizes; the hosted SwiftUI content reports none.
         for host in [sidebar, detail, inspector] { host.sizingOptions = [] }
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
@@ -266,7 +290,7 @@ final class ChromeController: NSSplitViewController {
         detailItem.automaticallyAdjustsSafeAreaInsets = true
         let inspectorItem = NSSplitViewItem(inspectorWithViewController: BelowToolbarController(hosting: inspector))
         inspectorItem.minimumThickness = 240
-        inspectorItem.maximumThickness = 320
+        inspectorItem.maximumThickness = 480
         inspectorItem.canCollapse = true
         inspectorItem.isCollapsed = true
         inspectorItem.titlebarSeparatorStyle = .none
@@ -276,9 +300,11 @@ final class ChromeController: NSSplitViewController {
         addSplitViewItem(sidebarItem)
         addSplitViewItem(detailItem)
         addSplitViewItem(inspectorItem)
-        // One name for all windows, as in Finder: a new one opens with the sidebar and inspector
-        // as the last left them, and the model follows via `splitViewDidResizeSubviews`.
+        // One name for all windows, as in Finder: a new one opens with the sidebar and the
+        // columns' widths as the last left them, and the model follows the sidebar via
+        // `splitViewDidResizeSubviews`. The inspector's state is the model's.
         splitView.autosaveName = "Transfer.Split"
+        inspectorItem.isCollapsed = !inspectorShown
     }
 
     override func viewDidLoad() {
@@ -526,6 +552,13 @@ final class ChromeController: NSSplitViewController {
     @objc func paste(_ sender: Any?) {
         guard let model else { return }
         Task { await model.paste(moving: false) }
+    }
+
+    /// The system's toggle, from anywhere in the responder chain, goes through the model as the
+    /// toolbar item and Command-I do, so the menu's title and the saved choice follow it.
+    override func toggleInspector(_ sender: Any?) {
+        guard let model else { return super.toggleInspector(sender) }
+        model.showsInspector.toggle()
     }
 
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {

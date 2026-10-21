@@ -51,6 +51,42 @@ public enum EditableFile {
     }
 }
 
+/// What the inspector's preview box shows for a file, decided from its name and listed size before
+/// anything is fetched: a file it cannot show is never downloaded, and its box shows its icon.
+public enum InspectorPreviewPlan: Equatable, Sendable {
+    /// The first `EditableFile.previewHead` bytes as text, whatever the file's size.
+    case text
+    /// The whole file, decoded as a picture.
+    case picture
+    /// The whole file, through Quick Look.
+    case quickLook
+    /// Nothing to fetch.
+    case icon
+
+    /// The largest file that is not text the inspector fetches to preview. A file listed without
+    /// a size could be read without end, so it is not previewed.
+    public static let limit: UInt64 = 10 << 20
+
+    /// Types Quick Look draws as more than an icon. Anything else (archives, executables, unknown
+    /// extensions) would only show its icon, so it is not fetched.
+    private static let quickLookTypes: [UTType] = [
+        .pdf, .audiovisualContent, .rtf, .rtfd, .text, .presentation, .spreadsheet, .compositeContent,
+        .font, .threeDContent, .usdz, .epub,
+    ]
+
+    /// `isText` is the Live rule (`EditableFile.openKind`): an editable file shows its head.
+    public static func plan(fileName: String, size: UInt64?, isText: Bool) -> Self {
+        if isText { return .text }
+        guard let size, size <= limit else { return .icon }
+        // A name with no dot (README, LICENSE, Makefile) has no type to go by; Quick Look reads
+        // its contents and shows text as text, as it did before the plan existed.
+        guard let dot = fileName.lastIndex(of: ".") else { return .quickLook }
+        guard let type = UTType(filenameExtension: String(fileName[fileName.index(after: dot)...])) else { return .icon }
+        if type.conforms(to: .image) { return .picture }
+        return quickLookTypes.contains(where: type.conforms) ? .quickLook : .icon
+    }
+}
+
 public enum NameCollisionChoice: String, Sendable {
     case skip
     case keepBoth

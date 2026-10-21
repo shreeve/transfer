@@ -21,6 +21,12 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     let refusesDiscard = Locked(false)
     /// Asks for a password during login; no answer cancels it.
     let asksPassword = Locked(false)
+    /// Extensions that open Live, so the inspector shows their text.
+    let liveExtensions = Locked<Set<String>>([])
+    /// The local copies the inspector gets, by remote path; any other path fails.
+    let inspectorCopies = Locked<[RemotePath: URL]>([:])
+    /// How long an inspector copy takes to arrive.
+    let inspectorTime = Locked<Duration?>(nil)
     private let eventStream: AsyncStream<SessionEvent>
     let send: AsyncStream<SessionEvent>.Continuation
 
@@ -71,11 +77,18 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         record("download \(path.display)")
     }
-    func openKind(fileName: String) async -> OpenKind { .view }
+    func openKind(fileName: String) async -> OpenKind {
+        EditableFile.openKind(fileName: fileName, extensions: liveExtensions.value) == .live && !liveExtensions.value.isEmpty ? .live : .view
+    }
     func prepareLiveFile(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
     func prepareViewFile(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
     func preparePreview(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
-    func prepareInspectorPreview(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
+    func prepareInspectorPreview(_ path: RemotePath) async throws -> URL {
+        record("inspector \(path.display)")
+        if let time = inspectorTime.value { try await Task.sleep(for: time) }
+        guard let url = inspectorCopies.value[path] else { throw TransferError.notConnected }
+        return url
+    }
     func discardLiveFile(_ path: RemotePath, force: Bool) async throws {
         if refusesDiscard.value, !force { throw TransferError.liveUnsynced(1) }
         record("discard \(path.display)")

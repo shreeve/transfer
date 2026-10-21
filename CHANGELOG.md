@@ -2,6 +2,14 @@
 
 What changed in each release of Transfer. `Scripts/release.sh <version>` publishes that version's section as the GitHub release notes and as the notes Sparkle shows in the update dialog, and refuses to release a version that has no section here. Changes not yet released collect under Unreleased, whose heading becomes the version's when it ships.
 
+## Unreleased
+
+- The inspector is now a preview panel with a steady layout: a preview box of one fixed size at the top, then the name on one line (the full name in its tooltip), kind and size, date and time, and permissions with owner and group. Nothing moves as the selection changes; a file that is loading or cannot be previewed shows its icon in the same box, and a missing detail reads "—".
+- An Inspector button beside Transfers in the toolbar shows and hides the inspector, as View → Show Inspector (Command-I) does.
+- The inspector stays open or closed as you left it, in new windows and after relaunching.
+- Pictures and other files preview in the inspector up to 10 MB (was 8 MB); text still shows its first 64 KB at any size. A file of a type the inspector cannot preview is no longer downloaded for it.
+- The inspector can be widened to 480 points (was 320).
+
 ## 0.3.1 — 2026-09-27
 
 - In column view, Command-click and Shift-click select several folders in a column, as in Finder, so they can be copied, dragged, or deleted together; no column opens beside them.

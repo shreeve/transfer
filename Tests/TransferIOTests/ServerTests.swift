@@ -152,7 +152,7 @@ struct ServerTests {
     }
 
     /// Quick Look's head of a UTF-8 text file that ended inside a character was not UTF-8, so the
-    /// whole file was fetched instead (XFR-03). The inspector's limit for a file that is not text
+    /// whole file was fetched instead (XFR-03). The inspector's limit (10 MB) for a file that is not text
     /// was checked only against the listing the window had (SEC2-03): IO holds it too.
     @Test func previewsFetchOnlyWhatTheyShow() async throws {
         try await withHarness("cut", connected: true) { h in
@@ -161,8 +161,13 @@ struct ServerTests {
             let page = try await h.session.preparePreview(h.remotePath.appending("cjk.txt"))
             #expect(page.lastPathComponent == "cjk.txt.html")
 
+            // 10 MB previews; a byte more does not.
+            #expect(SSHConnection.inspectorLimit == 10 << 20)
             let blob = h.remote.appendingPathComponent("large.bin")
             #expect(FileManager.default.createFile(atPath: blob.path, contents: nil))
+            try FileHandle(forWritingTo: blob).truncate(atOffset: SSHConnection.inspectorLimit)
+            let whole = try await h.session.prepareInspectorPreview(h.remotePath.appending("large.bin"))
+            #expect(try FileManager.default.attributesOfItem(atPath: whole.path)[.size] as? UInt64 == SSHConnection.inspectorLimit)
             try FileHandle(forWritingTo: blob).truncate(atOffset: SSHConnection.inspectorLimit + 1)
             await #expect(throws: TransferError.self) { try await h.session.prepareInspectorPreview(h.remotePath.appending("large.bin")) }
         }
