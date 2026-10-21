@@ -51,12 +51,12 @@ struct InspectorTests {
         return url
     }
 
-    /// Every kind of selection keeps each fact's row and the preview area in one place: a
+    /// Every kind of selection keeps the header line and the preview area in one place: a
     /// picture, a text file, a file of a type it cannot show, one over the limit, one still
-    /// loading, a folder, two items, and a link, whose target fills the status line. The area
-    /// runs from under the rows to the Wrap lines strip at the panel's foot. The name stays one
-    /// line, and a missing fact reads "—".
-    @Test func theRowsAndThePreviewAreaHoldStillWhateverIsSelected() async throws {
+    /// loading, a folder, two items, and a link. The header is one line; the area runs from under
+    /// it to the Wrap lines strip at the panel's foot. Text and the list of several items draw on
+    /// the document background, the rest on gray. A missing fact reads "—".
+    @Test func theHeaderAndThePreviewAreaHoldStillWhateverIsSelected() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "TransferUITests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -101,29 +101,39 @@ struct InspectorTests {
             window.contentView?.layoutSubtreeIfNeeded()
             return slots.frames
         }
-        let fixed = ["name", "kind", "modified", "access", "status", "preview", "foot"]
+        let fixed = ["header", "preview", "foot"]
         var seen: [String: [String: CGRect]] = [:]
+        var surfaces: [String: String] = [:]
 
         select(longName)
         #expect(await eventually { if case .picture? = model.inspectorPreview { true } else { false } })
         seen["picture"] = await frames()
+        surfaces["picture"] = slots.surface
         let one = InspectorFacts(model: model)
         #expect(one.name == longName)
-        #expect(one.kindAndSize.hasSuffix(" · 1.0 kB"))
-        #expect(one.modified.hasPrefix(Format.day(when) + " · "))
-        #expect(one.access == "rw-r--r-- · steve:staff")
+        #expect(one.kind == "PNG image")
+        #expect(one.size == "1.0kB")
+        #expect(one.day == Format.day(when))
+        #expect(one.time == Format.clock(when))
+        #expect(one.permissions == "rw-r--r--")
+        #expect(one.owner == "steve:staff")
+        let tip = one.tooltip(link: nil, live: nil, transfer: nil)
+        #expect(tip.contains("PNG image") && tip.contains("steve:staff") && tip.contains("1,000 bytes"))
 
         select("notes.txt")
         #expect(await eventually { if case .text? = model.inspectorPreview { true } else { false } })
+        #expect(await eventually { slots.screens.last == "text" })
         seen["text"] = await frames()
+        surfaces["text"] = slots.surface
 
         select("blob.xyz")
         #expect(await eventually { model.inspectorPreview == nil && model.inspectorWait == .icon })
         seen["unsupported"] = await frames()
+        surfaces["unsupported"] = slots.surface
         let bare = InspectorFacts(model: model)
-        #expect(bare.kindAndSize.hasSuffix(" · —"))
-        #expect(bare.modified == "—")
-        #expect(bare.access == "—")
+        #expect(bare.size == "—")
+        #expect(bare.day == "—" && bare.time == "—")
+        #expect(bare.permissions == "—" && bare.owner == nil)
 
         select("huge.png")
         #expect(await eventually { model.inspectorPreview == nil && model.inspectorWait == .icon })
@@ -139,84 +149,217 @@ struct InspectorTests {
         select("docs")
         #expect(await eventually { model.inspectorWait == .icon })
         seen["folder"] = await frames()
+        surfaces["folder"] = slots.surface
         let folderFacts = InspectorFacts(model: model)
-        #expect(folderFacts.kindAndSize == "Folder · —")
+        #expect(folderFacts.kind == "Folder")
+        #expect(folderFacts.size == "—")
         #expect(folderFacts.file == nil)
 
         select("notes.txt", "docs")
         #expect(await eventually { model.inspectorWait == .icon && model.inspectorPreview == nil })
         seen["two items"] = await frames()
+        surfaces["two items"] = slots.surface
         let two = InspectorFacts(model: model)
-        #expect(two.name == "2 items selected")
-        #expect(two.kindAndSize == "1 file, 1 folder · 16 B")
-        #expect(two.modified == "—")
+        #expect(two.name == "2 items selected · 1 folder")
+        #expect(two.total == 16)
+        #expect(two.several?.map(\.name) == ["docs", "notes.txt"])
 
         select("link")
         #expect(await eventually { model.inspectorLinkTarget != nil && model.inspectorPreview == nil && model.inspectorWait == .icon })
         seen["link"] = await frames()
+        #expect(InspectorFacts(model: model).tooltip(link: model.inspectorLinkTarget, live: nil, transfer: nil).contains("→ "))
+        #expect(seen["link"]?["symbols"].map { $0.width > 0 } == true)
 
         // Neither a server nor the inspector fetched anything it could not show.
         let fetched = session.calls.value.filter { $0.hasPrefix("inspector ") }
         #expect(!fetched.contains { $0.hasSuffix("blob.xyz") || $0.hasSuffix("huge.png") })
 
+        #expect(surfaces == ["picture": "gray", "text": "document", "unsupported": "gray", "folder": "gray", "two items": "document"])
         let reference = try #require(seen["picture"])
         for key in fixed { #expect(reference[key] != nil, "\(key)") }
-        let area = try #require(reference["preview"]), status = try #require(reference["status"])
+        let area = try #require(reference["preview"]), header = try #require(reference["header"])
         let foot = try #require(reference["foot"])
-        // The panel's width less its margins, from under the last row to the strip at the foot.
+        // One line, the panel's width less its margins; the area from under it to the foot's strip.
+        #expect(header.height == InspectorColumn.headerHeight)
+        #expect(header.width == window.frame.width - 32)
         #expect(area.width == window.frame.width - 32)
-        #expect(area.minY == status.maxY + 12)
+        #expect(area.minY == header.maxY + InspectorColumn.headerGap)
         #expect(area.maxY == 640 - InspectorColumn.bottomMargin - InspectorColumn.footHeight - InspectorColumn.footGap)
         #expect(foot.maxY == 640 - InspectorColumn.bottomMargin)
         #expect(foot.height == InspectorColumn.footHeight)
-        for key in ["name", "kind", "modified", "access", "status"] {
-            #expect(try #require(reference[key]).maxY <= area.minY, "\(key)")
-        }
         for (state, frames) in seen {
             for key in fixed { #expect(frames[key] == reference[key], "\(state): \(key)") }
         }
-        // One line however long the name: as tall as a short name, and no wider than its row.
-        let name = try #require(reference["nameText"]), row = try #require(reference["name"])
+        // One line however long the name: as tall as a short name, and inside the header.
+        let name = try #require(reference["nameText"])
         let short = try #require(seen["two items"]?["nameText"])
         #expect(name.height == short.height)
-        #expect(name.height < InspectorColumn.nameHeight + 1)
-        #expect(name.width <= row.width)
+        #expect(name.height < InspectorColumn.headerHeight + 1)
+        #expect(name.minX >= header.minX && name.maxX <= header.maxX)
     }
 
-    /// A taller panel gives the preview area all the extra height; the rows above it stay put.
-    @Test func aTallerPanelGivesThePreviewAreaTheHeight() async throws {
+    /// The header holds one item's facts on one line. A narrow panel drops them from the right,
+    /// permissions, then time, then date, and never the size; nothing overlaps or leaves the line.
+    @Test func theHeaderDropsDetailsFromTheRightWhenNarrow() async throws {
+        let when: UInt32 = 1_788_000_000
+        let names = ["notes.txt", longName]
+        let session = FakeSession(server, folders: [home: names.map {
+            RemoteItem(path: path($0), kind: .file, size: 77_933_067, mtime: when, mode: 0o100644, owner: "steve", group: "staff")
+        }])
+        let model = TransferModel(provider: FakeProvider([session]), defaults: Defaults().store)
+        await model.connect(server)
+        #expect(await eventually { model.items.count == 2 })
+        let order = ["size", "day", "time", "permissions"]
+        var counts: [Int] = []
+        for name in names {
+            model.snapshot.selection = [path(name)]
+            model.selectionChanged()
+            for width in [480, 360, 300, 240, 200] as [CGFloat] {
+                let slots = InspectorSlots()
+                let window = await window(InspectorColumn(model: model).environment(\.inspectorSlots, slots).frame(width: width, height: 400), width: width, height: 400)
+                window.contentView?.layoutSubtreeIfNeeded()
+                let frames = slots.frames
+                window.close()
+                let header = try #require(frames["header"])
+                #expect(header.height == InspectorColumn.headerHeight)
+                let shown = order.filter { frames["detail \($0)"].map { $0.width > 0 } ?? false }
+                // What shows is the left of the order: the size always, the rest from the right.
+                #expect(shown == Array(order.prefix(shown.count)), "\(name) at \(width): \(shown)")
+                #expect(!shown.isEmpty, "\(name) at \(width)")
+                let text = try #require(frames["nameText"])
+                var left = text.maxX
+                for key in shown {
+                    let part = try #require(frames["detail \(key)"])
+                    #expect(part.minX >= left - 0.5, "\(name) at \(width): \(key)")
+                    #expect(part.maxX <= header.maxX + 0.5, "\(name) at \(width): \(key)")
+                    #expect(abs(part.midY - text.midY) < 2, "\(name) at \(width): \(key)")
+                    left = part.maxX
+                }
+                counts.append(shown.count)
+            }
+        }
+        // The short name shows everything when wide; the long one gives way at the narrowest.
+        #expect(counts.first == 4)
+        #expect(counts.last.map { $0 < 4 } == true)
+        // Narrower never shows more.
+        for run in [counts.prefix(5), counts.suffix(5)] {
+            #expect(zip(run, run.dropFirst()).allSatisfy { $0 >= $1 }, "\(counts)")
+        }
+    }
+
+    /// Several items: the count on the left, the files' total at the right as exact bytes and the
+    /// compact size (exact first to go), and a read-only list with one row per item in the
+    /// browser's order, its columns giving way from the right when narrow.
+    @Test func severalItemsListOneRowEachInBrowserOrder() async throws {
+        let when: UInt32 = 1_788_000_000
+        func item(_ name: String, _ kind: ItemKind, size: UInt64?) -> RemoteItem {
+            RemoteItem(path: path(name), kind: kind, size: size, mtime: when, mode: 0o100644, owner: "steve", group: "staff")
+        }
+        let items = [item("b.bin", .file, size: 77_933_000), item("a.txt", .file, size: 67), item("src", .directory, size: nil)]
+        let session = FakeSession(server, folders: [home: items, path("src"): []])
+        let model = TransferModel(provider: FakeProvider([session]), defaults: Defaults().store)
+        await model.connect(server)
+        #expect(await eventually { model.items.count == 3 })
+        model.snapshot.selection = Set(items.map(\.path))
+        model.selectionChanged()
+        let browser = model.displayedItems.map(\.name)
+        #expect(browser == ["src", "a.txt", "b.bin"])
+        let facts = InspectorFacts(model: model)
+        #expect(facts.name == "3 items selected · 1 folder")
+        #expect(facts.total == 77_933_067)
+        #expect(Format.sized(77_933_067) == "\(Format.exact(77_933_067)) ( 78MB)")
+        let rows = try #require(facts.several)
+        #expect(rows.map(\.name) == browser)
+        #expect(rows.map(\.size) == [nil, 67, 77_933_000])
+        #expect(rows[0].folder && rows[1].permissions == "rw-r--r--" && rows[1].owner == "steve:staff")
+        #expect(rows[2].day == Format.day(when) && rows[2].time == Format.shortClock(when))
+
+        let columns = ["name", "size", "permissions", "owner", "day", "time"]
+        func render(width: CGFloat) async throws -> [String: CGRect] {
+            let slots = InspectorSlots()
+            let window = await window(InspectorColumn(model: model).environment(\.inspectorSlots, slots).frame(width: width, height: 400), width: width, height: 400)
+            defer { window.close() }
+            #expect(await eventually { slots.frames["row 2 name"] != nil })
+            window.contentView?.layoutSubtreeIfNeeded()
+            #expect(slots.surface == "document")
+            return slots.frames
+        }
+        let wide = try await render(width: 480)
+        for index in 0..<3 {
+            for column in columns { #expect(wide["row \(index) \(column)"] != nil, "row \(index) \(column)") }
+        }
+        // In order down the list, one line each, and the sizes right-aligned in one column.
+        let tops = (0..<3).compactMap { wide["row \($0) name"]?.minY }
+        #expect(tops == tops.sorted() && Set(tops).count == 3)
+        let sizes = (0..<3).compactMap { wide["row \($0) size"]?.maxX }
+        #expect(Set(sizes).count == 1, "\(sizes)")
+        #expect(wide["row 3 name"] == nil)
+        let header = try #require(wide["header"]), total = try #require(wide["detail total"])
+        #expect(abs(total.maxX - header.maxX) < 1)
+        #expect(try #require(wide["nameText"]).maxX <= total.minX)
+
+        let narrow = try await render(width: 200)
+        let kept = columns.filter { narrow["row 0 \($0)"] != nil }
+        #expect(kept.contains("name") && kept.contains("size") && kept.contains("day"))
+        #expect(!kept.contains("time"))
+        // Time gives way first, then owner, then permissions.
+        if kept.contains("permissions") == false { #expect(!kept.contains("owner")) }
+        #expect(narrow["detail total"] == nil && narrow["detail compact total"] != nil)
+    }
+
+    /// Text draws on the document background, in light and in dark, and a picture on the gray.
+    @Test func textDrawsOnTheDocumentBackgroundInLightAndDark() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "TransferUITests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
         let png = try picture(in: folder)
-        let photo = RemoteItem(path: path("photo.png"), kind: .file, size: 1000)
-        let session = FakeSession(server, folders: [home: [photo]])
-        session.inspectorCopies.value = [photo.path: png]
+        let text = folder.appending(path: "notes.txt")
+        try Data("x\n".utf8).write(to: text)
+        let notes = RemoteItem(path: path("notes.txt"), kind: .file, size: 2), photo = RemoteItem(path: path("photo.png"), kind: .file, size: 1000)
+        let session = FakeSession(server, folders: [home: [notes, photo]])
+        session.liveExtensions.value = ["txt"]
+        session.inspectorCopies.value = [notes.path: text, photo.path: png]
         let defaults = Defaults()
         defaults.store.set(true, forKey: Preferences.showsInspector)
         let model = TransferModel(provider: FakeProvider([session]), defaults: defaults.store)
         await model.connect(server)
-        #expect(await eventually { model.items.count == 1 })
-        model.snapshot.selection = [photo.path]
-        model.selectionChanged()
-        #expect(await eventually { if case .picture? = model.inspectorPreview { true } else { false } })
-
-        func frames(height: CGFloat) async -> [String: CGRect] {
+        #expect(await eventually { model.items.count == 2 })
+        for name in [NSAppearance.Name.aqua, .darkAqua] {
+            let appearance = try #require(NSAppearance(named: name))
             let slots = InspectorSlots()
-            let window = await window(InspectorColumn(model: model).environment(\.inspectorSlots, slots).frame(width: 320, height: height), width: 320, height: height)
+            let window = await window(InspectorColumn(model: model).environment(\.inspectorSlots, slots).frame(width: 320, height: 400), width: 320, height: 400)
             defer { window.close() }
-            window.contentView?.layoutSubtreeIfNeeded()
-            return slots.frames
+            window.appearance = appearance
+            /// The area's color near its bottom-right corner, clear of any content.
+            func corner() async throws -> NSColor {
+                try? await Task.sleep(for: .milliseconds(200))
+                let view = try #require(window.contentView)
+                view.layoutSubtreeIfNeeded()
+                let area = try #require(slots.frames["preview"])
+                let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+                view.cacheDisplay(in: view.bounds, to: bitmap)
+                // The bitmap's rows run from the top, as the slots' coordinates do.
+                let scale = CGFloat(bitmap.pixelsWide) / view.bounds.width
+                let color = try #require(bitmap.colorAt(x: Int((area.maxX - 4) * scale), y: Int((area.maxY - 4) * scale)))
+                return try #require(color.usingColorSpace(.sRGB))
+            }
+            model.snapshot.selection = [notes.path]
+            model.selectionChanged()
+            #expect(await eventually { slots.screens.last == "text" })
+            let page = try await corner()
+            var document = NSColor.black
+            appearance.performAsCurrentDrawingAppearance { document = NSColor.textBackgroundColor.usingColorSpace(.sRGB) ?? .black }
+            // Opaque, and the document color (SwiftUI draws dark's a shade lighter than AppKit's 0.118).
+            #expect(page.alphaComponent == 1, "\(name.rawValue): \(page)")
+            #expect(abs(page.brightnessComponent - document.brightnessComponent) < 0.05, "\(name.rawValue): \(page) vs \(document)")
+
+            model.snapshot.selection = [photo.path]
+            model.selectionChanged()
+            #expect(await eventually { slots.screens.last == "picture" })
+            let gray = try await corner()
+            // The quiet gray: a faint wash over the panel (clear in this window), not the page.
+            #expect(gray.alphaComponent < 0.5, "\(name.rawValue): \(gray)")
         }
-        let short = await frames(height: 640), tall = await frames(height: 800)
-        for key in ["name", "kind", "modified", "access", "status"] {
-            #expect(short[key] != nil && short[key] == tall[key], "\(key)")
-        }
-        let shortArea = try #require(short["preview"]), tallArea = try #require(tall["preview"])
-        #expect(tallArea.minY == shortArea.minY)
-        #expect(tallArea.width == shortArea.width)
-        #expect(tallArea.height == shortArea.height + 160)
-        #expect(tallArea.maxY == 800 - InspectorColumn.bottomMargin - InspectorColumn.footHeight - InspectorColumn.footGap)
     }
 
     /// The location's facts when nothing is selected, with its item count once listed.
@@ -228,7 +371,7 @@ struct InspectorTests {
         #expect(await eventually { model.items.count == 2 })
         let facts = InspectorFacts(model: model)
         #expect(facts.name == "home")
-        #expect(facts.kindAndSize == "Folder · 2 items")
+        #expect(facts.kind == "Folder" && facts.size == "2 items")
         #expect(facts.file == nil)
     }
 

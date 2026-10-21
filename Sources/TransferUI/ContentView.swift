@@ -443,7 +443,7 @@ private struct Shelf: View {
 
     private func progressText(_ progress: TransferProgress) -> String {
         var parts: [String] = []
-        if progress.completed > 0 { parts.append(Format.si(progress.completed)) }
+        if progress.completed > 0 { parts.append(Format.si(progress.completed).trimmingCharacters(in: .whitespaces)) }
         if progress.itemsCompleted > 0 { parts.append(ClipText.count(progress.itemsCompleted, "item")) }
         return parts.joined(separator: ", ")
     }
@@ -461,7 +461,7 @@ private struct RateText: View {
         ZStack(alignment: .trailing) {
             ForEach(TransferRate.widestTexts, id: \.self) { Text($0).hidden() }
             TimelineView(.periodic(from: .now, by: 1)) { _ in
-                if let text = model.rateText(for: operation) { Text(text) }
+                if let text = model.rateText(for: operation) { Text(Format.figures(text)) }
             }
         }
         .font(.caption)
@@ -509,15 +509,16 @@ private struct SheetForm<Content: View, Actions: View>: View {
     }
 }
 
-/// The inspector: the facts at the top, each row in its own place, then the preview filling the
-/// rest of the panel down to its foot, the same for every selection, so nothing moves as the
-/// selection does. The area shows the file once a copy has arrived, else its icon: while it loads,
-/// when it cannot be shown, and for a folder or several items. A missing fact reads "—".
+/// The inspector: one header line at the top, then the preview filling the rest of the panel down
+/// to its foot, the same for every selection, so nothing moves as the selection does. The area
+/// shows the file once a copy has arrived, else its icon: while it loads, when it cannot be shown,
+/// and for a folder; several items show as a list. A missing fact reads "—".
 struct InspectorColumn: View {
     let model: TransferModel
     @AppStorage(Preferences.wrapsPreview) private var wrapsPreview = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.inspectorSlots) private var slots
+    @Environment(\.displayScale) private var displayScale
     /// The model's phase, the one coming in.
     @State private var shown = PreviewPhase()
     /// What the area draws. It follows `shown` at once, with each change's own animation, except
@@ -529,8 +530,9 @@ struct InspectorColumn: View {
     @State private var waitEnd: ContinuousClock.Instant?
 
     static let iconSize: CGFloat = 128
-    static let nameHeight: CGFloat = 18
-    static let rowHeight: CGFloat = 16
+    /// The one header line: icon, name, details, and the state symbols.
+    nonisolated static let headerHeight: CGFloat = 20
+    static let headerGap: CGFloat = 10
     /// The strip at the foot that holds Wrap lines for text; kept for every selection, so the
     /// preview area ends in the same place whether or not the toggle shows.
     static let footHeight: CGFloat = 20
@@ -544,8 +546,8 @@ struct InspectorColumn: View {
         let phase = PreviewPhase(preview: model.inspectorPreview, wait: model.inspectorWait)
         // A plain stack, not a scroll view: hosted scroll views reach up under the toolbar.
         return VStack(alignment: .leading, spacing: 0) {
-            rows(facts)
-            area(facts).padding(.top, 12)
+            header(facts)
+            area(facts).padding(.top, Self.headerGap)
             foot(facts).padding(.top, Self.footGap)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -608,8 +610,15 @@ struct InspectorColumn: View {
     /// change in place, instead of building a view that draws blank until it loads. Incoming text
     /// loads under what is on screen, transparent, until its page is in.
     private func area(_ facts: InspectorFacts) -> some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 8).fill(.quinary)
+        let document = facts.file != nil && onScreen.isText || facts.several != nil
+        return ZStack {
+            // Text and the list of several items draw on the document background, as a page
+            // does; everything else on the panel's quiet gray.
+            RoundedRectangle(cornerRadius: 8)
+                .fill(document ? AnyShapeStyle(Color(nsColor: .textBackgroundColor)) : AnyShapeStyle(.quinary))
+            if let several = facts.several {
+                SelectionList(rows: several)
+            }
             if facts.file != nil, case .text(let text)? = shown.preview {
                 SourcePreview(text: text, wraps: wrapsPreview, shown: pageShown)
                     .opacity(onScreen.isText ? 1 : 0)
@@ -619,7 +628,7 @@ struct InspectorColumn: View {
             if !onScreen.isText {
                 if facts.file != nil, let preview = onScreen.preview {
                     content(preview).transition(.opacity)
-                } else if facts.file == nil || onScreen.wait != .nothing {
+                } else if facts.several == nil, facts.file == nil || onScreen.wait != .nothing {
                     Image(nsImage: facts.icon)
                         .resizable()
                         .scaledToFit()
@@ -637,7 +646,15 @@ struct InspectorColumn: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            if document {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1 / displayScale)
+                    .allowsHitTesting(false)
+            }
+        }
         .slot("preview", slots)
+        .onChange(of: document, initial: true) { _, document in slots?.surface = document ? "document" : "gray" }
     }
 
     /// Wrap lines, for text only, in a strip that is there for everything.
@@ -685,99 +702,305 @@ struct InspectorColumn: View {
         }
     }
 
-    /// Name, kind and size, modified, access, then what is happening to the item, each one line
-    /// in its own place. The last line is there even when it is empty, so the preview area under
-    /// it never moves. Actions live in the context menu and on double-click, as in the browser.
-    private func rows(_ facts: InspectorFacts) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+    /// The one header line. One item: its small icon, the name in bold, then size, date, time,
+    /// and permissions, which give way from the right when the panel is narrow (the size never
+    /// does), and a symbol at the end for a link, a Live file, or a transfer. Several: their
+    /// count on the left and their total at the right. The rest goes in the tooltip. Actions live
+    /// in the context menu and on double-click, as in the browser.
+    @ViewBuilder private func header(_ facts: InspectorFacts) -> some View {
+        if let item = facts.file, let operation = model.operation(for: item.path) {
+            // Again every second, as on the shelf, so a stall shows without a report.
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                headerLine(facts, transfer: model.inspectorStatus(operation))
+            }
+        } else {
+            headerLine(facts, transfer: nil)
+        }
+    }
+
+    private func headerLine(_ facts: InspectorFacts, transfer: String?) -> some View {
+        let live = facts.file.flatMap { model.liveFile(for: $0.path) }
+        let link = facts.file?.kind == .symlink ? (model.inspectorLinkTarget ?? "…") : nil
+        let tooltip = facts.tooltip(link: link, live: live?.label, transfer: transfer)
+        return HeaderLine(trailing: facts.several != nil) {
+            if facts.several == nil {
+                Image(nsImage: facts.icon)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 16, height: 16)
+                    .accessibilityLabel(facts.kind)
+                    .layoutValue(key: HeaderRole.self, value: .icon)
+            }
             Text(facts.name)
                 .font(.headline)
                 .foregroundStyle(.primary)
                 .lineLimit(1)
-                .truncationMode(.middle)
-                .help(facts.name)
+                .truncationMode(facts.several == nil ? .middle : .tail)
                 .slot("nameText", slots)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .frame(height: Self.nameHeight)
-                .slot("name", slots)
-            row(facts.kindAndSize, "kind")
-            row(facts.modified, "modified").monospacedDigit()
-            row(facts.access, "access")
-            status(facts)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .frame(height: Self.rowHeight)
-                .slot("status", slots)
+                .layoutValue(key: HeaderRole.self, value: .name)
+            details(facts)
+                .layoutValue(key: HeaderRole.self, value: .details)
+            HStack(spacing: 4) {
+                if link != nil {
+                    Image(systemName: "arrow.turn.up.right").accessibilityLabel("Alias")
+                }
+                if let live {
+                    Circle()
+                        .fill(live.status == .conflict ? Color.red : Color.orange)
+                        .frame(width: 7, height: 7)
+                        .accessibilityLabel(live.label)
+                }
+                if transfer != nil {
+                    Image(systemName: "arrow.up.arrow.down").accessibilityLabel("Transferring")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .slot("symbols", slots)
+            .layoutValue(key: HeaderRole.self, value: .symbols)
         }
-        .font(.subheadline)
-        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity)
+        .frame(height: Self.headerHeight)
+        .contentShape(Rectangle())
+        .help(tooltip)
+        .slot("header", slots)
     }
 
-    /// A link's target, a Live file's state, and a transfer's, joined on the one status line; its
-    /// tooltip holds the whole of it.
-    @ViewBuilder private func status(_ facts: InspectorFacts) -> some View {
-        if let item = facts.file {
-            let known = [item.kind == .symlink ? "→ \(model.inspectorLinkTarget ?? "…")" : nil, model.liveFile(for: item.path)?.label].compactMap(\.self)
-            if let operation = model.operation(for: item.path) {
-                // Again every second, as on the shelf, so a stall shows without a report.
-                TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    line((known + [model.inspectorStatus(operation)]).joined(separator: " · ")).monospacedDigit()
-                }
-            } else if !known.isEmpty {
-                line(known.joined(separator: " · "))
-            } else {
-                Color.clear
+    /// One item's details, as many as fit, or several items' total, exact bytes first to go.
+    @ViewBuilder private func details(_ facts: InspectorFacts) -> some View {
+        if facts.several != nil {
+            ViewThatFits(in: .horizontal) {
+                detailLine([("total", facts.total.map(Format.sized) ?? InspectorFacts.missing)])
+                detailLine([("compact total", facts.total.map(Units.bytes) ?? InspectorFacts.missing)])
             }
         } else {
-            // Kept with nothing to say: an empty stack slot would close up, moving the area.
-            Color.clear
+            let parts = [("size", facts.size), ("day", facts.day), ("time", facts.time), ("permissions", facts.permissions)]
+            ViewThatFits(in: .horizontal) {
+                detailLine(parts)
+                detailLine(Array(parts.prefix(3)))
+                detailLine(Array(parts.prefix(2)))
+                detailLine(Array(parts.prefix(1)))
+            }
         }
     }
 
-    private func row(_ text: String, _ key: String) -> some View {
-        line(text)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: Self.rowHeight)
-            .slot(key, slots)
+    private func detailLine(_ parts: [(key: String, text: String)]) -> some View {
+        HStack(spacing: 0) {
+            ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
+                Text((index == 0 ? "" : " · ") + Format.figures(part.text))
+                    .slot("detail \(part.key)", slots)
+            }
+        }
+        .font(.subheadline)
+        .monospacedDigit()
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .fixedSize()
+    }
+}
+
+/// What each part of the inspector's header line is, for `HeaderLine`.
+enum HeaderRole: LayoutValueKey {
+    case icon, name, details, symbols, none
+    static let defaultValue = HeaderRole.none
+}
+
+/// The inspector's header: one line, never wrapping. The icon leads and the symbols end it; the
+/// name takes its own width, but no more than leaves the details their room once it has
+/// `nameFloor`; the details (a `ViewThatFits`, so as many as fit the room they are offered)
+/// follow the name, or, for several items, sit at the right edge.
+struct HeaderLine: Layout {
+    var trailing = false
+    var spacing: CGFloat = 6
+    static let nameFloor: CGFloat = 96
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        CGSize(width: proposal.width ?? 320, height: proposal.height ?? InspectorColumn.headerHeight)
     }
 
-    private func line(_ text: String) -> some View {
-        Text(text)
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .textSelection(.enabled)
-            .help(text)
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        func part(_ role: HeaderRole) -> LayoutSubview? { subviews.first { $0[HeaderRole.self] == role } }
+        var left = bounds.minX, right = bounds.maxX
+        if let icon = part(.icon) {
+            let size = icon.sizeThatFits(.unspecified)
+            icon.place(at: CGPoint(x: left, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(size))
+            left += size.width + spacing
+        }
+        if let symbols = part(.symbols) {
+            let size = symbols.sizeThatFits(.unspecified)
+            symbols.place(at: CGPoint(x: right, y: bounds.midY), anchor: .trailing, proposal: ProposedViewSize(size))
+            if size.width > 0 { right -= size.width + spacing }
+        }
+        let room = max(0, right - left)
+        let name = part(.name), details = part(.details)
+        let nameIdeal = name?.sizeThatFits(.unspecified).width ?? 0
+        let offered = max(0, room - min(nameIdeal, Self.nameFloor) - spacing)
+        let detailWidth = min(details?.sizeThatFits(ProposedViewSize(width: offered, height: bounds.height)).width ?? 0, room)
+        let nameWidth = max(0, min(nameIdeal, room - detailWidth - spacing))
+        name?.place(at: CGPoint(x: left, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(width: nameWidth, height: bounds.height))
+        let detailX = trailing ? right - detailWidth : left + nameWidth + spacing
+        details?.place(at: CGPoint(x: detailX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(width: offered, height: bounds.height))
+    }
+}
+
+/// Several selected items, one read-only row each in the browser's order: name, size, permissions,
+/// owner and group, date, and time (to the minute). Sizes and dates are monospaced digits, right-aligned, so they
+/// line up. Columns too wide for the panel give way: time, then owner, then permissions, then the
+/// exact size, leaving name, compact size, and date.
+struct SelectionList: View {
+    let rows: [InspectorFacts.Row]
+    @Environment(\.inspectorSlots) private var slots
+    @State private var width: CGFloat = 0
+
+    static let spacing: CGFloat = 6
+    static let inset: CGFloat = 6
+    static let nameFloor: CGFloat = 60
+    static let rowHeight: CGFloat = 18
+    static let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+
+    enum Column: String, CaseIterable { case exact, permissions, owner, time }
+
+    /// The widest text of each column.
+    private struct Widths {
+        var exact: CGFloat, compact: CGFloat, permissions: CGFloat, owner: CGFloat, day: CGFloat, time: CGFloat
+    }
+
+    private static func width(_ text: String) -> CGFloat {
+        ceil((text as NSString).size(withAttributes: [.font: font]).width) + 2
+    }
+
+    /// Any compact size: three digits' width, the widest prefix, and the unit.
+    private static let compactWidth: CGFloat = ["(888 B)", "(888kB)", "(888MB)", "(888GB)", "(888TB)"].map { width($0) }.max() ?? 0
+
+    /// Digits are all one width here, so for the exact sizes the longest text is the widest; the
+    /// other columns hold few distinct texts, each measured.
+    private func measure() -> Widths {
+        func widest(_ texts: some Sequence<String>) -> CGFloat { Set(texts).map { Self.width($0) }.max() ?? 0 }
+        let longest = rows.compactMap { $0.size.map(Format.exact) }.max { $0.count < $1.count }
+        return Widths(exact: max(longest.map(Self.width) ?? 0, Self.width("Folder") - Self.compactWidth - 4),
+                      compact: Self.compactWidth,
+                      permissions: widest(rows.lazy.map(\.permissions)),
+                      owner: widest(rows.lazy.map(\.owner)),
+                      day: widest(rows.lazy.map(\.day)),
+                      time: widest(rows.lazy.map(\.time)))
+    }
+
+    var body: some View {
+        let widths = measure()
+        let optional = [widths.exact, widths.permissions, widths.owner, widths.time]
+        let kept = ColumnFit.kept(optional.map(Double.init), required: [widths.compact, widths.day].map(Double.init),
+                                  spacing: Self.spacing, floor: Self.nameFloor, in: Double(width - 2 * Self.inset))
+        let shown = Set(Column.allCases.prefix(kept))
+        ScrollView(.vertical) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                    line(row, index: index, widths: widths, shown: shown)
+                }
+            }
+            .padding(.horizontal, Self.inset)
+            .padding(.vertical, 6)
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+    }
+
+    private func line(_ row: InspectorFacts.Row, index: Int, widths: Widths, shown: Set<Column>) -> some View {
+        HStack(spacing: Self.spacing) {
+            Text(row.name)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                .help(row.name)
+                .slot("row \(index) name", slots)
+            Group {
+                if let size = row.size {
+                    HStack(spacing: 4) {
+                        if shown.contains(.exact) {
+                            Text(Format.exact(size)).frame(width: widths.exact, alignment: .trailing)
+                        }
+                        Text("(\(Format.figures(Units.bytes(size))))").frame(width: widths.compact, alignment: .trailing)
+                    }
+                } else {
+                    Text(row.folder ? "Folder" : InspectorFacts.missing)
+                        .frame(width: (shown.contains(.exact) ? widths.exact + 4 : 0) + widths.compact, alignment: .trailing)
+                }
+            }
+            .slot("row \(index) size", slots)
+            if shown.contains(.permissions) {
+                Text(row.permissions).frame(width: widths.permissions, alignment: .leading).slot("row \(index) permissions", slots)
+            }
+            if shown.contains(.owner) {
+                Text(row.owner).lineLimit(1).frame(width: widths.owner, alignment: .leading).slot("row \(index) owner", slots)
+            }
+            Text(row.day).frame(width: widths.day, alignment: .leading).slot("row \(index) day", slots)
+            if shown.contains(.time) {
+                Text(row.time).frame(width: widths.time, alignment: .trailing).slot("row \(index) time", slots)
+            }
+        }
+        .font(Font(Self.font))
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .frame(height: Self.rowHeight)
     }
 }
 
 /// What the inspector says about the selection: one item, several, or the location when nothing
-/// is selected. Each fact is one line, "—" when it is not known.
+/// is selected. A fact that is not known reads "—".
 struct InspectorFacts {
     static let missing = "—"
 
     var name: String
+    /// The kind's name, for the tooltip and the icon's label.
     var kind: String
-    var kindAndSize: String
-    var modified: String
-    var access: String
+    /// The compact size, a folder's item count, or "—".
+    var size: String
+    var day: String
+    var time: String
+    var permissions: String
+    /// `owner:group`, for the tooltip; nil when unknown.
+    var owner: String?
     var icon: NSImage
     /// The one file or link selected, whose preview may fill the area; nil for anything else.
     var file: RemoteItem?
+    /// One row per item when several are selected, in the browser's order.
+    var several: [Row]?
+    /// Several items' files' bytes; nil when a file's size is unknown or there are no files.
+    var total: UInt64?
+    /// The exact bytes of one file, for the tooltip.
+    var bytes: UInt64?
+
+    /// One item of several, as the inspector's list shows it.
+    struct Row: Equatable {
+        var name: String
+        /// Bytes for a file; nil for a folder and for what has no size.
+        var size: UInt64?
+        var folder: Bool
+        var permissions: String
+        var owner: String
+        var day: String
+        var time: String
+    }
 
     @MainActor init(model: TransferModel) {
         let selected = model.selectedItems
         if selected.count > 1 {
             let folders = selected.count(where: { $0.kind == .directory })
-            let others = selected.filter { $0.kind != .directory }
-            var kinds: [String] = []
-            if !others.isEmpty { kinds.append(ClipText.count(others.count, "file")) }
-            if folders > 0 { kinds.append(ClipText.count(folders, "folder")) }
-            let sizes = others.compactMap(\.size)
-            let total = others.isEmpty || sizes.count < others.count ? nil : Self.size(sizes.reduce(0, +))
-            name = "\(selected.count) items selected"
-            kind = kinds.joined(separator: ", ")
-            kindAndSize = Self.pair(kind, total)
-            modified = Self.missing
-            access = Self.missing
+            let files = selected.filter { $0.kind == .file }
+            let sizes = files.compactMap(\.size)
+            name = "\(selected.count) items selected" + (folders > 0 ? " · \(ClipText.count(folders, "folder"))" : "")
+            kind = Self.missing
+            size = Self.missing
+            day = Self.missing
+            time = Self.missing
+            permissions = Self.missing
+            total = files.isEmpty || sizes.count < files.count ? nil : sizes.reduce(0, +)
+            several = selected.map { item in
+                Row(name: item.name, size: item.kind == .file ? item.size : nil, folder: item.kind == .directory,
+                    permissions: item.mode.map(Self.permissions) ?? Self.missing,
+                    owner: Self.owner(item) ?? Self.missing,
+                    day: item.mtime.map(Format.day) ?? Self.missing,
+                    time: item.mtime.map(Format.shortClock) ?? Self.missing)
+            }
             icon = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
             return
         }
@@ -789,34 +1012,48 @@ struct InspectorFacts {
         } else {
             name = "No Server"
             kind = Self.missing
-            kindAndSize = Self.missing
-            modified = Self.missing
-            access = Self.missing
+            size = Self.missing
+            day = Self.missing
+            time = Self.missing
+            permissions = Self.missing
             icon = NSImage(systemSymbolName: "server.rack", accessibilityDescription: nil) ?? NSImage()
             return
         }
         name = item.path.isRoot ? "/" : item.name
         kind = item.kindLabel
-        let size: String? = switch item.kind {
-        case .directory: model.itemCount(of: item.path).map { ClipText.count($0, "item") }
-        case .file: item.size.map(Self.size)
-        case .symlink, .other: nil
+        size = switch item.kind {
+        case .directory: model.itemCount(of: item.path).map { ClipText.count($0, "item") } ?? Self.missing
+        case .file: item.size.map(Units.bytes) ?? Self.missing
+        case .symlink, .other: Self.missing
         }
-        kindAndSize = Self.pair(kind, size)
-        modified = item.mtime.map { "\(Format.day($0)) · \(Format.clock($0))" } ?? Self.missing
-        access = item.mode == nil && item.owner == nil ? Self.missing
-            : Self.pair(item.mode.map(Self.permissions), item.owner.map { owner in item.group.map { "\(owner):\($0)" } ?? owner })
+        bytes = item.kind == .file ? item.size : nil
+        day = item.mtime.map(Format.day) ?? Self.missing
+        time = item.mtime.map(Format.clock) ?? Self.missing
+        permissions = item.mode.map(Self.permissions) ?? Self.missing
+        owner = Self.owner(item)
         icon = ItemIcon.image(for: item)
         file = selected.first.flatMap { $0.kind == .file || $0.kind == .symlink ? $0 : nil }
     }
 
-    /// "Plain Text · 1.2 kB", with "—" for either side that is missing.
-    static func pair(_ first: String?, _ second: String?) -> String {
-        "\(first ?? missing) · \(second ?? missing)"
+    /// Everything the header line leaves out or cuts short, one fact a line.
+    func tooltip(link: String?, live: String?, transfer: String?) -> String {
+        if let several {
+            return ([name] + (total.map { ["\(Format.sized($0)) in \(ClipText.count(several.count(where: { $0.size != nil }), "file"))"] } ?? [])).joined(separator: "\n")
+        }
+        var lines = [name, kind]
+        lines.append(bytes.map { "\(Format.exact($0)) bytes (\(Units.bytes($0).trimmingCharacters(in: .whitespaces)))" } ?? size)
+        if day != Self.missing { lines.append("Modified \(day) \(time)") }
+        if permissions != Self.missing || owner != nil {
+            lines.append([permissions == Self.missing ? nil : permissions, owner].compactMap(\.self).joined(separator: " "))
+        }
+        if let link { lines.append("→ \(link)") }
+        if let live { lines.append(live) }
+        if let transfer { lines.append(transfer) }
+        return lines.joined(separator: "\n")
     }
 
-    static func size(_ bytes: UInt64) -> String {
-        Units.bytes(bytes).trimmingCharacters(in: .whitespaces)
+    static func owner(_ item: RemoteItem) -> String? {
+        item.owner.map { owner in item.group.map { "\(owner):\($0)" } ?? owner }
     }
 
     static func permissions(_ mode: UInt32) -> String {
@@ -832,6 +1069,8 @@ struct InspectorFacts {
 final class InspectorSlots {
     nonisolated static let space = "inspector"
     var frames: [String: CGRect] = [:]
+    /// What the preview area is drawn on: "document" or "gray".
+    var surface: String?
     /// Each phase the preview area put on screen, in order (`PreviewPhase.label`).
     var screens: [String] = []
 }

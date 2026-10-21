@@ -261,6 +261,17 @@ import Testing
     #expect(html.components(separatedBy: "<span").count == 6)
 }
 
+/// The inspector's page is transparent over the document background, and in dark mode its
+/// colors are the dark ones: the dark rules come after the light rules they override.
+@Test func theInspectorsPageFollowsTheAppearance() {
+    let html = SyntaxPreview.html(text: "let a = 1", compact: true)
+    #expect(html.contains("background:transparent"))
+    let light = try! #require(html.range(of: ".k{color:#0b4f9c"))
+    let dark = try! #require(html.range(of: "@media(prefers-color-scheme:dark)"))
+    #expect(light.lowerBound < dark.lowerBound)
+    #expect(html.contains(".k{color:#6cb3ff}"))
+}
+
 @Test func syntaxPreviewEscapesAndLeavesStringsWhole() {
     let html = SyntaxPreview.html(text: "if (a < b) { return \"// not a comment\" }")
     #expect(html.contains("(a &lt; b)"))
@@ -270,37 +281,91 @@ import Testing
     #expect(!html.contains("class=\"c\""))
 }
 
-@Test func unitsScaleToThreeCharacters() {
-    #expect(Units.bytes(0) == "  0 B")
-    #expect(Units.bytes(959) == "959 B")
-    #expect(Units.bytes(1000) == "1.0 kB")
-    #expect(Units.bytes(14336) == " 14 kB")
-    #expect(Units.bytes(999_499) == "999 kB")
-    #expect(Units.bytes(999_500) == "1.0 MB")
-    #expect(Units.bytes(1_500_000_000) == "1.5 GB")
-    #expect(Units.bytes(5) == "5.0 B")
-    #expect(Units.bytes(999_499_999_999_999) == "999 TB")
-    #expect(Units.bytes(10_000_000_000_000_000) == "??? B")
-    #expect(Units.bytes(.max) == "??? B")
+/// A narrow row drops its optional columns last first, keeping the name its floor.
+@Test func columnsGiveWayLastFirst() {
+    let optional: [Double] = [40, 30, 20]
+    // 50 floor + 60 required + 3 spacing of 10 each for the three columns shown.
+    #expect(ColumnFit.kept(optional, required: [60], spacing: 10, floor: 50, in: 1000) == 3)
+    #expect(ColumnFit.kept(optional, required: [60], spacing: 10, floor: 50, in: 240) == 3)
+    #expect(ColumnFit.kept(optional, required: [60], spacing: 10, floor: 50, in: 239) == 2)
+    #expect(ColumnFit.kept(optional, required: [60], spacing: 10, floor: 50, in: 210) == 2)
+    #expect(ColumnFit.kept(optional, required: [60], spacing: 10, floor: 50, in: 209) == 1)
+    #expect(ColumnFit.kept(optional, required: [60], spacing: 10, floor: 50, in: 169) == 0)
+    #expect(ColumnFit.kept(optional, required: [60], spacing: 10, floor: 50, in: 120) == 0)
+    #expect(ColumnFit.kept([], required: [60], spacing: 10, floor: 50, in: 0) == 0)
 }
 
-@Test func everySizeReadsAsThreeCharactersWithinSixPercent() {
+/// The owner's examples, exactly.
+@Test func unitsReadCompactly() {
+    #expect(Units.scale(22, unit: "B") == " 22 B")
+    #expect(Units.scale(6100, unit: "B") == "6.1kB")
+    #expect(Units.scale(78e6, unit: "B") == " 78MB")
+    #expect(Units.scale(1.2e9, unit: "B") == "1.2GB")
+    #expect(Units.scale(1e6, unit: "B") == "1.0MB")
+    #expect(Units.scale(0.821, unit: "s") == "821ms")
+    #expect(Units.scale(0.074, unit: "s") == " 74ms")
+    #expect(Units.scale(1, unit: "s") == "  1 s")
+    #expect(Units.scale(1200, unit: "s") == "1.2ks")
+    #expect(Units.scale(0.0074, unit: "s") == "7.4ms")
+    #expect(Units.scale(0.000_000_5, unit: "s") == "500ns")
+    #expect(Units.scale(3e-6, unit: "s") == "3.0µs")
+    #expect(Units.bytes(0) == "  0 B")
+    #expect(Units.bytes(5) == "  5 B")
+    #expect(Units.bytes(959) == "959 B")
+    #expect(Units.bytes(1000) == "1.0kB")
+    #expect(Units.bytes(14336) == " 14kB")
+    #expect(Units.bytes(77_933_067) == " 78MB")
+    #expect(Units.bytes(999_499_999_999_999) == "999TB")
+    #expect(Units.bytes(10_000_000_000_000_000) == "??? B")
+    #expect(Units.bytes(.max) == "??? B")
+    #expect(Units.scale(-1, unit: "B") == "??? B")
+    #expect(Units.scale(.nan, unit: "B") == "??? B")
+    #expect(Units.scale(.infinity, unit: "B") == "??? B")
+    #expect(Units.scale(1e-13, unit: "s") == "??? s")
+}
+
+/// Where the rounding turns over: 999.5 goes up a prefix, 9.95 loses its decimal, and 0.995 is
+/// still one of the unit.
+@Test func unitsRoundAtTheirBoundaries() {
+    #expect(Units.scale(999.4, unit: "B") == "999 B")
+    #expect(Units.scale(999.5, unit: "B") == "1.0kB")
+    #expect(Units.bytes(999_499) == "999kB")
+    #expect(Units.bytes(999_500) == "1.0MB")
+    #expect(Units.bytes(9_949) == "9.9kB")
+    #expect(Units.bytes(9_950) == " 10kB")
+    #expect(Units.bytes(9_950_000) == " 10MB")
+    #expect(Units.scale(9.95, unit: "s") == " 10 s")
+    #expect(Units.scale(0.995, unit: "s") == "  1 s")
+    #expect(Units.scale(0.9949, unit: "s") == "995ms")
+    #expect(Units.scale(0.000_995, unit: "s") == "1.0ms")
+    #expect(Units.scale(999_500e12, unit: "B") == "??? B")
+}
+
+/// Every size, and every measure of another unit, is as wide as every other, and close to its value.
+@Test func everyMeasureHasOneWidthAndReadsWithinSixPercent() {
     var random = SeededRandom(state: 3)
-    let scales: [Substring: Double] = ["B": 1, "kB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12]
+    let scales: [Character: Double] = ["p": 1e-12, "n": 1e-9, "µ": 1e-6, "m": 1e-3, " ": 1, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12]
     for _ in 0..<20_000 {
         let size = random.next() >> (random.next() % 64)
         let text = Units.bytes(size)
+        #expect(text.count == 5, "\(size) \(text)")
+        #expect(text.hasSuffix("B"))
         guard !text.hasPrefix("???") else {
             #expect(Double(size) >= 999.5e12, "\(size)")
             continue
         }
-        let parts = text.split(separator: " ")
-        #expect(text.prefix(3).count == 3 && text.dropFirst(3).first == " ", "\(size) \(text)")
-        guard let number = Double(parts[0]), let scale = scales[parts[1]] else {
+        let number = Double(text.prefix(3).trimmingCharacters(in: .whitespaces))
+        guard let number, let scale = scales[text.dropFirst(3).first!] else {
             Issue.record("\(size) reads \(text)")
             continue
         }
         #expect(abs(number * scale - Double(size)) <= 0.06 * max(1, Double(size)), "\(size) \(text)")
+    }
+    for exponent in stride(from: -13.0, through: 16, by: 0.01) {
+        let value = pow(10, exponent)
+        for unit in ["s", "B/s"] {
+            #expect(Units.scale(value, unit: unit).count == 4 + unit.count, "\(value)")
+        }
     }
 }
 
@@ -308,7 +373,7 @@ import Testing
     var tally = ClipTally()
     tally.add(root: .file(size: 2100))
     tally.complete = true
-    #expect(ClipText.summary(tally, name: "notes.txt") == "“notes.txt” (2.1 kB)")
+    #expect(ClipText.summary(tally, name: "notes.txt") == "“notes.txt” (2.1kB)")
 }
 
 @Test func clipTextCountsFilesInsideFolders() {
@@ -319,7 +384,7 @@ import Testing
     for _ in 0..<28 { tally.add(inside: .file(size: 1000)) }
     tally.add(inside: .directory)
     tally.complete = true
-    #expect(ClipText.summary(tally, name: nil) == "3 files and 1 folder (31 files in all, 31 kB)")
+    #expect(ClipText.summary(tally, name: nil) == "3 files and 1 folder (31 files in all, 31kB)")
 }
 
 @Test func clipTextForFoldersAlone() {
