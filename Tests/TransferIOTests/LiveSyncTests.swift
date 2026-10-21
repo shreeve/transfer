@@ -1205,6 +1205,197 @@ struct LiveSyncTests {
         }
     }
 
+    // MARK: Timed checks of the server
+
+    /// Checks every 100 ms instead of about once a minute.
+    private func checking(_ h: Harness) async {
+        await h.live.checkRemote(every: .milliseconds(100))
+    }
+
+    private func notices(_ h: Harness) -> [String] {
+        h.fake.events.compactMap { if case .notice(let text) = $0 { text } else { nil } }
+    }
+
+    /// A check stats the file and flags it: nothing is fetched, written, or uploaded, and the
+    /// message bar hears of it once, however many checks see it.
+    @Test func aChangeOnTheServerIsFlaggedAndTheCopyLeftAlone() async throws {
+        try await withLive("check-flag") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            let stamp = LiveSync.stamp(local)
+            let fetches = await h.fake.fetches
+            await checking(h)
+            await h.fake.changeBehind(note, "their edit")
+            #expect(await waitUntil { await h.file()?.serverChange == .changed })
+            let checks = await h.fake.checks
+            #expect(await waitUntil { await h.fake.checks >= checks + 3 })
+            #expect(read(local) == "first")
+            #expect(LiveSync.stamp(local) == stamp)
+            #expect(!FileManager.default.fileExists(atPath: serverCopy(local).path))
+            #expect(await h.fake.fetches == fetches)
+            #expect(await h.fake.saves == 0)
+            #expect(await h.file()?.status == .changedOnServer)
+            #expect(await h.file().map { !$0.dirty && !$0.conflict } == true)
+            #expect(h.fake.conflicts.isEmpty)
+            #expect(notices(h).filter { $0.contains("note.txt") }.count == 1)
+            #expect(notices(h).contains { $0.contains("open it again") })
+            #expect(h.store.liveFiles(connection: h.connection).first?.conflict == nil)
+        }
+    }
+
+    @Test func aFlagClearsWhenTheServerGoesBackToTheBase() async throws {
+        try await withLive("check-back") { h in
+            _ = try await openLive(h, note, "first")
+            let original = try #require(await h.fake.file(note))
+            await checking(h)
+            await h.fake.changeBehind(note, "their edit")
+            #expect(await waitUntil { await h.file()?.serverChange == .changed })
+            await h.fake.restore(note, original)
+            #expect(await waitUntil { await h.file()?.serverChange == nil })
+            #expect(await h.file()?.status == .synced)
+        }
+    }
+
+    @Test func reopeningAFlaggedCopyRefreshesItAndClearsTheFlag() async throws {
+        try await withLive("check-reopen") { h in
+            let (local, _) = try await openLive(h, note, "first")
+            await checking(h)
+            await h.fake.changeBehind(note, "newer on server")
+            #expect(await waitUntil { await h.file()?.serverChange == .changed })
+            _ = try await h.live.open(note, on: h.connection)
+            #expect(read(local) == "newer on server")
+            #expect(await h.file()?.serverChange == nil)
+            // Later checks find the new base.
+            let checks = await h.fake.checks
+            #expect(await waitUntil { await h.fake.checks >= checks + 2 })
+            #expect(await h.file()?.serverChange == nil)
+        }
+    }
+
+    /// The flag changes nothing about a save: it meets the normal conflict, and a choice clears both.
+    @Test func aFlaggedFilesNextSaveIsTheNormalConflict() async throws {
+        try await withLive("check-save") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await checking(h)
+            await h.fake.changeBehind(note, "their edit")
+            #expect(await waitUntil { await h.file()?.serverChange == .changed })
+            try await edit(h, local, id, "my edit")
+            #expect(await waitUntil { await raised(h) })
+            #expect(await h.file()?.serverChange == nil)
+            #expect(await h.file()?.status == .conflict)
+            #expect(read(local) == "my edit")
+            #expect(await h.fake.saves == 0)
+            try await h.live.resolve(note, on: h.connection, choice: .keepRemote)
+            #expect(read(local) == "their edit")
+            #expect(await h.file().map { $0.serverChange == nil && !$0.conflict } == true)
+        }
+    }
+
+    /// Edits that no pass will upload (this save failed for good) meet the server's change as a
+    /// conflict as soon as a check sees it, uploading nothing.
+    @Test func unsyncedEditsMeetAServerChangeAsAConflictAtOnce() async throws {
+        try await withLive("check-conflict") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.fake.setSaveError(TransferError.permissionDenied(note.display))
+            try await edit(h, local, id, "my edit")
+            #expect(await waitUntil { shelf(h) == .failed })
+            #expect(await settled(h))
+            #expect(await h.file()?.dirty == true)
+            await h.fake.setSaveError(nil)
+            await checking(h)
+            await h.fake.changeBehind(note, "their edit")
+            #expect(await waitUntil { await raised(h) })
+            #expect(read(serverCopy(local)) == "their edit")
+            #expect(read(local) == "my edit")
+            #expect(await h.fake.saves == 0)
+            #expect(await h.fake.contents(note) == "their edit")
+        }
+    }
+
+    /// A paused file with edits is flagged as removed, never forgotten and never a conflict
+    /// until it is resumed.
+    @Test func aFileRemovedFromTheServerIsFlaggedAndKept() async throws {
+        try await withLive("check-removed") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            await h.live.setPaused(note, on: h.connection, paused: true)
+            try await edit(h, local, id, "unsynced edit")
+            #expect(await settled(h))
+            await checking(h)
+            await h.fake.delete(note)
+            #expect(await waitUntil { await h.file()?.serverChange == .removed })
+            #expect(await h.file()?.status == .removedFromServer)
+            #expect(await h.file()?.dirty == true)
+            #expect(read(local) == "unsynced edit")
+            #expect(h.store.liveFiles(connection: h.connection).count == 1)
+            // Opening it again would not take anything, so the notice does not say it would.
+            #expect(notices(h).contains { $0.contains("removed from the server") && $0.contains("Your edits are kept") })
+            #expect(!notices(h).contains { $0.contains("open it again") })
+            #expect(h.fake.conflicts.isEmpty)
+        }
+    }
+
+    @Test func aDisconnectStopsTheChecksAndALoginStartsThem() async throws {
+        try await withLive("check-disconnect") { h in
+            _ = try await openLive(h, note, "first")
+            await checking(h)
+            #expect(await waitUntil { await h.fake.checks >= 2 })
+            await h.live.disconnected(h.connection, server: h.fake)
+            // A stat already sent may still be answered.
+            await pause(150)
+            let stopped = await h.fake.checks
+            await pause(500)
+            #expect(await h.fake.checks == stopped)
+            await h.fake.changeBehind(note, "their edit")
+            await h.live.connected(h.connection, server: h.fake)
+            #expect(await waitUntil { await h.file()?.serverChange == .changed })
+        }
+    }
+
+    @Test func aCheckLeavesAFileWithAnUploadInFlightAlone() async throws {
+        try await withLive("check-upload") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            let gate = Locked(false)
+            await h.fake.setBeforeSave {
+                while !gate.value { try? await Task.sleep(for: .milliseconds(10)) }
+            }
+            await checking(h)
+            try await edit(h, local, id, "my edit")
+            #expect(await waitUntil { await h.file()?.uploading == true })
+            // A round that began before the upload may still finish its stat.
+            await pause(150)
+            let checks = await h.fake.checks
+            await pause(400)
+            #expect(await h.fake.checks == checks)
+            gate.value = true
+            #expect(await waitUntil { await h.fake.contents(note) == "my edit" })
+            #expect(await waitUntil { await h.fake.checks > checks })
+            #expect(await h.file()?.serverChange == nil)
+        }
+    }
+
+    /// A stat taken before an upload landed answers with the old base, which is no longer this
+    /// file's: applied, it would flag our own save as a change on the server. It is dropped.
+    @Test func aCheckAnsweredAfterAnUploadLandedIsIgnored() async throws {
+        try await withLive("check-stale") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            #expect(await settled(h))
+            await h.fake.holdChecks()
+            await checking(h)
+            #expect(await waitUntil { await h.fake.heldCheckCount == 1 })
+            try await edit(h, local, id, "my edit")
+            #expect(await waitUntil { await h.fake.contents(note) == "my edit" })
+            #expect(await waitUntil { await h.file().map { !$0.dirty && !$0.uploading } == true })
+            let checks = await h.fake.checks
+            await h.fake.releaseChecks()
+            // The held round's findings, and two fresh rounds after it.
+            #expect(await waitUntil { await h.fake.checks >= checks + 2 })
+            #expect(await settled(h))
+            #expect(await h.file().map { $0.serverChange == nil && !$0.conflict } == true)
+            #expect(h.fake.conflicts.isEmpty)
+            #expect(notices(h).isEmpty)
+            #expect(await h.fake.saves == 1)
+        }
+    }
+
     @Test func watcherPathsAreSplitUnderTheRealRoot() throws {
         let base = TestCaches.fresh("watcher")
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
@@ -1375,6 +1566,7 @@ actor FakeServer: LiveServer {
     }
 
     func liveFetch(_ item: RemoteItem, to local: URL, interactive: Bool) async throws {
+        fetches += 1
         if failing || failingFetches { throw TransferError.connectionLost("fake server unreachable") }
         guard let file = files[item.path] else { throw TransferError.noSuchFile(item.path.display) }
         if holding { await withCheckedContinuation { held.append($0) } }
@@ -1422,8 +1614,74 @@ actor FakeServer: LiveServer {
         return Set(files.keys.filter { $0.parent == folder }.map(\.name))
     }
 
+    /// Timed checks answered, by path, and fetches of any kind: a check must never fetch.
+    private(set) var checked: [RemotePath] = []
+    var checks: Int { checked.count }
+    private(set) var fetches = 0
+
+    func liveCheck(_ path: RemotePath) async throws -> RemoteItem? {
+        if failing { throw TransferError.connectionLost("fake server unreachable") }
+        checked.append(path)
+        // Read now, answered later when held: the answer is what the server held at the stat.
+        let answer = files[path].map { RemoteItem(path: path, kind: $0.kind, size: UInt64($0.data.count), mtime: $0.mtime) }
+        if holdingChecks { await withCheckedContinuation { heldChecks.append($0) } }
+        return answer
+    }
+
+    private var holdingChecks = false
+    private var heldChecks: [CheckedContinuation<Void, Never>] = []
+    var heldCheckCount: Int { heldChecks.count }
+
+    /// Checks read the server, then wait for `releaseChecks` before answering.
+    func holdChecks() { holdingChecks = true }
+
+    func releaseChecks() {
+        holdingChecks = false
+        for check in heldChecks { check.resume() }
+        heldChecks.removeAll()
+    }
+
+    /// Puts back the bytes and time a file had, as an undo on the server would.
+    func restore(_ path: RemotePath, _ file: File) { files[path] = file }
+    func file(_ path: RemotePath) -> File? { files[path] }
+
     nonisolated func liveEmit(_ event: SessionEvent) {
         log.withLock { $0.append(event) }
+    }
+}
+
+/// The timed check against the local sshd (`ServerHarness`), on the session's walker channel.
+@Suite(.enabled(if: ServerHarness.available, "needs the local sshd from Scripts/local-sshd.sh"))
+struct LiveCheckServerTests {
+    /// A file changed on the server behind the app is flagged within the check's interval, its
+    /// working copy untouched, and the flag clears when the server holds the base again.
+    @Test func aChangeMadeOnTheServerIsFlaggedWithinTheInterval() async throws {
+        try await withHarness("livechk", connected: true) { h in
+            let file = h.remote.appendingPathComponent("note.txt")
+            try Data("first".utf8).write(to: file)
+            let original = try #require(try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date)
+            let path = h.remotePath.appending(name: Array("note.txt".utf8))
+            let local = try await h.session.prepareLiveFile(path)
+            let stamp = LiveSync.stamp(local)
+            await h.live.checkRemote(every: .milliseconds(300))
+
+            try Data("changed on the server".utf8).write(to: file)
+            #expect(await waitUntil(3) { await h.session.liveFiles().first?.serverChange == .changed })
+            #expect(try Data(contentsOf: local) == Data("first".utf8))
+            #expect(LiveSync.stamp(local) == stamp)
+            // The recorder hears events from a task of its own, which may run after the flag is read.
+            let notices = { h.events.notices.filter { $0.contains("note.txt") }.count }
+            #expect(await waitUntil(3) { notices() >= 1 })
+            // Three more rounds see the same change and say nothing more.
+            try await Task.sleep(for: .seconds(1))
+            #expect(notices() == 1)
+            #expect(h.events.conflicts(path) == 0)
+
+            try Data("first".utf8).write(to: file)
+            try FileManager.default.setAttributes([.modificationDate: original], ofItemAtPath: file.path)
+            #expect(await waitUntil(3) { await h.session.liveFiles().first?.serverChange == nil })
+            #expect(await h.session.liveFiles().first?.status == .synced)
+        }
     }
 }
 

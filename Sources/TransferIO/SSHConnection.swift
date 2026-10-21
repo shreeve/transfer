@@ -1021,6 +1021,15 @@ extension SSHConnection: LiveServer {
         try await listedNames(folder)
     }
 
+    /// The walker, never browse or interactive: listings and the file the user waits on keep
+    /// their channels to themselves, and a walk is background work that one stat a minute per
+    /// Live file does not slow. No data channel either, as acquiring one can queue behind a copy.
+    /// When the walker is down (and not reopened yet), the check is skipped until its next round.
+    func liveCheck(_ path: RemotePath) async throws -> RemoteItem? {
+        guard let walker = await liveLink(.walker) else { throw TransferError.notConnected }
+        return try await walker.lookup(path)
+    }
+
     nonisolated func liveEmit(_ event: SessionEvent) {
         pipe.emit(event)
     }

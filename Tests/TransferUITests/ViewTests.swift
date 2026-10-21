@@ -164,6 +164,57 @@ struct ViewTests {
         #expect(await askB.value.text == nil)
     }
 
+    /// A Live file that a timed check finds changed (or removed) on the server gets a Live Files
+    /// row as soon as the session says so, though nothing in it is unsynced, with its own symbol,
+    /// the tooltip "Changed on the server", and the inspector's Live line naming it; the row goes
+    /// when the flag clears.
+    @Test func aLiveFileChangedOnTheServerShowsInTheSidebar() async throws {
+        let home = RemotePath(string: "/home")
+        let note = home.appending(name: Array("note.txt".utf8))
+        let gone = home.appending(name: Array("gone.txt".utf8))
+        let session = FakeSession(a)
+        let synced = [note, gone].map { LiveFile(id: LiveFileID(), path: $0, dirty: false, paused: false, conflict: false, uploading: false) }
+        session.live.value = synced
+        let model = TransferModel(provider: FakeProvider([session]))
+        let window = await host(ContentView(model: model))
+        defer { window.close() }
+        await model.connect(a)
+        let sidebar = { (rows: Int) in tables(in: window.contentView!).first { $0.numberOfRows == rows } }
+        // Servers, A, and Add Server: synced files have no row.
+        #expect(await eventually { model.liveFiles.count == 2 && sidebar(3) != nil })
+        #expect(model.activeLiveFiles.isEmpty)
+
+        var flagged = synced
+        flagged[0].serverChange = .changed
+        flagged[1].serverChange = .removed
+        session.live.value = flagged
+        session.send.yield(.liveChanged)
+        // Then Live Files and the two files.
+        #expect(await eventually { sidebar(6) != nil })
+        #expect(model.activeLiveFiles.map(\.path) == [note, gone])
+        #expect(model.liveFile(for: note)?.sidebarHelp == "/home/note.txt\nChanged on the server")
+        #expect(model.liveFile(for: gone)?.sidebarHelp == "/home/gone.txt\nRemoved from the server")
+        #expect(model.liveFile(for: note)?.status.label == "Live, changed on the server")
+        #expect(model.liveFile(for: gone)?.status.label == "Live, removed from the server")
+        #expect(model.liveFile(for: note)?.label == "Live, changed on the server")
+        // A flag outranks Paused in the status, and the row and the inspector still say it.
+        flagged[1].paused = true
+        session.live.value = flagged
+        session.send.yield(.liveChanged)
+        #expect(await eventually { model.liveFile(for: gone)?.paused == true })
+        #expect(model.liveFile(for: gone)?.sidebarHelp == "/home/gone.txt\nRemoved from the server; paused")
+        #expect(model.liveFile(for: gone)?.label == "Live, removed from the server, paused")
+        #expect(sidebar(6) != nil)
+        for status in [LiveFile.Status.changedOnServer, .removedFromServer] {
+            #expect(NSImage(systemSymbolName: status.symbolName, accessibilityDescription: nil) != nil)
+            #expect(![LiveFile.Status.synced, .conflict, .dirty].map(\.symbolName).contains(status.symbolName))
+        }
+
+        session.live.value = synced
+        session.send.yield(.liveChanged)
+        #expect(await eventually { sidebar(3) != nil })
+    }
+
     /// UIV-03: an Extensions edit made just before the tab goes away is saved, not dropped with
     /// the pause that waits for typing to stop.
     @Test func anExtensionsEditIsSavedWhenTheTabGoes() async throws {

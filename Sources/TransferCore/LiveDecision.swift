@@ -97,6 +97,20 @@ public enum LiveAction: Hashable, Sendable {
     case failRetryable(String)
 }
 
+/// What a timed check of the server's file does to a Live file. The check only stats the file:
+/// it never writes the working copy and never uploads.
+public enum LiveCheckAction: Hashable, Sendable {
+    /// Leave the file as it is: nothing new is known, or a pass or conflict already covers it.
+    case none
+    /// The server holds the base again: drop any flag.
+    case clear
+    /// The server moved on from the base: mark the file changed (or removed) on the server.
+    case flag(LiveConflictKind)
+    /// The server moved on and the working copy holds edits it lacks: the conflict the next
+    /// save would meet, raised now, uploading nothing.
+    case conflict(LiveConflictKind)
+}
+
 /// How the working copy compares with the last sync.
 public enum LiveLocalChange: Hashable, Sendable {
     case same
@@ -188,6 +202,26 @@ public enum LiveDecision {
     /// refreshes, since an editor may hold unsaved text.
     public static func refreshesOnOpen(_ state: LiveState, _ change: LiveLocalChange?, server: Fingerprint) -> Bool {
         !state.conflict && (change == .same || change == .touched) && server != state.base
+    }
+
+    /// A timed check found `server` while the working copy compares with the last sync as
+    /// `change` (nil: missing). A server holding the base clears the flag; one holding our own
+    /// unconfirmed upload is not a change, as the next pass adopts it; an unknown answer changes
+    /// nothing. Otherwise the file is flagged, and when the copy also holds edits the server
+    /// lacks, the conflict their save would meet is raised at once: waiting only stacks more
+    /// edits on a base that is gone. A paused file is only flagged, since Pause asks that
+    /// nothing happen to it until Resume, whose pass raises that conflict. A copy that is
+    /// missing or not known to be edited is only flagged too.
+    public static func afterCheck(_ state: LiveState, _ change: LiveLocalChange?, server: LiveServerFact) -> LiveCheckAction {
+        if state.conflict { return .none }
+        if case .file(let now) = server {
+            guard let base = state.base else { return .none }
+            if now == base { return .clear }
+            if let pending = state.pending, now == pending.fingerprint { return .none }
+        }
+        guard let kind = conflictKind(for: server) else { return .none }
+        let edited = change == .changed || (change == .needDigest && state.dirty)
+        return edited && !state.paused ? .conflict(kind) : .flag(kind)
     }
 
     public static func decide(_ state: LiveState, local: LiveLocal, server: LiveServerFact) -> LiveAction {

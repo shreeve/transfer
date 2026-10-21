@@ -86,8 +86,8 @@ struct SidebarColumn: View {
                         } icon: {
                             Image(systemName: live.status.symbolName)
                         }
-                        .help("\(live.path.display)\n\(live.status.help)")
-                        .accessibilityValue(live.status.label)
+                        .help(live.sidebarHelp)
+                        .accessibilityValue(live.label)
                         .tag(SidebarItem.live(live.path))
                         .contextMenu {
                             if live.paused {
@@ -632,7 +632,7 @@ struct InspectorColumn: View {
             row(facts.access, "access")
             if let item = facts.file {
                 if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
-                if let live = model.liveFile(for: item.path) { line(live.status.label) }
+                if let live = model.liveFile(for: item.path) { line(live.label) }
                 if let operation = model.operation(for: item.path) {
                     // Again every second, as on the shelf, so a stall shows without a report.
                     TimelineView(.periodic(from: .now, by: 1)) { _ in

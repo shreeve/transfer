@@ -1715,8 +1715,9 @@ public final class TransferModel {
         }
     }
 
-    /// Live files with something happening: edited, uploading, paused, or in conflict. A synced
-    /// mapping keeps working in the background but is not worth a sidebar row.
+    /// Live files with something happening: edited, uploading, paused, in conflict, or changed or
+    /// removed on the server. A synced mapping keeps working in the background but is not worth a
+    /// sidebar row.
     public var activeLiveFiles: [LiveFile] {
         liveFiles.filter { $0.status != .synced }
     }
@@ -1958,6 +1959,19 @@ public extension ViewMode {
     }
 }
 
+public extension LiveFile {
+    /// The Live Files sidebar row's tooltip: the remote path, then what the file is doing.
+    var sidebarHelp: String { "\(path.display)\n\(status.help)\(pausedToo ? "; paused" : "")" }
+
+    /// The inspector's Live line.
+    var label: String { "\(status.label)\(pausedToo ? ", paused" : "")" }
+
+    /// A flag from the server outranks Paused in the status, which must still say it.
+    private var pausedToo: Bool {
+        paused && (status == .changedOnServer || status == .removedFromServer)
+    }
+}
+
 /// Every label, symbol, and tooltip for what a Live file is doing comes from here.
 public extension LiveFile.Status {
     var label: String { words.label }
@@ -1967,6 +1981,8 @@ public extension LiveFile.Status {
     private var words: (label: String, symbol: String, help: String) {
         switch self {
         case .conflict: ("Conflict", "exclamationmark.triangle.fill", "Changed on the server; needs a decision")
+        case .changedOnServer: ("Live, changed on the server", "exclamationmark.arrow.circlepath", "Changed on the server")
+        case .removedFromServer: ("Live, removed from the server", "xmark.circle", "Removed from the server")
         case .uploading: ("Uploading", "arrow.up.circle.fill", "Uploading")
         case .paused: ("Paused", "pause.circle", "Paused")
         case .dirty: ("Live, unsynced", "pencil.circle.fill", "Edited here, not yet uploaded")
