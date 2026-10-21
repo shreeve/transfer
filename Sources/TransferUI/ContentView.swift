@@ -361,6 +361,7 @@ private struct IconGrid: View {
 /// pushes the browser out of the window.
 private struct Shelf: View {
     let model: TransferModel
+    @Environment(\.detailSlots) private var slots
     /// The rows at their natural height, which the scroll view grows to before scrolling.
     @State private var height: CGFloat = 0
 
@@ -371,7 +372,7 @@ private struct Shelf: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
-                    ForEach(model.operations) { operation in row(operation) }
+                    ForEach(model.operations) { operation in row(operation).slot("shelfRow \(operation.id)", slots, in: DetailSlots.space) }
                 }
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
             }
@@ -390,6 +391,9 @@ private struct Shelf: View {
                 }
             }
             Spacer()
+            if operation.state == .active, operation.livePath == nil {
+                RateText(model: model, operation: operation).slot("shelfRate \(operation.id)", slots, in: DetailSlots.space)
+            }
             if operation.state == .active || operation.state == .paused {
                 if let total = operation.progress.total, total > 0 {
                     ProgressView(value: Double(operation.progress.completed), total: Double(total))
@@ -442,6 +446,28 @@ private struct Shelf: View {
         if progress.completed > 0 { parts.append(Format.si(progress.completed)) }
         if progress.itemsCompleted > 0 { parts.append(ClipText.count(progress.itemsCompleted, "item")) }
         return parts.joined(separator: ", ")
+    }
+}
+
+/// A running transfer's speed and time left beside its progress bar, in a slot as wide as the
+/// widest it can read (less in a window too narrow for that) and one caption line tall, shorter
+/// than the row's title, so the row neither moves nor grows as the numbers change. It reads the
+/// rate every second as well as on each report, since a stalled transfer reports nothing.
+private struct RateText: View {
+    let model: TransferModel
+    let operation: TransferOperation
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            ForEach(TransferRate.widestTexts, id: \.self) { Text($0).hidden() }
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                if let text = model.rateText(for: operation) { Text(text) }
+            }
+        }
+        .font(.caption)
+        .monospacedDigit()
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
     }
 }
 
@@ -608,7 +634,10 @@ struct InspectorColumn: View {
                 if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
                 if let live = model.liveFile(for: item.path) { line(live.status.label) }
                 if let operation = model.operation(for: item.path) {
-                    line(operation.message ?? model.stateLabel(operation) ?? "Active")
+                    // Again every second, as on the shelf, so a stall shows without a report.
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        line(model.inspectorStatus(operation)).monospacedDigit()
+                    }
                 }
             }
         }
