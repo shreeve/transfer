@@ -576,8 +576,9 @@ struct InspectorColumn: View {
         let due = model.inspectorMovedAt + PreviewTiming.icon
         let end = waitEnd.map { min($0, due) } ?? due
         waitEnd = end
+        let clock = model.previewClock
         pageWait = Task { @MainActor in
-            try? await Task.sleep(until: end)
+            try? await clock.sleep(end)
             guard !Task.isCancelled, !onScreen.isText else { return }
             let icon = PreviewPhase(preview: nil, wait: .icon)
             withAnimation(animation(from: onScreen, to: icon)) { put(icon) }

@@ -197,7 +197,9 @@ public final class TransferModel {
     public var inspectorWait: InspectorWait = .nothing
     @ObservationIgnored private var inspectorTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var inspectorGeneration = 0
-    @ObservationIgnored private var lastSelectionChange = ContinuousClock.now - .seconds(10)
+    @ObservationIgnored private var lastSelectionChange: ContinuousClock.Instant?
+    /// The clock the inspector's choreography runs on; a hand-driven one in tests.
+    @ObservationIgnored public var previewClock = PreviewClock.system
     /// When the preview on show stopped being the selection's, so a held arrow key cannot keep
     /// an old file's preview up past `PreviewTiming.icon`.
     @ObservationIgnored private var inspectorStaleSince: ContinuousClock.Instant?
@@ -1125,8 +1127,9 @@ public final class TransferModel {
         inspectorTasks.removeAll()
         inspectorGeneration &+= 1
         let generation = inspectorGeneration
-        let now = ContinuousClock.now
-        let rapid = lastSelectionChange.duration(to: now) < PreviewTiming.coalesce
+        let clock = previewClock
+        let now = clock.now()
+        let rapid = lastSelectionChange.map { $0.duration(to: now) < PreviewTiming.coalesce } ?? false
         lastSelectionChange = now
         // An icon already up stays until the next preview replaces it, rather than blanking.
         inspectorWait = inspectorWait == .nothing ? .nothing : .icon
@@ -1151,7 +1154,7 @@ public final class TransferModel {
             // The wait, step by step, until the fetch lands and cancels it.
             Task { [weak self] in
                 for (at, step) in timeline {
-                    try? await Task.sleep(until: at)
+                    try? await clock.sleep(at)
                     guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
                     step(self)
                 }
@@ -1166,7 +1169,7 @@ public final class TransferModel {
                     inspectorWait = .icon
                     return
                 }
-                if rapid { try? await Task.sleep(for: PreviewTiming.coalesce) }
+                if rapid { try? await clock.sleep(now + PreviewTiming.coalesce) }
                 guard !Task.isCancelled else { return }
                 let preview = await Self.fetchPreview(item, session: session)
                 guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
@@ -2432,6 +2435,21 @@ public enum InspectorWait: Equatable {
 /// animation, so moving between files never shows an empty box; an icon that lands and is
 /// replaced within a few frames is a flicker, so the old preview gives way to the icon only once
 /// the wait is plainly long, and a spinner joins it later still. The details change at once.
+/// The time the inspector's choreography reads and waits on: the system's, or in tests one that
+/// moves only when told, so the order of its steps and their boundaries are checked exactly.
+public struct PreviewClock: Sendable {
+    public var now: @Sendable () -> ContinuousClock.Instant
+    /// Returns at the instant given, or throws when the task is cancelled first.
+    public var sleep: @Sendable (ContinuousClock.Instant) async throws -> Void
+
+    public init(now: @escaping @Sendable () -> ContinuousClock.Instant, sleep: @escaping @Sendable (ContinuousClock.Instant) async throws -> Void) {
+        self.now = now
+        self.sleep = sleep
+    }
+
+    public static let system = PreviewClock(now: { .now }, sleep: { try await Task.sleep(until: $0) })
+}
+
 public enum PreviewTiming {
     /// Selection changes closer together than this are a held key; only then does the fetch wait.
     public static let coalesce: Duration = .milliseconds(120)

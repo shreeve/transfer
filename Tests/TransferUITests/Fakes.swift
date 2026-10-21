@@ -153,12 +153,53 @@ func files(_ count: Int, in folder: String) -> [RemotePath: [RemoteItem]] {
     return [path: (0..<count).map { RemoteItem(path: path.appending(name: Array("file-\($0).txt".utf8)), kind: .file, size: 10) }]
 }
 
-/// Waits, letting the main actor run, until `done` holds or about two seconds pass.
+/// Waits, letting the main actor run, until `done` holds or about `seconds` pass.
 @MainActor
-func eventually(_ done: () -> Bool) async -> Bool {
-    for _ in 0..<400 {
+func eventually(seconds: Int = 2, _ done: () -> Bool) async -> Bool {
+    for _ in 0..<seconds * 200 {
         if done() { return true }
         try? await Task.sleep(for: .milliseconds(5))
     }
     return done()
+}
+
+/// A clock for the inspector's choreography that moves only when the test says, so a step's
+/// order and its boundary are checked exactly, however loaded the machine.
+final class ManualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = ContinuousClock.now
+    private var sleepers: [UUID: (deadline: ContinuousClock.Instant, wake: CheckedContinuation<Void, any Error>)] = [:]
+
+    var now: ContinuousClock.Instant { lock.withLock { current } }
+
+    var clock: PreviewClock {
+        PreviewClock(now: { self.now }, sleep: { try await self.sleep(until: $0) })
+    }
+
+    /// Moves time forward to `instant`, waking every sleeper due by then.
+    func advance(to instant: ContinuousClock.Instant) {
+        let due = lock.withLock {
+            current = max(current, instant)
+            let due = sleepers.filter { $0.value.deadline <= current }
+            for id in due.keys { sleepers[id] = nil }
+            return due.values.map(\.wake)
+        }
+        for wake in due { wake.resume() }
+    }
+
+    func sleep(until deadline: ContinuousClock.Instant) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (wake: CheckedContinuation<Void, any Error>) in
+                let now: Bool = lock.withLock {
+                    if deadline <= current || Task.isCancelled { return true }
+                    sleepers[id] = (deadline, wake)
+                    return false
+                }
+                if now { Task.isCancelled ? wake.resume(throwing: CancellationError()) : wake.resume() }
+            }
+        } onCancel: {
+            lock.withLock { sleepers.removeValue(forKey: id)?.wake }?.resume(throwing: CancellationError())
+        }
+    }
 }

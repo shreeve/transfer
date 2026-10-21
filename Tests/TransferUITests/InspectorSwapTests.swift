@@ -63,7 +63,7 @@ extension InspectorTests {
         let beta = SourcePage(text: "let beta = 2", wraps: false)
 
         view.show(alpha)
-        #expect(await eventually { view.swap.shown == alpha })
+        #expect(await eventually(seconds: 10) { view.swap.shown == alpha })
         let first = view.front
         #expect(first.alphaValue == 1)
         #expect(await pageText(first).contains("alpha"))
@@ -73,7 +73,7 @@ extension InspectorTests {
         #expect(view.front === first && view.swap.shown == alpha)
         #expect(await pageText(first).contains("alpha"))
         var waits = 0
-        while view.swap.shown != beta, waits < 400 {
+        while view.swap.shown != beta, waits < 2000 {
             #expect(view.front === first && first.alphaValue == 1)
             try? await Task.sleep(for: .milliseconds(5))
             waits += 1
@@ -112,14 +112,14 @@ extension InspectorTests {
 
         model.snapshot.selection = [path("one.txt")]
         model.selectionChanged()
-        #expect(await eventually { sourcePreview(in: window.contentView)?.swap.shown?.text == "let one = 1\n" })
+        #expect(await eventually(seconds: 10) { sourcePreview(in: window.contentView)?.swap.shown?.text == "let one = 1\n" })
         let view = try #require(sourcePreview(in: window.contentView))
         let buffers = view.buffers.map(ObjectIdentifier.init)
 
         model.snapshot.selection = [path("two.txt")]
         model.selectionChanged()
         var waits = 0
-        while view.swap.shown?.text != "let two = 2\n", waits < 400 {
+        while view.swap.shown?.text != "let two = 2\n", waits < 2000 {
             #expect(model.inspectorPreview != nil)
             #expect(sourcePreview(in: window.contentView) === view)
             try? await Task.sleep(for: .milliseconds(5))
@@ -131,8 +131,9 @@ extension InspectorTests {
     }
 
     /// A fast fetch replaces the previous preview with no gap. A slow one leaves the previous
-    /// preview up until `PreviewTiming.icon`, then the icon; a held key cannot keep a stale
-    /// preview up longer. A folder shows its icon at once.
+    /// preview up until `PreviewTiming.icon`, then the icon, and the spinner at
+    /// `PreviewTiming.spinner`; a held key cannot keep a stale preview up longer. A folder shows
+    /// its icon at once. Time is a `ManualClock`, so each boundary is checked to the millisecond.
     @Test func thePreviousPreviewStaysUntilTheNextIsReadyOrTheIconIsDue() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "TransferUITests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -151,59 +152,77 @@ extension InspectorTests {
         let defaults = Defaults()
         defaults.store.set(true, forKey: Preferences.showsInspector)
         let model = TransferModel(provider: FakeProvider([session]), defaults: defaults.store)
+        let time = ManualClock()
+        model.previewClock = time.clock
         await model.connect(server)
         #expect(await eventually { model.items.count == items.count })
+        /// A second after the last move, so no move reads as a held key.
         func select(_ name: String) {
+            time.advance(to: time.now + .seconds(1))
             model.snapshot.selection = [path(name)]
             model.selectionChanged()
         }
-        /// Polls until `done`, checking `meanwhile` on every look; the instant it came true.
-        func watch(until done: () -> Bool, meanwhile: () -> Bool) async -> ContinuousClock.Instant? {
-            for _ in 0..<1000 {
-                if done() { return .now }
-                #expect(meanwhile())
-                try? await Task.sleep(for: .milliseconds(2))
-            }
-            return nil
+        /// Lets every task the clock woke run its course.
+        func settle() async {
+            for _ in 0..<10 { await Task.yield() }
+            try? await Task.sleep(for: .milliseconds(30))
         }
+        func phase() -> PreviewPhase { PreviewPhase(preview: model.inspectorPreview, wait: model.inspectorWait) }
+        let a = PreviewPhase(preview: .text("a\n")), b = PreviewPhase(preview: .text("b\n"))
+        let icon = PreviewPhase(preview: nil, wait: .icon), spinner = PreviewPhase(preview: nil, wait: .spinner)
 
         select("a.txt")
-        #expect(await eventually { model.inspectorPreview == .text("a\n") })
+        #expect(await eventually { phase() == a })
+        // The clock stands still, so the area holds a's preview until b's lands: never the icon.
         select("b.txt")
-        // The area holds a's preview until b's lands: never empty, never the icon.
-        #expect(await watch(until: { model.inspectorPreview == .text("b\n") },
-                            meanwhile: { model.inspectorPreview == .text("a\n") && model.inspectorWait == .nothing }) != nil)
+        var looks = 0
+        while phase() != b, looks < 2000 {
+            #expect(phase() == a)
+            try? await Task.sleep(for: .milliseconds(2))
+            looks += 1
+        }
+        #expect(phase() == b)
 
+        // A slow fetch: b's preview until the instant `icon` is due, then the icon, then the spinner.
         session.inspectorTime.value = .seconds(30)
-        let start = ContinuousClock.now
         select("c.txt")
-        let cleared = try #require(await watch(until: { model.inspectorPreview == nil },
-                                               meanwhile: { model.inspectorPreview == .text("b\n") && model.inspectorWait == .nothing }))
-        #expect(cleared - start >= PreviewTiming.icon)
-        #expect(model.inspectorWait == .icon)
-        #expect(await eventually { model.inspectorWait == .spinner })
+        let moved = time.now
+        await settle()
+        #expect(phase() == b)
+        time.advance(to: moved + PreviewTiming.icon - .milliseconds(1))
+        await settle()
+        #expect(phase() == b)
+        time.advance(to: moved + PreviewTiming.icon)
+        #expect(await eventually { phase() == icon })
+        time.advance(to: moved + PreviewTiming.spinner - .milliseconds(1))
+        await settle()
+        #expect(phase() == icon)
+        time.advance(to: moved + PreviewTiming.spinner)
+        #expect(await eventually { phase() == spinner })
 
-        // A second move while the first is still loading starts no new 500 ms for the old preview.
+        // A second move while the first is still loading starts no new wait for the old preview:
+        // it goes at `icon` after the first move, not after the second.
         session.inspectorTime.value = nil
         select("a.txt")
-        #expect(await eventually { model.inspectorPreview == .text("a\n") })
+        #expect(await eventually { phase() == a })
         session.inspectorTime.value = .seconds(30)
-        let stale = ContinuousClock.now
         select("c.txt")
-        try? await Task.sleep(until: stale + .milliseconds(400))
-        let moved = ContinuousClock.now
-        select("d.txt")
-        let gone = try #require(await watch(until: { model.inspectorPreview == nil }, meanwhile: { model.inspectorPreview == .text("a\n") }))
-        #expect(gone - stale >= PreviewTiming.icon)
-        #expect(gone < moved + PreviewTiming.icon)
-        #expect(model.inspectorWait == .icon)
+        let stale = time.now
+        time.advance(to: stale + .milliseconds(400))
+        model.snapshot.selection = [path("d.txt")]
+        model.selectionChanged()
+        time.advance(to: stale + PreviewTiming.icon - .milliseconds(1))
+        await settle()
+        #expect(phase() == a)
+        time.advance(to: stale + PreviewTiming.icon)
+        #expect(await eventually { phase() == icon })
 
         // A folder has no preview to wait for: its icon, at once.
         session.inspectorTime.value = nil
         select("b.txt")
-        #expect(await eventually { model.inspectorPreview == .text("b\n") })
+        #expect(await eventually { phase() == b })
         select("docs")
-        #expect(model.inspectorPreview == nil && model.inspectorWait == .icon)
+        #expect(phase() == icon)
     }
 
     /// Text arriving over a picture, or over the icon, loads hidden: what was on screen stays
@@ -226,12 +245,17 @@ extension InspectorTests {
         let defaults = Defaults()
         defaults.store.set(true, forKey: Preferences.showsInspector)
         let model = TransferModel(provider: FakeProvider([session]), defaults: defaults.store)
+        // Time moves only between selections, so however slowly a page loads on a busy machine,
+        // the old preview's 500 ms never runs out under it.
+        let time = ManualClock()
+        model.previewClock = time.clock
         let slots = InspectorSlots()
         let window = await window(InspectorColumn(model: model).environment(\.inspectorSlots, slots).frame(width: 320, height: 640), width: 320)
         defer { window.close() }
         await model.connect(server)
         #expect(await eventually { model.items.count == items.count })
         func select(_ name: String) {
+            time.advance(to: time.now + .seconds(1))
             model.snapshot.selection = [path(name)]
             model.selectionChanged()
         }
@@ -242,7 +266,7 @@ extension InspectorTests {
             let mark = slots.screens.count
             var held = false
             select(name)
-            for _ in 0..<1000 where slots.screens.last != "text" {
+            for _ in 0..<5000 where slots.screens.last != "text" {
                 #expect(slots.screens.last == before)
                 if case .text? = model.inspectorPreview, sourcePreview(in: window.contentView) != nil { held = true }
                 try? await Task.sleep(for: .milliseconds(2))
