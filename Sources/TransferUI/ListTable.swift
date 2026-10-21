@@ -136,7 +136,7 @@ struct ListTable: NSViewRepresentable {
             case "mtime":
                 cell.textField?.stringValue = item.mtime.map(Format.date) ?? ""
             case "size":
-                cell.textField?.stringValue = item.kind == .file ? Format.si(item.size) : ""
+                cell.textField?.stringValue = item.kind == .file ? Format.figures(Format.si(item.size)) : ""
             default:
                 cell.textField?.stringValue = item.kindLabel
             }
@@ -369,9 +369,26 @@ final class ClosureMenuItem: NSMenuItem {
 }
 
 enum Format {
-    /// `959 B`, `1.2 kB`, ` 14 kB`: see `Units`.
+    /// `959 B`, `1.2kB`, ` 14kB`, in `Units`' fixed width.
     static func si(_ size: UInt64?) -> String {
         size.map(Units.bytes) ?? ""
+    }
+
+    /// A compact measure for a column or slot drawn in monospaced digits: the padding before its
+    /// number becomes figure spaces, as wide as a digit there, so the digits stack.
+    static func figures(_ text: String) -> String {
+        let pad = text.prefix { $0 == " " }.count
+        return String(repeating: "\u{2007}", count: pad) + text.dropFirst(pad)
+    }
+
+    /// The exact byte count as this Mac writes numbers: `77,933,067`.
+    static func exact(_ size: UInt64) -> String {
+        size.formatted(.number)
+    }
+
+    /// `77,933,067 ( 78MB)`.
+    static func sized(_ size: UInt64) -> String {
+        "\(exact(size)) (\(Units.bytes(size)))"
     }
 
     static func date(_ mtime: UInt32) -> String {
@@ -386,6 +403,11 @@ enum Format {
 
     static func clock(_ mtime: UInt32) -> String {
         Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .omitted, time: .standard)
+    }
+
+    /// The same to the minute, for the inspector's list of several items: `2:44 PM`, or `14:44`.
+    static func shortClock(_ mtime: UInt32) -> String {
+        Date(timeIntervalSince1970: TimeInterval(mtime)).formatted(date: .omitted, time: .shortened)
     }
 }
 

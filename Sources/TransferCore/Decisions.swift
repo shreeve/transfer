@@ -463,15 +463,17 @@ public enum SyntaxPreview {
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
         let colored = color(escaped)
+        // The compact page is transparent: the inspector draws the document background behind
+        // it, so the two never differ. Its dark colors come after the light ones, which they override.
         let body = compact
             ? "body{margin:6px 8px;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:\(wraps ? "pre-wrap" : "pre");overflow-wrap:anywhere;color:#1d1d1f;background:transparent;-webkit-user-select:text}"
-                + "@media(prefers-color-scheme:dark){body{color:#e5e5e7}.k{color:#6cb3ff}.s{color:#7ed49a}.c{color:#98989d}}"
             : "body{margin:24px;font:13px ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#1d1d1f;background:#fff}"
+        let dark = compact ? "\n@media(prefers-color-scheme:dark){body{color:#e5e5e7}.k{color:#6cb3ff}.s{color:#7ed49a}.c{color:#98989d}}" : ""
         return """
         <!doctype html><html><head><meta charset="utf-8">
         <style>
         \(body)
-        .k{color:#0b4f9c;font-weight:600}.s{color:#0b6b3a}.c{color:#6e6e73}
+        .k{color:#0b4f9c;font-weight:600}.s{color:#0b6b3a}.c{color:#6e6e73}\(dark)
         </style>
         </head><body>\(colored)</body></html>
         """
@@ -498,21 +500,55 @@ public enum SyntaxPreview {
     }
 }
 
-/// Sizes in three characters, a space, and the unit with its SI prefix: `959 B`, `1.2 kB`,
-/// ` 14 kB`, the same everywhere.
+/// Compact measures in a fixed width: the number right-aligned in three characters, one slot for
+/// the SI prefix (a space for none), then the unit: ` 22 B`, `6.1kB`, ` 78MB`, `1.2GB`, `821ms`,
+/// `1.2ks`. Only a scaled value under 10 has a decimal; a value in the base unit is whole. Zero is
+/// `  0 B`; a value beyond the prefixes, below one pico, negative, or not a number is `??? B`.
+/// Every output for one unit is as wide as every other, so sizes stack in columns.
 public enum Units {
-    public static func bytes(_ size: UInt64) -> String {
-        guard size > 0 else { return "  0 B" }
-        var value = Double(size)
-        for prefix in ["", "k", "M", "G", "T"] {
-            if value < 999.5 {
-                let tenth = (value * 10).rounded() / 10
-                let digits = tenth >= 10 ? String(Int(value.rounded())) : String(format: "%.1f", tenth)
-                return String(repeating: " ", count: 3 - digits.count) + digits + " " + prefix + "B"
-            }
-            value /= 1000
+    /// From pico (-4) to tera (4); the base unit is a space.
+    private static let prefixes: [Character] = ["p", "n", "µ", "m", " ", "k", "M", "G", "T"]
+
+    public static func scale(_ value: Double, unit: String) -> String {
+        if value == 0 { return "  0 " + unit }
+        guard value > 0, value.isFinite else { return "??? " + unit }
+        // `value` in units of 1000^power, divided or multiplied by whole powers so that a whole
+        // number of bytes divides exactly.
+        func scaled(_ power: Int, times: Double = 1) -> Double {
+            power >= 0 ? value / (pow(1000, Double(power)) / times) : value * pow(1000, Double(-power)) * times
         }
-        return "??? B"
+        var power = 0
+        while scaled(power) < 0.995, power > -4 { power -= 1 }
+        while scaled(power) >= 999.5, power < 4 { power += 1 }
+        let shown = scaled(power)
+        guard shown >= 0.995, shown < 999.5 else { return "??? " + unit }
+        var digits = String(Int(shown.rounded()))
+        if power != 0 {
+            // At least 1.0: a value just over 0.995 can land a hair under in binary.
+            let tenths = max(10, Int(scaled(power, times: 10).rounded()))
+            if tenths < 100 { digits = "\(tenths / 10).\(tenths % 10)" }
+        }
+        return String(repeating: " ", count: 3 - digits.count) + digits + String(prefixes[power + 4]) + unit
+    }
+
+    public static func bytes(_ size: UInt64) -> String {
+        scale(Double(size), unit: "B")
+    }
+}
+
+/// Which columns a narrow row keeps: its flexible column (a name) keeps at least `floor`, the
+/// required columns always show, and the optional ones give way last first.
+public enum ColumnFit {
+    /// How many of `optional`, in the order they are kept (the last gives way first), fit in
+    /// `available` beside `required` and the flexible column, with `spacing` between columns.
+    public static func kept(_ optional: [Double], required: [Double], spacing: Double, floor: Double, in available: Double) -> Int {
+        func width(_ count: Int) -> Double {
+            let columns = required + optional.prefix(count)
+            return floor + columns.reduce(0, +) + spacing * Double(columns.count)
+        }
+        var count = optional.count
+        while count > 0, width(count) > available { count -= 1 }
+        return count
     }
 }
 

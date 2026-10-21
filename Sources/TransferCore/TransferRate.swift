@@ -1,7 +1,7 @@
 import Foundation
 
 /// A running transfer's speed and time left, from the (time, bytes done) progress it reports:
-/// "12 MB/s · about 2 minutes left". One per attempt: a Restart or a Retry starts a new one.
+/// " 12MB/s · about 2 minutes left". One per attempt: a Restart or a Retry starts a new one.
 ///
 /// The speed is the bytes done over the last `window` seconds divided by that span, measured up to
 /// the moment it is read, not to the last report. At ten reports a second that is about fifty
@@ -102,9 +102,9 @@ public struct TransferRate: Hashable, Sendable {
             return reading
         }()
 
-        /// "12 MB/s", in the sizes' own three characters.
+        /// " 12MB/s", in the sizes' own fixed width (`Units`), whole bytes, never millibytes.
         public var speed: String {
-            Units.bytes(UInt64(bytesPerSecond.rounded())).trimmingCharacters(in: .whitespaces) + "/s"
+            Units.bytes(UInt64(bytesPerSecond.rounded())) + "/s"
         }
 
         /// "about 2 minutes left", or nil when there is nothing worth saying.
@@ -112,7 +112,7 @@ public struct TransferRate: Hashable, Sendable {
             secondsLeft.flatMap(TransferRate.words).map { "\($0) left" }
         }
 
-        /// "12 MB/s · about 2 minutes left", "12 MB/s", or "Stalled".
+        /// " 12MB/s · about 2 minutes left", " 12MB/s", or "Stalled".
         public var text: String {
             if stalled { return "Stalled" }
             return [speed, timeLeft].compactMap { $0 }.joined(separator: " · ")
@@ -136,9 +136,9 @@ public struct TransferRate: Hashable, Sendable {
     /// The widest texts a reading can make, for a slot as wide as the widest of them, which then
     /// never changes size as the numbers do.
     public static let widestTexts = [
-        "888 MB/s · about 88 seconds left",
-        "888 MB/s · about 88 minutes left",
-        "888 MB/s · about 88 hours left",
-        "888 MB/s · a few seconds left",
+        "888MB/s · about 88 seconds left",
+        "888MB/s · about 88 minutes left",
+        "888MB/s · about 88 hours left",
+        "888MB/s · a few seconds left",
     ]
 }

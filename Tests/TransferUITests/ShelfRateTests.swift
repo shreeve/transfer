@@ -57,9 +57,9 @@ struct ShelfRateTests {
         #expect(model.rateText(for: operation) == nil)
         await report(model, drive, time, at: 3, 40_000_000)
         operation = try #require(model.operations.first)
-        #expect(model.rateText(for: operation) == "10 MB/s · about 2 minutes left")
+        #expect(model.rateText(for: operation) == " 10MB/s · about 2 minutes left")
         // The inspector says what the shelf says.
-        #expect(model.inspectorStatus(operation) == "10 MB/s · about 2 minutes left")
+        #expect(model.inspectorStatus(operation) == " 10MB/s · about 2 minutes left")
 
         // Five seconds with no byte: no estimate of days, and the inspector agrees.
         time.value = 8
@@ -79,7 +79,7 @@ struct ShelfRateTests {
         await report(model, drive, time, at: 8.1, 5_000_000)
         await report(model, drive, time, at: 10.1, 25_000_000)
         operation = try #require(model.operations.first)
-        #expect(model.rateText(for: operation) == "10 MB/s · about 2 minutes left")
+        #expect(model.rateText(for: operation) == " 10MB/s · about 2 minutes left")
 
         // Finished, the row goes, and with it its rate.
         drive.ends.value = true
@@ -141,7 +141,7 @@ struct ShelfRateTests {
         let empty = try #require(await frames())
         #expect(model.rateText(for: try #require(model.operations.first)) == nil)
         await report(model, drive, time, at: 3, 40_000_000)
-        #expect(model.rateText(for: try #require(model.operations.first)) == "10 MB/s · about 2 minutes left")
+        #expect(model.rateText(for: try #require(model.operations.first)) == " 10MB/s · about 2 minutes left")
         let reading = try #require(await frames())
         time.value = 8.5
         let stalled = try #require(await frames())

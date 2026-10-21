@@ -1402,7 +1402,7 @@ public final class TransferModel {
         rates[id]?.record(at: clock(), completed: progress.completed)
     }
 
-    /// A running transfer's speed and time left, "12 MB/s · about 2 minutes left", or "Stalled";
+    /// A running transfer's speed and time left, " 12MB/s · about 2 minutes left", or "Stalled";
     /// nil for any other row, and until its rate has enough to go on (`TransferRate`).
     public func rateText(for operation: TransferOperation) -> String? {
         guard operation.state == .active, operation.livePath == nil, let rate = rates[operation.id] else { return nil }

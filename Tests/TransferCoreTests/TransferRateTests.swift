@@ -17,7 +17,7 @@ private func feed(_ rate: inout TransferRate, _ tenths: ClosedRange<Int>, perSec
     let reading = try #require(rate.reading(at: 10, total: done + 1_200_000_000))
     #expect(abs(reading.bytesPerSecond - 10_000_000) < 1)
     #expect(abs(try #require(reading.secondsLeft) - 120) < 0.1)
-    #expect(reading.text == "10 MB/s · about 2 minutes left")
+    #expect(reading.text == " 10MB/s · about 2 minutes left")
 }
 
 @Test func nothingShowsUntilTwoSecondsOfReports() throws {
@@ -25,7 +25,7 @@ private func feed(_ rate: inout TransferRate, _ tenths: ClosedRange<Int>, perSec
     _ = feed(&rate, 0...19, perSecond: 1_000_000)
     #expect(rate.reading(at: 1.9, total: 100_000_000) == nil)
     rate.record(at: 2, completed: 2_000_000)
-    #expect(try #require(rate.reading(at: 2, total: 100_000_000)).text == "1.0 MB/s · about 2 minutes left")
+    #expect(try #require(rate.reading(at: 2, total: 100_000_000)).text == "1.0MB/s · about 2 minutes left")
 }
 
 @Test func aBurstMovesTheSpeedOnlyByItsShareOfTheWindow() throws {
@@ -67,13 +67,13 @@ private func feed(_ rate: inout TransferRate, _ tenths: ClosedRange<Int>, perSec
     _ = feed(&rate, 0...50, perSecond: 1_200_000)
     let reading = try #require(rate.reading(at: 5, total: nil))
     #expect(reading.secondsLeft == nil && reading.timeLeft == nil)
-    #expect(reading.text == "1.2 MB/s")
+    #expect(reading.text == "1.2MB/s")
 }
 
 @Test func anEstimateTooLongToMeanAnythingIsLeftOut() throws {
     var rate = TransferRate()
     _ = feed(&rate, 0...50, perSecond: 1000)
-    #expect(try #require(rate.reading(at: 5, total: 1_000_000_000)).text == "1.0 kB/s")
+    #expect(try #require(rate.reading(at: 5, total: 1_000_000_000)).text == "1.0kB/s")
 }
 
 @Test func timeLeftIsWordedTheWayFinderWordsIt() {
@@ -105,11 +105,13 @@ private func feed(_ rate: inout TransferRate, _ tenths: ClosedRange<Int>, perSec
 }
 
 @Test func theWidestTextsHoldEveryReading() {
-    // Every speed reads in at most eight characters, as "888 MB/s" does.
+    // Every speed reads in seven characters, as "888MB/s" does.
     for exponent in 0...12 {
         let speed = TransferRate.Reading(bytesPerSecond: pow(10, Double(exponent)) * 0.9995, secondsLeft: nil).speed
-        #expect(speed.count <= "888 MB/s".count, "\(speed)")
+        #expect(speed.count == "888MB/s".count, "\(speed)")
     }
+    #expect(TransferRate.Reading(bytesPerSecond: 85_000, secondsLeft: nil).speed == " 85kB/s")
+    #expect(TransferRate.Reading(bytesPerSecond: 0.4, secondsLeft: nil).speed == "  0 B/s")
     // Every time left is "a few seconds" or "about", at most two digits, and a unit the slot was
     // sized for.
     for seconds in stride(from: 0.0, through: TransferRate.longestEstimate, by: 7) {
