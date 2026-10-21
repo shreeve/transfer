@@ -514,7 +514,7 @@ struct TransferServerTests {
             let taken = h.remotePath.appending(name: Array("up".utf8)).appending(name: Array("taken.txt".utf8))
             // Said so, not with the server's bare "Failure" (XFR-06).
             await #expect(throws: TransferError.failed("“taken.txt” appeared at the destination while it was being copied, and was not replaced")) {
-                try await h.session.uploadBytes(source, to: taken, replacing: false) { _ in }
+                try await h.session.uploadBytes(source, to: taken, replacing: nil) { _ in }
             }
             #expect(try Data(contentsOf: up.appendingPathComponent("taken.txt")) == Data("theirs".utf8))
             let leftovers = try FileManager.default.contentsOfDirectory(atPath: up.path).filter { $0.contains(".transfer-") }

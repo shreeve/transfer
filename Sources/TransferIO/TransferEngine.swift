@@ -20,6 +20,8 @@ struct TransferEngine {
     let sum: ProgressSum
     /// Where a moved original from this Mac goes; a test sends it somewhere other than the user's Trash.
     var trash: @Sendable (URL) throws -> Void = { try FileManager.default.trashItem(at: $0, resultingItemURL: nil) }
+    /// What a copy between servers keeps in flight; a test sets less.
+    var relayLimits = RelayLimits()
 
     init(request: TransferRequest, destination: SSHConnection, progress: @escaping @Sendable (TransferProgress) -> Void) {
         self.request = request
@@ -100,7 +102,12 @@ struct TransferEngine {
         } original: { try await destination.tree(path) } remove: { try await destination.removeMoved(path, verified: $0, savedSince: liveMark) }
     }
 
-    /// Down from the other server into a scratch folder on this Mac, then up, one item at a time.
+    /// Down from the other server into a scratch folder on this Mac and up again, pipelined: one
+    /// task walks the items in order and settles each name at the destination, asking there about
+    /// any collision, and hands each file to a job that downloads it into a scratch file of its
+    /// own, uploads that, and removes it once the upload's rename has landed. So while some files
+    /// go up the next come down, across items too, within the limits `Relay` keeps. An item is
+    /// checked, and in a move its original removed, once all of its own jobs are done.
     private func across(_ paths: [RemotePath], from source: SSHConnection) async throws {
         if request.moving {
             let parents = Set(paths.compactMap(\.parent))
@@ -108,27 +115,210 @@ struct TransferEngine {
         }
         let scratch = try destination.store.makeScratch()
         defer { try? FileManager.default.removeItem(at: scratch) }
-        let ignoresCase = (try? scratch.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames != true
-        try await each(paths, place: "on the other server", name: \.name) { index, path in
-            // The Mac's disk may not hold two names the server keeps apart. Refused before
-            // anything is copied, since one of the two would stand in for the other.
-            var clash = NameClash(ignoringCase: ignoresCase)
-            for try await (key, _) in source.walkTree(path) {
-                // APFS holds only UTF-8 names: this one would land renamed.
-                guard String(validating: key.bytes, as: UTF8.self) != nil else {
-                    return .failed("“\(key)” has a name that is not UTF-8, which this Mac's disk cannot hold")
-                }
-                clash.add(key)
+        let pending = paths.indices.filter { !isDone($0) }
+        let nested = request.moving ? Self.nesting(paths, pending) : [:]
+        let lookUp: @Sendable (Int) -> Task<Lookup, Error> = { [request, destination] index in
+            let (path, target) = (paths[index], request.folder.appending(name: paths[index].nameBytes))
+            return Task {
+                async let tree = RelayTree.walk(path, on: source)
+                async let found = destination.existing(target)
+                return Lookup(tree: try await tree, found: try await found)
             }
-            if let (first, second) = clash.found { return .clash(first.description, second.description) }
-            let target = request.folder.appending(name: path.nameBytes)
-            if request.moving, let refused = try await sameItem(path, at: target, on: source) { return refused }
-            let local = scratch.appendingPathComponent(String(index))
-            defer { try? FileManager.default.removeItem(at: local) }
-            return try await place(index, at: target) {
-                try await source.download(path, to: local, progress: sum.next())
-                try await destination.upload(local, to: target, tally: tally(index, sum.next()))
-            } original: { try await source.tree(path) } remove: { try await source.removeMoved(path, verified: $0, savedSince: liveMark) }
+        }
+        // What each item is, looked up a few items ahead: one at a time, its two round trips
+        // would hold every item up, as long as a small file takes to move.
+        var ahead: [Int: Task<Lookup, Error>] = [:]
+        defer { for lookup in ahead.values { lookup.cancel() } }
+        let outcomes = try await withThrowingTaskGroup(of: Relay.Event.self) { group in
+            var relay = Relay(scratch: scratch, limits: relayLimits)
+            for (position, index) in pending.enumerated() {
+                for next in pending[position..<min(position + Self.lookAhead, pending.count)] where ahead[next] == nil && nested[next] == nil {
+                    ahead[next] = lookUp(next)
+                }
+                do {
+                    let lookup: Task<Lookup, Error>
+                    if let earlier = nested[index] {
+                        // Inside an earlier item of this move, or holding one: that item goes
+                        // first, whole, and this one is looked at as it left it.
+                        try await relay.waitFor(earlier, &group)
+                        lookup = lookUp(index)
+                    } else {
+                        lookup = ahead.removeValue(forKey: index)!
+                    }
+                    let looked = try await withTaskCancellationHandler { try await lookup.value } onCancel: { lookup.cancel() }
+                    if let refused = try await relayItem(index, paths[index], looked, from: source, relay: &relay, group: &group) {
+                        relay.outcomes[index] = .kept(refused)
+                    }
+                } catch {
+                    if CopyTally.ends(error) { throw error }
+                    relay.outcomes[index] = .failed(error)
+                }
+            }
+            try await relay.drainAll(&group)
+            return relay.outcomes
+        }
+        var undone = Undone()
+        for (index, path) in paths.enumerated() {
+            switch outcomes[index] {
+            case .kept(let reason)?: undone.keep(path.name, reason)
+            case .failed(let error)?: try undone.failed(path.name, error)
+            case nil: break
+            }
+        }
+        try undone.check(moving: request.moving, place: "on the other server")
+    }
+
+    /// Items looked up at once ahead of the one being placed.
+    static let lookAhead = 16
+
+    /// For each of the `pending` items that is, holds, or lies inside an earlier one, those earlier
+    /// items: in a move, its copy waits for theirs to be checked and removed, as one item at a
+    /// time did. Found by each item's folders, not by comparing every pair.
+    static func nesting(_ paths: [RemotePath], _ pending: [Int]) -> [Int: [Int]] {
+        var at: [RemotePath: [Int]] = [:]
+        var below: [RemotePath: [Int]] = [:]
+        for index in pending {
+            let path = paths[index].normalized
+            at[path, default: []].append(index)
+            var folder = path.parent
+            while let above = folder {
+                below[above, default: []].append(index)
+                folder = above.parent
+            }
+        }
+        var nested: [Int: [Int]] = [:]
+        for index in pending {
+            let path = paths[index].normalized
+            var related = (at[path] ?? []) + (below[path] ?? [])
+            var folder = path.parent
+            while let above = folder {
+                related += at[above] ?? []
+                folder = above.parent
+            }
+            let earlier = related.filter { $0 < index }
+            if !earlier.isEmpty { nested[index] = earlier }
+        }
+        return nested
+    }
+
+    /// An item ahead: its tree on the other server, walked whole, and what holds its name at the
+    /// destination then.
+    private struct Lookup: Sendable {
+        var tree: RelayTree
+        var found: RemoteItem?
+    }
+
+    /// Source `index`, at `path` on `source`, as `lookup` found it: its entries settled at the
+    /// destination and its files handed to `relay`. Returns why a move refused it, or nil once it
+    /// is on its way, its outcome to come from `relay`.
+    private func relayItem(
+        _ index: Int,
+        _ path: RemotePath,
+        _ lookup: Lookup,
+        from source: SSHConnection,
+        relay: inout Relay,
+        group: inout ThrowingTaskGroup<Relay.Event, Error>
+    ) async throws -> TransferKept.Reason? {
+        let tree = lookup.tree
+        let target = request.folder.appending(name: path.nameBytes)
+        if request.moving, let refused = try await sameItem(path, at: target, on: source) { return refused }
+        // An earlier item still writing this name goes first, so this one meets its copy as it
+        // would one at a time: as something already there.
+        try await relay.waitForName(target.name, &group)
+        let reserved = relay.names
+        // Looked up ahead, before an earlier item of this paste may have written the name.
+        let again = relay.wrote(target.name)
+        relay.begin(index, name: target.name)
+        let tally = tally(index, sum.next())
+        do {
+            let found = again ? try await destination.existing(target) : lookup.found
+            try await relayEntry(tree.root, key: "", in: tree, at: target, found: found, reserved: reserved, from: source, item: index, tally: tally, relay: &relay, group: &group)
+        } catch {
+            relay.abandon(index)
+            throw error
+        }
+        try await relay.walked(index, landed: tally.landed(target)?.name, &group) { [self] in
+            do {
+                destination.pipe.emit(.directoryChanged(request.folder))
+                try tally.check()
+                return .kept(try await settled(index, at: target) { try await source.tree(path) } remove: { try await source.removeMoved(path, verified: $0, savedSince: liveMark) })
+            } catch {
+                if CopyTally.ends(error) { throw error }
+                return .failed(error)
+            }
+        }
+        return nil
+    }
+
+    /// `item`, at `key` in its source's `tree`, placed at `target` on the destination, where
+    /// `found` is: a folder made or merged into and what it holds placed in turn, a link copied as
+    /// a link, a file settled and handed to `relay`. As in a copy onto the server, a failure below
+    /// the item is recorded in `tally` and the rest goes on. `reserved` are names other items are
+    /// still writing beside the item, which Keep Both passes over.
+    private func relayEntry(
+        _ item: RemoteItem,
+        key: TreeKey,
+        in tree: RelayTree,
+        at target: RemotePath,
+        found: RemoteItem?,
+        reserved: Set<String> = [],
+        from source: SSHConnection,
+        item index: Int,
+        tally: CopyTally,
+        relay: inout Relay,
+        group: inout ThrowingTaskGroup<Relay.Event, Error>
+    ) async throws {
+        switch item.kind {
+        case .other:
+            // A socket, FIFO, or device has no bytes to copy: skipped, as a download skips one.
+            return
+        case .symlink:
+            try await destination.remoteLink(try await source.readlink(item.path), at: target, found: found, tally: tally, reserved: reserved)
+            tally.finished()
+        case .directory:
+            guard let folder = try await destination.remoteFolder(target, found: found, tally: tally, reserved: reserved) else { return }
+            let held = folder.made ? Holdings() : try await destination.holdings(folder.path)
+            for child in tree.children[key] ?? [] {
+                try Task.checkCancellation()
+                let name = child.path.nameBytes
+                let to = folder.path.appending(name: name)
+                do {
+                    let there = try await held.item(named: name, at: to, on: destination)
+                    try await relayEntry(child, key: key.appending(name), in: tree, at: to, found: there, from: source, item: index, tally: tally, relay: &relay, group: &group)
+                } catch {
+                    try tally.failed(to.name, error)
+                }
+            }
+        case .file:
+            let placed: (path: RemotePath, found: PlacedItem?)
+            if found == nil, tally.landed(target) == nil {
+                // A free name, which `Placement.settle` writes: no hop onto the destination's
+                // actor, which its uploads keep busy, to be told so.
+                placed = (target, nil)
+            } else {
+                guard let settled = try await destination.settleRemotely(.file(Fingerprint(item: item)), at: target, found: found, tally: tally, reserved: reserved) else {
+                    // Already there, as after a retry: counted as both its halves, so the row
+                    // reaches its total.
+                    let size = item.size ?? 0
+                    return tally.finished(bytes: size.saturatingAdd(size))
+                }
+                placed = settled
+            }
+            // What the user chose to replace, looked up again just before the rename.
+            let replacing = placed.found
+            try await relay.send(index, size: item.size, &group) { [destination] local in
+                do {
+                    // Removed once its upload's rename has landed, or as soon as either half fails.
+                    defer { try? FileManager.default.removeItem(at: local) }
+                    // In `Scratch/`, which each launch empties: its temp needs no record.
+                    try await source.fetch(item.path, info: item, to: local, recorded: false, progress: tally.file())
+                    try await destination.uploadBytes(local, to: placed.path, replacing: replacing, progress: tally.file())
+                    tally.finished()
+                    tally.record(placed.path)
+                } catch {
+                    try tally.failed(target.name, error)
+                }
+            }
         }
     }
 
@@ -191,6 +381,18 @@ struct TransferEngine {
         remove: ([TreeKey: TreeEntry]) async throws -> Bool
     ) async throws -> TransferKept.Reason? {
         try await copy()
+        return try await settled(index, at: target, original: original, remove: remove)
+    }
+
+    /// After source `index`'s copy to `target`: a move walks the `original` and, only when
+    /// `MoveCheck` passes, has `remove` take what the walk found. Returns why the original was
+    /// kept, or nil once the item is done.
+    private func settled(
+        _ index: Int,
+        at target: RemotePath,
+        original: () async throws -> [TreeKey: TreeEntry],
+        remove: ([TreeKey: TreeEntry]) async throws -> Bool
+    ) async throws -> TransferKept.Reason? {
         if request.moving {
             let tree = try await original()
             if let reason = try await keptReason(index, target: target, source: tree) { return reason }
@@ -338,35 +540,220 @@ enum LocalTree {
     }
 }
 
-/// Joins the progress of several copies, one after another, into one row on the shelf.
+/// Joins the progress of several copies into one row on the shelf. Between servers the items'
+/// copies overlap, so each reports into a slot of its own and the row shows their sum.
 final class ProgressSum: Sendable {
     private let report: @Sendable (TransferProgress) -> Void
     private let total: UInt64?
-    /// What the finished copies reported, and the running one.
-    private let state = Locked((base: TransferProgress(completed: 0), current: TransferProgress(completed: 0)))
+    /// The sum of every copy's latest report, and each copy's latest.
+    private let state = Locked((sum: TransferProgress(completed: 0), parts: [TransferProgress]()))
 
     init(_ report: @escaping @Sendable (TransferProgress) -> Void, total: UInt64?) {
         self.report = report
         self.total = total.flatMap { $0 > 0 ? $0 : nil }
     }
 
-    /// The reporter for the next copy. What the previous one reported is kept.
+    /// The reporter for the next copy. What the others report is kept.
     func next() -> @Sendable (TransferProgress) -> Void {
-        state.withLock { state in
-            state.base.completed = state.base.completed.saturatingAdd(state.current.completed)
-            state.base.itemsCompleted += state.current.itemsCompleted
-            state.current = TransferProgress(completed: 0)
+        let slot = state.withLock { state in
+            state.parts.append(TransferProgress(completed: 0))
+            return state.parts.count - 1
         }
         return { [self] progress in
-            let combined = state.withLock { state in
-                state.current = progress
-                return TransferProgress(
-                    completed: state.base.completed.saturatingAdd(progress.completed),
-                    total: total,
-                    itemsCompleted: state.base.itemsCompleted + progress.itemsCompleted
-                )
+            // Reported under the lock, so the row hears the sum in the order it grew: a copy's
+            // counts only grow, and a report overtaken by an older one would read as a file
+            // started over.
+            state.withLock { state in
+                let last = state.parts[slot]
+                let completed = max(last.completed, progress.completed)
+                let items = max(last.itemsCompleted, progress.itemsCompleted)
+                state.sum.completed = state.sum.completed.saturatingAdd(completed - last.completed)
+                state.sum.itemsCompleted += items - last.itemsCompleted
+                state.parts[slot] = TransferProgress(completed: completed, itemsCompleted: items)
+                report(TransferProgress(completed: state.sum.completed, total: total, itemsCompleted: state.sum.itemsCompleted))
             }
-            report(combined)
         }
+    }
+}
+
+/// What a copy between servers keeps in flight (`Relay`).
+struct RelayLimits: Sendable {
+    /// The scratch space its files may take, by their listed sizes: over a second of either half
+    /// at 100 MB/s, and far from a full disk however large the tree. A file larger than this
+    /// goes alone.
+    var bytes: UInt64 = 256 << 20
+    /// Jobs in its task group: each a file going down and up, or an item's check. As many as a
+    /// copy onto the server keeps, so each half can fill its data channels.
+    var jobs = CopyTally.jobLimit
+}
+
+/// A copy between servers in flight: its jobs, and the scratch space their files take, within
+/// its `RelayLimits`. Kept by the one task that walks the items, which reads each job's end from
+/// the group.
+private struct Relay {
+    enum Event: Sendable {
+        /// A file's job ended, giving back its share of the scratch space.
+        case file(item: Int, bytes: UInt64)
+        case checked(item: Int, Outcome)
+    }
+
+    enum Outcome: Sendable {
+        /// Done (nil), or its original kept, and why.
+        case kept(TransferKept.Reason?)
+        case failed(any Error)
+    }
+
+    /// An item walking or walked whose check has not ended.
+    private struct Item {
+        /// The name it writes in the destination folder, and the one Keep Both gave it.
+        var names: Set<String>
+        var jobs = 0
+        var check: (@Sendable () async throws -> Outcome)?
+        var abandoned = false
+    }
+
+    let scratch: URL
+    let limits: RelayLimits
+    var outcomes: [Int: Outcome] = [:]
+    private var items: [Int: Item] = [:]
+    /// Every name, folded, that an item of this paste began writing.
+    private var written: Set<String> = []
+    private var jobs = 0
+    private var bytes: UInt64 = 0
+    private var files = 0
+
+    init(scratch: URL, limits: RelayLimits) {
+        self.scratch = scratch
+        self.limits = limits
+    }
+
+    /// The names items in flight write in the destination folder.
+    var names: Set<String> { items.values.reduce(into: []) { $0.formUnion($1.names) } }
+
+    /// Waits until no item in flight writes `name`, as a disk that ignores case may fold it.
+    mutating func waitForName(_ name: String, _ group: inout ThrowingTaskGroup<Event, Error>) async throws {
+        let folded = name.diskFolded
+        while items.values.contains(where: { $0.names.contains { $0.diskFolded == folded } }) {
+            try await take(&group)
+        }
+    }
+
+    /// Waits until each of `earlier` has ended, its check too.
+    mutating func waitFor(_ earlier: [Int], _ group: inout ThrowingTaskGroup<Event, Error>) async throws {
+        while earlier.contains(where: { items[$0] != nil }) {
+            try await take(&group)
+        }
+    }
+
+    mutating func begin(_ item: Int, name: String) {
+        items[item] = Item(names: [name])
+        written.insert(name.diskFolded)
+    }
+
+    /// Whether an item of this paste began writing `name`, as a disk that ignores case may fold it.
+    func wrote(_ name: String) -> Bool { written.contains(name.diskFolded) }
+
+    /// Adds a job for a file of `item`, of `size` bytes, with a scratch file of its own, once the
+    /// limits leave room for it.
+    mutating func send(_ item: Int, size: UInt64?, _ group: inout ThrowingTaskGroup<Event, Error>, _ job: @escaping @Sendable (URL) async throws -> Void) async throws {
+        let room = RelayRoom(jobs: limits.jobs, bytes: limits.bytes)
+        let share = room.share(size: size)
+        while !room.admits(share, running: jobs, held: bytes) {
+            try await take(&group)
+        }
+        let local = scratch.appendingPathComponent(String(files))
+        files += 1
+        jobs += 1
+        bytes += share
+        items[item]?.jobs += 1
+        group.addTask {
+            try await job(local)
+            return .file(item: item, bytes: share)
+        }
+    }
+
+    /// `item`'s walk is done: `check` runs once its last job has. One that would start now waits
+    /// for room among the jobs first; one started as a job ends takes that job's place.
+    mutating func walked(_ item: Int, landed: String?, _ group: inout ThrowingTaskGroup<Event, Error>, check: @escaping @Sendable () async throws -> Outcome) async throws {
+        if let landed {
+            items[item]?.names.insert(landed)
+            written.insert(landed.diskFolded)
+        }
+        if items[item]?.jobs == 0 {
+            while jobs >= limits.jobs { try await take(&group) }
+        }
+        items[item]?.check = check
+        startCheck(item, &group)
+    }
+
+    /// `item`'s walk failed: its jobs run out, and nothing checks it.
+    mutating func abandon(_ item: Int) {
+        items[item]?.abandoned = true
+        if items[item]?.jobs == 0 { items[item] = nil }
+    }
+
+    /// Waits for every job and every check to end.
+    mutating func drainAll(_ group: inout ThrowingTaskGroup<Event, Error>) async throws {
+        while jobs > 0 { try await take(&group) }
+    }
+
+    /// Takes the next job to end back from the group. One that ends the paste throws here, and
+    /// leaving the group cancels the rest.
+    private mutating func take(_ group: inout ThrowingTaskGroup<Event, Error>) async throws {
+        guard let event = try await group.next() else {
+            // Nothing is left to wait for, which only a slip in these counts could bring: an item
+            // still waiting fails rather than passing as done, and no wait loops for ever.
+            for item in items.keys where outcomes[item] == nil {
+                outcomes[item] = .failed(TransferError.failed("The copy lost track of this item"))
+            }
+            items = [:]
+            jobs = 0
+            bytes = 0
+            return
+        }
+        jobs -= 1
+        switch event {
+        case .file(let item, let share):
+            bytes -= share
+            items[item]?.jobs -= 1
+            if items[item]?.abandoned == true, items[item]?.jobs == 0 { items[item] = nil }
+            startCheck(item, &group)
+        case .checked(let item, let outcome):
+            items[item] = nil
+            outcomes[item] = outcome
+        }
+    }
+
+    private mutating func startCheck(_ item: Int, _ group: inout ThrowingTaskGroup<Event, Error>) {
+        guard let state = items[item], !state.abandoned, state.jobs == 0, let check = state.check else { return }
+        items[item]?.check = nil
+        jobs += 1
+        group.addTask { .checked(item: item, try await check()) }
+    }
+}
+
+/// An item's tree on the other server, walked whole before any of it is copied. The copy takes
+/// only what this walk found, so a destination the source reaches too (two saved servers for one
+/// disk) never feeds the copy its own output. No name of it reaches this Mac's disk: each file
+/// passes through a numbered scratch file, so names the Mac's disk could not hold apart, or that
+/// are not UTF-8, go as the server holds them.
+private struct RelayTree: Sendable {
+    let root: RemoteItem
+    /// What each folder holds, by the folder's key, in the listing's order.
+    var children: [TreeKey: [RemoteItem]]
+
+    static func walk(_ path: RemotePath, on source: SSHConnection) async throws -> RelayTree {
+        var root: RemoteItem?
+        var children: [TreeKey: [RemoteItem]] = [:]
+        for try await (key, item) in source.walkItems(path) {
+            if key.bytes.isEmpty {
+                root = item
+            } else {
+                let parent = key.bytes.lastIndex(of: 0x2F).map { TreeKey(bytes: Array(key.bytes[..<$0])) } ?? ""
+                children[parent, default: []].append(item)
+            }
+        }
+        guard let root else { throw TransferError.noSuchFile(path.display) }
+        return RelayTree(root: root, children: children)
     }
 }

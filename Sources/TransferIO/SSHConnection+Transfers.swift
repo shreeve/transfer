@@ -92,7 +92,8 @@ extension SSHConnection {
     /// drops the write bits too, and a `live` working copy is private (0600) as it lands. Every
     /// download is quarantined as a browser's is, a Live working copy too, as the app it opens in may
     /// run it (D2), except a Live Terminal script, which Gatekeeper lets no editor open
-    /// (`EditableFile.quarantinesLiveCopy`); being 0600, it runs nowhere.
+    /// (`EditableFile.quarantinesLiveCopy`); being 0600, it runs nowhere. A temp in the library's
+    /// `Scratch/`, which each launch empties, is not `recorded`.
     func fetch(
         _ path: RemotePath,
         info: RemoteItem,
@@ -101,11 +102,12 @@ extension SSHConnection {
         readOnly: Bool = false,
         live: Bool = false,
         interactive: Bool = false,
+        recorded: Bool = true,
         progress: @escaping @Sendable (TransferProgress) -> Void
     ) async throws {
         let folder = destination.deletingLastPathComponent()
         let temp = folder.appendingPathComponent(KeepBothName.temp(for: destination.lastPathComponent))
-        store.rememberTemp(local: temp)
+        if recorded { store.rememberTemp(local: temp) }
         do {
             try await receive(path, info: info, into: temp, interactive: interactive, progress: progress)
             // Marked first: a file without write bits takes no extended attribute. The channel
@@ -120,10 +122,10 @@ extension SSHConnection {
             guard placed == 0 else {
                 throw TransferError.failed("Could not place \(destination.lastPathComponent): \(String(cString: strerror(errno)))")
             }
-            store.forgetTemp(local: temp)
+            if recorded { store.forgetTemp(local: temp) }
         } catch {
             // A temp that cannot be removed now stays recorded, and the next launch removes it.
-            if unlink(temp.path) == 0 || errno == ENOENT { store.forgetTemp(local: temp) }
+            if unlink(temp.path) == 0 || errno == ENOENT, recorded { store.forgetTemp(local: temp) }
             throw error
         }
     }
@@ -145,9 +147,10 @@ extension SSHConnection {
         try await copyToServer(.mac(source), at: destination, tally: tally)
     }
 
-    /// Temp-and-rename onto the server, over the data channels. No collision check, but without
-    /// `replacing` the rename refuses a name that something took since it was looked up.
-    func uploadBytes(_ source: URL, to placed: RemotePath, replacing: Bool, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    /// Temp-and-rename onto the server, over the data channels. `replacing` is what the user chose
+    /// to replace there, which alone goes; nil for a free name, which the rename refuses to take
+    /// from something that took it since it was looked up.
+    func uploadBytes(_ source: URL, to placed: RemotePath, replacing: PlacedItem?, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let local = LiveSync.stamp(source)
         let mode = ((try? FileManager.default.attributesOfItem(atPath: source.path))?[.posixPermissions] as? NSNumber)?.uint32Value
         let stamp = SFTPAttrs.stamp(mode: mode, mtime: local?.fingerprint.mtime)
@@ -396,8 +399,7 @@ extension SSHConnection {
         case .folder:
             guard let folder = try await remoteFolder(destination, found: found, tally: tally) else { return }
             // A folder already there is listed once, not looked up name by name (PERF-03).
-            var held = Holdings()
-            if !folder.made { for try await item in await link.list(folder.path) { held.add(item) } }
+            let held = folder.made ? Holdings() : try await holdings(folder.path, link: link)
             switch source {
             case .mac(let url):
                 for child in try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
@@ -411,8 +413,12 @@ extension SSHConnection {
                 }
             }
         case .file:
-            guard let placed = try await settleRemotely(incoming, at: destination, found: found, tally: tally) else { return tally.finished() }
-            let replacing = placed.found != nil
+            guard let placed = try await settleRemotely(incoming, at: destination, found: found, tally: tally) else {
+                // Already there, as after a retry: its bytes count, so the row reaches its total.
+                guard case .file(let print?) = incoming else { return tally.finished() }
+                return tally.finished(bytes: print.size)
+            }
+            let replacing = placed.found
             if tally.addingJob() { _ = try await group.next() }
             group.addTask {
                 do {
@@ -430,6 +436,14 @@ extension SSHConnection {
                 }
             }
         }
+    }
+
+    /// What `folder` holds now, listed once on `link`, else the walker passenger.
+    func holdings(_ folder: RemotePath, link: SFTPChannel? = nil) async throws -> Holdings {
+        let reader = if let link { link } else { try await walkerLink() }
+        var held = Holdings()
+        for try await item in await reader.list(folder) { held.add(item) }
+        return held
     }
 
     /// One entry of a folder being copied onto the server, which holds `held`. Its failure is
@@ -478,10 +492,11 @@ extension SSHConnection {
 
     /// The server's twin of `settleLocally`: where `incoming` lands at `proposed`, where `found`
     /// is, and what holds that spot; nil to skip it. A retry goes where Keep Both sent the item
-    /// before, unasked; in a move, only a copy this move wrote passes for the same file.
-    private func settleRemotely(_ incoming: PlacedItem, at proposed: RemotePath, found: RemoteItem?, tally: CopyTally) async throws -> (path: RemotePath, found: PlacedItem?)? {
+    /// before, unasked; in a move, only a copy this move wrote passes for the same file. Keep Both
+    /// also passes over `reserved`, names other items of the paste are still writing.
+    func settleRemotely(_ incoming: PlacedItem, at proposed: RemotePath, found: RemoteItem?, tally: CopyTally, reserved: Set<String> = []) async throws -> (path: RemotePath, found: PlacedItem?)? {
         if let landed = tally.landed(proposed) {
-            return try await settleRemotely(incoming, at: landed, found: try await existing(landed), tally: tally)
+            return try await settleRemotely(incoming, at: landed, found: try await existing(landed), tally: tally, reserved: reserved)
         }
         let there = try await placedItem(found)
         let moving = tally.moving && !tally.wrote(proposed)
@@ -492,7 +507,7 @@ extension SSHConnection {
             return (proposed, there)
         case .keepBoth:
             let parent = proposed.parent ?? RemotePath(string: "/")
-            let name = Placement.keepBoth(proposed.name, among: try await listedNames(parent), isFolder: incoming == .folder)
+            let name = Placement.keepBoth(proposed.name, among: try await listedNames(parent).union(reserved), isFolder: incoming == .folder)
             let landed = parent.appending(name: Array(name.utf8))
             tally.record(landed, for: proposed)
             return (landed, nil)
@@ -503,8 +518,8 @@ extension SSHConnection {
     /// it. A link or special file in the way goes only when the user chose Replace, and only if it
     /// still holds the name: a listing may be stale, and something else may have taken the name
     /// while the question was up. A folder never goes.
-    private func remoteFolder(_ path: RemotePath, found: RemoteItem?, tally: CopyTally) async throws -> (path: RemotePath, made: Bool)? {
-        guard let spot = try await settleRemotely(.folder, at: path, found: found, tally: tally) else { return nil }
+    func remoteFolder(_ path: RemotePath, found: RemoteItem?, tally: CopyTally, reserved: Set<String> = []) async throws -> (path: RemotePath, made: Bool)? {
+        guard let spot = try await settleRemotely(.folder, at: path, found: found, tally: tally, reserved: reserved) else { return nil }
         if spot.found == .folder { return (spot.path, false) }
         let link = try await metadataLink()
         if let asked = spot.found {
@@ -520,8 +535,8 @@ extension SSHConnection {
 
     /// A link is copied as a link, settled like a file: the same link is kept, anything else is
     /// asked about, and Replace swaps it in with one rename.
-    private func remoteLink(_ target: String, at destination: RemotePath, found: RemoteItem?, tally: CopyTally) async throws {
-        guard let spot = try await settleRemotely(.link(target), at: destination, found: found, tally: tally) else { return }
+    func remoteLink(_ target: String, at destination: RemotePath, found: RemoteItem?, tally: CopyTally, reserved: Set<String> = []) async throws {
+        guard let spot = try await settleRemotely(.link(target), at: destination, found: found, tally: tally, reserved: reserved) else { return }
         let link = try await metadataLink()
         if spot.found == nil {
             try await link.symlink(target: target, link: spot.path)
@@ -537,7 +552,7 @@ extension SSHConnection {
     /// Temp-and-rename on the server, keeping the source's mode and time so a later copy of the
     /// same file is skipped. `copy-data` when the server has it; else down to the Mac and back.
     /// The temp is renamed on the channel that wrote it, once the copy and its close are acknowledged.
-    private func copyFile(_ item: RemoteItem, to placed: RemotePath, replacing: Bool) async throws {
+    private func copyFile(_ item: RemoteItem, to placed: RemotePath, replacing: PlacedItem?) async throws {
         let stamp = SFTPAttrs.stamp(mode: item.mode.map { $0 & 0o7777 }, mtime: item.mtime)
         try await withRemoteTemp(for: placed) { temp in
             let onServer = try await withData(DataShare(size: item.size)) { link in
@@ -558,10 +573,16 @@ extension SSHConnection {
         }
     }
 
-    /// Renames the finished `temp` onto `placed` on `link`, the channel that wrote it. Without
-    /// `replacing` the rename refuses a name taken since it was looked up, which is said so rather
-    /// than with the server's bare "Failure" (XFR-06).
-    private func place(_ temp: RemotePath, onto placed: RemotePath, replacing: Bool, on link: SFTPChannel) async throws {
+    /// Renames the finished `temp` onto `placed` on `link`, the channel that wrote it. `replacing`
+    /// is what the user chose to replace, looked up again first: the bytes took a while, and
+    /// anything else there now fails the file, so nothing the user was not asked about is
+    /// replaced. Without it the rename refuses a name taken since it was looked up, which is said
+    /// so rather than with the server's bare "Failure" (XFR-06).
+    private func place(_ temp: RemotePath, onto placed: RemotePath, replacing asked: PlacedItem?, on link: SFTPChannel) async throws {
+        let replacing = asked != nil
+        if let asked, try await placedItem(try await link.lookup(placed), link: link) != asked {
+            throw TransferError.failed("“\(placed.name)” changed on the server while it was being replaced; nothing was removed")
+        }
         do {
             try await link.place(temp, onto: placed, replacing: replacing, log: asides)
         } catch where !replacing && !CopyTally.ends(error) {
@@ -638,14 +659,23 @@ extension SSHConnection {
     }
 
     public nonisolated func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, TreeEntry), Error> {
+        walk(root) { TreeEntry($0) }
+    }
+
+    /// `walkTree` with each entry as the listing gave it: parents before what they hold.
+    nonisolated func walkItems(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, RemoteItem), Error> {
+        walk(root) { $0 }
+    }
+
+    private nonisolated func walk<Entry: Sendable>(_ root: RemotePath, as entry: @escaping @Sendable (RemoteItem) -> Entry) -> AsyncThrowingStream<(TreeKey, Entry), Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     let link = try await self.walkerLink()
                     let item = try await link.lstat(root)
-                    continuation.yield(("", TreeEntry(item)))
+                    continuation.yield(("", entry(item)))
                     if item.kind == .directory {
-                        try await self.walk(root, key: "", link: link) { continuation.yield(($0, $1)) }
+                        try await self.walk(root, key: "", link: link) { _ = continuation.yield(($0, entry($1))) }
                     }
                     continuation.finish()
                 } catch {
@@ -663,15 +693,39 @@ extension SSHConnection {
         return entries
     }
 
-    private func walk(_ folder: RemotePath, key parent: TreeKey, link: SFTPChannel, visit: @escaping @Sendable (TreeKey, TreeEntry) -> Void) async throws {
-        for try await child in await link.list(folder) {
-            try Task.checkCancellation()
-            // Special files are reported too: no copy writes them, so a move that compares the
-            // trees keeps a folder holding one instead of removing it unseen.
-            let key = parent.appending(child.path.nameBytes)
-            visit(key, TreeEntry(child))
-            if child.kind == .directory {
-                try await walk(child.path, key: key, link: link, visit: visit)
+    /// Folders a walk lists at once on its one channel, and all walks on one connection together
+    /// (`listings`). One at a time, each folder cost its own round trips: at 20 ms, a 2,000-file
+    /// tree in ten folders took 761 ms to walk; eight at once, 225 ms.
+    static let walkWidth = 8
+
+    /// Visits what `folder` holds, and below. A folder is visited before what it holds, and
+    /// listed once its parent's listing found it, up to `walkWidth` folders at once.
+    private nonisolated func walk(_ folder: RemotePath, key: TreeKey, link: SFTPChannel, visit: @escaping @Sendable (TreeKey, RemoteItem) -> Void) async throws {
+        try await withThrowingTaskGroup(of: [(RemotePath, TreeKey)].self) { group in
+            var waiting = [(folder, key)]
+            var listing = 0
+            while !waiting.isEmpty || listing > 0 {
+                while listing < Self.walkWidth, let (next, parent) = waiting.popLast() {
+                    listing += 1
+                    group.addTask { [listings] in
+                        await listings.enter()
+                        defer { listings.leave() }
+                        var folders: [(RemotePath, TreeKey)] = []
+                        for try await child in await link.list(next) {
+                            try Task.checkCancellation()
+                            // Special files are reported too: no copy writes them, so a move that
+                            // compares the trees keeps a folder holding one instead of removing it unseen.
+                            let key = parent.appending(child.path.nameBytes)
+                            visit(key, child)
+                            if child.kind == .directory { folders.append((child.path, key)) }
+                        }
+                        return folders
+                    }
+                }
+                if let found = try await group.next() {
+                    listing -= 1
+                    waiting.append(contentsOf: found.reversed())
+                }
             }
         }
     }
@@ -939,7 +993,7 @@ final class CopyTally: Sendable {
 
 /// What a destination folder on the server holds, by name, from one listing; empty for a folder
 /// just made.
-private struct Holdings: Sendable {
+struct Holdings: Sendable {
     private var items: [[UInt8]: RemoteItem] = [:]
     private var folded: Set<String> = []
 
@@ -954,5 +1008,40 @@ private struct Holdings: Sendable {
         if let item = items[name] { return item }
         guard folded.contains(String(decoding: name, as: UTF8.self).diskFolded) else { return nil }
         return try await session.existing(path)
+    }
+}
+
+/// At most `width` holders at once, the rest let in as holders leave, in the order they came.
+/// A holder always leaves, so a waiter cancelled meanwhile gets in and finds itself cancelled.
+final class ListingGate: Sendable {
+    private let state: Locked<(free: Int, waiting: [CheckedContinuation<Void, Never>])>
+
+    init(_ width: Int) {
+        state = Locked((width, []))
+    }
+
+    func enter() async {
+        await withCheckedContinuation { continuation in
+            let now = state.withLock { state in
+                guard state.free > 0 else {
+                    state.waiting.append(continuation)
+                    return false
+                }
+                state.free -= 1
+                return true
+            }
+            if now { continuation.resume() }
+        }
+    }
+
+    func leave() {
+        let next = state.withLock { state -> CheckedContinuation<Void, Never>? in
+            guard !state.waiting.isEmpty else {
+                state.free += 1
+                return nil
+            }
+            return state.waiting.removeFirst()
+        }
+        next?.resume()
     }
 }

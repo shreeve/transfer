@@ -94,3 +94,20 @@ import Testing
     #expect(!TransferKept([.init("a", .alreadyThere), .init("b", .live(1))], moving: true, place: "on this Mac").hasFailures)
     #expect(TransferKept([.init("a", .failed("No such file")), .init("b", .alreadyThere)], moving: false, place: "on this Mac").hasFailures)
 }
+
+/// A copy between servers holds at most its limits of files and scratch in flight, and a file
+/// larger than the scratch limit, or of unknown size, goes alone rather than never.
+@Test func relayRoomKeepsToItsLimits() {
+    let room = RelayRoom(jobs: 3, bytes: 100)
+    #expect(room.share(size: 40) == 40)
+    #expect(room.share(size: 400) == 100)
+    #expect(room.share(size: nil) == 100)
+    #expect(room.admits(40, running: 0, held: 0))
+    #expect(room.admits(40, running: 2, held: 60))
+    #expect(!room.admits(40, running: 2, held: 61))
+    #expect(!room.admits(0, running: 3, held: 0))
+    // Alone, the largest file starts; beside it, only an empty file does, which holds nothing.
+    #expect(room.admits(room.share(size: 400), running: 0, held: 0))
+    #expect(!room.admits(room.share(size: 1), running: 1, held: 100))
+    #expect(room.admits(room.share(size: 0), running: 1, held: 100))
+}

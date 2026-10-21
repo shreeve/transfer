@@ -222,6 +222,31 @@ public struct NameClash: Sendable {
     }
 }
 
+/// Room for one more file in a copy between servers, whose files pass through this Mac's scratch
+/// folder while others are still on their way (`TransferEngine.across`): at most `jobs` at once,
+/// and at most `bytes` of scratch by their listed sizes. A file holds its size, at most all of
+/// `bytes`, and one of unknown size all of it, so a file larger than the limit, or of unknown
+/// size, goes alone; and alone, any file has room, so none waits for ever.
+package struct RelayRoom: Sendable, Equatable {
+    package let jobs: Int
+    package let bytes: UInt64
+
+    package init(jobs: Int, bytes: UInt64) {
+        self.jobs = jobs
+        self.bytes = bytes
+    }
+
+    /// The scratch a file of `size` holds while in flight.
+    package func share(size: UInt64?) -> UInt64 {
+        min(size ?? bytes, bytes)
+    }
+
+    /// Whether a file holding `share` may start beside `running` jobs that hold `held`.
+    package func admits(_ share: UInt64, running: Int, held: UInt64) -> Bool {
+        running < jobs && (held == 0 || held + share <= bytes)
+    }
+}
+
 package extension String {
     /// This name as a disk that ignores case and Unicode form sees it, folding case fully as APFS
     /// does (`ß` as `ss`, `ﬁ` as `fi`, every sigma alike): two names that fold the same may be one
@@ -281,8 +306,6 @@ package struct TransferMemo: Sendable {
 /// A paste that left some items where they were, and why; thrown once the rest are done.
 public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
     public enum Reason: Hashable, Sendable {
-        /// Two names in the item that this Mac's disk, which it passes through, cannot hold apart.
-        case clash(String, String)
         case alreadyThere
         case incomplete
         /// Live files under the original with edits not yet on the server.
@@ -335,8 +358,6 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
             let named = items.filter { $0.reason == reason }.map { "“\($0.name)”" }
             let list = ListFormatter.localizedString(byJoining: named)
             return switch reason {
-            case .clash(let first, let second):
-                "Did not \(moving ? "move" : "paste") \(list): “\(first)” and “\(second)” differ only in case or accents, and this Mac's disk, which the items pass through, cannot hold both."
             case .alreadyThere:
                 "Kept \(list) \(place): something with that name was already at the destination and was not replaced, so this move cannot tell its own copy from it."
             case .incomplete:
