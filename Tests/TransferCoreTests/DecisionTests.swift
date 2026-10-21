@@ -104,9 +104,13 @@ import Testing
 /// Live (FR-2); the built-in list holds no such name, and an empty entry matches nothing.
 @Test func anExtensionIsWhatFollowsTheLastDot() {
     func kind(_ name: String, _ extensions: Set<String>) -> OpenKind { EditableFile.openKind(fileName: name, extensions: extensions) }
-    for name in ["README", "Makefile", "LICENSE", "notes.", "..", ".bashrc", "a.tar.gz"] {
+    // Names whose outcome cannot depend on the apps installed: none of these has a type the system
+    // could know (`.bashrc` does once an app such as Syntax Highlight declares one, so it is checked
+    // against a list of its own below).
+    for name in ["README", "Makefile", "LICENSE", "notes.", "..", "a.tar.gz"] {
         #expect(kind(name, TransferConfig.builtIn.extensionSet) == .view, "\(name)")
     }
+    #expect(kind(".bashrc", ["bashrc"]) == .live)
     #expect(kind("README", ["readme"]) == .live)
     #expect(kind("Makefile", ["makefile"]) == .live)
     #expect(kind("Makefile", ["make"]) == .view)
