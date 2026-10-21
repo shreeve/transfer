@@ -94,11 +94,20 @@ struct SessionUnitTests {
         let big = try await Subprocess.run("/bin/sh", ["-c", "head -c 1000000 /dev/zero; echo done >&2"], timeout: .seconds(10))
         #expect(big.stdout.utf8.count == 1_000_000)
         #expect(big.stderr == "done\n")
+        // What is proved is that the command was stopped, not waited out: the timeout is thrown
+        // while it runs, and it is gone afterwards. A wall-clock bound of a few seconds would
+        // measure how loaded the Mac is (spawn and dispatch latency), so the only bound is the
+        // thirty seconds the command would take if it were never stopped.
+        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent("runner-pid-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
         let started = ContinuousClock.now
-        await #expect(throws: TransferError.timeout("sleep")) {
-            _ = try await Subprocess.run("/bin/sleep", ["30"], timeout: .milliseconds(300))
+        await #expect(throws: TransferError.timeout("sh")) {
+            _ = try await Subprocess.run("/bin/sh", ["-c", "echo $$ > \"$1\"; exec sleep 30", "sh", pidFile.path], timeout: .seconds(3))
         }
-        #expect(ContinuousClock.now - started < .seconds(5))
+        #expect(ContinuousClock.now - started < .seconds(25))
+        let pid = Int32(try String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines))
+        #expect(pid != nil)
+        if let pid { #expect(await waitUntil { kill(pid, 0) != 0 }) }
         let slow = Task { try await Subprocess.run("/bin/sleep", ["30"], timeout: .seconds(60)) }
         try await Task.sleep(for: .milliseconds(200))
         slow.cancel()

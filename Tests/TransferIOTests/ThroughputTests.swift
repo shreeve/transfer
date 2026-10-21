@@ -327,6 +327,10 @@ struct ThroughputServerTests {
     @Test func smallJobsShareDataChannelsAndWholeOnesDoNot() async throws {
         try await withHarness("share", connected: true) { h in
             let state = Locked((holders: [ObjectIdentifier: (small: Int, whole: Int)](), peak: 0, overfull: false, mixed: false))
+            // Every admitted job waits at this gate until more than `dataChannels` are inside at once,
+            // so the overlap is certain however slowly the Mac schedules them. (The timeout only
+            // keeps a broken pool from hanging the test; the peak check then fails.)
+            let gate = Locked(false)
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for index in 0..<48 {
                     let share: SSHConnection.DataShare = index % 6 == 0 ? .whole : .small
@@ -340,7 +344,11 @@ struct ThroughputServerTests {
                                 if held.small > SSHConnection.DataShare.whole.rawValue { state.overfull = true }
                                 if held.whole > 0, held.small + held.whole > 1 { state.mixed = true }
                             }
-                            try await Task.sleep(for: .milliseconds(30))
+                            let waitStart = ContinuousClock.now
+                            while !gate.value {
+                                if state.value.peak > SSHConnection.dataChannels || ContinuousClock.now - waitStart > .seconds(20) { gate.value = true; break }
+                                try await Task.sleep(for: .milliseconds(5))
+                            }
                             _ = try await link.realpath(RemotePath(string: "."))
                             state.withLock { state in
                                 if share == .whole { state.holders[ObjectIdentifier(link)]?.whole -= 1 } else { state.holders[ObjectIdentifier(link)]?.small -= 1 }
