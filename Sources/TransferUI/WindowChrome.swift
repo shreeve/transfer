@@ -314,6 +314,11 @@ final class ChromeController: NSSplitViewController {
         // One name for all windows, as in Finder: a new one opens with the sidebar and the
         // columns' widths as the last left them, and the model follows the sidebar via
         // `splitViewDidResizeSubviews`. The inspector's state is the model's.
+        let key = "NSSplitView Subview Frames Transfer.Split"
+        if let frames = UserDefaults.standard.array(forKey: key) as? [String],
+           let healed = SplitFrames.healed(frames, inspectorMinimum: Double(inspectorItem.minimumThickness)) {
+            UserDefaults.standard.set(healed, forKey: key)
+        }
         splitView.autosaveName = "Transfer.Split"
         inspectorItem.isCollapsed = !inspectorShown
     }

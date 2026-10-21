@@ -51,10 +51,12 @@ struct InspectorTests {
         return url
     }
 
-    /// Every kind of selection keeps the box and each fact's row in one place: a picture, a text
-    /// file, a file of a type it cannot show, one over the limit, one still loading, a folder, and
-    /// two items. The name stays one line, and a missing fact reads "—".
-    @Test func theBoxAndEveryRowHoldStillWhateverIsSelected() async throws {
+    /// Every kind of selection keeps each fact's row and the preview area in one place: a
+    /// picture, a text file, a file of a type it cannot show, one over the limit, one still
+    /// loading, a folder, two items, and a link, whose target fills the status line. The area
+    /// runs from under the rows to the Wrap lines strip at the panel's foot. The name stays one
+    /// line, and a missing fact reads "—".
+    @Test func theRowsAndThePreviewAreaHoldStillWhateverIsSelected() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "TransferUITests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -74,6 +76,7 @@ struct InspectorTests {
             file("huge.png", size: InspectorPreviewPlan.limit + 1),
             // Listed with no size, time, mode, or owner.
             RemoteItem(path: path("blob.xyz"), kind: .file),
+            RemoteItem(path: path("link"), kind: .symlink),
         ]
         let session = FakeSession(server, folders: [home: items, docs.path: []])
         session.liveExtensions.value = ["txt"]
@@ -98,7 +101,7 @@ struct InspectorTests {
             window.contentView?.layoutSubtreeIfNeeded()
             return slots.frames
         }
-        let fixed = ["box", "name", "kind", "modified", "access"]
+        let fixed = ["name", "kind", "modified", "access", "status", "preview", "foot"]
         var seen: [String: [String: CGRect]] = [:]
 
         select(longName)
@@ -148,16 +151,27 @@ struct InspectorTests {
         #expect(two.kindAndSize == "1 file, 1 folder · 16 B")
         #expect(two.modified == "—")
 
-        // Neither a server nor the box fetched anything it could not show.
+        select("link")
+        #expect(await eventually { model.inspectorLinkTarget != nil && model.inspectorPreview == nil && model.inspectorWait == .icon })
+        seen["link"] = await frames()
+
+        // Neither a server nor the inspector fetched anything it could not show.
         let fetched = session.calls.value.filter { $0.hasPrefix("inspector ") }
         #expect(!fetched.contains { $0.hasSuffix("blob.xyz") || $0.hasSuffix("huge.png") })
 
         let reference = try #require(seen["picture"])
         for key in fixed { #expect(reference[key] != nil, "\(key)") }
-        let box = try #require(reference["box"])
-        // The panel's width less its margins.
-        #expect(box.width == window.frame.width - 32)
-        #expect(box.height == InspectorColumn.boxHeight)
+        let area = try #require(reference["preview"]), status = try #require(reference["status"])
+        let foot = try #require(reference["foot"])
+        // The panel's width less its margins, from under the last row to the strip at the foot.
+        #expect(area.width == window.frame.width - 32)
+        #expect(area.minY == status.maxY + 12)
+        #expect(area.maxY == 640 - InspectorColumn.bottomMargin - InspectorColumn.footHeight - InspectorColumn.footGap)
+        #expect(foot.maxY == 640 - InspectorColumn.bottomMargin)
+        #expect(foot.height == InspectorColumn.footHeight)
+        for key in ["name", "kind", "modified", "access", "status"] {
+            #expect(try #require(reference[key]).maxY <= area.minY, "\(key)")
+        }
         for (state, frames) in seen {
             for key in fixed { #expect(frames[key] == reference[key], "\(state): \(key)") }
         }
@@ -167,6 +181,42 @@ struct InspectorTests {
         #expect(name.height == short.height)
         #expect(name.height < InspectorColumn.nameHeight + 1)
         #expect(name.width <= row.width)
+    }
+
+    /// A taller panel gives the preview area all the extra height; the rows above it stay put.
+    @Test func aTallerPanelGivesThePreviewAreaTheHeight() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "TransferUITests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let png = try picture(in: folder)
+        let photo = RemoteItem(path: path("photo.png"), kind: .file, size: 1000)
+        let session = FakeSession(server, folders: [home: [photo]])
+        session.inspectorCopies.value = [photo.path: png]
+        let defaults = Defaults()
+        defaults.store.set(true, forKey: Preferences.showsInspector)
+        let model = TransferModel(provider: FakeProvider([session]), defaults: defaults.store)
+        await model.connect(server)
+        #expect(await eventually { model.items.count == 1 })
+        model.snapshot.selection = [photo.path]
+        model.selectionChanged()
+        #expect(await eventually { if case .picture? = model.inspectorPreview { true } else { false } })
+
+        func frames(height: CGFloat) async -> [String: CGRect] {
+            let slots = InspectorSlots()
+            let window = await window(InspectorColumn(model: model).environment(\.inspectorSlots, slots).frame(width: 320, height: height), width: 320, height: height)
+            defer { window.close() }
+            window.contentView?.layoutSubtreeIfNeeded()
+            return slots.frames
+        }
+        let short = await frames(height: 640), tall = await frames(height: 800)
+        for key in ["name", "kind", "modified", "access", "status"] {
+            #expect(short[key] != nil && short[key] == tall[key], "\(key)")
+        }
+        let shortArea = try #require(short["preview"]), tallArea = try #require(tall["preview"])
+        #expect(tallArea.minY == shortArea.minY)
+        #expect(tallArea.width == shortArea.width)
+        #expect(tallArea.height == shortArea.height + 160)
+        #expect(tallArea.maxY == 800 - InspectorColumn.bottomMargin - InspectorColumn.footHeight - InspectorColumn.footGap)
     }
 
     /// The location's facts when nothing is selected, with its item count once listed.
@@ -185,6 +235,8 @@ struct InspectorTests {
     /// The toolbar's inspector toggle does what Command-I does, the split follows, and the
     /// choice is what the next window opens with.
     @Test func theToolbarToggleShowsTheInspectorAndIsRemembered() async throws {
+        // The split view saves to the runner's own domain; start from no save, whatever ran before.
+        UserDefaults.standard.removeObject(forKey: Self.splitFrames)
         let defaults = Defaults()
         let provider = FakeProvider([FakeSession(server)])
         let model = TransferModel(provider: provider, defaults: defaults.store)
@@ -212,6 +264,27 @@ struct InspectorTests {
         #expect(!defaults.store.bool(forKey: Preferences.showsInspector))
         #expect(await eventually { inspector.isCollapsed })
         #expect(!TransferModel(provider: provider, defaults: defaults.store).showsInspector)
+    }
+
+    static let splitFrames = "NSSplitView Subview Frames Transfer.Split"
+
+    /// A window closed while its inspector collapsed saves it open at width 0; the next window
+    /// still opens its inspector from the toolbar. Before the fix this alone, run after itself,
+    /// failed every other time.
+    @Test func anInspectorSavedMidCollapseStillOpens() async throws {
+        UserDefaults.standard.set(["0.000000, 0.000000, 150.000000, 640.000000, NO, NO",
+                                   "150.000000, 0.000000, 810.000000, 640.000000, NO, NO",
+                                   "960.000000, 0.000000, 0.000000, 640.000000, NO, NO"], forKey: Self.splitFrames)
+        defer { UserDefaults.standard.removeObject(forKey: Self.splitFrames) }
+        let model = TransferModel(provider: FakeProvider([FakeSession(server)]), defaults: Defaults().store)
+        let window = await window(ContentView(model: model), style: [.titled, .resizable])
+        defer { window.close() }
+        let controller = try #require(chrome(in: window))
+        let inspector = controller.splitViewItems[2]
+        #expect(inspector.isCollapsed)
+        let item = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.inspector })
+        #expect(NSApp.sendAction(try #require(item.action), to: item.target, from: item))
+        #expect(await eventually { !inspector.isCollapsed })
     }
 
     /// Back and Forward are dim until the history has somewhere to go, and follow it.

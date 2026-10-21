@@ -572,6 +572,24 @@ public struct HostKeyLine: Hashable, Sendable {
     public var text: String { "\(host) \(keyType) \(key)" }
 }
 
+/// The split view's saved frames, one string per column ("x, y, width, height, collapsed,
+/// hidden"). A window closed while its inspector was collapsing saves that column open at
+/// width 0, and a window restored from that never opens its inspector again (measured in
+/// `InspectorTests`). Such a column is saved again as collapsed at its minimum width; anything
+/// else, or a format it does not know, is left alone (nil).
+public enum SplitFrames {
+    public static func healed(_ frames: [String], inspectorMinimum: Double) -> [String]? {
+        guard frames.count == 3 else { return nil }
+        var fields = frames[2].split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard fields.count == 6, let width = Double(fields[2]), fields[4] == "NO", width < inspectorMinimum else { return nil }
+        fields[2] = String(format: "%f", inspectorMinimum)
+        fields[4] = "YES"
+        var healed = frames
+        healed[2] = fields.joined(separator: ", ")
+        return healed
+    }
+}
+
 /// What Quit asks, or nil when quitting loses nothing. `unsynced` is nil when the Live count did
 /// not arrive in time: then it asks, since unsynced edits cannot be ruled out.
 public struct QuitQuestion: Equatable, Sendable {
