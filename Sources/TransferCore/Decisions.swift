@@ -238,6 +238,36 @@ public struct BrowserSnapshot: Hashable, Sendable {
     public init() {}
 }
 
+/// What the path bar shows, as Finder's does: each folder from the server's root down to the
+/// location, then the selected item when exactly one item in the location is selected. Only a
+/// folder above the location is a place to go: the location is where the window already is, and
+/// the selected item is shown, never opened, from the bar.
+public enum PathTrail {
+    public struct Step: Hashable, Sendable {
+        /// The real bytes, so a name that is not UTF-8 is gone to as itself.
+        public var path: RemotePath
+        /// A click on it goes there.
+        public var navigable: Bool
+        /// The selected item that ends the trail.
+        public var isSelection: Bool
+    }
+
+    public static func steps(location: RemotePath, selection: Set<RemotePath>) -> [Step] {
+        var folders = [location]
+        while let parent = folders.last?.parent { folders.append(parent) }
+        var steps = folders.reversed().map { Step(path: $0, navigable: $0 != location, isSelection: false) }
+        if selection.count == 1, let only = selection.first, only != location, only.parent == location {
+            steps.append(Step(path: only, navigable: false, isSelection: true))
+        }
+        return steps
+    }
+
+    /// Whether a click on `path` goes anywhere from `location`: only a folder above it does.
+    public static func goes(to path: RemotePath, from location: RemotePath) -> Bool {
+        path != location && location.isInside(path)
+    }
+}
+
 /// What the column view shows for a location: a column per folder from the root down, each with its
 /// selection. Each column above the location selects the next folder down; the location's own
 /// column selects the items of `selection` it holds. So a selected folder that is the location is

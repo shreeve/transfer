@@ -26,6 +26,8 @@ public enum Preferences {
     public static let wrapsPreview = "transfer.wrapsPreview"
     /// Whether the inspector is out: the last window's choice, which new windows open with.
     public static let showsInspector = "transfer.showsInspector"
+    /// Whether the path bar shows: the last window's choice, which new windows open with.
+    public static let showsPathBar = "transfer.showsPathBar"
 }
 
 public enum SidebarItem: Hashable {
@@ -176,6 +178,14 @@ public final class TransferModel {
             refreshInspectorPreview()
         }
     }
+    /// The path bar at the foot of the browser, off until turned on (`Preferences.showsPathBar`);
+    /// each change becomes the choice new windows open with, as the inspector's does.
+    public var showsPathBar = false {
+        didSet {
+            guard showsPathBar != oldValue else { return }
+            defaults.set(showsPathBar, forKey: Preferences.showsPathBar)
+        }
+    }
     /// The primary file's preview, if small: text's first lines, a decoded picture, or a local copy
     /// for Quick Look. Held briefly after the selection moves so a fast fetch swaps with no gap.
     public var inspectorPreview: InspectorPreview?
@@ -250,6 +260,7 @@ public final class TransferModel {
             snapshot.viewMode = mode
         }
         showsInspector = defaults.bool(forKey: Preferences.showsInspector)
+        showsPathBar = defaults.bool(forKey: Preferences.showsPathBar)
     }
 
     /// Loads the library and follows preference and library changes, once the window is on screen.
@@ -842,6 +853,24 @@ public final class TransferModel {
             await navigate(found?.0 ?? path)
             if let found, isCurrent(context) { snapshot.selection = found.1 }
         }
+    }
+
+    /// The path bar's trail: the server's root, each folder down to the location, and the one
+    /// selected item (`PathTrail`), each with what the bar shows for it.
+    public var pathBar: [PathBarEntry] {
+        PathTrail.steps(location: snapshot.path, selection: snapshot.selection).map { step in
+            let server = currentConnection?.displayName ?? context?.connection.displayName ?? "/"
+            let title = step.path.isRoot ? server : step.path.name
+            let item = step.isSelection ? listedItem(step.path) : nil
+            return PathBarEntry(step: step, title: title, item: item)
+        }
+    }
+
+    /// A click on the path bar: a folder above the location opens as Go to Folder opens one, so
+    /// Back returns. The location itself and the selected item stay as they are.
+    public func goToPathBarFolder(_ path: RemotePath) async {
+        guard snapshot.connectionID != nil, PathTrail.goes(to: path, from: snapshot.path) else { return }
+        await navigate(path)
     }
 
     public func visible(_ items: [RemoteItem]) -> [RemoteItem] {

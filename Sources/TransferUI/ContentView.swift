@@ -121,15 +121,19 @@ struct SidebarColumn: View {
 /// and never re-diffs the grid.
 struct DetailColumn: View {
     @Bindable var model: TransferModel
+    @Environment(\.detailSlots) private var slots
 
     var body: some View {
         VStack(spacing: 0) {
             if let status = model.status { MessageBar(text: status) { model.status = nil } }
             if model.renaming { RenameBar(model: model) }
-            browser
-            if model.snapshot.connectionID != nil { ClipSlot() }
-            if model.showsShelf { Shelf(model: model) }
+            browser.slot("browser", slots, in: DetailSlots.space)
+            // Finder's order at the foot: the path bar under the browser, then the window's bars.
+            if model.snapshot.connectionID != nil, model.showsPathBar { PathBar(model: model).slot("pathBar", slots, in: DetailSlots.space) }
+            if model.snapshot.connectionID != nil { ClipSlot().slot("clipBar", slots, in: DetailSlots.space) }
+            if model.showsShelf { Shelf(model: model).slot("shelf", slots, in: DetailSlots.space) }
         }
+        .coordinateSpace(.named(DetailSlots.space))
         // A question that replaces another in the same sheet starts with fresh fields.
         .sheet(item: $model.sheet) { sheet in sheetView(sheet).id(sheet.id) }
         .scrollEdgeEffectHidden(true, for: .top)
@@ -443,8 +447,10 @@ private struct Shelf: View {
 
 /// The clipboard bar while there is a clip. Its own view, since staging updates the clip often.
 private struct ClipSlot: View {
+    @Environment(\.shownClip) private var shownClip
+
     var body: some View {
-        if let clip = Clipboard.shared.clip { ClipBar(clip: clip) }
+        if let clip = shownClip ?? Clipboard.shared.clip { ClipBar(clip: clip) }
     }
 }
 
@@ -711,13 +717,22 @@ final class InspectorSlots {
     var frames: [String: CGRect] = [:]
 }
 
+/// The same for the detail column's browser and the bars at its foot, which must never overlap.
+enum DetailSlots {
+    nonisolated static let space = "detail"
+}
+
 extension EnvironmentValues {
     @Entry var inspectorSlots: InspectorSlots?
+    @Entry var detailSlots: InspectorSlots?
+    /// A clip for the clipboard bar to show instead of the clipboard's, so the tests that measure
+    /// the bars never write the Mac's pasteboard. Nil, as in the app, shows the clipboard's.
+    @Entry var shownClip: Clipboard.Clip?
 }
 
 private extension View {
-    func slot(_ key: String, _ slots: InspectorSlots?) -> some View {
-        onGeometryChange(for: CGRect.self) { $0.frame(in: .named(InspectorSlots.space)) } action: { slots?.frames[key] = $0 }
+    func slot(_ key: String, _ slots: InspectorSlots?, in space: String = InspectorSlots.space) -> some View {
+        onGeometryChange(for: CGRect.self) { $0.frame(in: .named(space)) } action: { slots?.frames[key] = $0 }
     }
 }
 

@@ -9,6 +9,7 @@ What changed in each release of Transfer. `Scripts/release.sh <version>` publish
 - The inspector stays open or closed as you left it, in new windows and after relaunching.
 - Pictures and other files preview in the inspector up to 10 MB (was 8 MB); text still shows its first 64 KB at any size. A file of a type the inspector cannot preview is no longer downloaded for it.
 - The inspector can be widened to 480 points (was 320).
+- View → Show Path Bar (Option-Command-P) shows a path bar at the foot of the window, as in Finder: the server, each folder down to where you are, and the selected item. Click a folder in it to go there (Back returns), or drop files onto one to copy or move them into it. It stays shown or hidden as you left it.
 
 ## 0.3.1 — 2026-09-27
 
