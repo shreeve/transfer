@@ -230,6 +230,11 @@ public final class TransferModel {
     @ObservationIgnored private var owners: [String: SavedConnection] = [:]
     /// Rows whose move kept originals (`keep`).
     private var keptRows: Set<String> = []
+    /// Each running transfer's speed and time left, one per attempt: only `start` makes one, and
+    /// every way a row stops running drops it, so a Live file's row never has one.
+    private var rates: [String: TransferRate] = [:]
+    /// Seconds on a clock that only goes forward, for the rates; a fake one in tests.
+    @ObservationIgnored var clock: () -> Double = { ProcessInfo.processInfo.systemUptime }
     /// Transfer tasks running in every window, open or closed.
     private(set) static var running = 0
     @ObservationIgnored private var sidebarReload: Task<Void, Never>?
@@ -1261,6 +1266,7 @@ public final class TransferModel {
         guard let runner = runners[id], let server = owners[id] else { return }
         runner.task?.cancel()
         keptRows.remove(id)
+        rates[id] = TransferRate()
         update(id) { $0.state = .active; $0.message = nil }
         let body = runner.body
         let provider = provider
@@ -1281,7 +1287,7 @@ public final class TransferModel {
                     defer { box = nil }
                     return box
                 }) else { return }
-                self?.update(id) { $0.progress = progress }
+                self?.progressed(id, progress)
             }
         }
         let task = Task { [weak self] in
@@ -1310,9 +1316,11 @@ public final class TransferModel {
                     }
                     if RetryPolicy.isRetryable(error), let delay = RetryPolicy.delay(afterAttempt: attempt) {
                         attempt += 1
+                        self?.rates[id] = nil
                         self?.update(id) { $0.state = .queued; $0.message = "Retrying in \(Int(delay)) s" }
                         try? await Task.sleep(for: .seconds(delay))
                         if Task.isCancelled { return }
+                        self?.rates[id] = TransferRate()
                         self?.update(id) { $0.state = .active; $0.message = nil }
                         continue
                     }
@@ -1327,6 +1335,7 @@ public final class TransferModel {
     /// A move that kept some originals, because the user skipped them or a copy could not be
     /// checked: nothing is lost, so the row says so without the failure's red and message bar.
     private func keep(_ id: String, _ message: String) {
+        rates[id] = nil
         update(id) { $0.state = .failed; $0.message = message }
         keptRows.insert(id)
     }
@@ -1334,6 +1343,26 @@ public final class TransferModel {
     /// Whether the row's move ended keeping originals, rather than failing.
     public func isKept(_ operation: TransferOperation) -> Bool {
         operation.state == .failed && keptRows.contains(operation.id)
+    }
+
+    /// A report reaching the shelf, which a running row's rate hears too.
+    private func progressed(_ id: String, _ progress: TransferProgress) {
+        update(id) { $0.progress = progress }
+        guard rates[id] != nil, operations.contains(where: { $0.id == id && $0.state == .active }) else { return }
+        rates[id]?.record(at: clock(), completed: progress.completed)
+    }
+
+    /// A running transfer's speed and time left, "12 MB/s · about 2 minutes left", or "Stalled";
+    /// nil for any other row, and until its rate has enough to go on (`TransferRate`).
+    public func rateText(for operation: TransferOperation) -> String? {
+        guard operation.state == .active, operation.livePath == nil, let rate = rates[operation.id] else { return nil }
+        return rate.reading(at: clock(), total: operation.progress.total)?.text
+    }
+
+    /// What the inspector says of a row, in the shelf's words: its message, else its state label,
+    /// else, while it runs, its speed and time left.
+    public func inspectorStatus(_ operation: TransferOperation) -> String {
+        operation.message ?? stateLabel(operation) ?? rateText(for: operation) ?? "Active"
     }
 
     /// A row's state in the words the shelf and the inspector share; nil while it runs.
@@ -1355,6 +1384,7 @@ public final class TransferModel {
     /// Ends a row. What changed on the server arrives as change events, which relist the
     /// folders on screen, so nothing is relisted here.
     private func finish(_ id: String, state: OperationState, message: String?) {
+        rates[id] = nil
         update(id) { $0.state = state; $0.message = message }
         if state == .succeeded {
             operations.removeAll { $0.id == id }
@@ -1381,6 +1411,7 @@ public final class TransferModel {
     /// `resume` restarts it from its first byte.
     public func pause(_ operation: TransferOperation) async {
         guard operation.livePath == nil else { return await setLivePaused(operation, true) }
+        rates[operation.id] = nil
         update(operation.id) { $0.state = .paused; $0.message = nil }
         runners[operation.id]?.task?.cancel()
     }
@@ -1400,6 +1431,7 @@ public final class TransferModel {
         runners[operation.id] = nil
         owners[operation.id] = nil
         keptRows.remove(operation.id)
+        rates[operation.id] = nil
         operations.removeAll { $0.id == operation.id }
     }
 
