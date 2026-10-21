@@ -222,6 +222,31 @@ public struct NameClash: Sendable {
     }
 }
 
+/// Room for one more file in a copy between servers, whose files pass through this Mac's scratch
+/// folder while others are still on their way (`TransferEngine.across`): at most `jobs` at once,
+/// and at most `bytes` of scratch by their listed sizes. A file holds its size, at most all of
+/// `bytes`, and one of unknown size all of it, so a file larger than the limit, or of unknown
+/// size, goes alone; and alone, any file has room, so none waits for ever.
+package struct RelayRoom: Sendable, Equatable {
+    package let jobs: Int
+    package let bytes: UInt64
+
+    package init(jobs: Int, bytes: UInt64) {
+        self.jobs = jobs
+        self.bytes = bytes
+    }
+
+    /// The scratch a file of `size` holds while in flight.
+    package func share(size: UInt64?) -> UInt64 {
+        min(size ?? bytes, bytes)
+    }
+
+    /// Whether a file holding `share` may start beside `running` jobs that hold `held`.
+    package func admits(_ share: UInt64, running: Int, held: UInt64) -> Bool {
+        running < jobs && (held == 0 || held + share <= bytes)
+    }
+}
+
 package extension String {
     /// This name as a disk that ignores case and Unicode form sees it, folding case fully as APFS
     /// does (`ß` as `ss`, `ﬁ` as `fi`, every sigma alike): two names that fold the same may be one

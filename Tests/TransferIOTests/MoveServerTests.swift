@@ -64,7 +64,9 @@ struct MoveServerTests {
 
     /// A lookalike that reached the destination during the copy, after the move's snapshot of it,
     /// was answered Skip and then passed for the move's copy: the original was removed and only
-    /// the lookalike was left (XFR-01). Only what the move wrote counts now.
+    /// the lookalike was left (XFR-01). Only what the move wrote counts now. The name is settled
+    /// before the file comes down, so a lookalike arriving during the download is met by the
+    /// upload's rename, which never replaces what took the name since.
     @Test func aLookalikeArrivingDuringTheCopyNeverPassesForIt() async throws {
         try await withHarness("late", connected: true) { h in
             try await withAlias(h) { alias in
@@ -83,11 +85,11 @@ struct MoveServerTests {
                     scratch.value = (try? FileManager.default.contentsOfDirectory(atPath: scratchRoot)) ?? []
                 }
                 let skip = TestPrompts(collision: .skip)
-                await #expect(throws: TransferKept([.init("report.txt", .alreadyThere)], moving: true, place: "on the other server")) {
+                await #expect(throws: TransferError.failed("“report.txt” appeared at the destination while it was being copied, and was not replaced")) {
                     try await OperationPrompts.$current.withValue(skip) { try await engine.run(from: alias) }
                 }
                 #expect(planted.value)
-                #expect(skip.collisions == 1)
+                #expect(skip.collisions == 0)
                 #expect(try h.read("from/report.txt") == "AAAA")
                 #expect(try h.read("to/report.txt") == "BBBB")
                 // The copy passed through the library's scratch folder, which the next launch
@@ -573,6 +575,329 @@ struct MoveServerTests {
     }
 }
 
+/// Pastes between two saved servers, whose files go down to this Mac and up again at once, a
+/// few in flight, across items too (`TransferEngine.across`). Small limits keep several files
+/// in flight even in these small trees.
+extension MoveServerTests {
+    static let smallLimits = RelayLimits(bytes: 128 << 10, jobs: 4)
+
+    /// A paste between servers downloaded each item whole into the scratch folder before any of
+    /// it went up. Now its files go down and up at once; what lands is what a copy one item at a
+    /// time made, and a move removes all of it.
+    @Test func aPipelinedCopyAndMoveLandWhole() async throws {
+        try await withHarness("relay", connected: true) { h in
+            try await withAlias(h) { alias in
+                var files: [String: String?] = ["a.txt": "a", "sub/b.txt": "b", "sub/deep/c.txt": "c", "empty": nil]
+                for index in 0..<24 { files["bulk/f\(index).bin"] = String(repeating: String(index % 10), count: 40_000 + index) }
+                let from = try h.folder("from", files: files)
+                try FileManager.default.createSymbolicLink(atPath: h.remote.appendingPathComponent("from/sub/link").path, withDestinationPath: "../a.txt")
+                let sources = ["a.txt", "sub", "bulk", "empty"].map { from.appending($0) }
+                let bytes = try h.treeBytes("from")
+                let reported = Locked(TransferProgress(completed: 0))
+                let copy = TransferRequest(.server(alias.connection.id, sources), into: try h.folder("copy"), on: h.session.connection.id, moving: false, bytes: bytes)
+                var engine = TransferEngine(request: copy, destination: h.session) { reported.value = $0 }
+                engine.relayLimits = Self.smallLimits
+                try await engine.run(from: alias)
+                try h.expectSame("from", "copy")
+                // Every byte counts once on the way down and once on the way up; every file and
+                // link counts once.
+                #expect(reported.value.completed == 2 * bytes)
+                #expect(reported.value.total == 2 * bytes)
+                #expect(reported.value.itemsCompleted == 28)
+                try h.expectNoLeftovers(alias)
+
+                let move = TransferRequest(.server(alias.connection.id, sources), into: try h.folder("moved"), on: h.session.connection.id, moving: true)
+                var mover = TransferEngine(request: move, destination: h.session) { _ in }
+                mover.relayLimits = Self.smallLimits
+                try await mover.run(from: alias)
+                try h.expectSame("copy", "moved")
+                #expect(try h.names("from").isEmpty)
+                #expect(h.prompts.collisions == 0)
+                try h.expectNoLeftovers(alias)
+            }
+        }
+    }
+
+    /// The questions about names taken at the destination now come while earlier files are still
+    /// on their way. Skip, Keep Both, Replace, and Apply to All answer them as before, one at a
+    /// time, and a move keeps every original the user skipped.
+    @Test func collisionsMidCopyAreAskedOneAtATime() async throws {
+        try await withHarness("rlask", connected: true) { h in
+            try await withAlias(h) { alias in
+                var files: [String: String?] = ["f1.txt": "new 1", "f2.txt": "new 2", "dir/f3.txt": "new 3", "dir/fresh.txt": "fresh"]
+                for index in 0..<16 { files["bulk/b\(index).bin"] = String(repeating: "x", count: 32 << 10) }
+                let from = try h.folder("from", files: files)
+                let sources = ["bulk", "f1.txt", "f2.txt", "dir"].map { from.appending($0) }
+                // Each a size of its own, so none passes for the same file.
+                let older: [String: String?] = ["f1.txt": "older 1", "f2.txt": "older 2", "dir/f3.txt": "older 3"]
+                let reported = Locked(UInt64(0))
+                let firstAsked = Locked<UInt64?>(nil)
+                func paste(into name: String, moving: Bool = false, _ prompts: some PromptSink) async throws {
+                    let request = TransferRequest(.server(alias.connection.id, sources), into: try h.folder(name, files: older), on: h.session.connection.id, moving: moving)
+                    var engine = TransferEngine(request: request, destination: h.session) { reported.value = $0.completed }
+                    engine.relayLimits = Self.smallLimits
+                    try await OperationPrompts.$current.withValue(prompts) { try await engine.run(from: alias) }
+                }
+                let asked: @Sendable () -> Void = { firstAsked.withLock { $0 = $0 ?? reported.value } }
+
+                let skip = TestPrompts(collision: .skip, meanwhile: asked)
+                try await paste(into: "skip", skip)
+                #expect(skip.collisions == 3)
+                #expect((firstAsked.value ?? 0) > 0)
+                #expect(try h.read("skip/f1.txt") == "older 1" && h.read("skip/f2.txt") == "older 2" && h.read("skip/dir/f3.txt") == "older 3")
+                #expect(try h.read("skip/dir/fresh.txt") == "fresh")
+                #expect(try h.names("skip/bulk").count == 16)
+
+                let keepBoth = TestPrompts(collision: .keepBoth)
+                try await paste(into: "keep", keepBoth)
+                #expect(keepBoth.collisions == 3)
+                #expect(try h.read("keep/f1.txt") == "older 1" && h.read("keep/f1 2.txt") == "new 1")
+                #expect(try h.read("keep/f2 2.txt") == "new 2" && h.read("keep/dir/f3 2.txt") == "new 3")
+                #expect(try h.names("keep/dir") == ["f3 2.txt", "f3.txt", "fresh.txt"])
+
+                let replace = TestPrompts(collision: .replace)
+                try await paste(into: "replace", replace)
+                #expect(replace.collisions == 3)
+                #expect(try h.read("replace/f1.txt") == "new 1" && h.read("replace/f2.txt") == "new 2" && h.read("replace/dir/f3.txt") == "new 3")
+
+                let all = ApplyToAllPrompts(.replace)
+                try await paste(into: "all", all)
+                #expect(all.asked == 1)
+                #expect(all.calls == 3)
+                #expect(all.mostAtOnce == 1)
+                #expect(try h.read("all/f1.txt") == "new 1" && h.read("all/dir/f3.txt") == "new 3")
+
+                await #expect(throws: TransferKept([.init("f1.txt", .alreadyThere), .init("f2.txt", .alreadyThere), .init("dir", .alreadyThere)], moving: true, place: "on the other server")) {
+                    try await paste(into: "move", moving: true, TestPrompts(collision: .skip))
+                }
+                #expect(try h.names("from") == ["dir", "f1.txt", "f2.txt"])
+                #expect(try h.names("move/bulk").count == 16)
+                #expect(try h.read("move/f1.txt") == "older 1")
+                try h.expectNoLeftovers(alias)
+            }
+        }
+    }
+
+    /// A file that fails halfway through a pipelined paste, coming down or going up, leaves no
+    /// temp on either server, no scratch copy, and no temp record, and the rest of its item lands.
+    @Test func aFailureMidPipelineLeavesNothingBehind() async throws {
+        try await withHarness("rlfail", connected: true) { h in
+            try await withAlias(h) { alias in
+                var files: [String: String?] = ["dir/ro/inside.txt": "new"]
+                for index in 0..<20 { files["dir/f\(index).bin"] = String(repeating: "y", count: 48 << 10) }
+                let from = try h.folder("from", files: files)
+                let unreadable = h.remote.appendingPathComponent("from/dir/f7.bin")
+                let readOnly = h.remote.appendingPathComponent("to/dir/ro")
+                let to = try h.folder("to", files: ["dir/ro": nil])
+                try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadable.path)
+                try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: readOnly.path)
+                defer {
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: unreadable.path)
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: readOnly.path)
+                }
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("dir")]), into: to, on: h.session.connection.id, moving: false)
+                var engine = TransferEngine(request: request, destination: h.session) { _ in }
+                engine.relayLimits = RelayLimits(bytes: 96 << 10, jobs: 3)
+                await #expect(throws: TransferError.self) { try await engine.run(from: alias) }
+                let landed = try h.names("to/dir")
+                #expect(landed.filter { $0.hasSuffix(".bin") }.count == 19)
+                #expect(!landed.contains("f7.bin"))
+                #expect(try h.names("to/dir/ro").isEmpty)
+                try h.expectNoLeftovers(alias)
+            }
+        }
+    }
+
+    /// A connection dropped halfway through a pipelined paste, and the shelf's retry: what had
+    /// landed is neither downloaded nor uploaded again, and the rest is.
+    @Test func aRetryAfterADroppedConnectionDoesNothingTwice() async throws {
+        try await withHarness("rldrop", connected: true) { h in
+            try await withAlias(h) { alias in
+                let size = 32 << 10
+                var files: [String: String?] = [:]
+                for index in 0..<40 { files[String(format: "dir/f%02d.bin", index)] = String(repeating: "z", count: size) }
+                let from = try h.folder("from", files: files)
+                // The 21st file the walk meets is taken at the destination: while its question is
+                // up, once the 20 before it have landed, the source's connection drops.
+                var order: [String] = []
+                for try await item in alias.list(from.appending("dir")) { order.append(item.name) }
+                let victim = order[20]
+                let to = try h.folder("to", files: ["dir/\(victim)": "older"])
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("dir")]), into: to, on: h.session.connection.id, moving: false)
+                let finished = Locked(0)
+                let dropping = DroppingPrompts {
+                    _ = await waitUntil { finished.value >= 20 }
+                    await alias.disconnect()
+                }
+                var first = TransferEngine(request: request, destination: h.session) { finished.value = $0.itemsCompleted }
+                first.relayLimits = RelayLimits(bytes: 64 << 10, jobs: 2)
+                do {
+                    try await OperationPrompts.$current.withValue(dropping) { try await first.run(from: alias) }
+                    Issue.record("the paste went on past its dropped connection")
+                } catch {
+                    #expect(CopyTally.ends(error))
+                }
+                let before = order.prefix(20).map { $0 }
+                #expect(try h.names("to/dir") == (before + [victim]).sorted())
+                #expect(try h.read("to/dir/\(victim)") == "older")
+                try h.expectNoLeftovers(alias)
+                let inodes = try h.inodes("to/dir", before)
+
+                _ = try await alias.connect(prompts: h.prompts)
+                let moved = Locked(UInt64(0))
+                var retry = TransferEngine(request: request, destination: h.session) { moved.value = $0.completed }
+                retry.relayLimits = RelayLimits(bytes: 64 << 10, jobs: 2)
+                try await retry.run(from: alias)
+                // Down and up once each for the 20 files that had not landed, and only those.
+                #expect(moved.value == 2 * UInt64(20 * size))
+                #expect(try h.inodes("to/dir", before) == inodes)
+                #expect(try h.names("to/dir") == order.sorted())
+                #expect(try h.read("to/dir/\(victim)") == String(repeating: "z", count: size))
+                try h.expectNoLeftovers(alias)
+            }
+        }
+    }
+
+    /// A paste between servers held each item whole in the scratch folder, so a large tree could
+    /// fill this Mac's disk. Files in flight there now stay within the limits, by count and by
+    /// size, but for one file larger than the size limit, which goes alone.
+    @Test func thePipelineKeepsToItsLimits() async throws {
+        try await withHarness("rlcap", connected: true) { h in
+            try await withAlias(h) { alias in
+                var files: [String: String?] = ["dir/large.bin": String(repeating: "L", count: 512 << 10)]
+                for index in 0..<24 { files["dir/f\(index).bin"] = String(repeating: "s", count: 64 << 10) }
+                let from = try h.folder("from", files: files)
+                let scratch = try Store(root: h.root).scratch
+                let seen = Locked((files: 0, bytes: 0, alone: true))
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("dir")]), into: try h.folder("to"), on: h.session.connection.id, moving: false)
+                var engine = TransferEngine(request: request, destination: h.session) { _ in
+                    let held = scratchFiles(scratch)
+                    seen.withLock { seen in
+                        seen.files = max(seen.files, held.count)
+                        if held.contains(where: { $0.size > 64 << 10 }) {
+                            seen.alone = seen.alone && held.count == 1
+                        } else {
+                            seen.bytes = max(seen.bytes, held.reduce(0) { $0 + $1.size })
+                        }
+                    }
+                }
+                engine.relayLimits = RelayLimits(bytes: 256 << 10, jobs: 3)
+                try await engine.run(from: alias)
+                #expect(try h.names("to/dir").count == 25)
+                #expect(seen.value.files <= 3)
+                #expect(seen.value.files >= 2)
+                #expect(seen.value.bytes <= 256 << 10)
+                #expect(seen.value.alone)
+                try h.expectNoLeftovers(alias)
+            }
+        }
+    }
+
+    /// A pipelined move between servers removes an original only once its own copy is checked:
+    /// a file added to the original during its copy keeps all of it, an item that failed keeps
+    /// its own, and the other items' originals go.
+    @Test func aPipelinedMoveRemovesOnlyVerifiedOriginals() async throws {
+        try await withHarness("rlmove", connected: true) { h in
+            try await withAlias(h) { alias in
+                var files: [String: String?] = ["keep/locked.txt": "locked", "gone.txt": "g"]
+                for index in 0..<12 {
+                    files["grow/f\(index).bin"] = String(repeating: "m", count: 32 << 10)
+                    files["plain/p\(index).bin"] = String(repeating: "p", count: 32 << 10)
+                }
+                let from = try h.folder("from", files: files)
+                let locked = h.remote.appendingPathComponent("from/keep/locked.txt")
+                try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: locked.path)
+                defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: locked.path) }
+                let added = Locked(false)
+                let request = TransferRequest(.server(alias.connection.id, ["grow", "keep", "plain", "gone.txt"].map { from.appending($0) }), into: try h.folder("to"), on: h.session.connection.id, moving: true)
+                // As "grow" starts to copy, someone adds a file to it.
+                var engine = TransferEngine(request: request, destination: h.session) { _ in
+                    guard !added.withLock({ defer { $0 = true }; return $0 }) else { return }
+                    try? h.write("from/grow/late.txt", "late")
+                }
+                engine.relayLimits = Self.smallLimits
+                do {
+                    try await engine.run(from: alias)
+                    Issue.record("the move kept nothing")
+                } catch let kept as TransferKept {
+                    #expect(kept.items.map(\.name) == ["grow", "keep"])
+                    #expect(kept.items.first?.reason == .incomplete)
+                }
+                #expect(try h.names("from") == ["grow", "keep"])
+                #expect(try h.names("from/grow").count == 13)
+                #expect(try h.names("from/keep") == ["locked.txt"])
+                #expect(try h.names("to/grow").count == 12)
+                #expect(try h.names("to/plain").count == 12)
+                #expect(try h.read("to/gone.txt") == "g")
+                try h.expectNoLeftovers(alias)
+            }
+        }
+    }
+}
+
+/// Answers as a window's operation prompt does once Apply to All is checked: the first question
+/// is shown and answered for all, and the rest take that answer unasked. Counts the questions
+/// shown, the calls, and the most calls open at once.
+final class ApplyToAllPrompts: PromptSink {
+    private let state = Locked((asked: 0, calls: 0, open: 0, mostAtOnce: 0, chosen: NameCollisionChoice?.none))
+    private let choice: NameCollisionChoice
+
+    init(_ choice: NameCollisionChoice) {
+        self.choice = choice
+    }
+
+    var asked: Int { state.value.asked }
+    var calls: Int { state.value.calls }
+    var mostAtOnce: Int { state.value.mostAtOnce }
+
+    func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
+    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
+    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
+        let chosen = state.withLock { state in
+            state.calls += 1
+            state.open += 1
+            state.mostAtOnce = max(state.mostAtOnce, state.open)
+            return state.chosen
+        }
+        defer { state.withLock { $0.open -= 1 } }
+        if let chosen { return chosen }
+        // The user reads the sheet.
+        try? await Task.sleep(for: .milliseconds(30))
+        state.withLock {
+            $0.asked += 1
+            $0.chosen = choice
+        }
+        return choice
+    }
+}
+
+/// Runs `meanwhile`, which the paste waits on, before answering Replace to a collision.
+final class DroppingPrompts: PromptSink {
+    private let meanwhile: @Sendable () async -> Void
+
+    init(_ meanwhile: @escaping @Sendable () async -> Void) {
+        self.meanwhile = meanwhile
+    }
+
+    func answer(_ request: PromptRequest) async -> PromptReply { PromptReply(text: nil) }
+    func decideHostKey(_ event: HostKeyEvent) async -> HostKeyDecision { .trustOnce }
+    func resolveCollision(fileName: String) async -> NameCollisionChoice? {
+        await meanwhile()
+        return .replace
+    }
+}
+
+/// The files in a scratch folder and below, with their sizes.
+private func scratchFiles(_ scratch: URL) -> [(name: String, size: Int)] {
+    guard let walker = FileManager.default.enumerator(atPath: scratch.path) else { return [] }
+    var files: [(name: String, size: Int)] = []
+    while let key = walker.nextObject() as? String {
+        guard walker.fileAttributes?[.type] as? FileAttributeType == .typeRegular else { continue }
+        files.append((key, (walker.fileAttributes?[.size] as? NSNumber)?.intValue ?? 0))
+    }
+    return files
+}
+
 /// Placement without a server: a move never skips a lookalike (D9).
 @Test func aMoveAsksAboutTheSameFileOrLink() {
     let print = Fingerprint(size: 4, mtime: 9)
@@ -645,5 +970,63 @@ private extension ServerHarness {
 
     func setTime(_ path: String, _ seconds: TimeInterval) throws {
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: seconds)], ofItemAtPath: remote.appendingPathComponent(path).path)
+    }
+
+    /// The bytes of the files in a served folder and below.
+    func treeBytes(_ path: String) throws -> UInt64 {
+        let root = remote.appendingPathComponent(path)
+        var total: UInt64 = 0
+        for key in FileManager.default.enumerator(atPath: root.path)?.allObjects as? [String] ?? [] {
+            let attributes = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent(key).path)
+            if attributes[.type] as? FileAttributeType == .typeRegular { total += (attributes[.size] as? NSNumber)?.uint64Value ?? 0 }
+        }
+        return total
+    }
+
+    /// Expects served folders `a` and `b` to hold one tree: the same names and kinds, the same
+    /// bytes and whole-second times in each file, and the same link targets.
+    func expectSame(_ a: String, _ b: String) throws {
+        func entries(_ path: String) throws -> [String: String] {
+            let root = remote.appendingPathComponent(path)
+            var all: [String: String] = [:]
+            for key in FileManager.default.enumerator(atPath: root.path)?.allObjects as? [String] ?? [] {
+                let url = root.appendingPathComponent(key)
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                switch attributes[.type] as? FileAttributeType {
+                case .typeDirectory?:
+                    all[key] = "folder"
+                case .typeSymbolicLink?:
+                    all[key] = "link " + (try FileManager.default.destinationOfSymbolicLink(atPath: url.path))
+                default:
+                    let time = Int((attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+                    all[key] = "file \(time) " + (try Data(contentsOf: url)).base64EncodedString()
+                }
+            }
+            return all
+        }
+        let (left, right) = (try entries(a), try entries(b))
+        #expect(!left.isEmpty)
+        #expect(left == right)
+    }
+
+    /// Expects no temp left in the served folder, which every saved server here serves, no file
+    /// in the library's scratch folder, and no temp recorded for this Mac or any of `others`.
+    func expectNoLeftovers(_ others: SSHConnection...) throws {
+        let names = FileManager.default.enumerator(atPath: remote.path)?.allObjects as? [String] ?? []
+        #expect(names.filter { $0.contains(".transfer-") }.isEmpty)
+        let store = try Store(root: root)
+        #expect(scratchFiles(store.scratch).isEmpty)
+        #expect(store.localTemps().isEmpty)
+        for id in [session.connection.id] + others.map(\.connection.id) {
+            #expect(store.remoteTemps(connection: id).isEmpty)
+        }
+    }
+
+    /// The inode of each of `names` in a served folder: a file written again has a new one.
+    func inodes(_ folder: String, _ names: [String]) throws -> [UInt64] {
+        try names.map { name in
+            let attributes = try FileManager.default.attributesOfItem(atPath: remote.appendingPathComponent(folder).appendingPathComponent(name).path)
+            return (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        }
     }
 }
