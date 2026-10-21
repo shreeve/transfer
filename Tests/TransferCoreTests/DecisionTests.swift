@@ -412,7 +412,11 @@ import Testing
         #expect(plan(name, 1000) == .quickLook, "\(name)")
     }
     #expect(plan("paper.pdf", limit + 1) == .icon)
-    for name in ["blob.xyz", "archive.zip", "a.tar.gz", "lib.dylib", "Makefile", "core", "notes."] {
+    for name in ["blob.xyz", "archive.zip", "a.tar.gz", "lib.dylib", "notes."] {
         #expect(plan(name, 1000) == .icon, "\(name)")
     }
+    for name in ["README", "LICENSE", "Makefile"] {
+        #expect(plan(name, 1000) == .quickLook, "\(name)")
+    }
+    #expect(plan("README", limit + 1) == .icon)
 }

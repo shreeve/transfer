@@ -78,8 +78,10 @@ public enum InspectorPreviewPlan: Equatable, Sendable {
     public static func plan(fileName: String, size: UInt64?, isText: Bool) -> Self {
         if isText { return .text }
         guard let size, size <= limit else { return .icon }
-        guard let dot = fileName.lastIndex(of: "."),
-              let type = UTType(filenameExtension: String(fileName[fileName.index(after: dot)...])) else { return .icon }
+        // A name with no dot (README, LICENSE, Makefile) has no type to go by; Quick Look reads
+        // its contents and shows text as text, as it did before the plan existed.
+        guard let dot = fileName.lastIndex(of: ".") else { return .quickLook }
+        guard let type = UTType(filenameExtension: String(fileName[fileName.index(after: dot)...])) else { return .icon }
         if type.conforms(to: .image) { return .picture }
         return quickLookTypes.contains(where: type.conforms) ? .quickLook : .icon
     }
