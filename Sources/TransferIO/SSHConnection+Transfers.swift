@@ -726,6 +726,10 @@ extension SSHConnection {
 
     public func preparePreview(_ path: RemotePath) async throws -> URL {
         let item = try await stat(path)
+        // The listing the window checked may be old: the size read now decides too.
+        if QuickLookPlan.plan(kind: item.kind, size: item.size) == .tooLarge {
+            throw TransferError.failed(QuickLookPlan.tooLargeMessage(name: item.name))
+        }
         if EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live {
             // The page is named for the file's size and time too, so an unchanged file reuses it.
             let print = Fingerprint(item: item)

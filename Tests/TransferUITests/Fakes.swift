@@ -82,7 +82,16 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     }
     func prepareLiveFile(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
     func prepareViewFile(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
-    func preparePreview(_ path: RemotePath) async throws -> URL { throw TransferError.notConnected }
+    /// How long a Quick Look fetch takes; it never yields a copy, so no test opens the panel.
+    let previewTime = Locked<Duration?>(nil)
+    func preparePreview(_ path: RemotePath) async throws -> URL {
+        record("preview \(path.display)")
+        do { if let time = previewTime.value { try await Task.sleep(for: time) } } catch {
+            record("preview cancelled \(path.display)")
+            throw error
+        }
+        throw TransferError.notConnected
+    }
     func prepareInspectorPreview(_ path: RemotePath) async throws -> URL {
         record("inspector \(path.display)")
         if let time = inspectorTime.value { try await Task.sleep(for: time) }

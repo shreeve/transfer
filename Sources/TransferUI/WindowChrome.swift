@@ -51,6 +51,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         // List view's column header has its own line, so Finder shows no hover line there.
         controller.hoverLineEnabled = viewMode != .list
         context.coordinator.selectViewMode(viewMode)
+        context.coordinator.enableNavigation(back: model.canGoBack, forward: model.canGoForward)
         if context.coordinator.searchTick != searchTick {
             context.coordinator.searchTick = searchTick
             context.coordinator.beginSearch(nil)
@@ -64,6 +65,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         weak var controller: ChromeController?
         var searchTick = 0
         private var viewGroup: NSToolbarItemGroup?
+        private(set) var navigationGroup: NSToolbarItemGroup?
         private var searchView: SearchToolbarView?
 
         init(model: TransferModel) { self.model = model }
@@ -86,6 +88,8 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 let group = makeGroup(identifier, "Back/Forward", symbols: ["chevron.backward", "chevron.forward"],
                                       labels: ["Back", "Forward"], mode: .momentary, action: #selector(navigate(_:)))
                 group.isNavigational = true
+                navigationGroup = group
+                enableNavigation(back: model.canGoBack, forward: model.canGoForward)
                 return group
             case ChromeItem.viewMode:
                 let group = makeGroup(identifier, "View", symbols: ["square.grid.2x2", "list.bullet", "rectangle.split.3x1"],
@@ -158,6 +162,13 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             group.visibilityPriority = .high
             group.label = label
             return group
+        }
+
+        /// Back and Forward are dim when the history has nowhere to go.
+        func enableNavigation(back: Bool, forward: Bool) {
+            guard let items = navigationGroup?.subitems, items.count == 2 else { return }
+            if items[0].isEnabled != back { items[0].isEnabled = back }
+            if items[1].isEnabled != forward { items[1].isEnabled = forward }
         }
 
         private func index(of mode: ViewMode) -> Int {

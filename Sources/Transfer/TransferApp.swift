@@ -95,8 +95,10 @@ struct TransferApp: App {
                 Group {
                     Button("Back") { Task { await model?.goBack() } }
                         .keyboardShortcut("[")
+                        .disabled(model?.canGoBack != true)
                     Button("Forward") { Task { await model?.goForward() } }
                         .keyboardShortcut("]")
+                        .disabled(model?.canGoForward != true)
                     Button("Parent") { Task { await model?.goParent() } }
                         .keyboardShortcut(.upArrow, modifiers: .command)
                     Button("Remote Home") { Task { await model?.goHome() } }

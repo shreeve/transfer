@@ -94,6 +94,18 @@ struct ViewTests {
         #expect(coordinator.tableView(NSTableView(), rowViewForRow: 0)?.acceptsFirstMouse(for: nil) == true)
     }
 
+    /// A drag out of a background window must not raise it over Finder's drop target: the drag
+    /// sources delay the window's ordering on mouse-down. A click still takes the first mouse.
+    @Test func dragSourcesDelayTheirWindowsOrdering() {
+        _ = NSApplication.shared
+        let event = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let cell = IconItemView(frame: NSRect(origin: .zero, size: IconItemView.size))
+        #expect(cell.shouldDelayWindowOrdering(for: event) && cell.acceptsFirstMouse(for: event))
+        #expect(RowMenuTableView().shouldDelayWindowOrdering(for: event))
+        let row = FirstMouseRowView()
+        #expect(row.shouldDelayWindowOrdering(for: event) && row.acceptsFirstMouse(for: event))
+    }
+
     /// FR-9: going back to a filter that still holds text keeps Space and Return with it.
     @Test func refocusingTheFilterKeepsThePlainKeysWithIt() async throws {
         _ = NSApplication.shared

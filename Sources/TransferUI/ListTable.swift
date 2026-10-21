@@ -220,6 +220,14 @@ struct ListTable: NSViewRepresentable {
             return drag.writer(for: items[row], model: model)
         }
 
+        func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+            DragOrdering.begin(in: tableView.window)
+        }
+
+        func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+            DragOrdering.end(in: tableView.window, at: screenPoint)
+        }
+
         func tableView(_ tableView: NSTableView, validateDrop info: any NSDraggingInfo, proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
             let folder = dropFolder(row: row, operation: operation)
             if folder == model.snapshot.path { tableView.setDropRow(-1, dropOperation: .on) }
@@ -278,6 +286,9 @@ final class RowMenuTableView: NSTableView {
     weak var coordinator: ListTable.Coordinator?
     private var fittedWidth: CGFloat = 0
 
+    /// A drag out of a background window leaves it behind (`DragOrdering`).
+    override func shouldDelayWindowOrdering(for event: NSEvent) -> Bool { true }
+
     /// Name takes the width the others leave, down to its minimum, following window and inspector.
     /// Autoresizing only tracks changes and misses restored columns already wider than the view.
     override func layout() {
@@ -302,6 +313,7 @@ final class RowMenuTableView: NSTableView {
 /// a background window too, as the table itself does and as Finder's rows do.
 final class FirstMouseRowView: NSTableRowView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func shouldDelayWindowOrdering(for event: NSEvent) -> Bool { true }
 }
 
 /// The list and column views' right-click menu: for the clicked item, already in the selection, or

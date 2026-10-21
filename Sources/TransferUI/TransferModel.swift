@@ -223,6 +223,7 @@ public final class TransferModel {
     private var backStack: [RemotePath] = []
     private var forwardStack: [RemotePath] = []
     private var previewTask: Task<Void, Never>?
+    @ObservationIgnored private var previewSerial = 0
     @ObservationIgnored private var runners: [String: Runner] = [:]
     /// The server each shelf row runs on: a transfer's is the one it was queued for, and a Live
     /// row's the one whose events put it there, so Retry, Pause, and Resume reach that server
@@ -820,6 +821,10 @@ public final class TransferModel {
         await refresh()
     }
 
+    /// Whether Back and Forward have anywhere to go: the toolbar's items and Go's follow these.
+    public var canGoBack: Bool { !backStack.isEmpty }
+    public var canGoForward: Bool { !forwardStack.isEmpty }
+
     public func goBack() async {
         guard let path = backStack.popLast() else { return }
         remember(snapshot.path, in: &forwardStack)
@@ -1033,22 +1038,50 @@ public final class TransferModel {
             previewTask?.cancel()
             return
         }
+        // Space while a fetch is still running is the second press of a toggle: it cancels.
+        if previewing {
+            PreviewPanel.shared.close()
+            previewTask?.cancel()
+            previewing = false
+            return
+        }
         showPreview()
     }
 
+    /// Whether a Quick Look fetch is running (observable, for tests and the toggle).
+    public private(set) var previewing = false
+
     /// Quick Look on `item`, or on the primary selected item. A fetch that finishes after the
-    /// panel was put away leaves it closed.
+    /// panel was put away leaves it closed. A folder is not fetched, and neither is a file over
+    /// `QuickLookPlan.limit`: the message bar says so.
     public func showPreview(_ item: RemoteItem? = nil) {
         guard let session, let item = item ?? primaryItem else { return }
         previewTask?.cancel()
+        previewSerial &+= 1
+        let serial = previewSerial
         let generation = PreviewPanel.shared.generation
+        previewing = true
         previewTask = Task { [weak self] in
+            defer { if let self, self.previewSerial == serial { self.previewing = false } }
             do {
                 let target = try await Self.resolveLink(item, session: session)
+                if Task.isCancelled { return }
+                switch QuickLookPlan.plan(kind: target.kind, size: target.size) {
+                case .nothing:
+                    PreviewPanel.shared.clear()
+                    return
+                case .tooLarge:
+                    PreviewPanel.shared.clear()
+                    self?.status = QuickLookPlan.tooLargeMessage(name: target.name)
+                    return
+                case .fetch:
+                    break
+                }
                 let url = try await session.preparePreview(target.path)
                 if Task.isCancelled { return }
                 PreviewPanel.shared.show(url, title: target.name, generation: generation)
             } catch {
+                if Task.isCancelled { return }
                 self?.report(error)
             }
         }
@@ -2305,6 +2338,12 @@ final class PreviewPanel: NSObject, @MainActor QLPreviewPanelDataSource, @MainAc
         } else {
             panel.makeKeyAndOrderFront(nil)
         }
+    }
+
+    /// Nothing to show for the selection (a folder, a file too large): the panel, if open, empties.
+    func clear() {
+        item = nil
+        if isVisible { QLPreviewPanel.shared().reloadData() }
     }
 
     func close() {

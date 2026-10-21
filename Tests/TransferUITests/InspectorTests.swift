@@ -214,6 +214,30 @@ struct InspectorTests {
         #expect(!TransferModel(provider: provider, defaults: defaults.store).showsInspector)
     }
 
+    /// Back and Forward are dim until the history has somewhere to go, and follow it.
+    @Test func backAndForwardFollowTheHistory() async throws {
+        let home = RemotePath(string: "/home")
+        let docs = home.appending("docs")
+        let session = FakeSession(server, home: "/home", folders: [home: [RemoteItem(path: docs, kind: .directory)], docs: []])
+        let model = TransferModel(provider: FakeProvider([session]), defaults: Defaults().store)
+        let window = await window(ContentView(model: model), style: [.titled, .resizable])
+        defer { window.close() }
+        await model.connect(server)
+        let group = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.backForward } as? NSToolbarItemGroup)
+        func state() -> [Bool] { group.subitems.map(\.isEnabled) }
+        #expect(!model.canGoBack && !model.canGoForward)
+        #expect(await eventually { state() == [false, false] })
+
+        await model.navigate(docs)
+        #expect(model.canGoBack && !model.canGoForward)
+        #expect(await eventually { state() == [true, false] })
+        await model.goBack()
+        #expect(!model.canGoBack && model.canGoForward)
+        #expect(await eventually { state() == [false, true] })
+        await model.goForward()
+        #expect(await eventually { state() == [true, false] })
+    }
+
     /// A window opens with the inspector as the last one left it, whatever the split view's
     /// autosave held, and landing does not change the saved choice.
     @Test func aNewWindowOpensWithTheRememberedInspector() async throws {
