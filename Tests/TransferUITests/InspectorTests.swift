@@ -389,7 +389,8 @@ struct InspectorTests {
         let controller = try #require(chrome(in: window))
         let inspector = controller.splitViewItems[2]
         #expect(inspector.isCollapsed)
-        #expect(inspector.maximumThickness == 480)
+        let side = controller.splitViewItems[0].isCollapsed ? 0 : Double(controller.splitViewItems[0].viewController.view.frame.width)
+        #expect(inspector.maximumThickness == CGFloat(InspectorWidth.maximum(splitWidth: Double(controller.splitView.bounds.width), sidebar: side)))
         let item = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.inspector })
         let identifiers = window.toolbar?.items.map(\.itemIdentifier) ?? []
         #expect(identifiers.firstIndex(of: ChromeItem.inspector) == identifiers.firstIndex(of: ChromeItem.transfers).map { $0 + 1 })
