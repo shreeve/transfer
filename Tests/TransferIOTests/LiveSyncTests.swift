@@ -1627,7 +1627,12 @@ struct LiveCheckServerTests {
             #expect(await waitUntil(3) { await h.session.liveFiles().first?.serverChange == .changed })
             #expect(try Data(contentsOf: local) == Data("first".utf8))
             #expect(LiveSync.stamp(local) == stamp)
-            #expect(h.events.notices.filter { $0.contains("note.txt") }.count == 1)
+            // The recorder hears events from a task of its own, which may run after the flag is read.
+            let notices = { h.events.notices.filter { $0.contains("note.txt") }.count }
+            #expect(await waitUntil(3) { notices() >= 1 })
+            // Three more rounds see the same change and say nothing more.
+            try await Task.sleep(for: .seconds(1))
+            #expect(notices() == 1)
             #expect(h.events.conflicts(path) == 0)
 
             try Data("first".utf8).write(to: file)
