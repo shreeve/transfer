@@ -147,9 +147,10 @@ extension SSHConnection {
         try await copyToServer(.mac(source), at: destination, tally: tally)
     }
 
-    /// Temp-and-rename onto the server, over the data channels. No collision check, but without
-    /// `replacing` the rename refuses a name that something took since it was looked up.
-    func uploadBytes(_ source: URL, to placed: RemotePath, replacing: Bool, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
+    /// Temp-and-rename onto the server, over the data channels. `replacing` is what the user chose
+    /// to replace there, which alone goes; nil for a free name, which the rename refuses to take
+    /// from something that took it since it was looked up.
+    func uploadBytes(_ source: URL, to placed: RemotePath, replacing: PlacedItem?, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         let local = LiveSync.stamp(source)
         let mode = ((try? FileManager.default.attributesOfItem(atPath: source.path))?[.posixPermissions] as? NSNumber)?.uint32Value
         let stamp = SFTPAttrs.stamp(mode: mode, mtime: local?.fingerprint.mtime)
@@ -413,7 +414,7 @@ extension SSHConnection {
             }
         case .file:
             guard let placed = try await settleRemotely(incoming, at: destination, found: found, tally: tally) else { return tally.finished() }
-            let replacing = placed.found != nil
+            let replacing = placed.found
             if tally.addingJob() { _ = try await group.next() }
             group.addTask {
                 do {
@@ -547,7 +548,7 @@ extension SSHConnection {
     /// Temp-and-rename on the server, keeping the source's mode and time so a later copy of the
     /// same file is skipped. `copy-data` when the server has it; else down to the Mac and back.
     /// The temp is renamed on the channel that wrote it, once the copy and its close are acknowledged.
-    private func copyFile(_ item: RemoteItem, to placed: RemotePath, replacing: Bool) async throws {
+    private func copyFile(_ item: RemoteItem, to placed: RemotePath, replacing: PlacedItem?) async throws {
         let stamp = SFTPAttrs.stamp(mode: item.mode.map { $0 & 0o7777 }, mtime: item.mtime)
         try await withRemoteTemp(for: placed) { temp in
             let onServer = try await withData(DataShare(size: item.size)) { link in
@@ -568,10 +569,16 @@ extension SSHConnection {
         }
     }
 
-    /// Renames the finished `temp` onto `placed` on `link`, the channel that wrote it. Without
-    /// `replacing` the rename refuses a name taken since it was looked up, which is said so rather
-    /// than with the server's bare "Failure" (XFR-06).
-    private func place(_ temp: RemotePath, onto placed: RemotePath, replacing: Bool, on link: SFTPChannel) async throws {
+    /// Renames the finished `temp` onto `placed` on `link`, the channel that wrote it. `replacing`
+    /// is what the user chose to replace, looked up again first: the bytes took a while, and
+    /// anything else there now fails the file, so nothing the user was not asked about is
+    /// replaced. Without it the rename refuses a name taken since it was looked up, which is said
+    /// so rather than with the server's bare "Failure" (XFR-06).
+    private func place(_ temp: RemotePath, onto placed: RemotePath, replacing asked: PlacedItem?, on link: SFTPChannel) async throws {
+        let replacing = asked != nil
+        if let asked, try await placedItem(try await link.lookup(placed), link: link) != asked {
+            throw TransferError.failed("“\(placed.name)” changed on the server while it was being replaced; nothing was removed")
+        }
         do {
             try await link.place(temp, onto: placed, replacing: replacing, log: asides)
         } catch where !replacing && !CopyTally.ends(error) {

@@ -265,7 +265,8 @@ struct TransferEngine {
                 }
                 placed = settled
             }
-            let replacing = placed.found != nil
+            // What the user chose to replace, looked up again just before the rename.
+            let replacing = placed.found
             try await relay.send(index, size: item.size, &group) { [destination] local in
                 do {
                     // Removed once its upload's rename has landed, or as soon as either half fails.

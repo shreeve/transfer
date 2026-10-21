@@ -618,6 +618,54 @@ extension MoveServerTests {
         }
     }
 
+    /// Replace was answered before the file came down, about what held the name then, and the
+    /// upload's rename replaced whatever held it once the bytes had arrived: a file that took the
+    /// name meanwhile was overwritten unasked. The name is looked up again just before the rename
+    /// now, on every route that replaces: anything but what the user was asked about fails the
+    /// file and stays.
+    @Test func aReplaceTakesOnlyWhatWasAskedAbout() async throws {
+        try await withHarness("rlrepl", connected: true) { h in
+            try await withAlias(h) { alias in
+                let size = 4 << 20
+                let from = try h.folder("from", files: ["report.txt": String(repeating: "N", count: size)])
+                try h.setTime("from/report.txt", 1_700_000_000)
+                let to = try h.folder("to", files: ["report.txt": "old"])
+                // Alike in size and time to the one coming, so nothing but a lookup tells them apart.
+                let third = String(repeating: "T", count: size)
+                let planted = Locked(false)
+                let plant: @Sendable () -> Void = {
+                    guard !planted.withLock({ defer { $0 = true }; return $0 }) else { return }
+                    try? h.write("to/report.txt", third)
+                    try? h.setTime("to/report.txt", 1_700_000_000)
+                }
+                let refused = TransferError.failed("“report.txt” changed on the server while it was being replaced; nothing was removed")
+                let replace = TestPrompts(collision: .replace)
+                let request = TransferRequest(.server(alias.connection.id, [from.appending("report.txt")]), into: to, on: h.session.connection.id, moving: false)
+                let engine = TransferEngine(request: request, destination: h.session) { _ in plant() }
+                await #expect(throws: refused) {
+                    try await OperationPrompts.$current.withValue(replace) { try await engine.run(from: alias) }
+                }
+                #expect(planted.value)
+                #expect(replace.collisions == 1)
+                #expect(try h.read("to/report.txt") == third)
+                try h.expectNoLeftovers(alias)
+
+                // From this Mac, the same.
+                planted.value = false
+                try h.write("to/report.txt", "old")
+                let mac = h.staging.appendingPathComponent("report.txt")
+                try Data(repeating: 0x4D, count: size).write(to: mac)
+                let upload = TransferEngine(request: TransferRequest(.mac([mac]), into: to, on: h.session.connection.id, moving: false), destination: h.session) { _ in plant() }
+                await #expect(throws: refused) {
+                    try await OperationPrompts.$current.withValue(replace) { try await upload.run(from: nil) }
+                }
+                #expect(replace.collisions == 2)
+                #expect(try h.read("to/report.txt") == third)
+                try h.expectNoLeftovers(alias)
+            }
+        }
+    }
+
     /// The questions about names taken at the destination now come while earlier files are still
     /// on their way. Skip, Keep Both, Replace, and Apply to All answer them as before, one at a
     /// time, and a move keeps every original the user skipped.
