@@ -1237,6 +1237,7 @@ struct LiveSyncTests {
             #expect(await h.file().map { !$0.dirty && !$0.conflict } == true)
             #expect(h.fake.conflicts.isEmpty)
             #expect(notices(h).filter { $0.contains("note.txt") }.count == 1)
+            #expect(notices(h).contains { $0.contains("open it again") })
             #expect(h.store.liveFiles(connection: h.connection).first?.conflict == nil)
         }
     }
@@ -1325,7 +1326,9 @@ struct LiveSyncTests {
             #expect(await h.file()?.dirty == true)
             #expect(read(local) == "unsynced edit")
             #expect(h.store.liveFiles(connection: h.connection).count == 1)
-            #expect(notices(h).contains { $0.contains("removed from the server") })
+            // Opening it again would not take anything, so the notice does not say it would.
+            #expect(notices(h).contains { $0.contains("removed from the server") && $0.contains("Your edits are kept") })
+            #expect(!notices(h).contains { $0.contains("open it again") })
             #expect(h.fake.conflicts.isEmpty)
         }
     }

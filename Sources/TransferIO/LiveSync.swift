@@ -585,7 +585,7 @@ actor LiveSync {
                 if now.remote != nil, let cleared = mark(now.id, { $0.remote = nil }) { emit(cleared, .liveChanged) }
             case .flag(let kind):
                 guard now.remote != kind, let flagged = mark(now.id, { $0.remote = kind }) else { continue }
-                if now.remote == nil { emit(flagged, .notice(Self.flagNotice(flagged.name, kind))) }
+                if now.remote == nil { emit(flagged, .notice(Self.flagNotice(flagged.name, kind, copy: change.map { LiveDecision.isUnsynced(now.state, $0) }))) }
                 emit(flagged, .liveChanged)
             case .conflict(let kind):
                 await raiseConflict(now.id, kind: kind, item: checked.item)
@@ -594,12 +594,21 @@ actor LiveSync {
     }
 
     /// The one notice a file's flag gets: its working copy is untouched, and what comes next.
-    static func flagNotice(_ name: String, _ kind: LiveConflictKind) -> String {
-        switch kind {
-        case .changed: "“\(name)” changed on the server. Your copy is untouched; open it again to get the new version."
-        case .removed: "“\(name)” was removed from the server. Your copy is kept."
-        case .notAFile: "“\(name)” was replaced on the server by something that is not a file. Your copy is kept."
+    /// `copy` is whether the working copy holds edits the server lacks, nil when it is missing:
+    /// only a copy without edits takes the new version when opened again.
+    static func flagNotice(_ name: String, _ kind: LiveConflictKind, copy edited: Bool?) -> String {
+        let what = switch kind {
+        case .changed: "“\(name)” changed on the server."
+        case .removed: "“\(name)” was removed from the server."
+        case .notAFile: "“\(name)” was replaced on the server by something that is not a file."
         }
+        let next = switch (kind, edited) {
+        case (_, nil): "Its working copy is missing."
+        case (_, true?): "Your edits are kept; nothing uploads until you choose what to keep."
+        case (.changed, false?): "Your copy is untouched; open it again to get the new version."
+        case (_, false?): "Your copy is kept."
+        }
+        return "\(what) \(next)"
     }
 
     // MARK: A pass
