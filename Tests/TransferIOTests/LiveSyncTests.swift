@@ -1372,6 +1372,30 @@ struct LiveSyncTests {
         }
     }
 
+    /// A stat taken before an upload landed answers with the old base, which is no longer this
+    /// file's: applied, it would flag our own save as a change on the server. It is dropped.
+    @Test func aCheckAnsweredAfterAnUploadLandedIsIgnored() async throws {
+        try await withLive("check-stale") { h in
+            let (local, id) = try await openLive(h, note, "first")
+            #expect(await settled(h))
+            await h.fake.holdChecks()
+            await checking(h)
+            #expect(await waitUntil { await h.fake.heldCheckCount == 1 })
+            try await edit(h, local, id, "my edit")
+            #expect(await waitUntil { await h.fake.contents(note) == "my edit" })
+            #expect(await waitUntil { await h.file().map { !$0.dirty && !$0.uploading } == true })
+            let checks = await h.fake.checks
+            await h.fake.releaseChecks()
+            // The held round's findings, and two fresh rounds after it.
+            #expect(await waitUntil { await h.fake.checks >= checks + 2 })
+            #expect(await settled(h))
+            #expect(await h.file().map { $0.serverChange == nil && !$0.conflict } == true)
+            #expect(h.fake.conflicts.isEmpty)
+            #expect(notices(h).isEmpty)
+            #expect(await h.fake.saves == 1)
+        }
+    }
+
     @Test func watcherPathsAreSplitUnderTheRealRoot() throws {
         let base = TestCaches.fresh("watcher")
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
@@ -1598,8 +1622,23 @@ actor FakeServer: LiveServer {
     func liveCheck(_ path: RemotePath) async throws -> RemoteItem? {
         if failing { throw TransferError.connectionLost("fake server unreachable") }
         checked.append(path)
-        guard let file = files[path] else { return nil }
-        return RemoteItem(path: path, kind: file.kind, size: UInt64(file.data.count), mtime: file.mtime)
+        // Read now, answered later when held: the answer is what the server held at the stat.
+        let answer = files[path].map { RemoteItem(path: path, kind: $0.kind, size: UInt64($0.data.count), mtime: $0.mtime) }
+        if holdingChecks { await withCheckedContinuation { heldChecks.append($0) } }
+        return answer
+    }
+
+    private var holdingChecks = false
+    private var heldChecks: [CheckedContinuation<Void, Never>] = []
+    var heldCheckCount: Int { heldChecks.count }
+
+    /// Checks read the server, then wait for `releaseChecks` before answering.
+    func holdChecks() { holdingChecks = true }
+
+    func releaseChecks() {
+        holdingChecks = false
+        for check in heldChecks { check.resume() }
+        heldChecks.removeAll()
     }
 
     /// Puts back the bytes and time a file had, as an undo on the server would.
