@@ -131,6 +131,9 @@ struct TransferApp: App {
                     .keyboardShortcut("b")
                 Button(model?.showsInspector == true ? "Hide Inspector" : "Show Inspector") { model?.showsInspector.toggle() }
                     .keyboardShortcut("i")
+                // Finder's key.
+                Button(model?.showsPathBar == true ? "Hide Path Bar" : "Show Path Bar") { model?.showsPathBar.toggle() }
+                    .keyboardShortcut("p", modifiers: [.command, .option])
                 Button("Transfers") { model?.showsShelf.toggle() }
                 Divider()
                 // Finder's Add to Sidebar key.

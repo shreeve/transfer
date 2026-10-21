@@ -169,6 +169,35 @@ struct ClickTests {
         #expect(Set(model.selectedItems.map(\.path)) == paths("a", "b"))
     }
 
+    /// A click on a path bar folder, sent through the window, goes there and Back returns; a
+    /// click on the location goes nowhere.
+    @Test func aClickOnThePathBarGoesToThatFolder() async throws {
+        let model = await connected(.list)
+        model.showsPathBar = true
+        let window = window(showing: NSHostingView(rootView: PathBar(model: model).frame(width: 960, height: PathBar.height)))
+        defer { inOwnRun { window.close() } }
+        // The window starts `MainLoopGuard` from a timer, which must fire on the runner's own
+        // loop, not in the first click's run, or that run never ends.
+        try? await Task.sleep(for: .milliseconds(300))
+        var found: PathBarControl?
+        #expect(await eventually {
+            found = first(PathBarControl.self, in: window.contentView!)
+            return found.map { $0.pathItems.count == 2 && $0.bounds.width > 0 } ?? false
+        })
+        let control = try #require(found)
+        func center(_ index: Int) -> NSPoint {
+            let cell = control.cell as! NSPathCell
+            let rect = cell.rect(of: cell.pathComponentCells[index], withFrame: control.bounds, in: control)
+            return control.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+        }
+        click(center(1), in: window, modifiers: [])
+        #expect(model.snapshot.path == home)
+        click(center(0), in: window, modifiers: [])
+        #expect(await eventually { model.snapshot.path == RemotePath(string: "/") })
+        await model.goBack()
+        #expect(model.snapshot.path == home)
+    }
+
     /// Icon view extends a selection with folders too.
     @Test func commandClickSelectsSeveralFoldersInIcons() async throws {
         let model = await connected(.icon)

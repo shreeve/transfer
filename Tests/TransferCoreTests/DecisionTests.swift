@@ -13,6 +13,30 @@ import Testing
     ])
 }
 
+@Test func pathTrailRunsFromTheRootToTheLocationThenTheOneSelectedItem() {
+    let location = RemotePath(string: "/home/shreeve/mvts")
+    func step(_ path: String, _ navigable: Bool, selection: Bool = false) -> PathTrail.Step {
+        PathTrail.Step(path: RemotePath(string: path), navigable: navigable, isSelection: selection)
+    }
+    let folders = [step("/", true), step("/home", true), step("/home/shreeve", true), step("/home/shreeve/mvts", false)]
+    #expect(PathTrail.steps(location: location, selection: []) == folders)
+    let file = RemotePath(string: "/home/shreeve/mvts/a.txt")
+    #expect(PathTrail.steps(location: location, selection: [file]) == folders + [step("/home/shreeve/mvts/a.txt", false, selection: true)])
+    // Several items, the location itself (a folder selected in column view), or an item elsewhere end at the location.
+    #expect(PathTrail.steps(location: location, selection: [file, RemotePath(string: "/home/shreeve/mvts/b.txt")]) == folders)
+    #expect(PathTrail.steps(location: location, selection: [location]) == folders)
+    #expect(PathTrail.steps(location: location, selection: [RemotePath(string: "/tmp/x")]) == folders)
+    #expect(PathTrail.steps(location: RemotePath(string: "/"), selection: []) == [step("/", false)])
+    // A name that is not UTF-8 keeps its bytes.
+    let odd = RemotePath(bytes: Array("/srv/".utf8) + [0xFF, 0x41])
+    #expect(PathTrail.steps(location: odd.appending("x"), selection: [])[2].path == odd)
+    // Only a folder above the location goes anywhere.
+    #expect(PathTrail.goes(to: RemotePath(string: "/home"), from: location))
+    #expect(!PathTrail.goes(to: location, from: location))
+    #expect(!PathTrail.goes(to: file, from: location))
+    #expect(!PathTrail.goes(to: RemotePath(string: "/home/sh"), from: location))
+}
+
 @Test func columnTrailSelectsFilesInTheLocationsColumn() {
     let root = RemotePath(string: "/")
     let folder = RemotePath(string: "/srv")
