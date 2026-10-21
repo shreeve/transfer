@@ -178,6 +178,11 @@ final class EventRecorder: Sendable {
         events.value.filter { if case .conflict(let p, _) = $0 { p == path } else { false } }.count
     }
 
+    /// The message bar's notices, in order.
+    var notices: [String] {
+        events.value.compactMap { if case .notice(let text) = $0 { text } else { nil } }
+    }
+
     /// Operations on the Live file at `path` that reached the shelf as succeeded.
     func succeeded(_ path: RemotePath) -> Int {
         events.value.filter { if case .operation(let op) = $0 { op.livePath == path && op.state == .succeeded } else { false } }.count

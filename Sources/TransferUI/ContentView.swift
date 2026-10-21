@@ -86,7 +86,7 @@ struct SidebarColumn: View {
                         } icon: {
                             Image(systemName: live.status.symbolName)
                         }
-                        .help("\(live.path.display)\n\(live.status.help)")
+                        .help(live.sidebarHelp)
                         .accessibilityValue(live.status.label)
                         .tag(SidebarItem.live(live.path))
                         .contextMenu {

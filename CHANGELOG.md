@@ -14,6 +14,7 @@ What changed in each release of Transfer. `Scripts/release.sh <version>` publish
 - Back and Forward are dimmed, in the toolbar and in the Go menu, when there is nowhere to go, and light up as you browse.
 - Quick Look: Space while a preview is still loading cancels it, a file over 256 MB is not downloaded for it (the message bar says it is too large and suggests Download Copy), and a folder is no longer fetched.
 - Dragging from a background Transfer window (icon and list view) no longer brings it over the Finder window you drop on; a plain click still selects and brings the window forward.
+- A Live file changed on the server while you have it open is flagged within about a minute, instead of only at your next save: its Live Files row and the inspector say "Changed on the server", and the message bar says it once. Your copy is never touched: your next save asks which to keep, as before, and opening an unedited file again takes the new version. A file with edits not yet uploaded becomes a conflict at once. A file removed from the server is flagged as removed and kept.
 
 ## 0.3.1 — 2026-09-27
 

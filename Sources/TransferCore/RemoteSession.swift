@@ -115,23 +115,37 @@ public struct LiveFile: Hashable, Sendable, Identifiable {
     public var paused: Bool
     public var conflict: Bool
     public var uploading: Bool
+    /// What a timed check last found on the server that the working copy does not hold, nil
+    /// when the server still holds what it was based on. Kept in memory only.
+    public var serverChange: ServerChange?
 
-    public init(id: LiveFileID, path: RemotePath, dirty: Bool, paused: Bool, conflict: Bool, uploading: Bool) {
+    public init(id: LiveFileID, path: RemotePath, dirty: Bool, paused: Bool, conflict: Bool, uploading: Bool, serverChange: ServerChange? = nil) {
         self.id = id
         self.path = path
         self.dirty = dirty
         self.paused = paused
         self.conflict = conflict
         self.uploading = uploading
+        self.serverChange = serverChange
+    }
+
+    /// The server's file moved on from the working copy's base, or is gone (or is no longer a file).
+    public enum ServerChange: Hashable, Sendable {
+        case changed, removed
     }
 
     /// What the file is doing, the most pressing first.
     public enum Status: Equatable, Sendable {
-        case conflict, uploading, paused, dirty, synced
+        case conflict, changedOnServer, removedFromServer, uploading, paused, dirty, synced
     }
 
     public var status: Status {
         if conflict { return .conflict }
+        switch serverChange {
+        case .changed: return .changedOnServer
+        case .removed: return .removedFromServer
+        case nil: break
+        }
         if uploading { return .uploading }
         if paused { return .paused }
         return dirty ? .dirty : .synced

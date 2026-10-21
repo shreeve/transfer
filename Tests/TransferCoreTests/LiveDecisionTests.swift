@@ -283,3 +283,54 @@ private func present(size: UInt64 = 10, at date: Date = t0, digest: String? = ni
     #expect(!LiveDecision.keepRemoteForgets(.notAFile, server: .missing))
     #expect(!LiveDecision.keepRemoteForgets(nil, server: .missing))
 }
+
+// A timed check of the server
+
+/// The server holding the base clears a flag; any other file flags it; our own unconfirmed upload
+/// and an answer that is not known change nothing.
+@Test func aCheckFlagsAChangeButNotTheBaseOrOurOwnUpload() {
+    #expect(LiveDecision.afterCheck(state(), .same, server: .file(base)) == .clear)
+    #expect(LiveDecision.afterCheck(state(), .same, server: .file(other)) == .flag(.changed(other)))
+    #expect(LiveDecision.afterCheck(state(), .touched, server: .file(other)) == .flag(.changed(other)))
+    var uploading = state(dirty: true)
+    uploading.pending = LiveStamp(size: 12, mtime: Date(timeIntervalSince1970: 1_700_000_500.5))
+    #expect(LiveDecision.afterCheck(uploading, .changed, server: .file(other)) == .none)
+    #expect(LiveDecision.afterCheck(state(), .same, server: .unreachable("down")) == .none)
+    #expect(LiveDecision.afterCheck(state(), .same, server: .notChecked) == .none)
+    #expect(LiveDecision.afterCheck(LiveState(base: nil), .same, server: .file(other)) == .none)
+}
+
+/// A file gone from the server is flagged as removed (or replaced), never forgotten: no answer of
+/// the check drops a record.
+@Test func aCheckFlagsARemovedFile() {
+    #expect(LiveDecision.afterCheck(state(), .same, server: .missing) == .flag(.removed))
+    #expect(LiveDecision.afterCheck(state(), .same, server: .notFile(.directory)) == .flag(.notAFile))
+    #expect(LiveDecision.afterCheck(state(dirty: true), nil, server: .missing) == .flag(.removed))
+}
+
+/// Edits the server lacks meet the changed server as a conflict at once, uploading nothing: the
+/// next save would raise it anyway. A paused file, a missing copy, and a copy whose bytes are not
+/// known to differ are only flagged; a conflict already raised is left to its choice.
+@Test func aCheckRaisesTheConflictAtOnceForUnsyncedEdits() {
+    #expect(LiveDecision.afterCheck(state(), .changed, server: .file(other)) == .conflict(.changed(other)))
+    #expect(LiveDecision.afterCheck(state(dirty: true), .changed, server: .file(other)) == .conflict(.changed(other)))
+    #expect(LiveDecision.afterCheck(state(dirty: true), .changed, server: .missing) == .conflict(.removed))
+    #expect(LiveDecision.afterCheck(state(dirty: true), .needDigest, server: .file(other)) == .conflict(.changed(other)))
+    #expect(LiveDecision.afterCheck(state(), .needDigest, server: .file(other)) == .flag(.changed(other)))
+    #expect(LiveDecision.afterCheck(state(dirty: true, paused: true), .changed, server: .file(other)) == .flag(.changed(other)))
+    #expect(LiveDecision.afterCheck(state(dirty: true), .changed, server: .file(base)) == .clear)
+    #expect(LiveDecision.afterCheck(state(dirty: true, conflict: true), .changed, server: .file(other)) == .none)
+    #expect(LiveDecision.afterCheck(state(conflict: true), .same, server: .file(base)) == .none)
+}
+
+/// A flag shows before every status but a conflict, and leaves a file's other facts alone.
+@Test func aServerChangeShowsAfterAConflictOnly() {
+    func file(_ change: LiveFile.ServerChange?, conflict: Bool = false, paused: Bool = false) -> LiveFile {
+        LiveFile(id: LiveFileID(), path: RemotePath(string: "/srv/note.txt"), dirty: false, paused: paused, conflict: conflict, uploading: false, serverChange: change)
+    }
+    #expect(file(.changed).status == .changedOnServer)
+    #expect(file(.removed, paused: true).status == .removedFromServer)
+    #expect(file(.changed, conflict: true).status == .conflict)
+    #expect(file(nil).status == .synced)
+    #expect(file(.changed).isSynced)
+}

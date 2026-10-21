@@ -16,6 +16,9 @@ protocol LiveServer: AnyObject, Sendable {
     /// server file's new fingerprint.
     func liveSave(_ snapshot: URL, to path: RemotePath, expecting: ServerExpectation, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> Fingerprint
     func liveNames(in folder: RemotePath) async throws -> Set<String>
+    /// The item at `path`, as `liveLookup`, for a timed check: one stat on a channel the user's
+    /// own work never waits on. Throws, asking nothing, when that channel is not open.
+    func liveCheck(_ path: RemotePath) async throws -> RemoteItem?
     func liveEmit(_ event: SessionEvent)
 }
 
@@ -34,6 +37,9 @@ actor LiveSync {
     static let expiry: TimeInterval = 24 * 60 * 60
     /// How often every working copy is stamped when FSEvents cannot watch the Live folder.
     static let pollInterval: Duration = .seconds(2)
+    /// About how often a logged-in server's Live files are checked for changes made there (each
+    /// wait is jittered by a tenth either way); the first check comes a twelfth of it after login.
+    static let checkInterval: Duration = .seconds(60)
     /// The digest of bytes that cannot be read: never equal to a real one, so they count as an edit.
     private static let unreadable = "unreadable"
 
@@ -59,6 +65,9 @@ actor LiveSync {
         var attempts = 0
         /// The state of this file's row on the shelf, as last reported.
         var shown: OperationState?
+        /// What a timed check last found on the server instead of the base: the file is changed
+        /// (or removed) on the server. Memory only; the first check after a login finds it again.
+        var remote: LiveConflictKind?
 
         var name: String { path.name }
         var folder: URL { local.deletingLastPathComponent() }
@@ -77,6 +86,7 @@ actor LiveSync {
             state.pending = nil
             pendingDigest = nil
             state.dirty = false
+            remote = nil
         }
         /// Named after the working copy, which keeps its name when the remote file is renamed.
         var serverCopy: URL { folder.appendingPathComponent(LiveDecision.siblingName(of: local.lastPathComponent, suffix: " (server)")) }
@@ -92,6 +102,8 @@ actor LiveSync {
         var waitingForServer: Set<LiveFileID> = []
         var commands: [Command] = []
         var running = false
+        /// The file whose pass is running, which a timed check leaves alone.
+        var passing: LiveFileID?
         var wake: CheckedContinuation<Void, Never>?
         var timer: Task<Void, Never>?
         var loop: Task<Void, Never>?
@@ -114,6 +126,9 @@ actor LiveSync {
     private var opening: [UUID: (connection: ConnectionID, path: RemotePath)] = [:]
     private var watcher: LiveWatcher?
     private var watching: Task<Void, Never>?
+    /// Each logged-in server's timed check of its Live files, and how often it runs.
+    private var checkers: [ConnectionID: Task<Void, Never>] = [:]
+    private var checkEvery = LiveSync.checkInterval
 
     /// `watches` is false only in tests, which report changes through `localChanged`.
     init(store: Store, watches: Bool = true) {
@@ -178,19 +193,24 @@ actor LiveSync {
         for notice in notices.removeValue(forKey: connection) ?? [] { server.liveEmit(.notice(notice)) }
         for entry in entries.values where entry.connection == connection { lookAgain(entry.id) }
         poke(connection)
+        startChecking(connection)
         server.liveEmit(.liveChanged)
     }
 
-    /// The connection went away. Nothing is cancelled: passes that need the server wait for it.
-    /// Only the current object counts; the hub may have replaced an older one that still disconnects.
+    /// The connection went away. Nothing is cancelled but the timed check: passes that need the
+    /// server wait for it. Only the current object counts; the hub may have replaced an older one
+    /// that still disconnects.
     func disconnected(_ connection: ConnectionID, server: any LiveServer) {
-        if servers[connection]?.server === server { ready.remove(connection) }
+        guard servers[connection]?.server === server else { return }
+        ready.remove(connection)
+        checkers.removeValue(forKey: connection)?.cancel()
     }
 
     /// Stops a connection's worker and forgets its files in memory, as when the server is removed.
     func close(_ connection: ConnectionID) {
         ready.remove(connection)
         servers[connection] = nil
+        checkers.removeValue(forKey: connection)?.cancel()
         if let worker = workers.removeValue(forKey: connection) {
             worker.loop?.cancel()
             worker.timer?.cancel()
@@ -234,7 +254,13 @@ actor LiveSync {
         var files: [LiveFile] = []
         for entry in entries.values where entry.connection == connection {
             let unsynced = await isUnsynced(entry)
-            files.append(LiveFile(id: entry.id, path: entry.path, dirty: unsynced, paused: entry.state.paused, conflict: entry.state.conflict, uploading: entry.uploading))
+            let change: LiveFile.ServerChange? = switch entry.remote {
+            case .changed: .changed
+            case .removed, .notAFile: .removed
+            case nil: nil
+            }
+            files.append(LiveFile(id: entry.id, path: entry.path, dirty: unsynced, paused: entry.state.paused, conflict: entry.state.conflict,
+                                  uploading: entry.uploading, serverChange: change))
         }
         return files.sorted { $0.path.display < $1.path.display }
     }
@@ -407,7 +433,9 @@ actor LiveSync {
             } else if let next = worker.due.filter({ $0.value <= now }).min(by: { $0.value < $1.value })?.key {
                 workers[connection]?.due[next] = nil
                 workers[connection]?.running = true
+                workers[connection]?.passing = next
                 await pass(next)
+                workers[connection]?.passing = nil
                 workers[connection]?.running = false
                 // A pass that neither waited again nor reported clears a "Waiting for the server" row.
                 if let entry = entries[next], entry.shown == .queued, workers[connection]?.waitingForServer.contains(next) != true {
@@ -458,6 +486,117 @@ actor LiveSync {
                 cancel: { done.resume(throwing: TransferError.cancelled) }
             ))
             poke(connection)
+        }
+    }
+
+    /// Queues `body` on the connection's worker, between passes, with nobody waiting for it.
+    private func enqueue(on connection: ConnectionID, _ body: @escaping @Sendable () async -> Void) {
+        startWorker(connection)
+        workers[connection]?.commands.append(Command(run: body, cancel: {}))
+        poke(connection)
+    }
+
+    // MARK: Checking the server
+
+    /// Restarts the timed check of every logged-in server at `interval`. Tests shorten it.
+    func checkRemote(every interval: Duration) {
+        checkEvery = interval
+        for connection in ready { startChecking(connection) }
+    }
+
+    /// While `connection` is logged in, its Live files are checked about every `checkEvery`, the
+    /// first time soon after login, so a change made on the server is flagged without waiting for
+    /// a save. `disconnected` and `close` stop it.
+    private func startChecking(_ connection: ConnectionID) {
+        checkers.removeValue(forKey: connection)?.cancel()
+        let interval = checkEvery
+        checkers[connection] = Task { [weak self] in
+            var wait = interval / 12
+            while !Task.isCancelled {
+                try? await Task.sleep(for: wait * Double.random(in: 0.9...1.1))
+                guard !Task.isCancelled, let self else { return }
+                await self.checkServer(connection)
+                wait = interval
+            }
+        }
+    }
+
+    /// One stat per file, never a download, on the server's walker channel (`liveCheck`), and off
+    /// the worker, so no pass or command waits for it. A file with a pass due, running, or waiting
+    /// for the server, an upload in flight, or a conflict is skipped: its pass or its choice looks
+    /// at the server itself. What was found goes to the worker, which alone changes a file's state.
+    private func checkServer(_ connection: ConnectionID) async {
+        guard ready.contains(connection), let server = servers[connection]?.server else { return }
+        var busy = Set<LiveFileID>()
+        if let worker = workers[connection] {
+            busy.formUnion(worker.due.keys)
+            busy.formUnion(worker.waitingForServer)
+            if let passing = worker.passing { busy.insert(passing) }
+        }
+        let candidates = entries.values
+            .filter { $0.connection == connection && !$0.uploading && !$0.state.conflict && !busy.contains($0.id) }
+            .sorted { $0.path.display < $1.path.display }
+        var found: [Checked] = []
+        for entry in candidates {
+            let item: RemoteItem?
+            do {
+                item = try await server.liveCheck(entry.path)
+            } catch {
+                // The channel is down or the connection dropped: the next round asks again.
+                break
+            }
+            guard !Task.isCancelled, ready.contains(connection) else { return }
+            let fact: LiveServerFact = if let item {
+                item.kind == .file ? Fingerprint(item: item).map(LiveServerFact.file) ?? .notFile(.file) : .notFile(item.kind)
+            } else {
+                .missing
+            }
+            found.append(Checked(id: entry.id, path: entry.path, state: entry.state, item: item, fact: fact))
+        }
+        guard !found.isEmpty else { return }
+        enqueue(on: connection) { [found] in await self.applyCheck(found, from: server) }
+    }
+
+    private struct Checked: Sendable {
+        let id: LiveFileID
+        let path: RemotePath
+        let state: LiveState
+        let item: RemoteItem?
+        let fact: LiveServerFact
+    }
+
+    /// On the worker: each file still as it was when checked, with no pass due and no upload in
+    /// flight, takes what `LiveDecision.afterCheck` answers. A flag writes nothing to the working
+    /// copy and uploads nothing; a file's first flag says so once in the message bar.
+    private func applyCheck(_ results: [Checked], from server: any LiveServer) async {
+        for checked in results {
+            guard let entry = entries[checked.id], servers[entry.connection]?.server === server, ready.contains(entry.connection),
+                  entry.path == checked.path, entry.state == checked.state, !entry.uploading,
+                  workers[entry.connection]?.due[entry.id] == nil, workers[entry.connection]?.waitingForServer.contains(entry.id) != true
+            else { continue }
+            let change = await localChange(of: entry)
+            guard let now = entries[entry.id], now.state == checked.state else { continue }
+            switch LiveDecision.afterCheck(now.state, change, server: checked.fact) {
+            case .none:
+                continue
+            case .clear:
+                if now.remote != nil, let cleared = mark(now.id, { $0.remote = nil }) { emit(cleared, .liveChanged) }
+            case .flag(let kind):
+                guard now.remote != kind, let flagged = mark(now.id, { $0.remote = kind }) else { continue }
+                if now.remote == nil { emit(flagged, .notice(Self.flagNotice(flagged.name, kind))) }
+                emit(flagged, .liveChanged)
+            case .conflict(let kind):
+                await raiseConflict(now.id, kind: kind, item: checked.item)
+            }
+        }
+    }
+
+    /// The one notice a file's flag gets: its working copy is untouched, and what comes next.
+    static func flagNotice(_ name: String, _ kind: LiveConflictKind) -> String {
+        switch kind {
+        case .changed: "“\(name)” changed on the server. Your copy is untouched; open it again to get the new version."
+        case .removed: "“\(name)” was removed from the server. Your copy is kept."
+        case .notAFile: "“\(name)” was replaced on the server by something that is not a file. Your copy is kept."
         }
     }
 
@@ -627,6 +766,7 @@ actor LiveSync {
             $0.conflict = kind
             $0.state.conflict = true
             $0.state.dirty = true
+            $0.remote = nil
         }) else {
             // Discarded while the copy downloaded: only what that download made goes.
             try? FileManager.default.removeItem(at: entry.serverCopy)
