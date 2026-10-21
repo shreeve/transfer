@@ -45,6 +45,9 @@ public actor SSHConnection: RemoteSession {
     private var refusedAt: ContinuousClock.Instant?
     let pipe = EventPipe()
     let lane = InteractiveLane()
+    /// Folder listings walks have open at once on the walker channel, across every walk: a paste
+    /// between servers walks items ahead, and moves check theirs, all on that one channel.
+    nonisolated let listings = ListingGate(SSHConnection.walkWidth)
     /// Live files are `LiveSync`'s; this connection is its `LiveServer` and forwards the Live API.
     let live: LiveSync
     /// A config file every ssh this connection runs reads with `-F` in place of `~/.ssh/config`.

@@ -689,9 +689,9 @@ extension SSHConnection {
         return entries
     }
 
-    /// Folders a walk lists at once on its one channel. One at a time, each folder cost its own
-    /// round trips: at 20 ms, a 2,000-file tree in ten folders took 761 ms to walk; eight at
-    /// once, 225 ms.
+    /// Folders a walk lists at once on its one channel, and all walks on one connection together
+    /// (`listings`). One at a time, each folder cost its own round trips: at 20 ms, a 2,000-file
+    /// tree in ten folders took 761 ms to walk; eight at once, 225 ms.
     static let walkWidth = 8
 
     /// Visits what `folder` holds, and below. A folder is visited before what it holds, and
@@ -703,7 +703,9 @@ extension SSHConnection {
             while !waiting.isEmpty || listing > 0 {
                 while listing < Self.walkWidth, let (next, parent) = waiting.popLast() {
                     listing += 1
-                    group.addTask {
+                    group.addTask { [listings] in
+                        await listings.enter()
+                        defer { listings.leave() }
                         var folders: [(RemotePath, TreeKey)] = []
                         for try await child in await link.list(next) {
                             try Task.checkCancellation()
@@ -1002,5 +1004,40 @@ struct Holdings: Sendable {
         if let item = items[name] { return item }
         guard folded.contains(String(decoding: name, as: UTF8.self).diskFolded) else { return nil }
         return try await session.existing(path)
+    }
+}
+
+/// At most `width` holders at once, the rest let in as holders leave, in the order they came.
+/// A holder always leaves, so a waiter cancelled meanwhile gets in and finds itself cancelled.
+final class ListingGate: Sendable {
+    private let state: Locked<(free: Int, waiting: [CheckedContinuation<Void, Never>])>
+
+    init(_ width: Int) {
+        state = Locked((width, []))
+    }
+
+    func enter() async {
+        await withCheckedContinuation { continuation in
+            let now = state.withLock { state in
+                guard state.free > 0 else {
+                    state.waiting.append(continuation)
+                    return false
+                }
+                state.free -= 1
+                return true
+            }
+            if now { continuation.resume() }
+        }
+    }
+
+    func leave() {
+        let next = state.withLock { state -> CheckedContinuation<Void, Never>? in
+            guard !state.waiting.isEmpty else {
+                state.free += 1
+                return nil
+            }
+            return state.waiting.removeFirst()
+        }
+        next?.resume()
     }
 }

@@ -192,3 +192,23 @@ private actor Gate {
         waiters = []
     }
 }
+
+/// The walks of one connection list at most `walkWidth` folders at once between them: the gate
+/// lets in at most its width, and every waiter as holders leave.
+@Test func aListingGateLetsInAtMostItsWidth() async {
+    let gate = ListingGate(2)
+    let inside = Locked((now: 0, most: 0, done: 0))
+    await withTaskGroup(of: Void.self) { group in
+        for _ in 0..<20 {
+            group.addTask {
+                await gate.enter()
+                inside.withLock { $0.now += 1; $0.most = max($0.most, $0.now) }
+                try? await Task.sleep(for: .milliseconds(2))
+                inside.withLock { $0.now -= 1; $0.done += 1 }
+                gate.leave()
+            }
+        }
+    }
+    #expect(inside.value.most == 2)
+    #expect(inside.value.done == 20)
+}
