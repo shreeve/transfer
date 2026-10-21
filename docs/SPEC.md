@@ -118,4 +118,4 @@ Transfer opens `sftp://user@host:port/path` links from other apps. The link name
 | Add to Starred, Remove from Starred | Control-Command-T |
 | Settings… | Command-Comma |
 
-Download Copy…, Upload…, Open in Terminal, Transfers, and Clear Preview Cache have no key. Command-Down and Space act once when held, and only in the browser, never in a text field, on a button, or in a sheet, the sidebar, or the inspector. In the filter or rename field, Command-Delete edits the text. Escape closes an open rename bar before it clears the clipboard.
+Download Copy…, Upload…, Open in Terminal, Transfers, and Clear Preview Cache have no key. Command-Down and Space act once when held, and only in the browser, never in a text field, on a button, or in a sheet, the sidebar, or the inspector. In the filter or rename field, Command-Delete edits the text. Escape closes an open rename bar before it clears the clipboard. Back and Forward are dimmed, in the toolbar and in Go, while the history has nowhere to go.

@@ -11,6 +11,7 @@ What changed in each release of Transfer. `Scripts/release.sh <version>` publish
 - The inspector can be widened to 480 points (was 320).
 - View → Show Path Bar (Option-Command-P) shows a path bar at the foot of the window, as in Finder: the server, each folder down to where you are, and the selected item. Click a folder in it to go there (Back returns), or drop files onto one to copy or move them into it. It stays shown or hidden as you left it.
 - A running transfer on the shelf shows its speed and time left, as Finder words them: "12 MB/s · about 2 minutes left". The speed averages the last five seconds, so it holds steady; a transfer that receives nothing for five seconds reads Stalled. The inspector shows the same.
+- Back and Forward are dimmed, in the toolbar and in the Go menu, when there is nowhere to go, and light up as you browse.
 
 ## 0.3.1 — 2026-09-27
 

@@ -820,6 +820,10 @@ public final class TransferModel {
         await refresh()
     }
 
+    /// Whether Back and Forward have anywhere to go: the toolbar's items and Go's follow these.
+    public var canGoBack: Bool { !backStack.isEmpty }
+    public var canGoForward: Bool { !forwardStack.isEmpty }
+
     public func goBack() async {
         guard let path = backStack.popLast() else { return }
         remember(snapshot.path, in: &forwardStack)
