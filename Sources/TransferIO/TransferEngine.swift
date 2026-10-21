@@ -115,13 +115,12 @@ struct TransferEngine {
         }
         let scratch = try destination.store.makeScratch()
         defer { try? FileManager.default.removeItem(at: scratch) }
-        let ignoresCase = (try? scratch.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames != true
         let pending = paths.indices.filter { !isDone($0) }
         let nested = request.moving ? Self.nesting(paths, pending) : [:]
         let lookUp: @Sendable (Int) -> Task<Lookup, Error> = { [request, destination] index in
             let (path, target) = (paths[index], request.folder.appending(name: paths[index].nameBytes))
             return Task {
-                async let tree = RelayTree.walk(path, on: source, ignoringCase: ignoresCase)
+                async let tree = RelayTree.walk(path, on: source)
                 async let found = destination.existing(target)
                 return Lookup(tree: try await tree, found: try await found)
             }
@@ -205,14 +204,13 @@ struct TransferEngine {
     /// An item ahead: its tree on the other server, walked whole, and what holds its name at the
     /// destination then.
     private struct Lookup: Sendable {
-        var tree: RelayTree.Walk
+        var tree: RelayTree
         var found: RemoteItem?
     }
 
-    /// Source `index`, at `path` on `source`, as `lookup` found it: refused before anything of it
-    /// is copied when this Mac's disk could not hold its names apart; else its entries are settled
-    /// at the destination and its files handed to `relay`. Returns why it was refused, or nil once
-    /// it is on its way, its outcome to come from `relay`.
+    /// Source `index`, at `path` on `source`, as `lookup` found it: its entries settled at the
+    /// destination and its files handed to `relay`. Returns why a move refused it, or nil once it
+    /// is on its way, its outcome to come from `relay`.
     private func relayItem(
         _ index: Int,
         _ path: RemotePath,
@@ -221,11 +219,7 @@ struct TransferEngine {
         relay: inout Relay,
         group: inout ThrowingTaskGroup<Relay.Event, Error>
     ) async throws -> TransferKept.Reason? {
-        let tree: RelayTree
-        switch lookup.tree {
-        case .refused(let reason): return reason
-        case .walked(let walked): tree = walked
-        }
+        let tree = lookup.tree
         let target = request.folder.appending(name: path.nameBytes)
         if request.moving, let refused = try await sameItem(path, at: target, on: source) { return refused }
         // An earlier item still writing this name goes first, so this one meets its copy as it
@@ -735,32 +729,20 @@ private struct Relay {
     }
 }
 
-/// An item's tree on the other server, walked whole before any of it is copied: its names are
-/// checked against this Mac's disk first, and the copy takes only what this walk found, so a
-/// destination the source reaches too (two saved servers for one disk) never feeds the copy its
-/// own output.
+/// An item's tree on the other server, walked whole before any of it is copied. The copy takes
+/// only what this walk found, so a destination the source reaches too (two saved servers for one
+/// disk) never feeds the copy its own output. No name of it reaches this Mac's disk: each file
+/// passes through a numbered scratch file, so names the Mac's disk could not hold apart, or that
+/// are not UTF-8, go as the server holds them.
 private struct RelayTree: Sendable {
     let root: RemoteItem
     /// What each folder holds, by the folder's key, in the listing's order.
     var children: [TreeKey: [RemoteItem]]
 
-    enum Walk: Sendable {
-        case walked(RelayTree)
-        case refused(TransferKept.Reason)
-    }
-
-    static func walk(_ path: RemotePath, on source: SSHConnection, ignoringCase: Bool) async throws -> Walk {
-        // The Mac's disk may not hold two names the server keeps apart. Refused before anything
-        // is copied, since one of the two would stand in for the other.
-        var clash = NameClash(ignoringCase: ignoringCase)
+    static func walk(_ path: RemotePath, on source: SSHConnection) async throws -> RelayTree {
         var root: RemoteItem?
         var children: [TreeKey: [RemoteItem]] = [:]
         for try await (key, item) in source.walkItems(path) {
-            // APFS holds only UTF-8 names: this one would land renamed.
-            guard String(validating: key.bytes, as: UTF8.self) != nil else {
-                return .refused(.failed("“\(key)” has a name that is not UTF-8, which this Mac's disk cannot hold"))
-            }
-            clash.add(key)
             if key.bytes.isEmpty {
                 root = item
             } else {
@@ -768,8 +750,7 @@ private struct RelayTree: Sendable {
                 children[parent, default: []].append(item)
             }
         }
-        if let (first, second) = clash.found { return .refused(.clash(first.description, second.description)) }
         guard let root else { throw TransferError.noSuchFile(path.display) }
-        return .walked(RelayTree(root: root, children: children))
+        return RelayTree(root: root, children: children)
     }
 }

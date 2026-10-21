@@ -306,8 +306,6 @@ package struct TransferMemo: Sendable {
 /// A paste that left some items where they were, and why; thrown once the rest are done.
 public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
     public enum Reason: Hashable, Sendable {
-        /// Two names in the item that this Mac's disk, which it passes through, cannot hold apart.
-        case clash(String, String)
         case alreadyThere
         case incomplete
         /// Live files under the original with edits not yet on the server.
@@ -360,8 +358,6 @@ public struct TransferKept: Error, Equatable, Sendable, LocalizedError {
             let named = items.filter { $0.reason == reason }.map { "“\($0.name)”" }
             let list = ListFormatter.localizedString(byJoining: named)
             return switch reason {
-            case .clash(let first, let second):
-                "Did not \(moving ? "move" : "paste") \(list): “\(first)” and “\(second)” differ only in case or accents, and this Mac's disk, which the items pass through, cannot hold both."
             case .alreadyThere:
                 "Kept \(list) \(place): something with that name was already at the destination and was not replaced, so this move cannot tell its own copy from it."
             case .incomplete:
