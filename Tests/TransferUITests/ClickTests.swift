@@ -30,7 +30,7 @@ struct ClickTests {
     /// Offscreen, transparent, and ignoring the pointer.
     func window(showing view: NSView) -> NSWindow {
         _ = NSApplication.shared
-        let window = NSWindow(contentRect: NSRect(x: -5000, y: -5000, width: 960, height: 640), styleMask: [.borderless], backing: .buffered, defer: false)
+        let window = OffscreenWindow(contentRect: NSRect(x: -5000, y: -5000, width: 960, height: 640), styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.alphaValue = 0
         window.ignoresMouseEvents = true

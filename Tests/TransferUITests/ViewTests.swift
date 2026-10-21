@@ -171,7 +171,16 @@ struct ViewTests {
 
 /// A window whose sheets are never seen: AppKit keeps a window that is ordered in partly on a
 /// screen, and a sheet on it with it.
+///
+/// It never animates: closing an ordered-in window that does runs an `NSAnimation` on a worker
+/// thread, which ends by stopping the main run loop. It also starts `MainLoopGuard`.
 final class OffscreenWindow: NSWindow {
+    override init(contentRect: NSRect, styleMask: NSWindow.StyleMask, backing: NSWindow.BackingStoreType, defer flag: Bool) {
+        MainLoopGuard.install()
+        super.init(contentRect: contentRect, styleMask: styleMask, backing: backing, defer: flag)
+        animationBehavior = .none
+    }
+
     override func beginSheet(_ sheetWindow: NSWindow, completionHandler handler: ((NSApplication.ModalResponse) -> Void)? = nil) {
         sheetWindow.alphaValue = 0
         sheetWindow.ignoresMouseEvents = true
@@ -191,5 +200,41 @@ struct ExtensionsHost: View {
 
     var body: some View {
         if shown.on { ExtensionSettings(provider: provider) } else { Text("General") }
+    }
+}
+
+/// Keeps the test process's main run loop from ending while tests remain. The runner spins the
+/// main thread in one `CFRunLoopRun`; once that returns, the process exits with status 0 and
+/// prints no summary, whatever tests had not run. AppKit stops the main run loop on its own:
+/// `postEvent` at once and from a block, a closing window's animation as it ends, and, once
+/// anything has asked for the next event (`ClickTests`), HIToolbox for every window-server event
+/// it queues (`PushToCGEventQueue`), at any later time. Measured with breakpoints on
+/// `CFRunLoopStop` and `CFRunLoopPerformBlock`: `--filter TransferUITests` ended after about half
+/// its tests. So the first window starts a run of its own on the main loop that never ends: a
+/// stop ends one pass and the next begins, all main-actor work runs inside it, and the runner's
+/// exit, called from that work once every test is done, ends the process.
+///
+/// It starts from a timer, not a block: blocks queued in the same pass as one that never returns
+/// are never run, and SwiftUI queues its updates as blocks, so windows stopped updating. And it
+/// starts only from the runner's own loop, never from a run nested in it, such as
+/// `ClickTests.inOwnRun`, which must end.
+@MainActor
+enum MainLoopGuard {
+    private static var installed = false
+
+    static func install() {
+        guard !installed else { return }
+        installed = true
+        start(after: 0)
+    }
+
+    private static func start(after delay: TimeInterval) {
+        let timer = Timer(fire: Date.now.addingTimeInterval(delay), interval: 0, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                guard Thread.callStackSymbols.count(where: { $0.contains(" __CFRunLoopRun ") }) == 1 else { return start(after: 0.05) }
+                while true { CFRunLoopRunInMode(.defaultMode, 60, false) }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .default)
     }
 }
