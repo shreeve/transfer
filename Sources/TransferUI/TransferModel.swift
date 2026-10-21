@@ -201,6 +201,10 @@ public final class TransferModel {
     /// When the preview on show stopped being the selection's, so a held arrow key cannot keep
     /// an old file's preview up past `PreviewTiming.icon`.
     @ObservationIgnored private var inspectorStaleSince: ContinuousClock.Instant?
+    /// When what the inspector showed before the latest selection change went stale. Kept after
+    /// the next preview lands, so the view can hold the old one while that preview's view gets
+    /// ready, by the same `PreviewTiming.icon` rule.
+    @ObservationIgnored public private(set) var inspectorMovedAt = ContinuousClock.now
     public var sidebarCollapsed = false
     public var showsShelf = false
     public var draft = SavedConnection(name: "", host: "")
@@ -1124,9 +1128,11 @@ public final class TransferModel {
         let now = ContinuousClock.now
         let rapid = lastSelectionChange.duration(to: now) < PreviewTiming.coalesce
         lastSelectionChange = now
-        inspectorWait = .nothing
+        // An icon already up stays until the next preview replaces it, rather than blanking.
+        inspectorWait = inspectorWait == .nothing ? .nothing : .icon
         // Read before the guards below clear the preview, which forgets when it went stale.
         let stale = inspectorPreview == nil ? now : inspectorStaleSince ?? now
+        inspectorMovedAt = stale
         guard showsInspector, let session, let item = primaryItem else {
             inspectorPreview = nil
             return
@@ -2421,7 +2427,8 @@ public enum InspectorWait: Equatable {
 }
 
 /// The inspector's choreography. The fetch always starts at once; these only shape what shows
-/// while it runs. The previous preview stays up until the next one replaces it, with no
+/// while it runs. The previous preview, or an icon already up, stays until the next preview is
+/// ready to draw (for text, until `InspectorColumn`'s hidden web view has its page), with no
 /// animation, so moving between files never shows an empty box; an icon that lands and is
 /// replaced within a few frames is a flicker, so the old preview gives way to the icon only once
 /// the wait is plainly long, and a spinner joins it later still. The details change at once.

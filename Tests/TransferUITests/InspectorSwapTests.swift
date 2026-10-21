@@ -205,4 +205,60 @@ extension InspectorTests {
         select("docs")
         #expect(model.inspectorPreview == nil && model.inspectorWait == .icon)
     }
+
+    /// Text arriving over a picture, or over the icon, loads hidden: what was on screen stays
+    /// until the page is in, then the page replaces it in one step, never an empty area.
+    @Test func aPictureStaysUntilTheTextReplacingItHasLoaded() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "TransferUITests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let png = try picture(in: folder)
+        let notes = folder.appending(path: "notes.txt")
+        try Data("let notes = 1\n".utf8).write(to: notes)
+        let items = [
+            RemoteItem(path: path("docs"), kind: .directory),
+            RemoteItem(path: path("photo.png"), kind: .file, size: 1000),
+            RemoteItem(path: path("notes.txt"), kind: .file, size: 14),
+        ]
+        let session = FakeSession(server, folders: [home: items, path("docs"): []])
+        session.liveExtensions.value = ["txt"]
+        session.inspectorCopies.value = [path("photo.png"): png, path("notes.txt"): notes]
+        let defaults = Defaults()
+        defaults.store.set(true, forKey: Preferences.showsInspector)
+        let model = TransferModel(provider: FakeProvider([session]), defaults: defaults.store)
+        let slots = InspectorSlots()
+        let window = await window(InspectorColumn(model: model).environment(\.inspectorSlots, slots).frame(width: 320, height: 640), width: 320)
+        defer { window.close() }
+        await model.connect(server)
+        #expect(await eventually { model.items.count == items.count })
+        func select(_ name: String) {
+            model.snapshot.selection = [path(name)]
+            model.selectionChanged()
+        }
+        /// Selects `name` over what is on screen, `before`, and watches until the page is on
+        /// screen: `before` stays the whole time, the text waits hidden for its page at least
+        /// once, and nothing else is put up on the way.
+        func replace(_ before: String, with name: String) async {
+            let mark = slots.screens.count
+            var held = false
+            select(name)
+            for _ in 0..<1000 where slots.screens.last != "text" {
+                #expect(slots.screens.last == before)
+                if case .text? = model.inspectorPreview, sourcePreview(in: window.contentView) != nil { held = true }
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+            #expect(held)
+            #expect(Array(slots.screens[mark...]) == ["text"])
+            // On screen only once its page had loaded.
+            #expect(sourcePreview(in: window.contentView)?.swap.shown?.text == "let notes = 1\n")
+        }
+
+        select("photo.png")
+        #expect(await eventually { slots.screens.last == "picture" })
+        await replace("picture", with: "notes.txt")
+
+        select("docs")
+        #expect(await eventually { slots.screens.last == "icon" })
+        await replace("icon", with: "notes.txt")
+    }
 }

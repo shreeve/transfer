@@ -518,8 +518,15 @@ struct InspectorColumn: View {
     @AppStorage(Preferences.wrapsPreview) private var wrapsPreview = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.inspectorSlots) private var slots
-    /// The view's copy of the model's phase, so each change can pick its own animation.
+    /// The model's phase, the one coming in.
     @State private var shown = PreviewPhase()
+    /// What the area draws. It follows `shown` at once, with each change's own animation, except
+    /// that incoming text waits for its page (`pageShown`): a web view is empty until it loads.
+    @State private var onScreen = PreviewPhase()
+    /// That wait, which puts the icon up when the old preview's time (`PreviewTiming.icon`) is up
+    /// at `waitEnd`.
+    @State private var pageWait: Task<Void, Never>?
+    @State private var waitEnd: ContinuousClock.Instant?
 
     static let iconSize: CGFloat = 128
     static let nameHeight: CGFloat = 18
@@ -546,33 +553,84 @@ struct InspectorColumn: View {
         .padding(.top, 12)
         .padding(.bottom, Self.bottomMargin)
         .coordinateSpace(.named(InspectorSlots.space))
-        .onChange(of: phase, initial: true) { old, new in
-            withAnimation(animation(from: old, to: new)) { shown = new }
+        .onChange(of: phase, initial: true) { _, new in arrive(new) }
+    }
+
+    /// A new phase from the model. Text arriving over anything but text loads hidden while what
+    /// is on screen, a preview of another kind, the icon, or nothing, stays; the page then takes
+    /// its place in one step, or, if it is still loading when the old preview's time is up, the
+    /// icon does until it lands. Everything else goes on screen at once.
+    private func arrive(_ new: PreviewPhase) {
+        pageWait?.cancel()
+        pageWait = nil
+        guard case .text = new.preview, !onScreen.isText else {
+            waitEnd = nil
+            withAnimation(animation(from: onScreen, to: new)) {
+                shown = new
+                put(new)
+            }
+            return
         }
+        shown = new
+        // A wait already running keeps its end: what is on screen went stale when it began.
+        let due = model.inspectorMovedAt + PreviewTiming.icon
+        let end = waitEnd.map { min($0, due) } ?? due
+        waitEnd = end
+        pageWait = Task { @MainActor in
+            try? await Task.sleep(until: end)
+            guard !Task.isCancelled, !onScreen.isText else { return }
+            let icon = PreviewPhase(preview: nil, wait: .icon)
+            withAnimation(animation(from: onScreen, to: icon)) { put(icon) }
+        }
+    }
+
+    /// The hidden web view has loaded `text`: if it is still the one coming in, it goes on
+    /// screen in one step.
+    private func pageShown(_ text: String) {
+        guard case .text(text)? = shown.preview, !onScreen.isText else { return }
+        pageWait?.cancel()
+        pageWait = nil
+        waitEnd = nil
+        put(shown)
+    }
+
+    private func put(_ phase: PreviewPhase) {
+        guard phase != onScreen else { return }
+        onScreen = phase
+        slots?.screens.append(phase.label)
     }
 
     /// The preview area, everything between the facts and the foot: one file's preview once it is
     /// here, else an icon centered in it. Only the wait for one file leaves it empty, until
     /// `PreviewTiming.icon`. The content keeps its identity while the kind of preview does, so
     /// moving from one text file to the next reuses the web view, and Quick Look and pictures
-    /// change in place, instead of building a view that draws blank until it loads.
+    /// change in place, instead of building a view that draws blank until it loads. Incoming text
+    /// loads under what is on screen, transparent, until its page is in.
     private func area(_ facts: InspectorFacts) -> some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8).fill(.quinary)
-            if facts.file != nil, let preview = shown.preview {
-                content(preview).transition(.opacity)
-            } else if facts.file == nil || shown.wait != .nothing {
-                Image(nsImage: facts.icon)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: Self.iconSize, maxHeight: Self.iconSize)
-                    .padding(16)
-                    .accessibilityLabel(facts.kind)
+            if facts.file != nil, case .text(let text)? = shown.preview {
+                SourcePreview(text: text, wraps: wrapsPreview, shown: pageShown)
+                    .opacity(onScreen.isText ? 1 : 0)
+                    .allowsHitTesting(onScreen.isText)
                     .transition(.opacity)
+            }
+            if !onScreen.isText {
+                if facts.file != nil, let preview = onScreen.preview {
+                    content(preview).transition(.opacity)
+                } else if facts.file == nil || onScreen.wait != .nothing {
+                    Image(nsImage: facts.icon)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: Self.iconSize, maxHeight: Self.iconSize)
+                        .padding(16)
+                        .accessibilityLabel(facts.kind)
+                        .transition(.opacity)
+                }
             }
         }
         .overlay(alignment: .bottom) {
-            if facts.file != nil, shown.preview == nil, shown.wait == .spinner {
+            if facts.file != nil, onScreen.preview == nil, onScreen.wait == .spinner {
                 ProgressView().controlSize(.small).accessibilityLabel("Loading preview").padding(.bottom, 16).transition(.opacity)
             }
         }
@@ -584,7 +642,7 @@ struct InspectorColumn: View {
     /// Wrap lines, for text only, in a strip that is there for everything.
     private func foot(_ facts: InspectorFacts) -> some View {
         ZStack(alignment: .trailing) {
-            if facts.file != nil, case .text? = shown.preview {
+            if facts.file != nil, onScreen.isText {
                 Toggle("Wrap lines", isOn: $wrapsPreview)
                     .toggleStyle(.checkbox)
                     .controlSize(.small)
@@ -610,7 +668,8 @@ struct InspectorColumn: View {
         return nil
     }
 
-    /// A picture scales to fit and centers in the area; text and Quick Look fill it and scroll inside it.
+    /// A picture scales to fit and centers in the area; Quick Look fills it and scrolls inside it.
+    /// Text has its own layer in `area`.
     @ViewBuilder private func content(_ preview: InspectorPreview) -> some View {
         switch preview {
         case .picture(let picture):
@@ -620,8 +679,8 @@ struct InspectorColumn: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .file(let url):
             QuickLookPreview(url: url)
-        case .text(let text):
-            SourcePreview(text: text, wraps: wrapsPreview)
+        case .text:
+            EmptyView()
         }
     }
 
@@ -772,6 +831,8 @@ struct InspectorFacts {
 final class InspectorSlots {
     nonisolated static let space = "inspector"
     var frames: [String: CGRect] = [:]
+    /// Each phase the preview area put on screen, in order (`PreviewPhase.label`).
+    var screens: [String] = []
 }
 
 /// The same for the detail column's browser and the bars at its foot, which must never overlap.
@@ -978,14 +1039,18 @@ struct QuickLookPreview: NSViewRepresentable {
 struct SourcePreview: NSViewRepresentable {
     let text: String
     let wraps: Bool
+    /// Told each time a page is on show, with its text.
+    var shown: (String) -> Void = { _ in }
 
     func makeNSView(context: Context) -> SourcePreviewView {
         let view = SourcePreviewView()
+        view.onShow = { shown($0.text) }
         view.show(SourcePage(text: text, wraps: wraps))
         return view
     }
 
     func updateNSView(_ view: SourcePreviewView, context: Context) {
+        view.onShow = { shown($0.text) }
         view.show(SourcePage(text: text, wraps: wraps))
     }
 }
@@ -1039,6 +1104,8 @@ final class SourcePreviewView: NSView, WKNavigationDelegate {
     private(set) var buffers: [WKWebView] = []
     private(set) var swap = PageSwap<SourcePage>()
     private var navigation: (step: WKNavigation, load: Int)?
+    /// Told each time a page comes to the front, never from inside `show`.
+    var onShow: (SourcePage) -> Void = { _ in }
 
     init() {
         super.init(frame: .zero)
@@ -1071,13 +1138,16 @@ final class SourcePreviewView: NSView, WKNavigationDelegate {
         if let step = buffers[next.buffer].loadHTMLString(html, baseURL: nil) {
             navigation = (step, next.load)
         } else {
-            finish(next.load)
+            // Never synchronously: `show` runs inside a SwiftUI update.
+            DispatchQueue.main.async { [weak self] in self?.finish(next.load) }
         }
     }
 
     private func finish(_ load: Int) {
         navigation = nil
-        if swap.finished(load) { showFront() }
+        guard swap.finished(load) else { return }
+        showFront()
+        if let page = swap.shown { onShow(page) }
     }
 
     private func showFront() {
@@ -1113,4 +1183,18 @@ final class SourcePreviewView: NSView, WKNavigationDelegate {
 struct PreviewPhase: Equatable {
     var preview: InspectorPreview?
     var wait: InspectorWait = .nothing
+
+    var isText: Bool {
+        if case .text? = preview { true } else { false }
+    }
+
+    /// The phase in a word, for `InspectorSlots.screens`.
+    var label: String {
+        switch preview {
+        case .text?: "text"
+        case .picture?: "picture"
+        case .file?: "quickLook"
+        case nil: wait == .nothing ? "empty" : wait == .icon ? "icon" : "spinner"
+        }
+    }
 }
