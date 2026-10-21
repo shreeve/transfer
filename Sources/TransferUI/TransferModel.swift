@@ -1164,7 +1164,7 @@ public final class TransferModel {
         ]
     }
 
-    /// What the box can show for a file, from its name and listed size; a text file is one that
+    /// What the inspector can show for a file, from its name and listed size; a text file is one that
     /// opens Live, and only its head is fetched, so a large one previews too.
     private static func plan(for file: RemoteItem, session: any RemoteSession) async -> InspectorPreviewPlan {
         let isText = await session.openKind(fileName: file.name) == .live
@@ -1198,7 +1198,7 @@ public final class TransferModel {
     }
 
     /// Warms the cache for the files on either side of `item`, one at a time, so an arrow key
-    /// lands on a copy that is already here. Only files the box can show are fetched. A newer
+    /// lands on a copy that is already here. Only files the inspector can show are fetched. A newer
     /// selection cancels this like everything else.
     private func prefetchNeighbors(of item: RemoteItem, session: any RemoteSession, generation: Int) {
         let list = displayedItems

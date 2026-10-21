@@ -509,10 +509,10 @@ private struct SheetForm<Content: View, Actions: View>: View {
     }
 }
 
-/// The inspector: a preview box of one fixed size, then the facts in rows that each keep their
-/// place, the same for every selection, so nothing moves as the selection does. The box shows the
-/// file once a copy has arrived, else its icon: while it loads, when it cannot be shown, and for a
-/// folder or several items. A missing fact reads "—".
+/// The inspector: the facts at the top, each row in its own place, then the preview filling the
+/// rest of the panel down to its foot, the same for every selection, so nothing moves as the
+/// selection does. The area shows the file once a copy has arrived, else its icon: while it loads,
+/// when it cannot be shown, and for a folder or several items. A missing fact reads "—".
 struct InspectorColumn: View {
     let model: TransferModel
     @AppStorage(Preferences.wrapsPreview) private var wrapsPreview = false
@@ -522,11 +522,14 @@ struct InspectorColumn: View {
     @State private var shown = PreviewPhase()
     @State private var previewID = 0
 
-    /// The box's height, whatever the panel's width; it fills the width.
-    static let boxHeight: CGFloat = 240
     static let iconSize: CGFloat = 128
     static let nameHeight: CGFloat = 18
     static let rowHeight: CGFloat = 16
+    /// The strip at the foot that holds Wrap lines for text; kept for every selection, so the
+    /// preview area ends in the same place whether or not the toggle shows.
+    static let footHeight: CGFloat = 20
+    static let footGap: CGFloat = 8
+    static let bottomMargin: CGFloat = 12
 
     // MARK: Inspector
 
@@ -535,21 +538,14 @@ struct InspectorColumn: View {
         let phase = PreviewPhase(preview: model.inspectorPreview, wait: model.inspectorWait)
         // A plain stack, not a scroll view: hosted scroll views reach up under the toolbar.
         return VStack(alignment: .leading, spacing: 0) {
-            box(facts)
-            rows(facts).padding(.top, 12)
-            Spacer(minLength: 0)
-            if facts.file != nil, case .text? = shown.preview {
-                Toggle("Wrap lines", isOn: $wrapsPreview)
-                    .toggleStyle(.checkbox)
-                    .controlSize(.small)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
+            rows(facts)
+            area(facts).padding(.top, 12)
+            foot(facts).padding(.top, Self.footGap)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.horizontal, 16)
         .padding(.top, 12)
-        .padding(.bottom, 16)
+        .padding(.bottom, Self.bottomMargin)
         .coordinateSpace(.named(InspectorSlots.space))
         .onChange(of: phase, initial: true) { old, new in
             if new.preview != old.preview { previewID &+= 1 }
@@ -557,9 +553,10 @@ struct InspectorColumn: View {
         }
     }
 
-    /// The fixed box: one file's preview once it is here, else an icon centered in it. Only the
-    /// wait for one file leaves it empty, until `PreviewTiming.icon`.
-    private func box(_ facts: InspectorFacts) -> some View {
+    /// The preview area, everything between the facts and the foot: one file's preview once it is
+    /// here, else an icon centered in it. Only the wait for one file leaves it empty, until
+    /// `PreviewTiming.icon`.
+    private func area(_ facts: InspectorFacts) -> some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8).fill(.quinary)
             if facts.file != nil, let preview = shown.preview {
@@ -567,7 +564,9 @@ struct InspectorColumn: View {
             } else if facts.file == nil || shown.wait != .nothing {
                 Image(nsImage: facts.icon)
                     .resizable()
-                    .frame(width: Self.iconSize, height: Self.iconSize)
+                    .scaledToFit()
+                    .frame(maxWidth: Self.iconSize, maxHeight: Self.iconSize)
+                    .padding(16)
                     .accessibilityLabel(facts.kind)
                     .transition(.opacity)
             }
@@ -577,15 +576,29 @@ struct InspectorColumn: View {
                 ProgressView().controlSize(.small).accessibilityLabel("Loading preview").padding(.bottom, 16).transition(.opacity)
             }
         }
-        .frame(maxWidth: .infinity)
-        .frame(height: Self.boxHeight)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .slot("box", slots)
+        .slot("preview", slots)
+    }
+
+    /// Wrap lines, for text only, in a strip that is there for everything.
+    private func foot(_ facts: InspectorFacts) -> some View {
+        ZStack(alignment: .trailing) {
+            if facts.file != nil, case .text? = shown.preview {
+                Toggle("Wrap lines", isOn: $wrapsPreview)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .frame(height: Self.footHeight)
+        .slot("foot", slots)
     }
 
     /// No animation for a swap inside the hold (it reads as instant) or content landing in an empty
-    /// box. Old content fades out, the icon and spinner fade in, and a picture over the icon
-    /// crossfades. Web and Quick Look views draw late, so fading them shows an empty box.
+    /// area. Old content fades out, the icon and spinner fade in, and a picture over the icon
+    /// crossfades. Web and Quick Look views draw late, so fading them shows an empty area.
     private func animation(from old: PreviewPhase, to new: PreviewPhase) -> Animation? {
         guard !reduceMotion else { return nil }
         if let preview = new.preview {
@@ -597,7 +610,7 @@ struct InspectorColumn: View {
         return nil
     }
 
-    /// A picture scales to fit inside the box; text and Quick Look fill it and scroll inside it.
+    /// A picture scales to fit and centers in the area; text and Quick Look fill it and scroll inside it.
     @ViewBuilder private func content(_ preview: InspectorPreview) -> some View {
         switch preview {
         case .picture(let picture):
@@ -612,9 +625,9 @@ struct InspectorColumn: View {
         }
     }
 
-    /// Name, kind and size, modified, then access, each one line in its own place; then what is
-    /// happening to the item, below them all. Actions live in the context menu and on
-    /// double-click, as in the browser.
+    /// Name, kind and size, modified, access, then what is happening to the item, each one line
+    /// in its own place. The last line is there even when it is empty, so the preview area under
+    /// it never moves. Actions live in the context menu and on double-click, as in the browser.
     private func rows(_ facts: InspectorFacts) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(facts.name)
@@ -630,19 +643,34 @@ struct InspectorColumn: View {
             row(facts.kindAndSize, "kind")
             row(facts.modified, "modified").monospacedDigit()
             row(facts.access, "access")
-            if let item = facts.file {
-                if item.kind == .symlink { line("→ \(model.inspectorLinkTarget ?? "…")") }
-                if let live = model.liveFile(for: item.path) { line(live.label) }
-                if let operation = model.operation(for: item.path) {
-                    // Again every second, as on the shelf, so a stall shows without a report.
-                    TimelineView(.periodic(from: .now, by: 1)) { _ in
-                        line(model.inspectorStatus(operation)).monospacedDigit()
-                    }
-                }
-            }
+            status(facts)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: Self.rowHeight)
+                .slot("status", slots)
         }
         .font(.subheadline)
         .foregroundStyle(.secondary)
+    }
+
+    /// A link's target, a Live file's state, and a transfer's, joined on the one status line; its
+    /// tooltip holds the whole of it.
+    @ViewBuilder private func status(_ facts: InspectorFacts) -> some View {
+        if let item = facts.file {
+            let known = [item.kind == .symlink ? "→ \(model.inspectorLinkTarget ?? "…")" : nil, model.liveFile(for: item.path)?.label].compactMap(\.self)
+            if let operation = model.operation(for: item.path) {
+                // Again every second, as on the shelf, so a stall shows without a report.
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    line((known + [model.inspectorStatus(operation)]).joined(separator: " · ")).monospacedDigit()
+                }
+            } else if !known.isEmpty {
+                line(known.joined(separator: " · "))
+            } else {
+                Color.clear
+            }
+        } else {
+            // Kept with nothing to say: an empty stack slot would close up, moving the area.
+            Color.clear
+        }
     }
 
     private func row(_ text: String, _ key: String) -> some View {
@@ -672,7 +700,7 @@ struct InspectorFacts {
     var modified: String
     var access: String
     var icon: NSImage
-    /// The one file or link selected, whose preview may fill the box; nil for anything else.
+    /// The one file or link selected, whose preview may fill the area; nil for anything else.
     var file: RemoteItem?
 
     @MainActor init(model: TransferModel) {
@@ -739,7 +767,7 @@ struct InspectorFacts {
 }
 
 /// Where each part of the inspector landed, in its own coordinates, for the tests that hold the
-/// box and every row still across selections. Nil, as in the app, records nothing.
+/// preview area and every row still across selections. Nil, as in the app, records nothing.
 @MainActor
 final class InspectorSlots {
     nonisolated static let space = "inspector"
