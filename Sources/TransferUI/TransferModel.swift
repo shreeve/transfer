@@ -1961,7 +1961,15 @@ public extension ViewMode {
 
 public extension LiveFile {
     /// The Live Files sidebar row's tooltip: the remote path, then what the file is doing.
-    var sidebarHelp: String { "\(path.display)\n\(status.help)" }
+    var sidebarHelp: String { "\(path.display)\n\(status.help)\(pausedToo ? "; paused" : "")" }
+
+    /// The inspector's Live line.
+    var label: String { "\(status.label)\(pausedToo ? ", paused" : "")" }
+
+    /// A flag from the server outranks Paused in the status, which must still say it.
+    private var pausedToo: Bool {
+        paused && (status == .changedOnServer || status == .removedFromServer)
+    }
 }
 
 /// Every label, symbol, and tooltip for what a Live file is doing comes from here.

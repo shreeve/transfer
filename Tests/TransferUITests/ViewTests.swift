@@ -196,6 +196,15 @@ struct ViewTests {
         #expect(model.liveFile(for: gone)?.sidebarHelp == "/home/gone.txt\nRemoved from the server")
         #expect(model.liveFile(for: note)?.status.label == "Live, changed on the server")
         #expect(model.liveFile(for: gone)?.status.label == "Live, removed from the server")
+        #expect(model.liveFile(for: note)?.label == "Live, changed on the server")
+        // A flag outranks Paused in the status, and the row and the inspector still say it.
+        flagged[1].paused = true
+        session.live.value = flagged
+        session.send.yield(.liveChanged)
+        #expect(await eventually { model.liveFile(for: gone)?.paused == true })
+        #expect(model.liveFile(for: gone)?.sidebarHelp == "/home/gone.txt\nRemoved from the server; paused")
+        #expect(model.liveFile(for: gone)?.label == "Live, removed from the server, paused")
+        #expect(sidebar(6) != nil)
         for status in [LiveFile.Status.changedOnServer, .removedFromServer] {
             #expect(NSImage(systemSymbolName: status.symbolName, accessibilityDescription: nil) != nil)
             #expect(![LiveFile.Status.synced, .conflict, .dirty].map(\.symbolName).contains(status.symbolName))
