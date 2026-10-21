@@ -553,7 +553,9 @@ actor LiveSync {
             }
             found.append(Checked(id: entry.id, path: entry.path, state: entry.state, item: item, fact: fact))
         }
-        guard !found.isEmpty else { return }
+        // A round cut short still hands on what it found, but never to a connection that has gone
+        // or been replaced meanwhile, for which it would start a worker nothing stops.
+        guard !Task.isCancelled, ready.contains(connection), servers[connection]?.server === server, !found.isEmpty else { return }
         enqueue(on: connection) { [found] in await self.applyCheck(found, from: server) }
     }
 
