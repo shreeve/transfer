@@ -531,3 +531,21 @@ import Testing
     #expect(QuickLookPlan.plan(kind: .directory, size: 4096) == .nothing)
     #expect(QuickLookPlan.plan(kind: .directory, size: nil) == .nothing)
 }
+
+
+@Suite struct InspectorWidthTests {
+    @Test func sixtyPercentOfTheSplitWithinTheContentMinimum() {
+        #expect(InspectorWidth.maximum(splitWidth: 1200, sidebar: 200) == 720)
+        #expect(InspectorWidth.maximum(splitWidth: 1200, sidebar: 0) == 720)
+        #expect(InspectorWidth.maximum(splitWidth: 2400, sidebar: 200) == 1440)
+        #expect(InspectorWidth.maximum(splitWidth: 1600, sidebar: 200) == 960)
+    }
+
+    @Test func theContentMinimumWinsOverTheShareButNotOverTheInspectorMinimum() {
+        // 600 wide: 60% is 360, but the content keeps 260 first; a sidebar can squeeze it to the 240 floor.
+        #expect(InspectorWidth.maximum(splitWidth: 600, sidebar: 0) == 340)
+        #expect(InspectorWidth.maximum(splitWidth: 600, sidebar: 150) == 240)
+        #expect(InspectorWidth.maximum(splitWidth: 600, sidebar: 320) == 240)
+        #expect(InspectorWidth.maximum(splitWidth: 300, sidebar: 0) == 240)
+    }
+}

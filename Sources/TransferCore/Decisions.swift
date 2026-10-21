@@ -608,6 +608,21 @@ public struct HostKeyLine: Hashable, Sendable {
     public var text: String { "\(host) \(keyType) \(key)" }
 }
 
+/// How wide the inspector may grow: 60% of the split view's width, never under its own minimum,
+/// and never so wide that the content pane would fall under its minimum (that minimum wins over
+/// the 60%, but not over the inspector's own).
+public enum InspectorWidth {
+    public static let minimum = 240.0
+    public static let share = 0.6
+    public static let contentMinimum = 260.0
+
+    /// `sidebar` is the sidebar's current width, 0 when it is hidden.
+    public static func maximum(splitWidth: Double, sidebar: Double) -> Double {
+        let room = splitWidth - sidebar - contentMinimum
+        return max(minimum, min((splitWidth * share).rounded(.down), room))
+    }
+}
+
 /// The split view's saved frames, one string per column ("x, y, width, height, collapsed,
 /// hidden"). A window closed while its inspector was collapsing saves that column open at
 /// width 0, and a window restored from that never opens its inspector again (measured in
