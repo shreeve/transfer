@@ -253,6 +253,10 @@ final class IconItemView: DropTargetView, NSDraggingSource {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    /// A drag begun in a background window leaves it behind (`DragOrdering`); a plain click still
+    /// brings it forward, on mouse-up.
+    override func shouldDelayWindowOrdering(for event: NSEvent) -> Bool { true }
+
     /// Command or Shift adds or removes the cell, as in Finder's icon view.
     override func mouseDown(with event: NSEvent) {
         down = event.locationInWindow
@@ -298,7 +302,12 @@ final class IconItemView: DropTargetView, NSDraggingSource {
             dragItem.setDraggingFrame(frame, contents: index == 0 ? ItemIcon.image(for: item) : nil)
             return dragItem
         }
+        DragOrdering.begin(in: window)
         beginDraggingSession(with: dragging, event: event, source: self)
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        DragOrdering.end(in: window, at: screenPoint)
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
@@ -334,5 +343,23 @@ final class IconGridBackgroundView: DropTargetView {
         window?.makeFirstResponder(self)
         model.snapshot.selection = []
         return ItemMenu.fill(item: nil, model: model)
+    }
+}
+
+/// A drag begun in a background window must not raise it over the drop target: Finder's window
+/// stays in front while it is dropped on. The drag-source views delay the window's ordering on
+/// mouse-down (`shouldDelayWindowOrdering(for:)`) and `begin` cancels it once a drag starts, so
+/// only a plain click orders the window forward, on mouse-up. `end` brings the window forward
+/// when the drop lands on it, since nothing else would.
+@MainActor
+enum DragOrdering {
+    static func begin(in window: NSWindow?) {
+        guard let window, !window.isKeyWindow else { return }
+        NSApp.preventWindowOrdering()
+    }
+
+    static func end(in window: NSWindow?, at screenPoint: NSPoint) {
+        guard let window, !window.isKeyWindow, window.frame.contains(screenPoint) else { return }
+        window.makeKeyAndOrderFront(nil)
     }
 }
