@@ -444,3 +444,12 @@ import Testing
     }
     #expect(plan("README", limit + 1) == .icon)
 }
+
+@Test func quickLookFetchesFilesUpTo256MBAndNothingElse() {
+    #expect(QuickLookPlan.plan(kind: .file, size: 0) == .fetch)
+    #expect(QuickLookPlan.plan(kind: .file, size: nil) == .fetch)
+    #expect(QuickLookPlan.plan(kind: .file, size: 256 << 20) == .fetch)
+    #expect(QuickLookPlan.plan(kind: .file, size: (256 << 20) + 1) == .tooLarge)
+    #expect(QuickLookPlan.plan(kind: .directory, size: 4096) == .nothing)
+    #expect(QuickLookPlan.plan(kind: .directory, size: nil) == .nothing)
+}

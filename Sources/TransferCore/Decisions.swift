@@ -87,6 +87,31 @@ public enum InspectorPreviewPlan: Equatable, Sendable {
     }
 }
 
+/// What Space does for an item before anything is fetched: Quick Look downloads the whole file,
+/// so a file over `limit` is not, and a folder has nothing to download.
+public enum QuickLookPlan: Equatable, Sendable {
+    case fetch
+    /// The file is over `limit`: say so and suggest Download Copy.
+    case tooLarge
+    /// A folder or a special file: no fetch, no panel.
+    case nothing
+
+    /// The largest file Quick Look fetches. A file listed without a size is fetched, as it always was.
+    public static let limit: UInt64 = 256 << 20
+
+    public static func tooLargeMessage(name: String) -> String {
+        "“\(name)” is too large to preview (over 256 MB). Use Download Copy instead."
+    }
+
+    /// `kind` and `size` of the item after a link is followed.
+    public static func plan(kind: ItemKind, size: UInt64?) -> Self {
+        switch kind {
+        case .file: (size ?? 0) > limit ? .tooLarge : .fetch
+        default: .nothing
+        }
+    }
+}
+
 public enum NameCollisionChoice: String, Sendable {
     case skip
     case keepBoth
