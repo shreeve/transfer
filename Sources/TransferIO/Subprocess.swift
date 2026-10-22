@@ -79,6 +79,7 @@ final class OutputTail: Sendable {
     }
 
     var text: String { String(decoding: data.value, as: UTF8.self) }
+    var bytes: [UInt8] { Array(data.value) }
 
     /// Waits until `deadline`, a second from now unless given, for everything the process wrote
     /// before it exited.

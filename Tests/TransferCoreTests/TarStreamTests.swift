@@ -130,46 +130,61 @@ private func entry(_ name: String, size: UInt64 = 5, mtime: UInt64? = 1_700_000_
 
 @Test func aPlanTakesTheExpectedFilesInOrderAndPassesOverOnesTarSkipped() {
     var plan = TarBatchPlan([file("/srv/a"), file("/srv/b"), file("/srv/c")], skipLimit: 1 << 20)
-    #expect(plan.judge(entry("srv/a")) == .take(0))
+    #expect(plan.judge(entry("/srv/a")) == .take(0))
     // tar could not read b: c comes next, and b goes over SFTP.
-    #expect(plan.judge(entry("srv/c")) == .take(2))
+    #expect(plan.judge(entry("/srv/c")) == .take(2))
     #expect(plan.isDone)
     // Nothing comes back around.
     var again = TarBatchPlan([file("/srv/a"), file("/srv/b")], skipLimit: 1 << 20)
-    #expect(again.judge(entry("srv/b")) == .take(1))
-    #expect(again.judge(entry("srv/a")) == .stop)
+    #expect(again.judge(entry("/srv/b")) == .take(1))
+    #expect(again.judge(entry("/srv/a")) == .stop)
 }
 
 @Test func aPlanTakesOnlyARegularFileOfTheListedSizeAndTime() {
     var plan = TarBatchPlan([file("/a"), file("/b"), file("/c"), file("/d"), file("/e")], skipLimit: 100)
-    #expect(plan.judge(entry("a", size: 6)) == .pass(0))
-    #expect(plan.judge(entry("b", mtime: 1_700_000_001)) == .pass(1))
-    #expect(plan.judge(entry("c", size: 0, isFile: false)) == .pass(2))
-    #expect(plan.judge(TarBatchPlan.Entry(name: Array("d".utf8), size: 5, mtime: 1_700_000_000, isFile: true, unreadable: true)) == .pass(3))
+    #expect(plan.judge(entry("/a", size: 6)) == .pass(0))
+    #expect(plan.judge(entry("/b", mtime: 1_700_000_001)) == .pass(1))
+    #expect(plan.judge(entry("/c", size: 0, isFile: false)) == .pass(2))
+    #expect(plan.judge(TarBatchPlan.Entry(name: Array("/d".utf8), size: 5, mtime: 1_700_000_000, isFile: true, unreadable: true)) == .pass(3))
     // More bytes than any batch asks for is not a tar of these files.
-    #expect(plan.judge(entry("e", size: 101)) == .stop)
+    #expect(plan.judge(entry("/e", size: 101)) == .stop)
 }
 
 /// The stream's names only say which expected file an entry is; one that is not exactly an
-/// expected member name, as tar stores it, ends the stream.
+/// expected path, as tar stores it with `-P`, ends the stream.
 @Test func aPlanStopsAtAnyNameNotExpected() {
-    for hostile in ["/srv/a", "../srv/a", "srv/a/", "srv//a", "srv/./a", "SRV/a", "srv/a\0x", "elsewhere"] {
+    for hostile in ["srv/a", "../srv/a", "/srv/a/", "/srv//a", "/srv/./a", "/SRV/a", "/srv/a\0x", "//srv/a", "elsewhere"] {
         var plan = TarBatchPlan([file("/srv/a")], skipLimit: 1 << 20)
         #expect(plan.judge(entry(hostile)) == .stop, "\(hostile)")
     }
-    var plan = TarBatchPlan([file("//srv/a")], skipLimit: 1 << 20)
-    #expect(plan.judge(entry("srv/a")) == .take(0))
+    var plan = TarBatchPlan([file("/srv/a")], skipLimit: 1 << 20)
+    #expect(plan.judge(entry("/srv/a")) == .take(0))
 }
 
 @Test func aPlanGrowsBatchByBatch() {
     var plan = TarBatchPlan(skipLimit: 1 << 20)
     plan.append([file("/a")])
-    #expect(plan.judge(entry("a")) == .take(0))
+    #expect(plan.judge(entry("/a")) == .take(0))
     #expect(plan.isDone)
     plan.append([file("/b"), file("/c")])
     #expect(!plan.isDone)
-    #expect(plan.judge(entry("c")) == .take(2))
+    #expect(plan.judge(entry("/c")) == .take(2))
     #expect(plan.next == 3)
+}
+
+/// A stream of a million files keeps only the files still to come.
+@Test func aPlanForgetsWhatItHasJudged() {
+    var plan = TarBatchPlan(skipLimit: 1 << 20)
+    for batch in 0..<100 {
+        plan.append((0..<64).map { file("/f\(batch)-\($0)") })
+        for index in 0..<64 { #expect(plan.judge(entry("/f\(batch)-\(index)")) == .take(batch * 64 + index)) }
+        plan.forgetJudged()
+        #expect(plan.expected.isEmpty)
+    }
+    #expect(plan.base == 6400)
+    plan.append([file("/last"), file("/after")])
+    #expect(plan.judge(entry("/after")) == .take(6401))
+    #expect(plan.end == 6402)
 }
 
 private func begin(_ fill: inout TarBatchFill, _ count: Int) -> Bool {

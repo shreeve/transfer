@@ -71,7 +71,7 @@ struct TarReceiverTests {
         }
         let tar = Process()
         tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        tar.arguments = ["-cf", "-", "--no-recursion", "--null", "-T", "-"]
+        tar.arguments = ["-cf", "-", "-P", "--no-recursion", "--null", "-T", "-"]
         tar.environment = ["COPYFILE_DISABLE": "1"]
         let input = Pipe()
         let output = Pipe()
@@ -95,9 +95,9 @@ struct TarReceiverTests {
         defer { try? FileManager.default.removeItem(at: base) }
         let long = "/srv/" + String(repeating: "x", count: 150)
         var stream = TarStreamBytes()
-        stream.longName(String(long.dropFirst()))
+        stream.longName(long)
         stream.file("././@LongLink", Array("one".utf8), gnu: true)
-        stream.pax([("path", "srv/second")])
+        stream.pax([("path", "/srv/second")])
         stream.file("PaxHeader-ignored", Array("two".utf8))
         stream.end()
         let judge = Judge([expected(long, 3), expected("/srv/second", 3)], in: base)
@@ -111,7 +111,7 @@ struct TarReceiverTests {
         let base = try scratch("tarbanner")
         defer { try? FileManager.default.removeItem(at: base) }
         var stream = TarStreamBytes()
-        stream.file("srv/a", Array("alpha".utf8))
+        stream.file("/srv/a", Array("alpha".utf8))
         stream.end()
         let judge = Judge([expected("/srv/a", 5)], in: base)
         receive(Array("Welcome!\n".utf8) + Self.marker + stream.bytes, judge)
@@ -123,8 +123,8 @@ struct TarReceiverTests {
         let base = try scratch("tarshort")
         defer { try? FileManager.default.removeItem(at: base) }
         var stream = TarStreamBytes()
-        stream.file("srv/a", Array("alpha".utf8))
-        stream.bytes += TarStreamBytes.header("srv/b", size: 4000) + [UInt8](repeating: 7, count: 1000)
+        stream.file("/srv/a", Array("alpha".utf8))
+        stream.bytes += TarStreamBytes.header("/srv/b", size: 4000) + [UInt8](repeating: 7, count: 1000)
         let judge = Judge([expected("/srv/a", 5), expected("/srv/b", 4000)], in: base)
         receive(Self.marker + stream.bytes, judge)
         #expect(judge.written.value == [0])
@@ -137,10 +137,10 @@ struct TarReceiverTests {
         let base = try scratch("tarlink")
         defer { try? FileManager.default.removeItem(at: base) }
         var stream = TarStreamBytes()
-        stream.file("srv/a", [], type: "2")
-        stream.file("srv/b", [], type: "1")
-        stream.file("srv/c", [], type: "3")
-        stream.file("srv/d", Array("delta".utf8))
+        stream.file("/srv/a", [], type: "2")
+        stream.file("/srv/b", [], type: "1")
+        stream.file("/srv/c", [], type: "3")
+        stream.file("/srv/d", Array("delta".utf8))
         stream.end()
         let judge = Judge([expected("/srv/a", 0), expected("/srv/b", 0), expected("/srv/c", 0), expected("/srv/d", 5)], in: base)
         receive(Self.marker + stream.bytes, judge)
@@ -153,10 +153,10 @@ struct TarReceiverTests {
     @Test func anUnexpectedNameEndsTheStream() throws {
         let base = try scratch("tarname")
         defer { try? FileManager.default.removeItem(at: base) }
-        for hostile in ["../../Library/LaunchAgents/evil.plist", "/srv/a", "srv/other"] {
+        for hostile in ["../../Library/LaunchAgents/evil.plist", "srv/a", "/srv/other"] {
             var stream = TarStreamBytes()
             stream.file(hostile, Array("evil!".utf8))
-            stream.file("srv/a", Array("alpha".utf8))
+            stream.file("/srv/a", Array("alpha".utf8))
             stream.end()
             let judge = Judge([expected("/srv/a", 5)], in: base)
             receive(Self.marker + stream.bytes, judge)
@@ -168,7 +168,7 @@ struct TarReceiverTests {
     @Test func aGarbledOrBoundlessHeaderEndsTheStream() throws {
         let base = try scratch("targarbled")
         defer { try? FileManager.default.removeItem(at: base) }
-        var bad = TarStreamBytes.header("srv/a", size: 5)
+        var bad = TarStreamBytes.header("/srv/a", size: 5)
         bad[0] ^= 0x01
         var huge = TarStreamBytes.header("PaxHeader/x", size: 1 << 20, type: "x")
         huge += [UInt8](repeating: 0x41, count: 4096)
@@ -191,7 +191,7 @@ struct TarReceiverTests {
         let judge = Judge([expected("/srv/a", 5)], in: base)
         try FileManager.default.createSymbolicLink(atPath: judge.temps[0].path, withDestinationPath: target.path)
         var stream = TarStreamBytes()
-        stream.file("srv/a", Array("alpha".utf8))
+        stream.file("/srv/a", Array("alpha".utf8))
         stream.end()
         receive(Self.marker + stream.bytes, judge)
         #expect(judge.written.value.isEmpty)

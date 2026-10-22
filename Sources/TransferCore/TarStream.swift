@@ -124,9 +124,9 @@ public struct TarBatchPlan: Sendable {
             self.mtime = mtime
         }
 
-        /// The member name tar gives the path: GNU tar and bsdtar both store it without its
-        /// leading slashes.
-        var member: [UInt8] { Array(path.drop { $0 == UInt8(ascii: "/") }) }
+        /// The member name tar gives the path: the path itself, as both tars store it with
+        /// `-P`, which also keeps them from warning on standard error that they stripped it.
+        var member: [UInt8] { path }
     }
 
     /// An entry with what its metadata headers said: a pax `path` or `size`, or a GNU long name.
@@ -180,11 +180,16 @@ public struct TarBatchPlan: Sendable {
         case stop
     }
 
-    /// Every file whose name was sent, in order: a stream takes batch after batch.
+    /// The files whose names were sent and are not yet judged, in order, from `base`: a stream
+    /// takes batch after batch, and forgets each file once it is judged (`forgetJudged`).
     public private(set) var expected: [Expected]
-    /// The next expected file the stream may still send. Those before it that it never sent
-    /// (tar could not read them, or they went away) go over SFTP.
+    /// The index of `expected`'s first file among all the files sent.
+    public private(set) var base = 0
+    /// The next expected file the stream may still send, by its index among all sent. Those
+    /// before it that it never sent (tar could not read them, or they went away) go over SFTP.
     public private(set) var next = 0
+    /// One past the last file sent, by index.
+    public var end: Int { base + expected.count }
     /// The most a skipped entry may hold: more than any batch asks for is not a tar of these files.
     public let skipLimit: UInt64
 
@@ -199,15 +204,22 @@ public struct TarBatchPlan: Sendable {
     }
 
     /// Every expected file has had its entry, or been passed over.
-    public var isDone: Bool { next >= expected.count }
+    public var isDone: Bool { next >= end }
+
+    /// Forgets the files already judged, so a stream of a million files keeps only those to come.
+    public mutating func forgetJudged() {
+        expected.removeFirst(next - base)
+        base = next
+    }
 
     /// What `entry` means. Its name must be that of an expected file at or after `next`: tar sends
     /// names in the order it reads them and skips only one it cannot read. That file is taken only
     /// when it is a regular file of the listed size and time.
     public mutating func judge(_ entry: Entry) -> Verdict {
-        guard let index = expected[next...].firstIndex(where: { $0.member == entry.name }) else { return .stop }
+        guard let found = expected[(next - base)...].firstIndex(where: { $0.member == entry.name }) else { return .stop }
+        let index = base + found
         next = index + 1
-        let file = expected[index]
+        let file = expected[found]
         if entry.isFile, !entry.unreadable, entry.size == file.size, entry.mtime == UInt64(file.mtime) { return .take(index) }
         return entry.size <= skipLimit ? .pass(index) : .stop
     }
@@ -229,6 +241,9 @@ public enum TarBatching {
     /// Streams at once, each a session on the master in place of a data channel. Six were no
     /// faster than four.
     public static let streams = 4
+    /// A stream takes no more batches after this many files, and another takes its place: it
+    /// keeps what it placed until it has closed clean, in case a read error comes later.
+    public static let streamFiles = 20_000
     /// A download streams only once this many small files are to come: below it, a stream's start
     /// costs about what SFTP takes for them. At 150 a stream was never slower in the bench (one
     /// folder of 150 at 20 ms: 191 ms streamed, 200 over SFTP; at 80 ms, 610 and 689) and below it

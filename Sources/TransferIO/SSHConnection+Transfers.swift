@@ -95,11 +95,31 @@ extension SSHConnection {
                 }
                 try await group.waitForAll()
             }
+            // A stream that reported an error after it had placed files may have padded one with
+            // zeros: what it placed comes again over SFTP.
+            if let batch { try await refetch(await batch.feeds.placedByFaultedStreams(), tally: tally) }
         } catch {
             batch?.feeds.cancel()
             throw error
         }
         try tally.check()
+    }
+
+    /// Fetches `jobs`, files a faulted stream placed, again over SFTP over what it placed.
+    private func refetch(_ jobs: [TarJob], tally: CopyTally) async throws {
+        guard !jobs.isEmpty else { return }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for job in jobs {
+                group.addTask {
+                    do {
+                        try await self.fetch(job.item.path, info: job.item, to: job.destination, replacing: true) { _ in }
+                    } catch {
+                        try tally.failed(job.destination.lastPathComponent, error)
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
     }
 
     /// One batch, sent down one of `feeds`' streams: what it does not land goes over SFTP, each
@@ -109,7 +129,7 @@ extension SSHConnection {
         if let ticket = await feeds?.submit(jobs, store: store) {
             let written = await withTaskCancellationHandler { await ticket.written() } onCancel: { ticket.feed.cancel() }
             left = []
-            for (job, outcome) in zip(jobs, try await landTarBatch(jobs, temps: ticket.temps, written: written)) {
+            for (job, outcome) in zip(jobs, try await landTarBatch(jobs, temps: ticket.temps, written: written, from: ticket.feed)) {
                 switch outcome {
                 case .landed:
                     tarLanded += 1

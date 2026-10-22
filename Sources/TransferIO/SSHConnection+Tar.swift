@@ -14,8 +14,10 @@ extension SSHConnection {
     /// input, so no name is ever read by the server's shell. The marker comes first, so output a
     /// startup file prints is never read as the archive. `env` sets the variable in any shell, and
     /// keeps a Mac server's tar from adding `._` AppleDouble entries. GNU tar and bsdtar both take
-    /// these flags, `--no-recursion` and `--null` before the `-T` they apply to.
-    static let tarCommandLine = "echo TRANSFER-TAR-1; exec env COPYFILE_DISABLE=1 tar -cf - --no-recursion --null -T -"
+    /// these flags, `--no-recursion` and `--null` before the `-T` they apply to. `-P` keeps each
+    /// name as sent, so neither prints its warning about leading slashes: standard error carries
+    /// nothing but the startup output the probe saw, and a read error.
+    static let tarCommandLine = "echo TRANSFER-TAR-1; exec env COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T -"
     static let tarMarker = Array("TRANSFER-TAR-1\n".utf8)
 
     /// One file of a batch: the listing's item and the name the walk settled for it.
@@ -25,23 +27,34 @@ extension SSHConnection {
         let replacing: Bool
     }
 
+    /// What the probe learned: whether tar streams as asked, and what the server writes to
+    /// standard error for a command that goes right (a shell's startup files may), which a stream
+    /// may write too.
+    struct TarProbe: Sendable {
+        var works: Bool
+        var baseline: [UInt8]
+    }
+
     /// Runs `command` with no names. It works when it prints the marker, then an empty archive
     /// (zero blocks only), and exits 0: tar is there, takes the flags, and no startup output gets
-    /// in the way. At most 64 KB of its output is read, and it gets 15 s.
-    static func probeTar(_ arguments: [String]) async -> Bool {
+    /// in the way. At most 64 KB of its output and 4 KB of its standard error are read, and it
+    /// gets 15 s.
+    static func probeTar(_ arguments: [String]) async -> TarProbe {
+        let failed = TarProbe(works: false, baseline: [])
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         process.arguments = arguments
         let output = Pipe()
+        let errors = OutputTail(limit: 4097)
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errors.pipe
         let exited = AsyncStream<Int32>.makeStream()
         process.terminationHandler = { exited.continuation.yield($0.terminationStatus) }
         do {
             try process.run()
         } catch {
-            return false
+            return failed
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + 15) { if process.isRunning { process.terminate() } }
         let reader = output.fileHandleForReading
@@ -59,17 +72,21 @@ extension SSHConnection {
             status = code
             break
         }
-        guard status == 0, bytes.starts(with: tarMarker) else { return false }
+        await errors.waitForEnd()
+        let baseline = errors.bytes
+        guard status == 0, bytes.starts(with: tarMarker), baseline.count <= 4096 else { return failed }
         let archive = bytes.dropFirst(tarMarker.count)
-        return archive.count >= 2 * TarFormat.block && archive.count % TarFormat.block == 0 && archive.allSatisfy { $0 == 0 }
+        let works = archive.count >= 2 * TarFormat.block && archive.count % TarFormat.block == 0 && archive.allSatisfy { $0 == 0 }
+        return TarProbe(works: works, baseline: baseline)
     }
 
     /// A stream for a download's batches, in a place free now or the next to come free; nil when
     /// tar is off or missing here, or every stream runs already. Its place is given back when its
     /// process ends.
     func startTarFeed() async -> TarFeed? {
-        guard let command = tarCommand, await tarReady(), let slot = try? await takeTarSlot(waiting: true) else { return nil }
-        let feed = TarFeed.start(tarArguments(command)) { [weak self] in
+        guard let command = tarCommand, let probe = await tarProbeResult(), probe.works,
+              let slot = try? await takeTarSlot(waiting: true) else { return nil }
+        let feed = TarFeed.start(tarArguments(command), baseline: probe.baseline, stallLimit: tarStallLimit) { [weak self] in
             Task { await self?.giveBackTarSlot(slot) }
         }
         if feed == nil { giveBackTarSlot(slot) }
@@ -86,10 +103,13 @@ extension SSHConnection {
     }
 
     /// After a batch's entries: each file written whole lands only when a fresh look at the server
-    /// still lists it as it was, so tar read it unchanged. Cancelled, it removes every temp.
-    func landTarBatch(_ jobs: [TarJob], temps: [URL], written: Set<Int>) async throws -> [TarOutcome] {
+    /// still lists it as it was, so tar read it unchanged, and when its stream has said nothing on
+    /// standard error. Cancelled, it removes every temp.
+    func landTarBatch(_ jobs: [TarJob], temps: [URL], written: Set<Int>, from feed: TarFeed) async throws -> [TarOutcome] {
         let store = store
         var fresh: [Int: Fingerprint] = [:]
+        // A read error on the server comes only on standard error, its bytes as zeros.
+        let written = feed.isFaulted ? [] : written
         do {
             try Task.checkCancellation()
             if !written.isEmpty {
@@ -108,7 +128,13 @@ extension SSHConnection {
             Self.discard(temps, store: store)
             throw error
         }
-        return await Self.landBatch(jobs, temps: temps, written: written, fresh: fresh, store: store)
+        guard !feed.isFaulted else { return await Self.landBatch(jobs, temps: temps, written: [], fresh: [:], store: store) }
+        let outcomes = await Self.landBatch(jobs, temps: temps, written: written, fresh: fresh, store: store)
+        feed.landed(zip(jobs, outcomes).compactMap { job, outcome in
+            if case .landed = outcome { return job }
+            return nil
+        })
+        return outcomes
     }
 
     /// Off the actor: places each file the stream wrote that the server still lists as it was,
@@ -159,6 +185,8 @@ final class TarFeeds: Sendable {
         /// told no more come once they are.
         var submitting = 0
         var finishing = false
+        /// Streams that ended or were retired: what they placed is checked once they close.
+        var retired: [TarFeed] = []
     }
 
     private let session: SSHConnection
@@ -178,25 +206,23 @@ final class TarFeeds: Sendable {
             return true
         }
         guard first else { return }
-        Task {
-            await withTaskGroup(of: Void.self) { group in
-                for _ in 0..<TarBatching.streams {
-                    group.addTask {
-                        let feed = await self.session.startTarFeed()
-                        let (waiting, late) = self.state.withLock { state -> ([CheckedContinuation<Void, Never>], Bool) in
-                            state.starting -= 1
-                            if let feed, !state.closed { state.feeds.append(feed) }
-                            guard feed != nil || state.starting == 0 else { return ([], state.closed) }
-                            defer { state.waiting = [] }
-                            return (state.waiting, state.closed)
-                        }
-                        // A stream that started after the download ended is told so at once.
-                        if late { feed?.finish() }
-                        for continuation in waiting { continuation.resume() }
-                    }
-                }
-            }
+        for _ in 0..<TarBatching.streams { Task { await self.startOne() } }
+    }
+
+    /// One stream, counted in `starting` already, once `after` has ended and given back its place.
+    private func startOne(after retired: TarFeed? = nil) async {
+        await retired?.closed()
+        let feed = await session.startTarFeed()
+        let (waiting, late) = state.withLock { state -> ([CheckedContinuation<Void, Never>], Bool) in
+            state.starting -= 1
+            if let feed, !state.closed { state.feeds.append(feed) }
+            guard feed != nil || state.starting == 0 else { return ([], state.closed) }
+            defer { state.waiting = [] }
+            return (state.waiting, state.closed)
         }
+        // A stream that started after the download ended is told so at once.
+        if late { feed?.finish() }
+        for continuation in waiting { continuation.resume() }
     }
 
     /// A batch is on its way to `submit`, which may run after `finish`: the streams wait for it.
@@ -218,7 +244,8 @@ final class TarFeeds: Sendable {
         start()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let ready = state.withLock { state in
-                state.feeds.removeAll { $0.isEnded }
+                state.retired += state.feeds.filter { !$0.isOpen }
+                state.feeds.removeAll { !$0.isOpen }
                 guard state.feeds.isEmpty, state.starting > 0 else { return true }
                 state.waiting.append(continuation)
                 return false
@@ -234,10 +261,43 @@ final class TarFeeds: Sendable {
         let temps = jobs.map { $0.destination.deletingLastPathComponent().appendingPathComponent(KeepBothName.temp(for: $0.destination.lastPathComponent)) }
         store.rememberTemps(local: temps)
         for feed in running.sorted(by: { $0.load < $1.load }) {
-            if let range = feed.send(jobs, temps: temps) { return TarTicket(feed: feed, range: range, temps: temps) }
+            guard let range = feed.send(jobs, temps: temps) else { continue }
+            // A stream keeps what it placed until it has ended clean, so it ends after so many
+            // files and another takes its place.
+            if range.upperBound >= TarBatching.streamFiles { retire(feed) }
+            return TarTicket(feed: feed, range: range, temps: temps)
         }
         store.forgetTemps(local: temps)
         return nil
+    }
+
+    /// `feed` takes no more batches; another stream starts once it has ended.
+    private func retire(_ feed: TarFeed) {
+        feed.finish()
+        let replace = state.withLock { state in
+            guard !state.closed, !state.finishing else { return false }
+            state.starting += 1
+            return true
+        }
+        if replace { Task { await self.startOne(after: feed) } }
+    }
+
+    /// Once every stream has ended: the files placed by a stream that then wrote to standard
+    /// error, which may hold a read error's zeros and go again over SFTP.
+    func placedByFaultedStreams() async -> [SSHConnection.TarJob] {
+        var all: [TarFeed] = []
+        while true {
+            let (feeds, starting) = state.withLock { ($0.retired + $0.feeds, $0.starting) }
+            all = feeds
+            if starting == 0 { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        var jobs: [SSHConnection.TarJob] = []
+        for feed in all {
+            await feed.closed()
+            jobs += feed.placedIfFaulted
+        }
+        return jobs
     }
 
     /// No more batches: each stream ends once tar has sent what it was asked for, and the pool
@@ -298,52 +358,86 @@ protocol TarJudge: AnyObject, Sendable {
     func judge(_ entry: TarBatchPlan.Entry) -> (verdict: TarBatchPlan.Verdict, temp: URL?)
     /// The entry judged last is done with: `index` when it was taken and written whole.
     func wrote(_ index: Int?)
+    /// Bytes came, so the stream is alive.
+    func heard()
+}
+
+extension TarJudge {
+    func heard() {}
 }
 
 /// One `ssh … tar` passenger fed batch after batch: names go to its standard input on a queue of
-/// their own, and a reader thread writes each entry its plan takes into that file's temp.
+/// their own, and a reader thread writes each entry its plan takes into that file's temp. Its
+/// standard error is watched: anything past the probe's baseline (tar reports a read error only
+/// there, padding the file with zeros) faults the stream, which then lands nothing more, and what
+/// it placed goes again over SFTP. A stream silent for `stallLimit` while a batch waits on it is
+/// stopped, and the batch's files not yet written go over SFTP.
 final class TarFeed: TarJudge {
     private struct State {
         var plan = TarBatchPlan(skipLimit: TarBatching.batchBytes)
+        /// Temps and sizes of the files from `plan.base` on, as the plan keeps them.
         var temps: [URL] = []
+        var sizes: [UInt64] = []
         var written: Set<Int> = []
+        /// Every file before this one has been judged and, if taken, written whole.
+        var settled = 0
         var waiting: [(range: Range<Int>, continuation: CheckedContinuation<Set<Int>, Never>)] = []
         var ended = false
         var finished = false
         var inputClosed = false
+        var faulted = false
         /// Bytes sent and not yet judged, to pick the least loaded stream.
-        var sizes: [UInt64] = []
         var load: UInt64 = 0
+        var lastHeard = ContinuousClock.now
+        /// What the stream's standard error has said, and whether it has closed.
+        var errors: [UInt8] = []
+        var errorsEnded = false
+        var closers: [CheckedContinuation<Void, Never>] = []
+        var placed: [SSHConnection.TarJob] = []
     }
 
     private let process: Process
     private let writer: FileHandle
+    private let baseline: [UInt8]
     private let names = DispatchQueue(label: "TarFeed.names", qos: .userInitiated)
     private let state = Locked(State())
 
-    private init(process: Process, writer: FileHandle) {
+    private init(process: Process, writer: FileHandle, baseline: [UInt8]) {
         self.process = process
         self.writer = writer
+        self.baseline = baseline
     }
 
-    /// Starts `ssh` with `arguments`, and its reader; `ended` runs once the stream is over.
-    static func start(_ arguments: [String], ended: @escaping @Sendable () -> Void) -> TarFeed? {
+    /// Starts `ssh` with `arguments`, its reader, its standard error's watcher, and its stall
+    /// watchdog; `ended` runs once the stream is over.
+    static func start(_ arguments: [String], baseline: [UInt8], stallLimit: Duration, ended: @escaping @Sendable () -> Void) -> TarFeed? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
         process.arguments = arguments
         let input = Pipe()
         let output = Pipe()
+        let errors = Pipe()
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errors
+        // A server that stops reading must not end the app with SIGPIPE.
+        _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        let feed = TarFeed(process: process, writer: input.fileHandleForWriting, baseline: baseline)
+        errors.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                feed.errorsEnded()
+                return
+            }
+            feed.said(chunk)
+        }
         do {
             try process.run()
         } catch {
+            errors.fileHandleForReading.readabilityHandler = nil
             return nil
         }
-        // A server that stops reading must not end the app with SIGPIPE.
-        _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
-        let feed = TarFeed(process: process, writer: input.fileHandleForWriting)
         let reader = output.fileHandleForReading
         Thread.detachNewThread {
             var receiver = TarReceiver(reader.fileDescriptor)
@@ -352,10 +446,14 @@ final class TarFeed: TarJudge {
             feed.end()
             ended()
         }
+        Task { await feed.watch(stallLimit) }
         return feed
     }
 
     var isEnded: Bool { state.value.ended }
+    /// Running, and not yet told that no more names come.
+    var isOpen: Bool { state.withLock { !$0.ended && !$0.finished } }
+    var isFaulted: Bool { state.value.faulted }
     var load: UInt64 { state.value.load }
 
     /// Queues `jobs`, whose `temps` are recorded: their names go to tar after every name before
@@ -363,11 +461,13 @@ final class TarFeed: TarJudge {
     func send(_ jobs: [SSHConnection.TarJob], temps: [URL]) -> Range<Int>? {
         state.withLock { state in
             guard !state.ended, !state.finished else { return nil }
-            let range = state.plan.expected.count..<(state.plan.expected.count + jobs.count)
+            let range = state.plan.end..<(state.plan.end + jobs.count)
             state.plan.append(jobs.map { TarBatchPlan.Expected(path: $0.item.path.bytes, size: $0.item.size ?? 0, mtime: $0.item.mtime ?? 0) })
             state.temps += temps
             state.sizes += jobs.map { $0.item.size ?? 0 }
             state.load += jobs.reduce(0) { $0 + ($1.item.size ?? 0) }
+            // Silence is counted from the first batch waiting, not from before it was sent.
+            if state.waiting.isEmpty { state.lastHeard = .now }
             // Queued inside the lock, so names go out in the order the plan expects them.
             let bytes = Data(jobs.flatMap { $0.item.path.bytes + [0] })
             let writer = writer
@@ -376,15 +476,15 @@ final class TarFeed: TarJudge {
         }
     }
 
-    /// The files of `range` written whole, by their place in it.
+    /// The files of `range` written whole, by their place in it; none once the stream faulted.
     func written(_ range: Range<Int>) async -> Set<Int> {
         await withCheckedContinuation { continuation in
             let now: Set<Int>? = state.withLock { state in
-                guard state.ended || state.plan.next >= range.upperBound else {
+                guard state.ended || state.settled >= range.upperBound else {
                     state.waiting.append((range, continuation))
                     return nil
                 }
-                return Self.take(range, from: &state.written)
+                return Self.take(range, from: &state)
             }
             if let now { continuation.resume(returning: now) }
         }
@@ -415,48 +515,143 @@ final class TarFeed: TarJudge {
         if process.isRunning { process.terminate() }
     }
 
+    /// Returns once the stream has ended and its standard error has closed, or a second after,
+    /// which counts as a fault: what it would still say is not known.
+    func closed() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let now = state.withLock { state in
+                guard !(state.ended && state.errorsEnded) else { return true }
+                state.closers.append(continuation)
+                return false
+            }
+            if now { continuation.resume() }
+        }
+    }
+
+    /// Files a batch of this stream placed: kept until the stream has closed clean.
+    func landed(_ jobs: [SSHConnection.TarJob]) {
+        state.withLock { state in
+            guard state.faulted || !(state.ended && state.errorsEnded) else { return }
+            state.placed += jobs
+        }
+    }
+
+    /// What this stream placed, once it has closed, when it faulted.
+    var placedIfFaulted: [SSHConnection.TarJob] {
+        state.withLock { $0.faulted ? $0.placed : [] }
+    }
+
+    // MARK: Standard error and silence
+
+    private func said(_ chunk: Data) {
+        let fault = state.withLock { state -> Bool in
+            state.errors += chunk.prefix(8192 - min(state.errors.count, 8192))
+            guard !state.faulted, !baseline.starts(with: state.errors) else { return false }
+            state.faulted = true
+            return true
+        }
+        if fault { cancel() }
+    }
+
+    private func errorsEnded() {
+        let closers = state.withLock { state -> [CheckedContinuation<Void, Never>] in
+            state.errorsEnded = true
+            guard state.ended else { return [] }
+            defer { state.closers = [] }
+            return state.closers
+        }
+        for closer in closers { closer.resume() }
+    }
+
+    func heard() {
+        state.withLock { $0.lastHeard = .now }
+    }
+
+    /// Stops a stream that sends nothing for `limit` while a batch waits on it.
+    private func watch(_ limit: Duration) async {
+        let tick = min(limit / 4, .seconds(1))
+        while true {
+            try? await Task.sleep(for: tick)
+            let (ended, stalled) = state.withLock { state in
+                (state.ended, !state.waiting.isEmpty && ContinuousClock.now - state.lastHeard > limit)
+            }
+            if ended { return }
+            if stalled {
+                cancel()
+                return
+            }
+        }
+    }
+
     // MARK: The reader's side
 
     /// What the next entry is, and the temp to write a taken one into.
     func judge(_ entry: TarBatchPlan.Entry) -> (verdict: TarBatchPlan.Verdict, temp: URL?) {
         state.withLock { state in
+            let base = state.plan.base
             let before = state.plan.next
             let verdict = state.plan.judge(entry)
-            for index in before..<min(state.plan.next, state.sizes.count) { state.load -= state.sizes[index] }
-            if case .take(let index) = verdict { return (verdict, state.temps[index]) }
+            for index in before..<min(state.plan.next, base + state.sizes.count) { state.load -= state.sizes[index - base] }
+            if case .take(let index) = verdict { return (verdict, state.temps[index - base]) }
             return (verdict, nil)
         }
     }
 
-    /// Entry `index` is written whole. Batches whose files have all been judged are told.
+    /// The entry judged last is done with. Batches whose files have all been settled are told,
+    /// and what the plan has judged is forgotten.
     func wrote(_ index: Int?) {
         let ready = state.withLock { state in
             if let index { state.written.insert(index) }
-            let next = state.plan.next
-            let ready = state.waiting.filter { $0.range.upperBound <= next }
-            state.waiting.removeAll { $0.range.upperBound <= next }
-            return ready.map { ($0.continuation, Self.take($0.range, from: &state.written)) }
+            state.settled = state.plan.next
+            let settled = state.settled
+            let ready = state.waiting.filter { $0.range.upperBound <= settled }
+            state.waiting.removeAll { $0.range.upperBound <= settled }
+            let results = ready.map { ($0.continuation, Self.take($0.range, from: &state)) }
+            let judged = state.plan.next - state.plan.base
+            if judged >= 1024 {
+                state.plan.forgetJudged()
+                state.temps.removeFirst(judged)
+                state.sizes.removeFirst(judged)
+            }
+            return results
         }
         for (continuation, written) in ready { continuation.resume(returning: written) }
     }
 
-    /// The stream is over: every batch still waiting has what it got.
+    /// The stream is over: every batch still waiting has what it got. ssh is left a second to
+    /// exit, so what tar writes to standard error as it ends still comes.
     private func end() {
-        if process.isRunning { process.terminate() }
-        let ready = state.withLock { state in
+        let (ready, closers) = state.withLock { state in
             state.ended = true
             defer { state.waiting.removeAll() }
-            return state.waiting.map { ($0.continuation, Self.take($0.range, from: &state.written)) }
+            let ready = state.waiting.map { ($0.continuation, Self.take($0.range, from: &state)) }
+            guard state.errorsEnded else { return (ready, [CheckedContinuation<Void, Never>]()) }
+            defer { state.closers = [] }
+            return (ready, state.closers)
         }
         for (continuation, written) in ready { continuation.resume(returning: written) }
+        for closer in closers { closer.resume() }
         closeInput()
+        // A standard error that has not closed a second after the stream counts as a fault, and
+        // ssh is stopped.
+        Task {
+            try? await Task.sleep(for: .seconds(1))
+            let late = state.withLock { state -> Bool in
+                guard !state.errorsEnded else { return false }
+                state.faulted = true
+                return true
+            }
+            cancel()
+            if late { errorsEnded() }
+        }
     }
 
-    /// The files of `range` in `written`, by their place in it, no longer kept there.
-    private static func take(_ range: Range<Int>, from written: inout Set<Int>) -> Set<Int> {
+    /// The files of `range` written whole, by their place in it, no longer kept; none after a
+    /// fault.
+    private static func take(_ range: Range<Int>, from state: inout State) -> Set<Int> {
         var taken: Set<Int> = []
-        for index in range where written.remove(index) != nil { taken.insert(index - range.lowerBound) }
-        return taken
+        for index in range where state.written.remove(index) != nil { taken.insert(index - range.lowerBound) }
+        return state.faulted ? [] : taken
     }
 }
 
@@ -468,12 +663,15 @@ struct TarReceiver {
     private var buffer = [UInt8](repeating: 0, count: 256 << 10)
     private var start = 0
     private var end = 0
+    private var heard: (() -> Void)?
 
     init(_ descriptor: Int32) {
         self.descriptor = descriptor
     }
 
     mutating func receive(_ feed: some TarJudge) {
+        heard = { feed.heard() }
+        defer { heard = nil }
         guard read(SSHConnection.tarMarker.count) == SSHConnection.tarMarker else { return }
         var longName: [UInt8]?
         var pax: [(key: String, value: [UInt8])] = []
@@ -577,6 +775,7 @@ struct TarReceiver {
             if n < 0, errno == EINTR { continue }
             guard n > 0 else { return false }
             end = n
+            heard?()
             return true
         }
     }

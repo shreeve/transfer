@@ -605,15 +605,29 @@ extension TransferServerTests {
         #!/bin/sh
         names=$(tr '\\000' '\\n')
         echo TRANSFER-TAR-1
-        [ -z "$names" ] && exec env COPYFILE_DISABLE=1 tar -cf - --no-recursion --null -T /dev/null
+        [ -z "$names" ] && exec env COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T /dev/null
         list() { printf '%s\\n' "$names" | tr '\\n' '\\000'; }
+        gnu() { tar --version 2>/dev/null | grep -q GNU; }
         case "$1" in
         garbled) head -c 200000 /dev/urandom ;;
         renamed)
-            if tar --version 2>/dev/null | grep -q GNU; then rename="--transform=s,^,elsewhere/,"; else rename="-s,^,elsewhere/,"; fi
-            list | COPYFILE_DISABLE=1 tar -cf - --no-recursion --null -T - "$rename" ;;
-        short) list | COPYFILE_DISABLE=1 tar -cf - --no-recursion --null -T - | head -c 30000 ;;
+            if gnu; then rename="--transform=s,^,elsewhere/,"; else rename="-s,^,elsewhere/,"; fi
+            list | COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T - "$rename" ;;
+        short) list | COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T - | head -c 30000 ;;
         slow) sleep 10 ;;
+        padded)
+            # Every file as zeros of its size and time, as tar sends one it could not read, and
+            # the read error on standard error once the archive is out.
+            zero=$(mktemp -d)
+            printf '%s\\n' "$names" | while IFS= read -r name; do
+                mkdir -p "$zero$(dirname "$name")"
+                head -c "$(wc -c < "$name")" /dev/zero > "$zero$name"
+                touch -r "$name" "$zero$name"
+            done
+            if gnu; then rename="--transform=s,^$zero,,"; else rename="-s,^$zero,,"; fi
+            printf '%s\\n' "$names" | sed "s,^,$zero," | tr '\\n' '\\000' | COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T - "$rename"
+            echo "tar: $(printf '%s\\n' "$names" | head -1): Read error at byte 0: Input/output error" >&2
+            rm -rf "$zero" ;;
         esac
 
         """.write(to: script, atomically: true, encoding: .utf8)
@@ -721,6 +735,37 @@ extension TransferServerTests {
             await #expect(throws: (any Error).self) { try await download.value }
             await expectNoTemps(h)
             #expect(await waitUntil { (try? await processes(h, "fake-tar.sh"))?.isEmpty == true })
+        }
+    }
+
+    /// A stream that sends its marker and then nothing holds the download only until the stall
+    /// limit: its files then come over SFTP.
+    @Test func aSilentStreamFallsBackToSFTP() async throws {
+        try await withHarness("tstall", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand(try fakeTar(h, "slow"))
+            await h.session.useTarStallLimit(.seconds(1))
+            let local = h.staging.appendingPathComponent("tree")
+            let started = ContinuousClock.now
+            try await h.session.download(tree, to: local) { _ in }
+            #expect(ContinuousClock.now - started < .seconds(8))
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            #expect(await h.session.tarLanded == 0)
+            await expectNoTemps(h)
+        }
+    }
+
+    /// tar pads a file it cannot read with zeros and says so only on standard error: whatever the
+    /// stream placed before the error came, and whatever it would place after, is the server's
+    /// bytes in the end.
+    @Test func aReadErrorOnStandardErrorNeverLeavesZeros() async throws {
+        try await withHarness("tpadded", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand(try fakeTar(h, "padded"))
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            await expectNoTemps(h)
         }
     }
 

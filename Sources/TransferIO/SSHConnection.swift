@@ -55,8 +55,10 @@ public actor SSHConnection: RemoteSession {
     private var tarWaiters: [(id: UUID, continuation: CheckedContinuation<Int?, Error>)] = []
     /// Whether this login's server runs `tarCommand` as asked, tried once per login, and its
     /// answer once known.
-    private var tarProbe: (generation: Int, answer: Task<Bool?, Never>)?
-    private var tarAnswer: (generation: Int, works: Bool)?
+    private var tarProbe: (generation: Int, id: UUID, answer: Task<SSHConnection.TarProbe?, Never>)?
+    private var tarAnswer: (generation: Int, probe: SSHConnection.TarProbe)?
+    /// How long a stream may send nothing while a batch waits on it. Tests shorten it.
+    private(set) var tarStallLimit: Duration = .seconds(60)
     private var probedCommand: String? = SSHConnection.tarCommandLine
     /// What a tar stream runs on the server; nil sends every file over SFTP. Tests swap it.
     private(set) var tarCommand: String? = SSHConnection.tarCommandLine
@@ -764,32 +766,49 @@ public actor SSHConnection: RemoteSession {
 
     /// This login's server is known not to run `tarCommand`: small files go over SFTP at once.
     var tarMissing: Bool {
-        tarCommand == nil || tarAnswer.map { $0.generation == generation && !$0.works } ?? false
+        tarCommand == nil || tarAnswer.map { $0.generation == generation && !$0.probe.works } ?? false
     }
 
     /// Whether this login's server streams tar as `tarCommand` asks, learned once per login by
     /// running it with no names: the reply must be the marker and an empty archive. A probe that
     /// found no free place says nothing, and the next batch asks again.
     func tarReady() async -> Bool {
-        guard let command = tarCommand else { return false }
-        if let probe = tarProbe, probe.generation == generation, let answer = await probe.answer.value { return answer }
-        if let probe = tarProbe, probe.generation == generation { tarProbe = nil }
-        let asked = generation
-        let task = Task<Bool?, Never> {
-            guard let slot = try? await self.takeTarSlot(waiting: true) else { return nil }
-            let works = await Self.probeTar(self.tarArguments(command))
-            self.giveBackTarSlot(slot)
-            if asked == self.generation { self.tarAnswer = (asked, works) }
-            return works
+        await tarProbeResult()?.works ?? false
+    }
+
+    /// What this login's probe learned, probing first when no probe has answered; nil when it
+    /// found no place. Callers meanwhile share one probe: only the caller that saw a probe find
+    /// no place starts the next.
+    func tarProbeResult() async -> TarProbe? {
+        guard let command = tarCommand else { return nil }
+        if let answer = tarAnswer, answer.generation == generation { return answer.probe }
+        if let probe = tarProbe, probe.generation == generation {
+            if let answer = await probe.answer.value { return answer }
+            guard tarProbe?.id == probe.id else { return await tarProbe?.answer.value }
+            tarProbe = nil
         }
-        tarProbe = (asked, task)
-        return await task.value ?? false
+        let asked = generation
+        let task = Task<TarProbe?, Never> {
+            guard let slot = try? await self.takeTarSlot(waiting: true) else { return nil }
+            let probe = await Self.probeTar(self.tarArguments(command))
+            self.giveBackTarSlot(slot)
+            if asked == self.generation { self.tarAnswer = (asked, probe) }
+            return probe
+        }
+        tarProbe = (asked, UUID(), task)
+        return await task.value
+    }
+
+    /// For tests: how long a stream may be silent while a batch waits on it.
+    func useTarStallLimit(_ limit: Duration) {
+        tarStallLimit = limit
     }
 
     /// `ssh` joining the master to run `command`, as a passenger does: never logging in on its
     /// own, with no TTY and no escape character, since names on its standard input are any bytes.
     func tarArguments(_ command: String) -> [String] {
-        configArguments + ["-S", socketPath, "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ProxyCommand=/usr/bin/false", "-e", "none"]
+        // Quiet: a stream's standard error is the server's alone, where anything new ends it.
+        configArguments + ["-q", "-S", socketPath, "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ProxyCommand=/usr/bin/false", "-e", "none"]
             + Self.plainSession + ["--", connection.destination, command]
     }
 
