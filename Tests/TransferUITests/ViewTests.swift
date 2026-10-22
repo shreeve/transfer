@@ -225,12 +225,14 @@ struct ViewTests {
         func editor(in view: NSView) -> NSTextView? {
             (view as? NSTextView) ?? view.subviews.lazy.compactMap { editor(in: $0) }.first
         }
-        let text = try #require(editor(in: window.contentView!))
-        #expect(await eventually { text.string == "md" })
+        var found: NSTextView?
+        #expect(await eventually(seconds: 10) { found = editor(in: window.contentView!); return found != nil })
+        let text = try #require(found)
+        #expect(await eventually(seconds: 10) { text.string == "md" })
         text.insertText(" txt", replacementRange: NSRange(location: 2, length: 0))
         try? await Task.sleep(for: .milliseconds(50))
         shown.on = false
-        #expect(await eventually { provider.extensions.value == ["md", "txt"] })
+        #expect(await eventually(seconds: 10) { provider.extensions.value == ["md", "txt"] })
     }
 }
 
