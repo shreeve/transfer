@@ -69,8 +69,8 @@ struct TransferApp: App {
                     .disabled(primary == nil || !plainKeys)
                 Button("Forget Synced Live Files") { Task { await model?.forgetSyncedLive() } }
                     .disabled(model?.liveFiles.contains(where: \.isSynced) != true)
-                Button("Discard Live File") { Task { await model?.discardSelectedLive() } }
-                    .disabled(model.map { m in m.liveFiles.contains { m.snapshot.selection.contains($0.path) } } != true)
+                Button(TransferModel.stopLiveTitle(model?.selectedLiveFiles ?? [])) { Task { await model?.stopSelectedLive() } }
+                    .disabled(model?.selectedLiveFiles.isEmpty != false)
             }
             // The standard Copy and Paste serve text fields, and with no text field focused they
             // reach the window's ChromeController, which copies and pastes files.

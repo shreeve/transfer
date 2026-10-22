@@ -139,6 +139,26 @@ public actor TransferHub: SessionProvider {
 
     public var unsyncedLiveCount: Int { get async { await live.unsyncedCount() } }
 
+    public func libraryLiveFiles() async -> [LibraryLiveFile] {
+        let names = Dictionary(store.connections().map { ($0.id, $0.displayName) }, uniquingKeysWith: { first, _ in first })
+        return await live.allFiles()
+            .map { LibraryLiveFile(connection: $0.connection, server: names[$0.connection] ?? "Unknown server", file: $0.file) }
+            .sorted { a, b in
+                let order = a.server.localizedStandardCompare(b.server)
+                return order == .orderedSame ? a.file.path.display < b.file.path.display : order == .orderedAscending
+            }
+    }
+
+    public func liveChanges() async -> AsyncStream<Void> {
+        await live.changes()
+    }
+
+    public func stopLive(_ files: [LiveFileID], warned: Set<LiveFileID>) async -> [LibraryLiveFile] {
+        let kept = Set(await live.stop(files, warned: warned))
+        guard !kept.isEmpty else { return [] }
+        return await libraryLiveFiles().filter { kept.contains($0.id) }
+    }
+
     public func disconnectAll() async {
         await withTaskGroup(of: Void.self) { group in
             for session in sessions.values { group.addTask { await session.disconnect() } }

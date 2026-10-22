@@ -67,11 +67,14 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
         private var viewGroup: NSToolbarItemGroup?
         private(set) var navigationGroup: NSToolbarItemGroup?
         private var searchView: SearchToolbarView?
+        private(set) var liveItem: NSToolbarItem?
+        private(set) var liveBadge: LiveBadgeView?
+        private(set) var livePopover: NSPopover?
 
         init(model: TransferModel) { self.model = model }
 
         func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-            [.toggleSidebar, .sidebarTrackingSeparator, ChromeItem.backForward, .flexibleSpace, ChromeItem.viewMode, ChromeItem.transfers,
+            [.toggleSidebar, .sidebarTrackingSeparator, ChromeItem.backForward, .flexibleSpace, ChromeItem.live, ChromeItem.viewMode, ChromeItem.transfers,
              ChromeItem.inspector, ChromeItem.search]
         }
 
@@ -91,6 +94,26 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 navigationGroup = group
                 enableNavigation(back: model.canGoBack, forward: model.canGoForward)
                 return group
+            case ChromeItem.live:
+                // Shown only while a Live file exists anywhere in the library (`showLiveCount`).
+                let item = NSToolbarItem(itemIdentifier: identifier)
+                let badge = LiveBadgeView()
+                badge.target = self
+                badge.action = #selector(showLiveFiles(_:))
+                item.view = badge
+                item.label = "Live"
+                item.toolTip = LiveBadge.help
+                item.visibilityPriority = .high
+                badge.count = model.libraryLive.count
+                item.isHidden = badge.count == 0
+                // Only the item in this window's toolbar follows the count, not one AppKit asks
+                // for elsewhere.
+                if flag {
+                    liveItem = item
+                    liveBadge = badge
+                    followLiveCount()
+                }
+                return item
             case ChromeItem.viewMode:
                 let group = makeGroup(identifier, "View", symbols: ["square.grid.2x2", "list.bullet", "rectangle.split.3x1"],
                                       labels: ["Icons", "List", "Columns"], mode: .selectOne, action: #selector(changeViewMode(_:)))
@@ -171,6 +194,40 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             if items[1].isEnabled != forward { items[1].isEnabled = forward }
         }
 
+        /// The badge observes the library's Live files itself, as the hosted columns observe the
+        /// model, so it never waits for the chrome to be updated.
+        private func followLiveCount() {
+            let count = withObservationTracking { model.libraryLive.count } onChange: { [weak self] in
+                Task { @MainActor in self?.followLiveCount() }
+            }
+            showLiveCount(count)
+        }
+
+        /// The badge reads "Live", or "Live 4" for several, and hides with its list at zero.
+        func showLiveCount(_ count: Int) {
+            liveBadge?.count = count
+            if let liveItem, liveItem.isHidden != (count == 0) { liveItem.isHidden = count == 0 }
+            if count == 0, livePopover?.isShown == true { livePopover?.performClose(nil) }
+        }
+
+        /// The badge's click: the list of every Live file, under the badge; a second click closes it.
+        @objc func showLiveFiles(_ sender: Any?) {
+            guard let badge = liveBadge else { return }
+            if let shown = livePopover, shown.isShown {
+                shown.performClose(nil)
+                return
+            }
+            let popover = NSPopover()
+            popover.behavior = .transient
+            let content = NSHostingController(rootView: LiveFilesList(model: model))
+            content.sizingOptions = .preferredContentSize
+            popover.contentViewController = content
+            livePopover = popover
+            Task { await model.reloadLibraryLive() }
+            guard badge.window != nil else { return }
+            popover.show(relativeTo: badge.bounds, of: badge, preferredEdge: .minY)
+        }
+
         private func index(of mode: ViewMode) -> Int {
             ViewMode.allCases.firstIndex(of: mode) ?? 0
         }
@@ -240,6 +297,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
 enum ChromeItem {
     static let backForward = NSToolbarItem.Identifier("transfer.backForward")
     static let viewMode = NSToolbarItem.Identifier("transfer.viewMode")
+    static let live = NSToolbarItem.Identifier("transfer.live")
     static let transfers = NSToolbarItem.Identifier("transfer.transfers")
     static let inspector = NSToolbarItem.Identifier("transfer.inspector")
     static let search = NSToolbarItem.Identifier("transfer.search")

@@ -176,16 +176,17 @@ class DropTargetView: NSView {
 /// One icon-grid cell, hosting its AppKit view.
 struct FilePromiseLabel: NSViewRepresentable {
     var item: RemoteItem
+    var mark: LiveMark?
     var model: TransferModel
 
     func makeNSView(context: Context) -> IconItemView {
         let view = IconItemView()
-        view.apply(item: item, model: model)
+        view.apply(item: item, mark: mark, model: model)
         return view
     }
 
     func updateNSView(_ view: IconItemView, context: Context) {
-        view.apply(item: item, model: model)
+        view.apply(item: item, mark: mark, model: model)
     }
 }
 
@@ -203,6 +204,10 @@ final class IconItemView: DropTargetView, NSDraggingSource {
     private var narrowsOnUp = false
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
+    /// The Live marker at the glyph's lower right.
+    private let markView = LiveMarkView()
+    static let markSize: CGFloat = 14
+    var liveMark: LiveMark? { markView.mark }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -224,7 +229,13 @@ final class IconItemView: DropTargetView, NSDraggingSource {
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(icon)
         addSubview(label)
+        markView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(markView)
         NSLayoutConstraint.activate([
+            markView.widthAnchor.constraint(equalToConstant: Self.markSize),
+            markView.heightAnchor.constraint(equalToConstant: Self.markSize),
+            markView.trailingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 1),
+            markView.bottomAnchor.constraint(equalTo: icon.bottomAnchor, constant: 1),
             icon.topAnchor.constraint(equalTo: topAnchor, constant: Self.inset),
             icon.centerXAnchor.constraint(equalTo: centerXAnchor),
             icon.widthAnchor.constraint(equalToConstant: 48),
@@ -238,11 +249,12 @@ final class IconItemView: DropTargetView, NSDraggingSource {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func apply(item: RemoteItem, model: TransferModel) {
+    func apply(item: RemoteItem, mark: LiveMark? = nil, model: TransferModel) {
         self.item = item
         self.model = model
         icon.image = ItemIcon.image(for: item)
         label.stringValue = item.name
+        markView.mark = mark
     }
 
     override var dropFolder: RemotePath? { item.kind == .directory ? item.path : super.dropFolder }

@@ -93,8 +93,7 @@ struct SidebarColumn: View {
                             if live.paused {
                                 Button("Resume Syncing") { Task { await model.resumeLive(live.path) } }
                             }
-                            Button("Discard Live File") { Task { await model.discardLive(live.path) } }
-                                .disabled(live.uploading)
+                            Button(TransferModel.stopLiveTitle([live])) { Task { await model.stopLive([live.id]) } }
                             Button("Forget Synced Live Files") { Task { await model.forgetSyncedLive() } }
                                 .disabled(!model.liveFiles.contains(where: \.isSynced))
                         }
@@ -223,13 +222,24 @@ struct DetailColumn: View {
             } actions: {
                 Button("Remove") { Task { await model.removeServer(connection) } }
             }
-        case .discardLive(let path, let server):
-            SheetForm(title: "Discard unsynced edits to “\(path.name)”?", detail: "The working copy has changes that were not uploaded.", width: 420, onCancel: { model.sheet = nil }) {
-                EmptyView()
+        case .stopLive(let batch, let unsynced):
+            // Cancel is the default button: stopping discards these edits for good.
+            SheetForm(title: "Stop Live editing?", detail: StopLiveSheet.detail(unsynced.count), width: 440, onCancel: { model.sheet = nil }) {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(unsynced.prefix(StopLiveSheet.namesShown)) { file in
+                        Text("“\(file.file.path.name)” on \(file.server)")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(file.file.path.display)
+                    }
+                    if unsynced.count > StopLiveSheet.namesShown {
+                        Text("and \(unsynced.count - StopLiveSheet.namesShown) more").foregroundStyle(.secondary)
+                    }
+                }
             } actions: {
-                Button("Discard") {
+                Button("Stop and Discard Edits") {
                     model.sheet = nil
-                    Task { await model.discardLive(path, force: true, on: server) }
+                    Task { await model.stopLive(batch, warned: Set(unsynced.map(\.id))) }
                 }
             }
         }
@@ -343,7 +353,7 @@ private struct IconGrid: View {
                 // still and only the column count steps, as in Finder's icon view.
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 108, maximum: 108), spacing: 16)], alignment: .leading, spacing: 16) {
                     ForEach(model.displayedItems) { item in
-                        FilePromiseLabel(item: item, model: model)
+                        FilePromiseLabel(item: item, mark: model.liveMark(for: item.path), model: model)
                             .frame(width: IconItemView.size.width, height: IconItemView.size.height)
                             .background(model.snapshot.selection.contains(item.path) ? Color.accentColor.opacity(0.2) : Color.clear)
                             .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -745,10 +755,15 @@ struct InspectorColumn: View {
                     Image(systemName: "arrow.turn.up.right").accessibilityLabel("Alias")
                 }
                 if let live {
-                    Circle()
-                        .fill(live.status == .conflict ? Color.red : Color.orange)
-                        .frame(width: 7, height: 7)
-                        .accessibilityLabel(live.label)
+                    // Live stops the file; Conflict opens its sheet.
+                    Button { Task { await model.liveCapsuleClicked(live) } } label: {
+                        LiveCapsule(text: live.conflict ? "Conflict" : "Live")
+                    }
+                    .buttonStyle(.plain)
+                    .help(live.conflict ? "Resolve the conflict" : "Stop editing Live")
+                    .accessibilityLabel(live.conflict ? "Resolve Conflict" : "Stop Live Editing")
+                    .accessibilityValue(live.label)
+                    .slot("live capsule", slots)
                 }
                 if transfer != nil {
                     Image(systemName: "arrow.up.arrow.down").accessibilityLabel("Transferring")
@@ -1083,12 +1098,14 @@ enum DetailSlots {
 extension EnvironmentValues {
     @Entry var inspectorSlots: InspectorSlots?
     @Entry var detailSlots: InspectorSlots?
+    /// The same for the toolbar's Live list (`LiveFilesList.space`).
+    @Entry var liveListSlots: InspectorSlots?
     /// A clip for the clipboard bar to show instead of the clipboard's, so the tests that measure
     /// the bars never write the Mac's pasteboard. Nil, as in the app, shows the clipboard's.
     @Entry var shownClip: Clipboard.Clip?
 }
 
-private extension View {
+extension View {
     func slot(_ key: String, _ slots: InspectorSlots?, in space: String = InspectorSlots.space) -> some View {
         onGeometryChange(for: CGRect.self) { $0.frame(in: .named(space)) } action: { slots?.frames[key] = $0 }
     }

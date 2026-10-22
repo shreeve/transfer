@@ -334,3 +334,13 @@ private func present(size: UInt64 = 10, at date: Date = t0, digest: String? = ni
     #expect(file(nil).status == .synced)
     #expect(file(.changed).isSynced)
 }
+
+/// Stop Live Editing stops a synced batch at once; a batch holding edits nobody was warned
+/// about stops nothing and names every unsynced file, so Cancel keeps them all.
+@Test func stoppingAsksBeforeAnyUnwarnedEditIsLost() {
+    #expect(LiveDecision.stopPlan(unsynced: [Int](), warned: []) == .stop)
+    #expect(LiveDecision.stopPlan(unsynced: [1], warned: []) == .ask([1]))
+    #expect(LiveDecision.stopPlan(unsynced: [1, 2], warned: [1]) == .ask([1, 2]))
+    #expect(LiveDecision.stopPlan(unsynced: [1, 2], warned: [1, 2, 3]) == .stop)
+}
+

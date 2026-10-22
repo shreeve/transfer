@@ -35,17 +35,19 @@ struct SheetTests {
         #expect(!reply.saveInKeychain)
     }
 
-    /// UIM2-04: a second Discard sheet waits for the first instead of replacing it.
-    @Test func eachRefusedDiscardAsksInTurn() async {
+    /// UIM2-04: a second Stop Live Editing sheet waits for the first instead of replacing it.
+    @Test func eachRefusedStopAsksInTurn() async {
         let session = FakeSession(a)
-        session.refusesDiscard.value = true
+        let one = LiveFile(id: LiveFileID(), path: RemotePath(string: "/home/one.txt"), dirty: true, paused: false, conflict: false, uploading: false)
+        let two = LiveFile(id: LiveFileID(), path: RemotePath(string: "/home/two.txt"), dirty: true, paused: false, conflict: false, uploading: false)
+        session.live.value = [one, two]
         let model = TransferModel(provider: FakeProvider([session]))
         await model.connect(a)
-        let one = RemotePath(string: "/home/one.txt"), two = RemotePath(string: "/home/two.txt")
-        await model.discardLive(one)
-        await model.discardLive(two)
-        #expect(model.sheet?.id == AppSheet.discardLive(one, a.id).id)
+        await model.stopLive([one.id])
+        await model.stopLive([two.id])
+        #expect(model.sheet?.id == "stop-\(one.id.rawValue.uuidString)")
         model.sheet = nil
-        #expect(model.sheet?.id == AppSheet.discardLive(two, a.id).id)
+        #expect(model.sheet?.id == "stop-\(two.id.rawValue.uuidString)")
+        #expect(!session.calls.value.contains { $0.hasPrefix("stop ") })
     }
 }

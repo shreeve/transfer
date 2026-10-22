@@ -146,6 +146,46 @@ final class FakeProvider: SessionProvider, @unchecked Sendable {
     func setEditableExtensions(_ extensions: [String]) async throws { self.extensions.value = extensions }
     func transfer(_ request: TransferRequest, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {}
     func clearPreviewCache() async {}
+
+    // Live files across the library: every session's `live`, in library order.
+    private let observers = Locked<[AsyncStream<Void>.Continuation]>([])
+
+    /// Tells every window's Live badge that some session's `live` changed.
+    func liveDidChange() {
+        for observer in observers.value { observer.yield() }
+    }
+
+    func libraryLiveFiles() async -> [LibraryLiveFile] { libraryLive() }
+
+    private func libraryLive() -> [LibraryLiveFile] {
+        let sessions = sessions.value
+        return saved.value.flatMap { connection in
+            (sessions[connection.id]?.live.value ?? []).map { LibraryLiveFile(connection: connection.id, server: connection.displayName, file: $0) }
+        }
+    }
+
+    func liveChanges() async -> AsyncStream<Void> {
+        let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        observers.withLock { $0.append(continuation) }
+        return stream
+    }
+
+    /// As the hub: the batch's unsynced files come back, and nothing stops, unless all were warned.
+    func stopLive(_ files: [LiveFileID], warned: Set<LiveFileID>) async -> [LibraryLiveFile] {
+        let all = libraryLive()
+        let batch = all.filter { files.contains($0.id) }
+        let unsynced = batch.filter { !$0.file.isSynced }.map(\.id)
+        if case .ask(let names) = LiveDecision.stopPlan(unsynced: unsynced, warned: warned) {
+            return all.filter { names.contains($0.id) }
+        }
+        for file in batch {
+            guard let session = sessions.value[file.connection] else { continue }
+            session.live.withLock { $0.removeAll { $0.id == file.id } }
+            session.record("stop \(file.file.path.display)")
+        }
+        liveDidChange()
+        return []
+    }
 }
 
 func files(_ count: Int, in folder: String) -> [RemotePath: [RemoteItem]] {
