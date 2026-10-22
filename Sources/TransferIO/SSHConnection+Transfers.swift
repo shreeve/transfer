@@ -87,8 +87,6 @@ extension SSHConnection {
                 try await placeDown(item, named: destination.lastPathComponent, in: folder, link: link, batch: batch, group: &group, tally: tally)
                 if let batch {
                     let rest = batch.drain()
-                    // No batch went: the rest goes over SFTP, on every channel.
-                    if !rest.stream { releaseTarPlaces(batch.feeds) }
                     if !rest.jobs.isEmpty {
                         if tally.addingJob() { _ = try await group.next() }
                         group.addTask { try await self.receiveBatch(rest.jobs, in: rest.stream ? batch.feeds : nil, tally: tally) }
@@ -334,7 +332,7 @@ extension SSHConnection {
         in folder: URL,
         taken: Bool = false,
         link: SFTPChannel,
-        listed: Task<[RemoteItem], Error>? = nil,
+        listed: [RemoteItem]? = nil,
         batch: TarBatcher? = nil,
         group: inout ThrowingTaskGroup<Void, Error>,
         tally: CopyTally
@@ -351,6 +349,16 @@ extension SSHConnection {
             var used: Set<String> = []
             // Folders wait until the rest of the listing is placed, so they can be listed ahead.
             var folders: [(item: RemoteItem, taken: Bool)] = []
+            // In a download that may stream, how many small files a folder holds decides whether
+            // they stream (`TarBatchFill`). A folder listed ahead is counted before its first file
+            // is placed; one listed as it is walked sends its first `sftpFirst` over SFTP as names
+            // arrive, and the rest wait for the end of its listing. Everything else is placed as
+            // names arrive.
+            let streams = batch != nil && !tarMissing
+            if streams, let listed, let batch { beginTar(batch, small: Self.smallFiles(listed)) }
+            if streams, batch?.streaming == true { await Task.yield() }
+            var unheld = streams && listed == nil && batch?.streaming != true ? TarBatching.sftpFirst : Int.max
+            var small: [(item: RemoteItem, taken: Bool)] = []
             let children: AsyncThrowingStream<RemoteItem, Error> = if let listed { Self.stream(listed) } else { await link.list(item.path) }
             for try await child in children {
                 try Task.checkCancellation()
@@ -359,6 +367,26 @@ extension SSHConnection {
                     folders.append((child, taken))
                     continue
                 }
+                if streams, listed == nil, Self.isSmallFile(child) {
+                    if unheld > 0 {
+                        unheld -= 1
+                    } else {
+                        small.append((child, taken))
+                        continue
+                    }
+                }
+                do {
+                    try await placeDown(child, named: child.name, in: local.url, taken: taken, link: link, batch: batch, group: &group, tally: tally)
+                } catch {
+                    try tally.failed(child.name, error)
+                }
+            }
+            if !small.isEmpty, let batch {
+                beginTar(batch, small: small.count)
+                if batch.streaming { await Task.yield() }
+            }
+            for (child, taken) in small {
+                try Task.checkCancellation()
                 do {
                     try await placeDown(child, named: child.name, in: local.url, taken: taken, link: link, batch: batch, group: &group, tally: tally)
                 } catch {
@@ -373,16 +401,20 @@ extension SSHConnection {
             for (index, folder) in folders.enumerated() {
                 while ahead.count < min(folders.count, index + Self.walkWidth) {
                     let path = folders[ahead.count].item.path
+                    let tarMissing = tarMissing
                     ahead.append(Task { [listings] in
                         await listings.enter()
                         defer { listings.leave() }
                         var items: [RemoteItem] = []
                         for try await child in await link.list(path) { items.append(child) }
+                        if !tarMissing { batch?.foresee(Self.smallFiles(items)) }
                         return items
                     })
                 }
                 do {
-                    try await placeDown(folder.item, named: folder.item.name, in: local.url, taken: folder.taken, link: link, listed: ahead[index], batch: batch, group: &group, tally: tally)
+                    let listed = try await ahead[index].value
+                    if !tarMissing { batch?.consume(Self.smallFiles(listed)) }
+                    try await placeDown(folder.item, named: folder.item.name, in: local.url, taken: folder.taken, link: link, listed: listed, batch: batch, group: &group, tally: tally)
                 } catch {
                     try tally.failed(folder.item.name, error)
                 }
@@ -397,8 +429,6 @@ extension SSHConnection {
             guard let placed = try await settleLocally(.file(Fingerprint(item: item)), named: name, in: folder, taken: taken) else {
                 return tally.finished()
             }
-            // Places for the streams are kept from the first small file (`keepTarPlaces`).
-            if let batch, !tarMissing, TarBatching.takes(size: item.size, mtime: item.mtime) { keepTarPlaces(batch.feeds) }
             if let batch, !tarMissing, TarBatching.takes(size: item.size, mtime: item.mtime),
                let full = batch.add(TarJob(item: item, destination: placed.url, replacing: placed.found != nil)) {
                 guard !full.isEmpty else { return }
@@ -420,19 +450,32 @@ extension SSHConnection {
         }
     }
 
-    /// A listing read ahead, as the stream `SFTPChannel.list` gives one.
-    private static func stream(_ listed: Task<[RemoteItem], Error>) -> AsyncThrowingStream<RemoteItem, Error> {
+    /// A listing already in, as the stream `SFTPChannel.list` gives one.
+    private static func stream(_ listed: [RemoteItem]) -> AsyncThrowingStream<RemoteItem, Error> {
         AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    for item in try await listed.value { continuation.yield(item) }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
+            for item in listed { continuation.yield(item) }
+            continuation.finish()
         }
+    }
+
+    /// A folder of `small` small files is about to be placed: when that makes the download one to
+    /// stream, the streams' places are kept and the streams start. Listings read ahead are often
+    /// in by then, so the walk would hold this actor to its end: it yields to the streams' starts,
+    /// queued on it.
+    private func beginTar(_ batch: TarBatcher, small: Int) {
+        guard batch.begin(small) else { return }
+        keepTarPlaces(batch.feeds)
+        batch.feeds.start()
+    }
+
+    /// Whether a tar batch may take `item`.
+    private static func isSmallFile(_ item: RemoteItem) -> Bool {
+        item.kind == .file && TarBatching.takes(size: item.size, mtime: item.mtime)
+    }
+
+    /// The files of `items` a tar batch may take.
+    private static func smallFiles(_ items: [RemoteItem]) -> Int {
+        items.count(where: isSmallFile)
     }
 
     /// Where `incoming` lands as `name` in `folder`, and what holds that spot now; nil to skip it.

@@ -229,10 +229,16 @@ public enum TarBatching {
     /// Streams at once, each a session on the master in place of a data channel. Six were no
     /// faster than four.
     public static let streams = 4
-    /// A download's first small files go over SFTP at once, three data channels' worth (16
-    /// each), before any batch: a download of fewer than `sftpFirst + batchFiles` small files
-    /// never starts a stream, whose start costs more round trips than SFTP takes for them.
-    public static let sftpFirst = 48
+    /// A download streams only once this many small files are to come: below it, a stream's start
+    /// costs about what SFTP takes for them. At 150 a stream was never slower in the bench (one
+    /// folder of 150 at 20 ms: 191 ms streamed, 200 over SFTP; at 80 ms, 610 and 689) and below it
+    /// no stream starts.
+    public static let minimumFiles = 150
+    /// A folder listed as it is walked, not read ahead, sends this many small files over SFTP as
+    /// their names arrive, one round of the data pool (seven channels of 16), before the rest
+    /// waits for the listing's end to be counted: holding a flat folder of 100 cost 5 to 7 ms at
+    /// 20 ms, and with 112 sent at once a folder of 150 or fewer took what SFTP alone takes.
+    public static let sftpFirst = 112
 
     /// Whether a file of the listing may go in a batch: its size and time are known, since the
     /// stream's entry is checked against both, and it is small.
@@ -242,9 +248,12 @@ public enum TarBatching {
     }
 }
 
-/// One folder download's small files as the walk settles them: the first `sftpFirst` over SFTP,
-/// the rest held until a batch is full. Files left at the walk's end go in a stream only when a
-/// batch went before them; otherwise SFTP takes them as fast.
+/// One folder download's small files as the walk settles them. A folder's files are placed once
+/// its whole listing is in, so the download knows how many small files are still to come: that
+/// folder's, and those of the folders listed ahead of it (`foresee`, `consume`). It streams once
+/// they reach `minimumFiles`, and from then on: its small files are held until a batch is full,
+/// and files held at the walk's end go in a stream too. Until then each goes over SFTP at once,
+/// held for nothing, so a download too small to gain never waits for a stream to start.
 public struct TarBatchFill: Sendable {
     public enum Step: Equatable, Sendable {
         /// Over SFTP now.
@@ -255,24 +264,41 @@ public struct TarBatchFill: Sendable {
         case full
     }
 
-    private var small = 0
+    /// Small files in folders listed ahead and not yet begun.
+    private var pending = 0
     private var held = 0
     private var bytes: UInt64 = 0
-    public private(set) var sent = false
+    /// Enough small files were to come: they go in batches.
+    public private(set) var streaming = false
 
     public init() {}
 
+    /// A folder listed ahead holds `count` small files.
+    public mutating func foresee(_ count: Int) {
+        pending += count
+    }
+
+    /// The walk reached a folder listed ahead, of `count` small files: they are its own now.
+    public mutating func consume(_ count: Int) {
+        pending = max(pending - count, 0)
+    }
+
+    /// A folder of `count` small files is about to be placed. True when the download now streams:
+    /// the streams should start.
+    public mutating func begin(_ count: Int) -> Bool {
+        guard !streaming, count + pending >= TarBatching.minimumFiles else { return false }
+        streaming = true
+        return true
+    }
+
     /// A small file of `size` bytes, settled.
     public mutating func add(size: UInt64) -> Step {
-        small += 1
-        if small <= TarBatching.sftpFirst { return .sftp }
+        guard streaming else { return .sftp }
         held += 1
         bytes += size
         guard held >= TarBatching.batchFiles || bytes >= TarBatching.batchBytes else { return .held }
         held = 0
         bytes = 0
-        sent = true
         return .full
     }
-
 }

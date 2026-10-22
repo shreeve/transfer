@@ -172,16 +172,44 @@ private func entry(_ name: String, size: UInt64 = 5, mtime: UInt64? = 1_700_000_
     #expect(plan.next == 3)
 }
 
-@Test func aDownloadsFirstSmallFilesGoOverSFTPThenFillBatches() {
+private func begin(_ fill: inout TarBatchFill, _ count: Int) -> Bool {
+    fill.begin(count)
+}
+
+private func add(_ fill: inout TarBatchFill, _ size: UInt64) -> TarBatchFill.Step {
+    fill.add(size: size)
+}
+
+/// A download too small to gain never streams, and holds nothing: its files go over SFTP as the
+/// walk settles them.
+@Test func aDownloadStreamsOnlyWhenEnoughSmallFilesAreToCome() {
     var fill = TarBatchFill()
-    for _ in 0..<TarBatching.sftpFirst { #expect(fill.add(size: 100) == .sftp) }
-    for _ in 1..<TarBatching.batchFiles { #expect(fill.add(size: 100) == .held) }
-    #expect(!fill.sent)
-    #expect(fill.add(size: 100) == .full)
-    #expect(fill.sent)
+    #expect(!begin(&fill, TarBatching.minimumFiles - 1))
+    #expect(add(&fill, 100) == .sftp)
+    // A folder listed ahead counts with the folder the walk is at.
+    fill.foresee(1)
+    #expect(begin(&fill, TarBatching.minimumFiles - 1))
+    #expect(fill.streaming)
+    #expect(!begin(&fill, TarBatching.minimumFiles))
+    for _ in 1..<TarBatching.batchFiles { #expect(add(&fill, 100) == .held) }
+    #expect(add(&fill, 100) == .full)
     // A batch also closes on its bytes.
-    #expect(fill.add(size: TarBatching.batchBytes - 1) == .held)
-    #expect(fill.add(size: 1) == .full)
+    #expect(add(&fill, TarBatching.batchBytes - 1) == .held)
+    #expect(add(&fill, 1) == .full)
+}
+
+/// What a folder listed ahead holds counts only until the walk reaches it; then it is that
+/// folder's own, counted once.
+@Test func aFolderListedAheadIsCountedOnce() {
+    var fill = TarBatchFill()
+    fill.foresee(100)
+    fill.foresee(100)
+    fill.consume(100)
+    #expect(!begin(&fill, TarBatching.minimumFiles - 101))
+    #expect(begin(&fill, TarBatching.minimumFiles - 100))
+    var drained = TarBatchFill()
+    drained.consume(5)
+    #expect(!begin(&drained, TarBatching.minimumFiles - 1))
 }
 
 @Test func onlySmallFilesOfAKnownSizeAndTimeAreBatched() {

@@ -592,6 +592,25 @@ final class TarBatcher: Sendable {
         feeds = TarFeeds(session)
     }
 
+    /// A folder listed ahead holds `count` small files.
+    func foresee(_ count: Int) {
+        state.withLock { $0.fill.foresee(count) }
+    }
+
+    /// The walk reached a folder listed ahead, of `count` small files.
+    func consume(_ count: Int) {
+        state.withLock { $0.fill.consume(count) }
+    }
+
+    /// The download streams its small files.
+    var streaming: Bool { state.value.fill.streaming }
+
+    /// A folder of `count` small files is about to be placed. True when that makes the download
+    /// one to stream: the caller keeps the places and starts the streams.
+    func begin(_ count: Int) -> Bool {
+        state.withLock { $0.fill.begin(count) }
+    }
+
     /// What to do with `job`: nil to fetch it over SFTP now, an empty batch while it is held,
     /// else the batch it closed, for the caller to `submit` (`expect` is done).
     func add(_ job: SSHConnection.TarJob) -> Jobs? {
@@ -611,12 +630,11 @@ final class TarBatcher: Sendable {
         return batch
     }
 
-    /// What is held once the walk ends, and whether it goes in a stream (`expect` is done): only
-    /// when a batch went.
+    /// What is held once the walk ends, and whether it goes in a stream (`expect` is done).
     func drain() -> (jobs: Jobs, stream: Bool) {
         let rest = state.withLock { state in
             defer { state.jobs = [] }
-            return (jobs: state.jobs, stream: state.fill.sent)
+            return (jobs: state.jobs, stream: state.fill.streaming)
         }
         if rest.stream, !rest.jobs.isEmpty { feeds.expect() }
         return rest

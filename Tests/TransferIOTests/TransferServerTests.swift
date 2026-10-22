@@ -556,8 +556,8 @@ private func quarantined(_ url: URL) -> Bool {
 /// the stream does not deliver whole and unchanged goes over SFTP: whatever the server's tar
 /// sends, the download lands the server's bytes or nothing, and leaves no temp behind.
 extension TransferServerTests {
-    /// More small files than the first SFTP ones and one batch, in two folders.
-    private func smallTree(_ h: ServerHarness, files: Int = 200) throws -> RemotePath {
+    /// Two folders of small files, each enough alone for a download to stream.
+    private func smallTree(_ h: ServerHarness, files: Int = 2 * TarBatching.minimumFiles) throws -> RemotePath {
         let tree = h.remote.appendingPathComponent("tree")
         for index in 0..<files {
             let folder = tree.appendingPathComponent("f\(index % 2)")
@@ -609,7 +609,9 @@ extension TransferServerTests {
         list() { printf '%s\\n' "$names" | tr '\\n' '\\000'; }
         case "$1" in
         garbled) head -c 200000 /dev/urandom ;;
-        renamed) list | COPYFILE_DISABLE=1 tar -cf - --no-recursion --null -T - -s ',^,elsewhere/,' ;;
+        renamed)
+            if tar --version 2>/dev/null | grep -q GNU; then rename="--transform=s,^,elsewhere/,"; else rename="-s,^,elsewhere/,"; fi
+            list | COPYFILE_DISABLE=1 tar -cf - --no-recursion --null -T - "$rename" ;;
         short) list | COPYFILE_DISABLE=1 tar -cf - --no-recursion --null -T - | head -c 30000 ;;
         slow) sleep 10 ;;
         esac
@@ -624,15 +626,33 @@ extension TransferServerTests {
             let local = h.staging.appendingPathComponent("tree")
             try await h.session.download(tree, to: local) { _ in }
             try expectSame(h.remote.appendingPathComponent("tree"), local)
-            // All but the first SFTP files came down a stream, quarantined as any download is.
-            #expect(await h.session.tarLanded == 200 - TarBatching.sftpFirst)
-            #expect(quarantined(local.appendingPathComponent("f0/file-198.txt")))
+            // Files came down a stream, quarantined as any download is.
+            let streamed = await h.session.tarLanded
+            #expect(streamed > 0)
+            #expect(quarantined(local.appendingPathComponent("f0/file-298.txt")))
             await expectNoTemps(h)
 
             // Again into the same folder: the same files are there, so nothing is asked or moved.
             try await h.session.download(tree, to: local) { _ in }
-            #expect(await h.session.tarLanded == 200 - TarBatching.sftpFirst)
+            #expect(await h.session.tarLanded == streamed)
             #expect(h.prompts.collisions == 0)
+        }
+    }
+
+    /// Paths past ustar's 100 bytes: GNU tar sends them as long-name entries, bsdtar in pax headers.
+    @Test func longNamesComeDownInTarStreams() async throws {
+        try await withHarness("tlong", connected: true) { h in
+            let folder = h.remote.appendingPathComponent("tree/" + String(repeating: "deep", count: 30), isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            for index in 0..<150 {
+                try Data("file \(index)".utf8).write(to: folder.appendingPathComponent(String(repeating: "n", count: 180) + "-\(index).txt"))
+            }
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(h.remotePath.appending(name: Array("tree".utf8)), to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            // One folder read ahead, counted before its first file: every file streams.
+            #expect(await h.session.tarLanded == 150)
+            await expectNoTemps(h)
         }
     }
 
@@ -668,7 +688,7 @@ extension TransferServerTests {
             let local = h.staging.appendingPathComponent("tree")
             try await h.session.download(tree, to: local) { _ in }
             try expectSame(h.remote.appendingPathComponent("tree"), local)
-            #expect(await h.session.tarLanded < 200 - TarBatching.sftpFirst)
+            #expect(await h.session.tarLanded < 2 * TarBatching.minimumFiles)
             await expectNoTemps(h)
         }
     }

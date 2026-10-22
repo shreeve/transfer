@@ -57,6 +57,7 @@ public actor SSHConnection: RemoteSession {
     /// answer once known.
     private var tarProbe: (generation: Int, answer: Task<Bool?, Never>)?
     private var tarAnswer: (generation: Int, works: Bool)?
+    private var probedCommand: String? = SSHConnection.tarCommandLine
     /// What a tar stream runs on the server; nil sends every file over SFTP. Tests swap it.
     private(set) var tarCommand: String? = SSHConnection.tarCommandLine
     /// Files a tar stream has landed in this session, for the tests and the bench.
@@ -746,9 +747,9 @@ public actor SSHConnection: RemoteSession {
         dispatch()
     }
 
-    /// Keeps places for `feeds`' streams from a download's first small file, so the channels
-    /// opened for the files before its first batch leave them free and its streams need not wait
-    /// for channels to go idle; let go when the server does not run tar. Once per download.
+    /// Keeps places for `feeds`' streams once a download is known to stream, so the channels
+    /// opened for other files leave them free; let go when the server does not run tar, and when
+    /// the download ends. Once per download.
     func keepTarPlaces(_ feeds: TarFeeds) {
         guard !tarMissing, feeds.markKept() else { return }
         tarKeepers.insert(ObjectIdentifier(feeds))
@@ -792,11 +793,15 @@ public actor SSHConnection: RemoteSession {
             + Self.plainSession + ["--", connection.destination, command]
     }
 
-    /// For tests: what tar streams run on the server, or nil for SFTP only.
+    /// For tests and the bench: what tar streams run on the server, or nil for SFTP only. Turning
+    /// the same command back on keeps what its probe learned.
     func useTarCommand(_ command: String?) {
+        if let command, command != probedCommand {
+            tarProbe = nil
+            tarAnswer = nil
+            probedCommand = command
+        }
         tarCommand = command
-        tarProbe = nil
-        tarAnswer = nil
     }
 
     /// A passenger on the master. The channel itself gives up when the server has not started
