@@ -101,6 +101,10 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 badge.target = self
                 badge.action = #selector(showLiveFiles(_:))
                 item.view = badge
+                // A custom view's item is bordered by default on macOS 26 and later, whatever the
+                // header says, and a bordered item sits in a Liquid Glass bezel. The badge is its
+                // own capsule.
+                item.isBordered = false
                 item.label = "Live"
                 item.toolTip = LiveBadge.help
                 item.visibilityPriority = .high
@@ -203,7 +207,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             showLiveCount(count)
         }
 
-        /// The badge reads "Live", or "Live 4" for several, and hides with its list at zero.
+        /// The badge reads "LIVE", or "LIVE 4" for several, and hides with its list at zero.
         func showLiveCount(_ count: Int) {
             liveBadge?.count = count
             if let liveItem, liveItem.isHidden != (count == 0) { liveItem.isHidden = count == 0 }

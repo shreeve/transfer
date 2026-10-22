@@ -762,7 +762,7 @@ struct InspectorColumn: View {
                 if let live {
                     // Live stops the file; Conflict opens its sheet.
                     Button { Task { await model.liveCapsuleClicked(live) } } label: {
-                        LiveCapsule(text: live.conflict ? "Conflict" : "Live")
+                        LiveCapsule(text: LiveCapsule.title(conflict: live.conflict))
                     }
                     .buttonStyle(.plain)
                     .help(live.conflict ? "Resolve the conflict" : "Stop editing Live")
