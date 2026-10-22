@@ -2,17 +2,22 @@ import Foundation
 import Testing
 @testable import TransferCore
 
-/// An inspector saved open at width 0, by a window closed mid-collapse, is saved again as
-/// collapsed at its minimum; a sound or unknown save is left alone.
-@Test func splitFramesHealAnInspectorSavedMidCollapse() {
+/// The saved inspector column is rewritten to the preference's state before the split reads it.
+@Test func splitFramesAlignToThePreference() {
     let sidebar = "0.000000, 0.000000, 150.000000, 640.000000, NO, NO"
-    let content = "150.000000, 0.000000, 810.000000, 640.000000, NO, NO"
-    let caught = [sidebar, content, "960.000000, 0.000000, 0.000000, 640.000000, NO, NO"]
-    #expect(SplitFrames.healed(caught, inspectorMinimum: 240) == [sidebar, content, "960.000000, 0.000000, 240.000000, 640.000000, YES, NO"])
-    #expect(SplitFrames.healed([sidebar, content, "960.000000, 0.000000, 240.000000, 640.000000, YES, NO"], inspectorMinimum: 240) == nil)
-    #expect(SplitFrames.healed([sidebar, content, "710.000000, 0.000000, 250.000000, 640.000000, NO, NO"], inspectorMinimum: 240) == nil)
-    #expect(SplitFrames.healed([sidebar, content], inspectorMinimum: 240) == nil)
-    #expect(SplitFrames.healed([sidebar, content, "960, 0, 0"], inspectorMinimum: 240) == nil)
+    let content = "150.000000, 0.000000, 410.000000, 640.000000, NO, NO"
+    let open = [sidebar, content, "560.000000, 0.000000, 400.000000, 640.000000, NO, NO"]
+    let closed = [sidebar, content, "560.000000, 0.000000, 400.000000, 640.000000, YES, NO"]
+    #expect(SplitFrames.aligned(open, inspectorShown: true, inspectorMinimum: 240) == nil)
+    #expect(SplitFrames.aligned(open, inspectorShown: false, inspectorMinimum: 240) == closed)
+    #expect(SplitFrames.aligned(closed, inspectorShown: false, inspectorMinimum: 240) == nil)
+    #expect(SplitFrames.aligned(closed, inspectorShown: true, inspectorMinimum: 240) == open)
+    let zero = [sidebar, content, "960.000000, 0.000000, 0.000000, 640.000000, NO, NO"]
+    // Saved open at width 0 by a window closed mid-collapse.
+    #expect(SplitFrames.aligned(zero, inspectorShown: true, inspectorMinimum: 240)?[2] == "960.000000, 0.000000, 240.000000, 640.000000, NO, NO")
+    #expect(SplitFrames.aligned(zero, inspectorShown: false, inspectorMinimum: 240)?[2] == "960.000000, 0.000000, 240.000000, 640.000000, YES, NO")
+    #expect(SplitFrames.aligned([sidebar, content], inspectorShown: true, inspectorMinimum: 240) == nil)
+    #expect(SplitFrames.aligned([sidebar, content, "960, 0, 0"], inspectorShown: true, inspectorMinimum: 240) == nil)
 }
 
 @Test func columnTrailSelectsTheWayDownToASelectedFolder() {
