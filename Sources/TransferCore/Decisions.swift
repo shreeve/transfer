@@ -20,10 +20,37 @@ public struct TransferConfig: Codable, Equatable, Sendable {
         Set(editableExtensions.map { $0.lowercased() })
     }
 
-    public static let builtIn = TransferConfig(editableExtensions: [
+    /// The list before 2.0.0, as every library's `config.json` began.
+    static let releasedBuiltIn = [
         "rip", "txt", "json", "ts", "rs", "c", "md", "swift", "py",
         "js", "jsx", "tsx", "html", "css", "yaml", "yml", "toml", "sh",
-    ])
+    ]
+
+    /// What 2.0.0 added: source and config files macOS gives no text type unless an app declares
+    /// one (`.zig`, `.kt`, `.env`, `Makefile` stay dynamic types even with Syntax Highlight
+    /// installed), or a type that is neither plain text nor source code (`.ini`, `.ex`), so they
+    /// showed only an icon and opened View. A name with no dot (`makefile`) matches whole. Left
+    /// out on purpose: `mts`, which the Mac reads as AVCHD video (as it reads `ts`, kept from the
+    /// first list, as an MPEG-2 transport stream), and `lock` and `mod`, which are not always
+    /// text. A library's own list receives these once (`Store` schema 4, `adding`).
+    public static let addedIn2: [String] = [
+        "zig", "go", "rb", "java", "kt", "kts", "lua", "sql", "ini", "conf", "cfg", "env",
+        "cpp", "cc", "cxx", "hpp", "hh", "h", "m", "mm", "cs", "php", "pl", "pm", "r", "scala",
+        "ex", "exs", "erl", "hrl", "hs", "ml", "mli", "nim", "v", "dart", "gradle", "cmake", "mk",
+        "vue", "svelte", "graphql", "tf", "hcl",
+        "makefile", "dockerfile", "gemfile", "rakefile", "justfile",
+        "gitignore", "gitattributes", "dockerignore", "editorconfig",
+    ]
+
+    public static let builtIn = TransferConfig(editableExtensions: releasedBuiltIn + addedIn2)
+
+    /// This list with each of `entries` it lacks (compared ignoring case) appended in order. The
+    /// list's own entries keep their order and none is removed, so a user's choices stand.
+    public func adding(_ entries: [String]) -> TransferConfig {
+        var present = extensionSet
+        let missing = entries.filter { present.insert($0.lowercased()).inserted }
+        return TransferConfig(editableExtensions: editableExtensions + missing)
+    }
 }
 
 public enum EditableFile {
@@ -41,6 +68,14 @@ public enum EditableFile {
         return .view
     }
 
+    /// The type the Mac declares for the name's extension; nil when it has none, a dynamic type
+    /// (no app declared it), or no extension at all ("README", "notes.").
+    public static func declaredType(fileName: String) -> UTType? {
+        guard let dot = fileName.lastIndex(of: "."), case let ext = fileName[fileName.index(after: dot)...], !ext.isEmpty,
+              let type = UTType(filenameExtension: String(ext)), !type.isDynamic else { return nil }
+        return type
+    }
+
     /// Whether a Live working copy is quarantined, as every other download is. A Terminal script
     /// (`.command`, `.tool`) is not: Gatekeeper refuses to open a quarantined one in any app, an
     /// editor too, so it could never be edited Live. The copy is 0600, so nothing runs it.
@@ -56,7 +91,11 @@ public enum EditableFile {
 public enum InspectorPreviewPlan: Equatable, Sendable {
     /// The first `EditableFile.previewHead` bytes as text, whatever the file's size.
     case text
-    /// The whole file, decoded as a picture.
+    /// A file of a type the Mac does not know: its first `EditableFile.previewHead` bytes, shown
+    /// as text when `TextHead.text` reads them as text, else the icon. Only the preview looks at
+    /// the bytes; whether a file opens Live goes by its name alone.
+    case textIfText
+    /// The whole file, as a picture.
     case picture
     /// The whole file, through Quick Look.
     case quickLook
@@ -67,23 +106,55 @@ public enum InspectorPreviewPlan: Equatable, Sendable {
     /// a size could be read without end, so it is not previewed.
     public static let limit: UInt64 = 10 << 20
 
-    /// Types Quick Look draws as more than an icon. Anything else (archives, executables, unknown
-    /// extensions) would only show its icon, so it is not fetched.
+    /// Types Quick Look draws as more than an icon with no extension installed. The selected file
+    /// goes to Quick Look whatever its type, since an installed extension may draw it, but a
+    /// neighbor is fetched ahead only when it is one of these: arrowing past archives and
+    /// executables never downloads them.
     private static let quickLookTypes: [UTType] = [
         .pdf, .audiovisualContent, .rtf, .rtfd, .text, .presentation, .spreadsheet, .compositeContent,
         .font, .threeDContent, .usdz, .epub,
     ]
 
+    /// Whether the plan reads only the file's head.
+    public var readsHead: Bool { self == .text || self == .textIfText }
+
     /// `isText` is the Live rule (`EditableFile.openKind`): an editable file shows its head.
-    public static func plan(fileName: String, size: UInt64?, isText: Bool) -> Self {
+    /// `prefetch` is for a neighbor fetched ahead of the selection.
+    public static func plan(fileName: String, size: UInt64?, isText: Bool, prefetch: Bool = false) -> Self {
         if isText { return .text }
+        // A name with no type to go by (README, LICENSE, build.zig) may be text: its head says.
+        guard let type = EditableFile.declaredType(fileName: fileName) else { return .textIfText }
         guard let size, size <= limit else { return .icon }
-        // A name with no dot (README, LICENSE, Makefile) has no type to go by; Quick Look reads
-        // its contents and shows text as text, as it did before the plan existed.
-        guard let dot = fileName.lastIndex(of: ".") else { return .quickLook }
-        guard let type = UTType(filenameExtension: String(fileName[fileName.index(after: dot)...])) else { return .icon }
         if type.conforms(to: .image) { return .picture }
-        return quickLookTypes.contains(where: type.conforms) ? .quickLook : .icon
+        return !prefetch || quickLookTypes.contains(where: type.conforms) ? .quickLook : .icon
+    }
+}
+
+/// Whether the start of a file reads as text, for the preview of a file whose type the Mac does
+/// not know. Never consulted for Live: contents never decide what opens Live.
+public enum TextHead {
+    /// How much is read: `EditableFile.previewHead`, 64 KB.
+    public static let length = EditableFile.previewHead
+
+    /// The first `length` of `bytes` as text: nil when they hold a NUL or are not UTF-8. `whole`
+    /// says `bytes` is the whole file; otherwise (or when there are more than `length`) the head
+    /// may end inside a character, and only that cut character, up to three bytes, is left off.
+    public static func text(_ bytes: Data, whole: Bool) -> String? {
+        let head = bytes.prefix(length)
+        let cut = !whole || bytes.count > length
+        guard !head.contains(0) else { return nil }
+        if let text = String(validating: head, as: UTF8.self) { return text }
+        guard cut else { return nil }
+        // The tail left off must be the start of one character: a lead byte and fewer
+        // continuation bytes than it calls for.
+        for dropped in 1...3 where dropped <= head.count {
+            let tail = head.suffix(dropped)
+            guard let lead = tail.first, tail.dropFirst().allSatisfy({ $0 & 0xC0 == 0x80 }) else { continue }
+            let needs = lead >= 0xF0 && lead <= 0xF4 ? 4 : lead >= 0xE0 && lead <= 0xEF ? 3 : lead >= 0xC2 && lead <= 0xDF ? 2 : 0
+            guard dropped < needs else { continue }
+            return String(validating: head.dropLast(dropped), as: UTF8.self)
+        }
+        return nil
     }
 }
 

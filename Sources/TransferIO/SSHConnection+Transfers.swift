@@ -921,12 +921,13 @@ extension SSHConnection {
     public func prepareInspectorPreview(_ path: RemotePath) async throws -> URL {
         let item = try await stat(path)
         let head = UInt64(EditableFile.previewHead)
-        guard EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live, (item.size ?? .max) > head else {
+        let isText = EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live
+        guard InspectorPreviewPlan.plan(fileName: item.name, size: item.size, isText: isText).readsHead, (item.size ?? .max) > head else {
             guard (item.size ?? .max) <= Self.inspectorLimit else { throw TransferError.failed("“\(item.name)” is too large to preview here") }
             return try await cachedCopy(item, lane: .preview)
         }
-        // Only the head of a text file is shown, so only the head is fetched. The copy is named for
-        // the file's size and time, so an unchanged file reuses it.
+        // Only the head of a text file, or of one whose type is unknown, is shown, so only the head
+        // is fetched. The copy is named for the file's size and time, so an unchanged file reuses it.
         let print = Fingerprint(item: item)
         let file = try previewURL(path, name: item.name, version: "head " + (print.map { "\($0.size):\($0.mtime)" } ?? ""))
         if print != nil, FileManager.default.fileExists(atPath: file.path) { return file }
@@ -961,7 +962,10 @@ extension SSHConnection {
         if QuickLookPlan.plan(kind: item.kind, size: item.size) == .tooLarge {
             throw TransferError.failed(QuickLookPlan.tooLargeMessage(name: item.name))
         }
-        if EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live {
+        // A file of a type the Mac does not know is highlighted too when its head is text;
+        // otherwise it is previewed as itself, like text that turns out not to be UTF-8.
+        let isText = EditableFile.openKind(fileName: item.name, extensions: editableExtensions) == .live
+        if isText || EditableFile.declaredType(fileName: item.name) == nil {
             // The page is named for the file's size and time too, so an unchanged file reuses it.
             let print = Fingerprint(item: item)
             let file = try previewURL(path, name: item.name, suffix: ".html", version: print.map { "\($0.size):\($0.mtime)" } ?? "")
@@ -973,7 +977,8 @@ extension SSHConnection {
             let data = try Data(contentsOf: part)
             // A head cut short may end inside a character: up to three of its bytes are dropped.
             let cut = (item.size ?? .max) > limit ? 3 : 0
-            guard let text = (0...cut).lazy.compactMap({ String(validating: data.dropLast($0), as: UTF8.self) }).first else {
+            guard isText || TextHead.text(data, whole: (item.size ?? .max) <= UInt64(data.count)) != nil,
+                  let text = (0...cut).lazy.compactMap({ String(validating: data.dropLast($0), as: UTF8.self) }).first else {
                 return try await cachedCopy(item, lane: .preview)
             }
             let html = SyntaxPreview.html(text: text)

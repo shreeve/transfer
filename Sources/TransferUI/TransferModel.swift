@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Observation
+import QuickLookThumbnailing
 import QuickLookUI
 import SwiftUI
 import TransferCore
@@ -192,7 +193,7 @@ public final class TransferModel {
             defaults.set(showsPathBar, forKey: Preferences.showsPathBar)
         }
     }
-    /// The primary file's preview, if small: text's first lines, a decoded picture, or a local copy
+    /// The primary file's preview, if small: text's first lines, a picture, or a local copy
     /// for Quick Look. Kept after the selection moves until the next one is ready, for at most
     /// `PreviewTiming.icon`, so moving between files swaps one preview for the next with no gap.
     public var inspectorPreview: InspectorPreview? {
@@ -213,6 +214,9 @@ public final class TransferModel {
     /// the next preview lands, so the view can hold the old one while that preview's view gets
     /// ready, by the same `PreviewTiming.icon` rule.
     @ObservationIgnored public private(set) var inspectorMovedAt = ContinuousClock.now
+    /// The inspector's preview area for a picture, in points, and the screen's scale, as the view
+    /// last laid it out; a picture is drawn at this size.
+    @ObservationIgnored public var inspectorPictureBox = PictureBox()
     public var sidebarCollapsed = false
     public var showsShelf = false
     public var draft = SavedConnection(name: "", host: "")
@@ -1162,6 +1166,7 @@ public final class TransferModel {
             return
         }
         inspectorStaleSince = stale
+        let box = inspectorPictureBox
         let timeline: [(at: ContinuousClock.Instant, step: @MainActor (TransferModel) -> Void)] = [
             (stale + PreviewTiming.icon, { $0.inspectorPreview = nil; $0.inspectorWait = .icon }),
             (now + PreviewTiming.spinner, { $0.inspectorWait = .spinner }),
@@ -1187,7 +1192,7 @@ public final class TransferModel {
                 }
                 if rapid { try? await clock.sleep(now + PreviewTiming.coalesce) }
                 guard !Task.isCancelled else { return }
-                let preview = await Self.fetchPreview(item, session: session)
+                let preview = await Self.fetchPreview(item, session: session, box: box)
                 guard let self, !Task.isCancelled, generation == inspectorGeneration else { return }
                 for task in inspectorTasks { task.cancel() }
                 inspectorPreview = preview
@@ -1198,16 +1203,18 @@ public final class TransferModel {
     }
 
     /// What the inspector can show for a file, from its name and listed size; a text file is one that
-    /// opens Live, and only its head is fetched, so a large one previews too.
-    private static func plan(for file: RemoteItem, session: any RemoteSession) async -> InspectorPreviewPlan {
+    /// opens Live, and only its head is fetched, so a large one previews too. A `prefetch` plan
+    /// fetches only what is likely to show more than an icon.
+    private static func plan(for file: RemoteItem, session: any RemoteSession, prefetch: Bool = false) async -> InspectorPreviewPlan {
         let isText = await session.openKind(fileName: file.name) == .live
-        return InspectorPreviewPlan.plan(fileName: file.name, size: file.size, isText: isText)
+        return InspectorPreviewPlan.plan(fileName: file.name, size: file.size, isText: isText, prefetch: prefetch)
     }
 
-    /// The preview for one file, ready to draw: text, a decoded picture, or the local copy for
-    /// Quick Look. Nil when there is nothing to show but the icon: a file the plan leaves out, a
-    /// text file whose bytes are not text, a failed fetch. The copy is read off the main thread.
-    private static func fetchPreview(_ item: RemoteItem, session: any RemoteSession) async -> InspectorPreview? {
+    /// The preview for one file, ready to draw: text, a picture, or the local copy for Quick Look.
+    /// Nil when there is nothing to show but the icon: a file the plan leaves out, a text file
+    /// whose bytes are not text, a failed fetch. The copy is read off the main thread, and a
+    /// picture is drawn out of process by Quick Look's thumbnailer at `box`'s size.
+    private static func fetchPreview(_ item: RemoteItem, session: any RemoteSession, box: PictureBox) async -> InspectorPreview? {
         do {
             let target = try await Self.resolveLink(item, session: session)
             guard target.kind == .file else { return nil }
@@ -1217,9 +1224,12 @@ public final class TransferModel {
             switch plan {
             case .text:
                 return await Task.detached(priority: .userInitiated) { previewText(url).map(InspectorPreview.text) }.value
+            case .textIfText:
+                let size = target.size
+                return await Task.detached(priority: .userInitiated) { sniffedText(url, size: size).map(InspectorPreview.text) }.value
             case .picture:
-                // A picture ImageIO cannot decode may still be one Quick Look can draw.
-                return await Task.detached(priority: .userInitiated) { decodePicture(url).map(InspectorPreview.picture) }.value ?? .file(url)
+                // A picture the thumbnailer cannot draw may still be one Quick Look can.
+                return await thumbnail(url, box: box).map(InspectorPreview.picture) ?? .file(url)
             case .quickLook:
                 return .file(url)
             case .icon:
@@ -1231,7 +1241,8 @@ public final class TransferModel {
     }
 
     /// Warms the cache for the files on either side of `item`, one at a time, so an arrow key
-    /// lands on a copy that is already here. Only files the inspector can show are fetched. A newer
+    /// lands on a copy that is already here. Only files the inspector can show are fetched, and for
+    /// Quick Look only the types it draws without an extension (`prefetch`). A newer
     /// selection cancels this like everything else.
     private func prefetchNeighbors(of item: RemoteItem, session: any RemoteSession, generation: Int) {
         let list = displayedItems
@@ -1241,21 +1252,18 @@ public final class TransferModel {
         inspectorTasks.append(Task { [weak self] in
             for neighbor in neighbors {
                 guard !Task.isCancelled, self?.inspectorGeneration == generation else { return }
-                guard await Self.plan(for: neighbor, session: session) != .icon else { continue }
+                guard await Self.plan(for: neighbor, session: session, prefetch: true) != .icon else { continue }
                 _ = try? await session.prepareInspectorPreview(neighbor.path)
             }
         })
     }
 
-    /// A picture decoded at a size the pane can use, so showing it never stalls the main thread.
-    nonisolated private static func decodePicture(_ url: URL) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 1200,
-        ]
-        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    /// A picture drawn at the size the pane shows it, by Quick Look's thumbnailer, which decodes
+    /// in its own sandboxed process: a server's file is never decoded in this one, which holds
+    /// the Keychain and the ssh agent.
+    nonisolated private static func thumbnail(_ url: URL, box: PictureBox) async -> CGImage? {
+        let request = QLThumbnailGenerator.Request(fileAt: url, size: box.size, scale: box.scale, representationTypes: .thumbnail)
+        return try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).cgImage
     }
 
     /// The first lines of a text file; nil when the bytes are not text after all.
@@ -1263,6 +1271,14 @@ public final class TransferModel {
         guard let handle = try? FileHandle(forReadingFrom: url), let data = try? handle.read(upToCount: EditableFile.previewHead) else { return nil }
         if data.prefix(8 << 10).contains(0) { return nil }
         return String(decoding: data, as: UTF8.self)
+    }
+
+    /// The head of a file whose type is unknown, as text when `TextHead` reads it as text.
+    nonisolated private static func sniffedText(_ url: URL, size: UInt64?) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url), let data = try? handle.read(upToCount: TextHead.length) else { return nil }
+        // The copy is the whole file when the file is no longer than it, else its head.
+        let whole = size.map { $0 <= UInt64(data.count) } ?? (data.count < TextHead.length)
+        return TextHead.text(data, whole: whole)
     }
 
     public func focusFilter() {
@@ -2486,6 +2502,18 @@ final class PreviewPanel: NSObject, @MainActor QLPreviewPanelDataSource, @MainAc
         default:
             return false
         }
+    }
+}
+
+/// Where the inspector draws a picture: the preview area less its margin, in points, and the
+/// screen's scale. Never smaller than 32 points a side.
+public struct PictureBox: Equatable, Sendable {
+    public var size: CGSize
+    public var scale: CGFloat
+
+    public init(size: CGSize = CGSize(width: 600, height: 600), scale: CGFloat = 2) {
+        self.size = CGSize(width: max(size.width, 32), height: max(size.height, 32))
+        self.scale = max(scale, 1)
     }
 }
 

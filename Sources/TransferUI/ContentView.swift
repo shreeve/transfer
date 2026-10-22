@@ -540,6 +540,7 @@ struct InspectorColumn: View {
     @State private var waitEnd: ContinuousClock.Instant?
 
     static let iconSize: CGFloat = 128
+    static let pictureMargin: CGFloat = 8
     /// The one header line: icon, name, details, and the state symbols.
     nonisolated static let headerHeight: CGFloat = 20
     static let headerGap: CGFloat = 10
@@ -665,6 +666,10 @@ struct InspectorColumn: View {
         }
         .slot("preview", slots)
         .onChange(of: document, initial: true) { _, document in slots?.surface = document ? "document" : "gray" }
+        // A picture is drawn at the size it shows: the area less its margin (`content`).
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+            model.inspectorPictureBox = PictureBox(size: CGSize(width: size.width - 2 * Self.pictureMargin, height: size.height - 2 * Self.pictureMargin), scale: displayScale)
+        }
     }
 
     /// Wrap lines, for text only, in a strip that is there for everything.
@@ -703,7 +708,7 @@ struct InspectorColumn: View {
         case .picture(let picture):
             Image(decorative: picture, scale: 1).resizable().scaledToFit()
                 .clipShape(RoundedRectangle(cornerRadius: 4))
-                .padding(8)
+                .padding(Self.pictureMargin)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .file(let url):
             QuickLookPreview(url: url)

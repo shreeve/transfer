@@ -290,6 +290,107 @@ struct StoreTests {
         #expect(read.map(\.path.bytes) == [bytes])
     }
 
+    /// `config.json` as Transfer 0.1.7 wrote it (its bundled file, copied on first launch), with
+    /// a user's edits: "ts" removed, "log" and "go" added, "md" moved first.
+    static let config017 = Data("""
+    {
+      "editableExtensions": [
+        "md",
+        "rip",
+        "txt",
+        "json",
+        "rs",
+        "c",
+        "swift",
+        "py",
+        "js",
+        "jsx",
+        "tsx",
+        "html",
+        "css",
+        "yaml",
+        "yml",
+        "toml",
+        "sh",
+        "log",
+        "GO"
+      ]
+    }
+
+    """.utf8)
+
+    /// Schema 4: a 0.1.7 library's `config.json` gets 2.0.0's new source types once, after the
+    /// user's own entries, which keep their order; none is removed or added twice ("GO" stays the
+    /// user's "go"), and "ts", which the user removed, does not come back. Opening again changes
+    /// nothing. A 0.2.0 to 0.3.1 library (schema 3) is migrated the same way.
+    @Test(arguments: [0, 3]) func anOlderLibrarysConfigGainsTheNewSourceTypesOnce(version: Int) throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        if version == 0 {
+            try Raw.fixture(.released, at: root)
+        } else {
+            _ = try Store(root: root)
+            try Raw(root).run("PRAGMA user_version = \(version)")
+        }
+        let file = root.appendingPathComponent("config.json")
+        try Self.config017.write(to: file)
+        let mine = try JSONDecoder().decode(TransferConfig.self, from: Self.config017).editableExtensions
+
+        _ = try Store(root: root)
+        #expect(try Raw(root).value("PRAGMA user_version") == "4")
+        let migrated = ConfigLoader.load(root: root).editableExtensions
+        #expect(Array(migrated.prefix(mine.count)) == mine)
+        #expect(Array(migrated.dropFirst(mine.count)) == TransferConfig.addedIn2.filter { $0 != "go" })
+        #expect(!migrated.contains("ts"))
+        #expect(Set(migrated.map { $0.lowercased() }).count == migrated.count)
+        let written = try Data(contentsOf: file)
+
+        _ = try Store(root: root)
+        #expect(try Data(contentsOf: file) == written)
+    }
+
+    /// The migration runs once: an entry the user removes in Settings afterwards stays removed
+    /// through every later launch.
+    @Test func anEntryRemovedAfterTheMigrationStaysRemoved() async throws {
+        let base = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("library", isDirectory: true)
+        // A 0.3.1 library with no rows: the hub's launch sweeps would act on a fixture's Live rows.
+        _ = try Store(root: root)
+        try Raw(root).run("PRAGMA user_version = 3")
+        try Self.config017.write(to: root.appendingPathComponent("config.json"))
+        do {
+            let hub = try TransferHub(root: root)
+            let migrated = await hub.editableExtensions()
+            #expect(migrated.contains("zig") && migrated.contains("makefile"))
+            try await hub.setEditableExtensions(migrated.filter { $0 != "zig" && $0 != "makefile" })
+        }
+        for _ in 0..<2 {
+            let hub = try TransferHub(root: root)
+            let later = await hub.editableExtensions()
+            #expect(!later.contains("zig") && !later.contains("makefile"))
+            #expect(later.contains("kt"))
+        }
+    }
+
+    /// With no `config.json` the migration writes none (the first load writes the whole built-in
+    /// list), and an unreadable one is left as it is, for the load to keep aside.
+    @Test func theMigrationLeavesAMissingOrUnreadableConfigAlone() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Raw.fixture(.released, at: root)
+        let file = root.appendingPathComponent("config.json")
+        _ = try Store(root: root)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+        #expect(ConfigLoader.load(root: root) == .builtIn)
+
+        try Raw(root).run("PRAGMA user_version = 3")
+        try Data("{ not json".utf8).write(to: file)
+        _ = try Store(root: root)
+        #expect(try Raw(root).value("PRAGMA user_version") == "4")
+        #expect(try Data(contentsOf: file) == Data("{ not json".utf8))
+    }
+
     /// A library from a newer Transfer is refused, with a reason, and left as it was; so is one
     /// with a negative version, which no Transfer wrote and which crashed at launch (WIR-04).
     @Test(arguments: [Store.schemaVersion + 1, -1]) func aNewerOrForeignLibraryIsRefusedAndUntouched(version: Int) throws {

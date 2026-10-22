@@ -132,7 +132,7 @@ ssh live 'mkdir -p ~/bin ~/.config/transfer && cat > ~/bin/xfer && chmod 755 ~/b
 
 Transfer uses the `ssh` already on the Mac, so your `~/.ssh/config`, agent, and `ProxyJump` apply. One login is shared by every window for that server. Listing, the file you are previewing, and copying run on separate SSH channels, so a download does not block the file list, and many files copy at once.
 
-Which files open for editing is `editableExtensions` in `config.json`. The first launch writes the built-in list there, and Settings → Extensions edits it.
+Which files open for editing is `editableExtensions` in `config.json`. The first launch writes the built-in list there, and Settings → Extensions edits it. Transfer 2.0.0 adds common source types to an existing list once (Zig, Go, Kotlin, `Makefile`, …), keeping your own entries; one you remove afterwards stays removed.
 
 ## Where your data lives
 
