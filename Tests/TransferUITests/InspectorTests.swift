@@ -431,6 +431,38 @@ struct InspectorTests {
         #expect(await eventually { !inspector.isCollapsed })
     }
 
+    /// The saved split and `Preferences.showsInspector` may disagree (a save from a window that
+    /// closed with the inspector out, a preference set since). The preference wins at setup, and
+    /// SwiftUI keeps updating the chrome: the view switcher follows the model and the toolbar
+    /// toggle still moves the split.
+    @Test(arguments: [true, false]) func aSplitSavedAgainstThePreferenceStillFollowsTheModel(shown: Bool) async throws {
+        let open = ["0.000000, 0.000000, 150.000000, 640.000000, NO, NO",
+                    "150.000000, 0.000000, 410.000000, 640.000000, NO, NO",
+                    "560.000000, 0.000000, 400.000000, 640.000000, NO, NO"]
+        let closed = ["0.000000, 0.000000, 150.000000, 640.000000, NO, NO",
+                      "150.000000, 0.000000, 810.000000, 640.000000, NO, NO",
+                      "960.000000, 0.000000, 0.000000, 640.000000, YES, NO"]
+        UserDefaults.standard.set(shown ? closed : open, forKey: Self.splitFrames)
+        defer { UserDefaults.standard.removeObject(forKey: Self.splitFrames) }
+        let defaults = Defaults()
+        defaults.store.set(shown, forKey: Preferences.showsInspector)
+        let model = TransferModel(provider: FakeProvider([FakeSession(server)]), defaults: defaults.store)
+        let window = await window(ContentView(model: model), style: [.titled, .resizable])
+        defer { window.close() }
+        let controller = try #require(chrome(in: window))
+        let inspector = controller.splitViewItems[2]
+        #expect(await eventually { inspector.isCollapsed == !shown })
+        #expect(model.showsInspector == shown)
+        let group = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.viewMode } as? NSToolbarItemGroup)
+        model.setViewMode(.list)
+        #expect(await eventually { group.selectedIndex == ViewMode.allCases.firstIndex(of: .list) })
+        model.setViewMode(.icon)
+        #expect(await eventually { group.selectedIndex == ViewMode.allCases.firstIndex(of: .icon) })
+        let item = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.inspector })
+        #expect(NSApp.sendAction(try #require(item.action), to: item.target, from: item))
+        #expect(await eventually { inspector.isCollapsed == shown })
+    }
+
     /// The inspector grows to 60% of the split view and no further, and a narrower window pulls
     /// it in while the content pane keeps its 260.
     @Test func theInspectorStopsAtSixtyPercentAndShrinksWithTheWindow() async throws {

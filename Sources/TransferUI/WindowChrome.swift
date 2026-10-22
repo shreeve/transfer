@@ -392,8 +392,8 @@ final class ChromeController: NSSplitViewController {
         // `splitViewDidResizeSubviews`. The inspector's state is the model's.
         let key = "NSSplitView Subview Frames Transfer.Split"
         if let frames = UserDefaults.standard.array(forKey: key) as? [String],
-           let healed = SplitFrames.healed(frames, inspectorMinimum: Double(inspectorItem.minimumThickness)) {
-            UserDefaults.standard.set(healed, forKey: key)
+           let aligned = SplitFrames.aligned(frames, inspectorShown: inspectorShown, inspectorMinimum: Double(inspectorItem.minimumThickness)) {
+            UserDefaults.standard.set(aligned, forKey: key)
         }
         splitView.autosaveName = "Transfer.Split"
         inspectorItem.isCollapsed = !inspectorShown

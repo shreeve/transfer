@@ -625,19 +625,27 @@ public enum InspectorWidth {
 
 /// The split view's saved frames, one string per column ("x, y, width, height, collapsed,
 /// hidden"). A window closed while its inspector was collapsing saves that column open at
-/// width 0, and a window restored from that never opens its inspector again (measured in
-/// `InspectorTests`). Such a column is saved again as collapsed at its minimum width; anything
-/// else, or a format it does not know, is left alone (nil).
+/// width 0, and a split restored in the other state than the preference's flips it after
+/// SwiftUI's first update; SwiftUI then never updates the chrome again (measured in
+/// `InspectorTests`).
 public enum SplitFrames {
-    public static func healed(_ frames: [String], inspectorMinimum: Double) -> [String]? {
+    /// The saved frames with the inspector column in the state the preference asks for, or nil
+    /// when they already are (or the format is unknown). A split restored with the inspector in
+    /// the other state flips it after SwiftUI's first update, and from then on SwiftUI never
+    /// updates the chrome again (measured in `InspectorTests`), so the save is rewritten before
+    /// the split reads it. Only the column's flag changes; its width stays at least `inspectorMinimum`.
+    public static func aligned(_ frames: [String], inspectorShown: Bool, inspectorMinimum: Double) -> [String]? {
         guard frames.count == 3 else { return nil }
         var fields = frames[2].split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
-        guard fields.count == 6, let width = Double(fields[2]), fields[4] == "NO", width < inspectorMinimum else { return nil }
-        fields[2] = String(format: "%f", inspectorMinimum)
-        fields[4] = "YES"
-        var healed = frames
-        healed[2] = fields.joined(separator: ", ")
-        return healed
+        guard fields.count == 6, let width = Double(fields[2]), fields[4] == "YES" || fields[4] == "NO" else { return nil }
+        let flag = inspectorShown ? "NO" : "YES"
+        let wide = max(width, inspectorMinimum)
+        guard fields[4] != flag || width < inspectorMinimum else { return nil }
+        fields[2] = String(format: "%f", wide)
+        fields[4] = flag
+        var aligned = frames
+        aligned[2] = fields.joined(separator: ", ")
+        return aligned
     }
 }
 
