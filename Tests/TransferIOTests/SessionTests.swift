@@ -525,12 +525,13 @@ struct SessionServerTests {
 
     /// A refusal while every open channel was held left the caller behind it waiting for one to be
     /// given back, which a long copy may not do for minutes, though room came back 10 s later
-    /// (FR-3). The first in line now opens it once the backoff passes.
+    /// (FR-3). The first in line now opens it once the backoff passes (3 s here, 10 s by default).
     @Test(.timeLimit(.minutes(1))) func aCallerWaitingOutARefusalOpensOnceTheBackoffPasses() async throws {
         try await withHarness("backoff", connected: true) { h in
             let config = try String(contentsOf: h.configFile, encoding: .utf8)
             let open = Locked(0)
             let done = Locked(false)
+            let backoff = Duration.seconds(3)
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for _ in 0..<3 {
                     group.addTask {
@@ -541,15 +542,17 @@ struct SessionServerTests {
                     }
                 }
                 #expect(await waitUntil { open.value == 3 })
+                await h.session.setRefusalBackoff(backoff)
                 try (config + "  NoSuchOption yes\n").write(to: h.configFile, atomically: true, encoding: .utf8)
                 let started = ContinuousClock.now
                 let waiter = Task { try await h.session.withData { _ in ContinuousClock.now - started } }
-                try await Task.sleep(for: .seconds(1))
+                // Mend the config only once the refusal has happened, not after a duration.
+                #expect(await waitUntil(30) { await h.session.refusedAt != nil })
                 try config.write(to: h.configFile, atomically: true, encoding: .utf8)
                 let waited = try await waiter.value
                 done.value = true
                 try await group.waitForAll()
-                #expect(waited >= .seconds(10))
+                #expect(waited >= backoff)
             }
         }
     }
