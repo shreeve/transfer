@@ -195,9 +195,11 @@ import TransferCore
         await server.stop()
     }
 
-    /// copy-data answers only when the whole file is written, so its silence is not a stall.
+    /// copy-data answers only when the whole file is written, so its silence is not a stall. The
+    /// limit is 1 s, not a few hundred ms, so the open before it cannot be taken for a stall by a
+    /// loaded machine's scheduling delay; the silence lasts 2.5 s, well past it.
     @Test func copyDataMayOutlastTheStallLimit() async throws {
-        let server = try await ScriptedServer(stallLimit: .milliseconds(200)) { request in
+        let server = try await ScriptedServer(stallLimit: .seconds(1)) { request in
             switch request.type {
             case SFTPCode.open: ScriptedServer.handle(request.id)
             case SFTPCode.close: ScriptedServer.ok(request.id)
@@ -205,8 +207,8 @@ import TransferCore
             }
         }
         let copy = Task { try await server.channel.copyData(Self.path, to: RemotePath(string: "/srv/b")) }
-        #expect(await waitUntil { !server.sent(SFTPCode.extended).isEmpty })
-        try await Task.sleep(for: .seconds(1))
+        #expect(await waitUntil(30) { !server.sent(SFTPCode.extended).isEmpty })
+        try await Task.sleep(for: .milliseconds(2500))
         server.send(ScriptedServer.ok(server.sent(SFTPCode.extended)[0].id))
         try await copy.value
         #expect(await waitUntil { server.sent(SFTPCode.close).count == 2 })
