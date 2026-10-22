@@ -42,7 +42,9 @@ public actor SSHConnection: RemoteSession {
     /// Callers waiting for a data channel, in order, with the share each takes. Each gets a
     /// channel with room, or nil to open one itself, already counted in `opening`.
     private var waiters: [(id: UUID, share: Int, continuation: CheckedContinuation<SFTPChannel?, Error>)] = []
-    private var refusedAt: ContinuousClock.Instant?
+    private(set) var refusedAt: ContinuousClock.Instant?
+    /// How long after a refusal no data channel opens; tests shorten or lengthen it.
+    private var refusalBackoff = Duration.seconds(10)
     let pipe = EventPipe()
     let lane = InteractiveLane()
     /// Folder listings walks have open at once on the walker channel, across every walk: a paste
@@ -547,10 +549,16 @@ public actor SSHConnection: RemoteSession {
     /// has not refused one in the last 10 s.
     private var canOpen: Bool {
         pool.count + opening < Self.dataChannels && master?.isRunning == true
-            && refusedAt.map { ContinuousClock.now - $0 > Self.refusalBackoff } ?? true
+            && refusedAt.map { ContinuousClock.now - $0 > refusalBackoff } ?? true
     }
 
-    private static let refusalBackoff = Duration.seconds(10)
+
+    /// Sets the refusal backoff (10 s) and hands out any channel the new value allows; for tests,
+    /// which cannot wait 10 s of a loaded machine's time.
+    func setRefusalBackoff(_ backoff: Duration) {
+        refusalBackoff = backoff
+        dispatch()
+    }
 
     /// The pool channel `share` goes on: an idle one, else, when `sharing`, the least loaded with room.
     private func fitting(_ share: Int, sharing: Bool) -> SFTPChannel? {
@@ -591,8 +599,9 @@ public actor SSHConnection: RemoteSession {
             refusedAt = .now
             // Room opens again after the backoff, when callers may still be waiting and every
             // channel still held, so nothing is given back to hand it on.
+            let backoff = refusalBackoff
             Task { [weak self] in
-                try? await Task.sleep(for: Self.refusalBackoff + .milliseconds(50))
+                try? await Task.sleep(for: backoff + .milliseconds(50))
                 await self?.dispatch(ifStill: generation)
             }
             if nothingLeft {
