@@ -45,6 +45,22 @@ public actor SSHConnection: RemoteSession {
     private(set) var refusedAt: ContinuousClock.Instant?
     /// How long after a refusal no data channel opens; tests shorten or lengthen it.
     private var refusalBackoff = Duration.seconds(10)
+    /// Tar streams of folder downloads running now (`TarFeed`), and the probe. Each is a session
+    /// on the master, so it takes one of the data channels' seven places.
+    private var tarStreams = 0
+    /// Folder downloads keeping places for their streams (`keepTarPlaces`): the data pool opens
+    /// no channel into them, so their streams need not wait for channels to go idle.
+    private var tarKeepers: Set<ObjectIdentifier> = []
+    /// Streams waiting for a place, handed the next data channel that goes idle.
+    private var tarWaiters: [(id: UUID, continuation: CheckedContinuation<Int?, Error>)] = []
+    /// Whether this login's server runs `tarCommand` as asked, tried once per login, and its
+    /// answer once known.
+    private var tarProbe: (generation: Int, answer: Task<Bool?, Never>)?
+    private var tarAnswer: (generation: Int, works: Bool)?
+    /// What a tar stream runs on the server; nil sends every file over SFTP. Tests swap it.
+    private(set) var tarCommand: String? = SSHConnection.tarCommandLine
+    /// Files a tar stream has landed in this session, for the tests and the bench.
+    var tarLanded = 0
     let pipe = EventPipe()
     let lane = InteractiveLane()
     /// Folder listings walks have open at once on the walker channel, across every walk: a paste
@@ -291,6 +307,12 @@ public actor SSHConnection: RemoteSession {
         pool.removeAll()
         load.removeAll()
         opening = 0
+        tarStreams = 0
+        tarKeepers.removeAll()
+        tarProbe = nil
+        tarAnswer = nil
+        for waiter in tarWaiters { waiter.continuation.resume(returning: nil) }
+        tarWaiters.removeAll()
         refusedAt = nil
         scratch.removeAll()
         startPath = nil
@@ -548,7 +570,7 @@ public actor SSHConnection: RemoteSession {
     /// Whether another data channel may open: fewer than seven are open or opening, and the server
     /// has not refused one in the last 10 s.
     private var canOpen: Bool {
-        pool.count + opening < Self.dataChannels && master?.isRunning == true
+        pool.count + opening + max(tarStreams, tarKeepers.isEmpty ? 0 : TarBatching.streams) < Self.dataChannels && master?.isRunning == true
             && refusedAt.map { ContinuousClock.now - $0 > refusalBackoff } ?? true
     }
 
@@ -645,6 +667,14 @@ public actor SSHConnection: RemoteSession {
         let id = ObjectIdentifier(link)
         guard pool.contains(where: { $0 === link }) else { return }
         load[id] = max(load[id, default: 0] - share, 0)
+        // A stream waiting for a place takes an idle channel's before any caller waiting for a
+        // channel: the pool opens none into the places streams keep, so it may never have room.
+        if load[id] == 0, !tarWaiters.isEmpty {
+            drop(link)
+            Task { await link.closeLink() }
+            tarStreams += 1
+            tarWaiters.removeFirst().continuation.resume(returning: generation)
+        }
         dispatch()
     }
 
@@ -668,6 +698,105 @@ public actor SSHConnection: RemoteSession {
     private func drop(_ link: SFTPChannel) {
         load[ObjectIdentifier(link)] = nil
         pool.removeAll { $0 === link }
+    }
+
+    // MARK: Tar streams
+
+    /// A place for a tar stream among the data channels': free now, or that of an idle data
+    /// channel, which closes; with `waiting`, else the next channel to go idle. Nil when
+    /// `TarBatching.streams` already run (another download's), or the master is gone: the batch
+    /// then goes over SFTP. The answer is the login it belongs to, for `giveBackTarSlot`.
+    func takeTarSlot(waiting: Bool) async throws -> Int? {
+        guard master?.isRunning == true, tarStreams < TarBatching.streams else { return nil }
+        if pool.count + opening + tarStreams < Self.dataChannels {
+            tarStreams += 1
+            return generation
+        }
+        if let idle = pool.first(where: { load[ObjectIdentifier($0), default: 0] == 0 }) {
+            drop(idle)
+            tarStreams += 1
+            Task { await idle.closeLink() }
+            return generation
+        }
+        // Channels still opening count as the pool's: they come back once their files are done.
+        guard waiting, !pool.isEmpty || opening > 0 else { return nil }
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled { continuation.resume(throwing: CancellationError()) } else { tarWaiters.append((id, continuation)) }
+            }
+        } onCancel: {
+            Task { await self.leaveTarQueue(id) }
+        }
+    }
+
+    private func leaveTarQueue(_ id: UUID) {
+        guard let index = tarWaiters.firstIndex(where: { $0.id == id }) else { return }
+        tarWaiters.remove(at: index).continuation.resume(throwing: CancellationError())
+    }
+
+    /// A stream ended: its place goes to a stream waiting for one, else back to the pool.
+    func giveBackTarSlot(_ slot: Int) {
+        guard slot == generation else { return }
+        if !tarWaiters.isEmpty {
+            tarWaiters.removeFirst().continuation.resume(returning: generation)
+            return
+        }
+        tarStreams -= 1
+        dispatch()
+    }
+
+    /// Keeps places for `feeds`' streams from a download's first small file, so the channels
+    /// opened for the files before its first batch leave them free and its streams need not wait
+    /// for channels to go idle; let go when the server does not run tar. Once per download.
+    func keepTarPlaces(_ feeds: TarFeeds) {
+        guard !tarMissing, feeds.markKept() else { return }
+        tarKeepers.insert(ObjectIdentifier(feeds))
+        Task { if await !tarReady() { releaseTarPlaces(feeds) } }
+    }
+
+    /// Lets the pool use `feeds`' places again, if they were kept in this login.
+    func releaseTarPlaces(_ feeds: TarFeeds) {
+        guard tarKeepers.remove(ObjectIdentifier(feeds)) != nil else { return }
+        dispatch()
+    }
+
+    /// This login's server is known not to run `tarCommand`: small files go over SFTP at once.
+    var tarMissing: Bool {
+        tarCommand == nil || tarAnswer.map { $0.generation == generation && !$0.works } ?? false
+    }
+
+    /// Whether this login's server streams tar as `tarCommand` asks, learned once per login by
+    /// running it with no names: the reply must be the marker and an empty archive. A probe that
+    /// found no free place says nothing, and the next batch asks again.
+    func tarReady() async -> Bool {
+        guard let command = tarCommand else { return false }
+        if let probe = tarProbe, probe.generation == generation, let answer = await probe.answer.value { return answer }
+        if let probe = tarProbe, probe.generation == generation { tarProbe = nil }
+        let asked = generation
+        let task = Task<Bool?, Never> {
+            guard let slot = try? await self.takeTarSlot(waiting: true) else { return nil }
+            let works = await Self.probeTar(self.tarArguments(command))
+            self.giveBackTarSlot(slot)
+            if asked == self.generation { self.tarAnswer = (asked, works) }
+            return works
+        }
+        tarProbe = (asked, task)
+        return await task.value ?? false
+    }
+
+    /// `ssh` joining the master to run `command`, as a passenger does: never logging in on its
+    /// own, with no TTY and no escape character, since names on its standard input are any bytes.
+    func tarArguments(_ command: String) -> [String] {
+        configArguments + ["-S", socketPath, "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ProxyCommand=/usr/bin/false", "-e", "none"]
+            + Self.plainSession + ["--", connection.destination, command]
+    }
+
+    /// For tests: what tar streams run on the server, or nil for SFTP only.
+    func useTarCommand(_ command: String?) {
+        tarCommand = command
+        tarProbe = nil
+        tarAnswer = nil
     }
 
     /// A passenger on the master. The channel itself gives up when the server has not started

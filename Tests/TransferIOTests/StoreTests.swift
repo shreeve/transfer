@@ -238,6 +238,22 @@ struct StoreTests {
         #expect(old.value("SELECT count(*) FROM temps WHERE connection_id LIKE '\(Self.alpha)%'") == "0")
     }
 
+    /// A tar batch records its temps in one commit and forgets them in another; they are the
+    /// same records one file's download makes, so a launch removes what a crash left.
+    @Test func aBatchOfLocalTempsIsRecordedAndForgottenTogether() throws {
+        let root = TestCaches.fresh("store")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try Store(root: root)
+        let temps = (0..<3).map { URL(fileURLWithPath: "/tmp/batch/.file-\($0).transfer-x") }
+        store.rememberTemp(local: URL(fileURLWithPath: "/tmp/single"))
+        store.rememberTemps(local: temps)
+        #expect(Set(try Store(root: root).localTemps()) == Set(temps + [URL(fileURLWithPath: "/tmp/single")]))
+        store.forgetTemps(local: Array(temps.prefix(2)))
+        #expect(Set(store.localTemps()) == [temps[2], URL(fileURLWithPath: "/tmp/single")])
+        store.forgetTemps(local: [])
+        #expect(store.localTemps().count == 2)
+    }
+
     /// Stars and remote temps were stored as text decoded from the path, so a name that is not
     /// UTF-8 came back as a different path: a star that opened nothing, a temp never removed.
     @Test func aNonUTF8StarAndTempRoundTripExactly() throws {
