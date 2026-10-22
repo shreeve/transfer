@@ -69,6 +69,68 @@ import TransferCore
         await server.stop()
     }
 
+    /// Only the end-of-folder status ends a listing: an empty page in the middle of a folder does
+    /// not, and the pages after it are still asked for and listed.
+    @Test func anEmptyPageDoesNotEndTheListing() async throws {
+        let pages: [[[UInt8]]] = [[Array("a".utf8)], [], [], [Array("b".utf8)]] + (0..<6).map { [Array("c\($0)".utf8)] }
+        let server = try await ScriptedServer(answer: ScriptedServer.listing(pages))
+        var names: [String] = []
+        for try await item in await server.channel.list(RemotePath(string: "/srv")) { names.append(item.name) }
+        #expect(names == ["a", "b"] + (0..<6).map { "c\($0)" })
+        await server.stop()
+    }
+
+    /// Replies that come back out of order are still listed in the order their pages were asked
+    /// for, all of them, up to the end-of-folder status.
+    @Test func outOfOrderPagesAreListedInOrder() async throws {
+        let pages = (0..<10).map { page in (0..<3).map { Array("p\(page)-\($0)".utf8) } }
+        let next = Locked(0)
+        let held = Locked<[(id: UInt32, page: Int)]>([])
+        let server = try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.opendir: return ScriptedServer.handle(request.id)
+            case SFTPCode.readdir:
+                let page = next.withLock { count in
+                    defer { count += 1 }
+                    return count
+                }
+                func reply(_ id: UInt32, _ page: Int) -> Data {
+                    page < pages.count ? ScriptedServer.names(id, pages[page]) : ScriptedServer.status(id, SFTPCode.eof)
+                }
+                // Every other request is answered only after the one asked after it.
+                guard page % 2 == 1 else {
+                    held.withLock { $0.append((request.id, page)) }
+                    return nil
+                }
+                let earlier = held.withLock { $0.removeLast() }
+                return reply(request.id, page) + reply(earlier.id, earlier.page)
+            case SFTPCode.close: return ScriptedServer.ok(request.id)
+            default: return ScriptedServer.status(request.id, SFTPCode.failure)
+            }
+        }
+        var names: [String] = []
+        for try await item in await server.channel.list(RemotePath(string: "/srv")) { names.append(item.name) }
+        #expect(names == pages.flatMap { $0 }.map { String(decoding: $0, as: UTF8.self) })
+        await server.stop()
+    }
+
+    /// A server that sends empty pages and never the end fails the listing instead of filling it
+    /// forever.
+    @Test func endlessEmptyPagesFailTheListing() async throws {
+        let server = try await ScriptedServer { request in
+            switch request.type {
+            case SFTPCode.opendir: return ScriptedServer.handle(request.id)
+            case SFTPCode.readdir: return ScriptedServer.names(request.id, [])
+            case SFTPCode.close: return ScriptedServer.ok(request.id)
+            default: return ScriptedServer.status(request.id, SFTPCode.failure)
+            }
+        }
+        await #expect(throws: TransferError.self) {
+            for try await _ in await server.channel.list(RemotePath(string: "/srv")) {}
+        }
+        await server.stop()
+    }
+
     /// A reader that stops early, as a lookup for one name does, also closes the handle.
     @Test func aListingLeftEarlyClosesItsHandle() async throws {
         let server = try await ScriptedServer(answer: ScriptedServer.listing([[Array("a".utf8), Array("b".utf8)]]))
