@@ -504,7 +504,9 @@ extension SSHConnection {
     private func settleLocally(_ incoming: PlacedItem, named name: String, in folder: URL, taken: Bool) async throws -> (url: URL, found: PlacedItem?)? {
         let url = try LocalPlacement.child(folder, name: name)
         var found = try LocalPlacement.occupant(url)
-        if taken, found == nil { found = .other }
+        // A name an earlier entry claimed collides whatever is there: once that entry has landed,
+        // a file of the same size and time would read as this one and be skipped unasked.
+        if taken, found == nil || incoming != .folder { found = .other }
         switch try await settle(incoming, onto: found, named: name, shown: name) {
         case .skip: return nil
         case .replace: return (url, found)
