@@ -471,13 +471,15 @@ struct SessionServerTests {
     }
 
     /// After a data channel fails to open, as when sshd refuses one for MaxSessions (a Terminal
-    /// tab on the master), the pool grows back once 10 s have passed, although callers never stop
-    /// waiting meanwhile. The opens fail here through a config error, so no other suite reading
-    /// sshd's log sees a refusal.
+    /// tab on the master), the pool does not grow while the backoff lasts, and grows back once it
+    /// has passed, although callers never stop waiting meanwhile. The opens fail here through a
+    /// config error, so no other suite reading sshd's log sees a refusal. The backoff is one hour
+    /// until the test ends it, and each step waits for the one before it, not for a duration, so a
+    /// loaded machine cannot reorder them.
     @Test(.timeLimit(.minutes(1))) func thePoolGrowsBackAfterARefusalWhileCallersWait() async throws {
         try await withHarness("regrow", connected: true) { h in
             let config = try String(contentsOf: h.configFile, encoding: .utf8)
-            let state = Locked((inUse: 0, peak: 0, early: 0))
+            let state = Locked((inUse: 0, peak: 0))
             let open = Locked(0)
             let broken = Locked(false)
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -490,17 +492,17 @@ struct SessionServerTests {
                     }
                 }
                 #expect(await waitUntil { open.value == 3 })
+                await h.session.setRefusalBackoff(.seconds(3600))
                 try (config + "  NoSuchOption yes\n").write(to: h.configFile, atomically: true, encoding: .utf8)
                 broken.value = true
-                let started = ContinuousClock.now
+                let deadline = ContinuousClock.now + .seconds(40)
                 for _ in 0..<(2 * SSHConnection.dataChannels) {
                     group.addTask {
-                        while state.value.peak < SSHConnection.dataChannels, ContinuousClock.now - started < .seconds(15) {
+                        while state.value.peak < SSHConnection.dataChannels, ContinuousClock.now < deadline {
                             try await h.session.withData { _ in
                                 state.withLock {
                                     $0.inUse += 1
                                     $0.peak = max($0.peak, $0.inUse)
-                                    if ContinuousClock.now - started < .seconds(1) { $0.early = $0.peak }
                                 }
                                 try await Task.sleep(for: .milliseconds(50))
                                 state.withLock { $0.inUse -= 1 }
@@ -508,11 +510,15 @@ struct SessionServerTests {
                         }
                     }
                 }
-                try await Task.sleep(for: .seconds(1))
+                // The refusal has happened and the three open channels are shared among the callers.
+                #expect(await waitUntil(30) { await h.session.refusedAt != nil })
+                #expect(await waitUntil(30) { state.value.peak == 3 })
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(state.value.peak == 3)
                 try config.write(to: h.configFile, atomically: true, encoding: .utf8)
+                await h.session.setRefusalBackoff(.zero)
                 try await group.waitForAll()
             }
-            #expect(state.value.early == 3)
             #expect(state.value.peak == SSHConnection.dataChannels)
         }
     }
