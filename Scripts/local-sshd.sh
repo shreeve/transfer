@@ -4,11 +4,20 @@
 #
 #   eval "$(Scripts/local-sshd.sh [port])" && swift test; kill $TRANSFER_TEST_SSHD
 #
+# With TRANSFER_TEST_TAR=gnu, commands run on the server find GNU tar as `tar` (Homebrew's
+# gnu-tar first on the sessions' PATH), as on a Linux server; otherwise the Mac's bsdtar.
+#
 # TRANSFER_TEST_SSHD is a small watcher, not sshd itself: killing it stops sshd and removes the
 # temporary folder that holds the keys, and it removes the folder too when sshd stops on its own.
 set -euo pipefail
 
 port="${1:-2222}"
+setenv=""
+if [ "${TRANSFER_TEST_TAR:-}" = gnu ]; then
+    gnubin=/opt/homebrew/opt/gnu-tar/libexec/gnubin
+    [ -x "$gnubin/tar" ] || { echo "error: TRANSFER_TEST_TAR=gnu needs GNU tar at $gnubin (brew install gnu-tar)" >&2; exit 1; }
+    setenv="SetEnv PATH=$gnubin:/usr/bin:/bin:/usr/sbin:/sbin"
+fi
 dir="$(mktemp -d -t transfer-sshd)"
 trap 'rm -rf "$dir"' EXIT
 chmod 700 "$dir"
@@ -28,6 +37,7 @@ PubkeyAuthentication yes
 AuthorizedKeysFile $dir/authorized_keys
 StrictModes no
 Subsystem sftp /usr/libexec/sftp-server
+$setenv
 # A first contact's host-key probe connects without authenticating, and the host-key tests make
 # many; repeated test runs would trip OpenSSH's per-source penalty and have every connection
 # dropped for 15 s or more.
