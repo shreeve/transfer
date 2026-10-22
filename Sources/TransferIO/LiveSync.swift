@@ -129,6 +129,8 @@ actor LiveSync {
     /// Each logged-in server's timed check of its Live files, and how often it runs.
     private var checkers: [ConnectionID: Task<Void, Never>] = [:]
     private var checkEvery = LiveSync.checkInterval
+    /// Every window's Live badge, told of each change to any server's files (`changes`).
+    private var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
 
     /// `watches` is false only in tests, which report changes through `localChanged`.
     init(store: Store, watches: Bool = true) {
@@ -195,6 +197,7 @@ actor LiveSync {
         poke(connection)
         startChecking(connection)
         server.liveEmit(.liveChanged)
+        changed()
     }
 
     /// The connection went away. Nothing is cancelled but the timed check: passes that need the
@@ -217,7 +220,9 @@ actor LiveSync {
             worker.wake?.resume()
             for command in worker.commands { command.cancel() }
         }
+        let had = entries.values.contains { $0.connection == connection }
         entries = entries.filter { $0.value.connection != connection }
+        if had { changed() }
     }
 
     /// Remove Server: `close`, and the connection's Live folder goes, but it refuses with
@@ -245,24 +250,49 @@ actor LiveSync {
         watching = nil
         watcher?.stop()
         watcher = nil
+        for observer in observers.values { observer.finish() }
+        observers.removeAll()
     }
 
     // MARK: The public Live API, per connection
 
     /// `dirty` is `isUnsynced`: an edit no pass has seen yet counts, so every warning sees it.
     func files(on connection: ConnectionID) async -> [LiveFile] {
-        var files: [LiveFile] = []
-        for entry in entries.values where entry.connection == connection {
+        await allFiles().filter { $0.connection == connection }.map(\.file)
+    }
+
+    /// Every server's files, by path within each server.
+    func allFiles() async -> [(connection: ConnectionID, file: LiveFile)] {
+        var files: [(connection: ConnectionID, file: LiveFile)] = []
+        for entry in entries.values {
             let unsynced = await isUnsynced(entry)
             let change: LiveFile.ServerChange? = switch entry.remote {
             case .changed: .changed
             case .removed, .notAFile: .removed
             case nil: nil
             }
-            files.append(LiveFile(id: entry.id, path: entry.path, dirty: unsynced, paused: entry.state.paused, conflict: entry.state.conflict,
-                                  uploading: entry.uploading, serverChange: change))
+            files.append((entry.connection, LiveFile(id: entry.id, path: entry.path, dirty: unsynced, paused: entry.state.paused,
+                                                     conflict: entry.state.conflict, uploading: entry.uploading, serverChange: change)))
         }
-        return files.sorted { $0.path.display < $1.path.display }
+        return files.sorted { $0.file.path.display < $1.file.path.display }
+    }
+
+    /// Yields once for each change to any file's record or state, on any server, coalesced while
+    /// nobody reads. Ends when the reader stops.
+    func changes() -> AsyncStream<Void> {
+        let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let id = UUID()
+        observers[id] = continuation
+        continuation.onTermination = { [weak self] _ in Task { await self?.unobserve(id) } }
+        return stream
+    }
+
+    private func unobserve(_ id: UUID) {
+        observers[id] = nil
+    }
+
+    private func changed() {
+        for observer in observers.values { observer.yield() }
     }
 
     /// Files with bytes the server lacks, even edits no pass has seen yet. Nil counts every server's.
@@ -293,6 +323,39 @@ actor LiveSync {
 
     func resolve(_ path: RemotePath, on connection: ConnectionID, choice: LiveConflictChoice) async throws {
         try await perform(on: connection) { try await self.resolveNow(path, on: connection, choice: choice) }
+    }
+
+    /// Stop Live Editing for `ids`, on any servers (`SessionProvider.stopLive`): what
+    /// `LiveDecision.stopPlan` answers for the batch, from what each copy holds now. Each server's
+    /// files then stop on its worker, between passes, each checked again there, so a file that
+    /// gained edits since the question and is not `warned` stays. Returns the files that did not
+    /// stop because their edits were not warned about: every unsynced one of the batch when it
+    /// asks, else those that changed meanwhile. A server's worker needs no login to stop a file.
+    func stop(_ ids: [LiveFileID], warned: Set<LiveFileID>) async -> [LiveFileID] {
+        var unsynced: [LiveFileID] = []
+        for id in ids {
+            if let entry = entries[id], await isUnsynced(entry) { unsynced.append(id) }
+        }
+        if case .ask(let names) = LiveDecision.stopPlan(unsynced: unsynced, warned: warned) { return names }
+        var byServer: [ConnectionID: [LiveFileID]] = [:]
+        for id in ids {
+            if let connection = entries[id]?.connection { byServer[connection, default: []].append(id) }
+        }
+        var kept: [LiveFileID] = []
+        for (connection, group) in byServer {
+            kept += (try? await perform(on: connection) { await self.stopNow(group, warned: warned) }) ?? []
+        }
+        return kept
+    }
+
+    /// On the worker: each file stops unless it holds edits nobody was warned about.
+    private func stopNow(_ ids: [LiveFileID], warned: Set<LiveFileID>) async -> [LiveFileID] {
+        var kept: [LiveFileID] = []
+        for id in ids {
+            guard let entry = entries[id] else { continue }
+            if !warned.contains(id), await isUnsynced(entry) { kept.append(id) } else { drop(entry) }
+        }
+        return kept
     }
 
     /// Refuses with `liveUnsynced` while the copy holds bytes the server lacks, unless `force`.
@@ -841,6 +904,7 @@ actor LiveSync {
         entries[id] = Entry(id: id, connection: connection, path: path, local: file, state: LiveState(base: print))
         adopt(id, server: print, stamp: stamp, digest: digest)
         server.liveEmit(.liveChanged)
+        changed()
         return file
     }
 
@@ -1085,6 +1149,7 @@ actor LiveSync {
 
     private func emit(_ entry: Entry, _ event: SessionEvent) {
         servers[entry.connection]?.server?.liveEmit(event)
+        if case .liveChanged = event { changed() }
     }
 
     /// The file's row on the shelf.

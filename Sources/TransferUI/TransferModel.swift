@@ -148,6 +148,12 @@ public final class TransferModel {
         didSet { liveByPath = Dictionary(liveFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first }) }
     }
     private var liveByPath: [RemotePath: LiveFile] = [:]
+    /// Every Live file in the library, every server's, not only the one shown: the toolbar's Live
+    /// badge counts them and its list shows them. Reloaded on each change the library reports.
+    public private(set) var libraryLive: [LibraryLiveFile] = []
+    @ObservationIgnored private var libraryListener: Task<Void, Never>?
+    @ObservationIgnored private var libraryReload: Task<Void, Never>?
+    @ObservationIgnored private var libraryReloadAgain = false
     /// Live files the server changed under an edit, from the Live files themselves.
     public var conflicts: [RemotePath] { liveFiles.filter(\.conflict).map(\.path) }
     /// Whether Compare can open each conflict, as its event said. A conflict from before a
@@ -301,6 +307,14 @@ public final class TransferModel {
             },
         ]
         Task { await reloadConnections() }
+        libraryListener = Task { [weak self, provider] in
+            let changes = await provider.liveChanges()
+            await self?.reloadLibraryLive()
+            for await _ in changes {
+                guard let self else { return }
+                scheduleLibraryReload()
+            }
+        }
     }
 
     /// The window closed: it stops listening, listing, previewing, and logging in now, since
@@ -314,6 +328,8 @@ public final class TransferModel {
         stopLogin()
         context?.close()
         sidebarReload?.cancel()
+        libraryListener?.cancel()
+        libraryReload?.cancel()
         previewTask?.cancel()
         for task in inspectorTasks { task.cancel() }
         prompts.cancelAll()
@@ -1696,20 +1712,74 @@ public final class TransferModel {
         }
     }
 
-    /// Discards the Live file at `path` on the server shown, or only on `server` when named, as
-    /// by the sheet that warned about its edits.
-    public func discardLive(_ path: RemotePath, force: Bool = false, on server: ConnectionID? = nil) async {
-        guard let context, server == nil || server == context.connection.id else { return }
-        do {
-            try await context.session.discardLiveFile(path, force: force)
-            guard isCurrent(context) else { return }
-            waitingConflicts.removeAll { $0 == path }
-            await reloadSidebars()
-        } catch TransferError.liveUnsynced {
-            if isCurrent(context) { sheet = .discardLive(path, context.connection.id) }
-        } catch {
-            report(error)
+    /// Reads every server's Live files for the toolbar's badge and list.
+    public func reloadLibraryLive() async {
+        let all = await provider.libraryLiveFiles()
+        if libraryLive != all { libraryLive = all }
+    }
+
+    /// Reloads the library's Live files soon, once however many changes ask for it meanwhile.
+    private func scheduleLibraryReload() {
+        guard libraryReload == nil else {
+            libraryReloadAgain = true
+            return
         }
+        libraryReload = Task { [weak self] in
+            repeat {
+                self?.libraryReloadAgain = false
+                await self?.reloadLibraryLive()
+            } while self?.libraryReloadAgain == true && !Task.isCancelled
+            self?.libraryReload = nil
+        }
+    }
+
+    /// Stop Live Editing for `files`, on whatever servers they are: each record and working copy
+    /// goes, on its server's Live worker (`SessionProvider.stopLive`). A file with edits the
+    /// server lacks stops only once a sheet named it (`warned`); while one has not been named,
+    /// nothing in the batch stops and the sheet asks, naming every such file, so Cancel keeps all.
+    public func stopLive(_ files: [LiveFileID], warned: Set<LiveFileID> = []) async {
+        guard !files.isEmpty else { return }
+        let kept = await provider.stopLive(files, warned: warned)
+        await reloadLibraryLive()
+        await reloadSidebars()
+        waitingConflicts.removeAll { !conflicts.contains($0) }
+        if !kept.isEmpty { sheet = .stopLive(batch: files, unsynced: kept) }
+    }
+
+    /// The toolbar list's Stop All: every Live file in the library.
+    public func stopAllLive() async {
+        await stopLive(libraryLive.map(\.id))
+    }
+
+    /// The Live files selected in this window, on the server it shows.
+    public var selectedLiveFiles: [LiveFile] {
+        liveFiles.filter { snapshot.selection.contains($0.path) }
+    }
+
+    /// File → Stop Live Editing, and the toolbar list's Stop Selected.
+    public func stopSelectedLive() async {
+        await stopLive(selectedLiveFiles.map(\.id))
+    }
+
+    /// "Stop Live Editing", with "…" when stopping `files` asks first: one holds edits the
+    /// server lacks, which stopping discards.
+    public static func stopLiveTitle(_ files: [LiveFile]) -> String {
+        files.contains { !$0.isSynced } ? "Stop Live Editing…" : "Stop Live Editing"
+    }
+
+    /// The inspector's capsule: Live stops the file; Conflict opens its sheet.
+    public func liveCapsuleClicked(_ live: LiveFile) async {
+        if live.conflict { showConflict(live.path) } else { await stopLive([live.id]) }
+    }
+
+    /// The marker on an item's icon in every view, nil when it is not Live.
+    func liveMark(for path: RemotePath) -> LiveMark? {
+        liveByPath[path].map(LiveMark.init)
+    }
+
+    /// Every Live item's marker, for the AppKit views to compare between updates.
+    var liveMarks: [RemotePath: LiveMark] {
+        liveByPath.mapValues(LiveMark.init)
     }
 
     public func resumeLive(_ path: RemotePath) async {
@@ -1724,12 +1794,6 @@ public final class TransferModel {
             try? await session.discardLiveFile(live.path, force: false)
         }
         await reloadSidebars()
-    }
-
-    public func discardSelectedLive() async {
-        for item in selectedItems where liveByPath[item.path] != nil {
-            await discardLive(item.path)
-        }
     }
 
     /// Live files with something happening: edited, uploading, paused, in conflict, or changed or
@@ -2006,6 +2070,19 @@ public extension LiveFile.Status {
         case .synced: ("Live", "checkmark.circle", "Synced; saves in the editor upload")
         }
     }
+
+    /// The toolbar's Live list's state column.
+    var listLabel: String {
+        switch self {
+        case .conflict: "Conflict"
+        case .changedOnServer: "Changed on the server"
+        case .removedFromServer: "Removed from the server"
+        case .uploading: "Uploading"
+        case .paused: "Paused"
+        case .dirty: "Edited, not uploaded yet"
+        case .synced: "Synced"
+        }
+    }
 }
 
 public extension RemoteItem {
@@ -2032,8 +2109,9 @@ public enum AppSheet: Identifiable {
     case conflict(RemotePath, comparable: Bool)
     case goToFolder
     case removeServer(SavedConnection)
-    /// Discarding a Live file's unsynced edits, on the server it names.
-    case discardLive(RemotePath, ConnectionID)
+    /// Stop Live Editing for `batch`, whose `unsynced` files hold edits it would discard, on
+    /// any servers: it asks before anything in the batch stops.
+    case stopLive(batch: [LiveFileID], unsynced: [LibraryLiveFile])
 
     public var id: String {
         switch self {
@@ -2045,7 +2123,7 @@ public enum AppSheet: Identifiable {
         case .conflict(let path, _): "conflict-\(path.display)"
         case .goToFolder: "goto"
         case .removeServer: "remove"
-        case .discardLive(let path, _): "discard-\(path.display)"
+        case .stopLive(let batch, _): "stop-\(batch.map(\.rawValue.uuidString).joined(separator: ","))"
         }
     }
 
@@ -2053,8 +2131,9 @@ public enum AppSheet: Identifiable {
     /// that server. A question belongs to its login or operation, which go on without the window.
     var isServerBound: Bool {
         switch self {
-        case .delete, .conflict, .goToFolder, .discardLive: true
-        case .connection, .prompt, .hostKey, .collision, .removeServer: false
+        case .delete, .conflict, .goToFolder: true
+        // Its files may be on any server, as the toolbar's Live list is.
+        case .connection, .prompt, .hostKey, .collision, .removeServer, .stopLive: false
         }
     }
 

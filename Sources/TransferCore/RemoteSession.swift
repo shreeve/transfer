@@ -156,6 +156,22 @@ public struct LiveFile: Hashable, Sendable, Identifiable {
     public var isSynced: Bool { !dirty && !uploading && !conflict }
 }
 
+/// A Live file anywhere in the library, with the saved server it belongs to, for the toolbar's
+/// Live badge and its list, which cover every server and not only the one a window shows.
+public struct LibraryLiveFile: Hashable, Sendable, Identifiable {
+    public var connection: ConnectionID
+    /// The saved server's name as the sidebar shows it.
+    public var server: String
+    public var file: LiveFile
+    public var id: LiveFileID { file.id }
+
+    public init(connection: ConnectionID, server: String, file: LiveFile) {
+        self.connection = connection
+        self.server = server
+        self.file = file
+    }
+}
+
 /// A library root in place of `~/Library/Application Support/Transfer`, from the `TRANSFER_LIBRARY`
 /// environment variable, for development builds and end-to-end tests. Under it go the SQLite
 /// library, the config, Live working copies, login scratch, and (in `Caches`) the preview cache and
@@ -178,6 +194,16 @@ public protocol SessionProvider: Sendable {
     /// The saved server an `sftp://` link means, or nil when none does.
     func connection(matching link: SFTPURL) async -> SavedConnection?
     var unsyncedLiveCount: Int { get async }
+    /// Every Live file of every saved server, by server and then path.
+    func libraryLiveFiles() async -> [LibraryLiveFile]
+    /// Yields whenever a Live file anywhere in the library appears, changes, or goes.
+    func liveChanges() async -> AsyncStream<Void>
+    /// Stop Live Editing: each file's record and working copy go, on its server's Live worker, as
+    /// Discard did. Decided by `LiveDecision.stopPlan`: while one of them holds bytes the server
+    /// lacks and `warned` does not name it, nothing stops and the unsynced ones come back, for the
+    /// user to be asked about; otherwise every file stops and nothing comes back, unless a file
+    /// gained edits after the question, which stays and comes back.
+    func stopLive(_ files: [LiveFileID], warned: Set<LiveFileID>) async -> [LibraryLiveFile]
     func disconnectAll() async
     /// The extensions that open Live, from the user's config file.
     func editableExtensions() async -> [String]

@@ -57,6 +57,9 @@ struct ColumnBrowser: NSViewRepresentable {
         /// the column was loaded with, and a folder is sorted once per change, not once per row.
         private var shown: [RemotePath: [RemoteItem]] = [:]
         private var syncing = false
+        /// The Live markers as of the last `sync`: what `willDisplayCell` draws, never read from
+        /// the model mid-layout.
+        private(set) var marks: [RemotePath: LiveMark] = [:]
         /// The model's selection as of the last `sync`, so one the model makes itself is shown.
         private var syncedSelection: Set<RemotePath> = []
         private let drag = RowDrag()
@@ -114,6 +117,12 @@ struct ColumnBrowser: NSViewRepresentable {
             }
             // A folder whose column closed is read from the model afresh when it opens again.
             shown = shown.filter { loaded.contains($0.key) }
+            let freshMarks = model.liveMarks
+            if freshMarks != marks {
+                marks = freshMarks
+                // Each row's cell is filled in as it draws (`willDisplayCell`).
+                Self.redraw(browser)
+            }
         }
 
         /// Selects in `column` what the trail selects there, when the column still shows the
@@ -220,7 +229,13 @@ struct ColumnBrowser: NSViewRepresentable {
             guard let cell = cell as? NSBrowserCell else { return }
             let entry = entry(row: row, column: column)
             cell.image = entry is UpEntry ? ItemIcon.upImage : (entry as? RemoteItem).map(ItemIcon.image(for:))
+            (cell as? CenteredBrowserCell)?.liveMark = (entry as? RemoteItem).flatMap { marks[$0.path] }
             cell.setAccessibilityLabel(entry is UpEntry ? "Parent folder" : nil)
+        }
+
+        private static func redraw(_ view: NSView) {
+            view.needsDisplay = true
+            for subview in view.subviews { redraw(subview) }
         }
 
         /// The `..` row is as tall as the list view's column header, so the rows beneath it sit
@@ -562,6 +577,9 @@ final class CenteredBrowserCell: NSBrowserCell {
 
     static let iconSize: CGFloat = 16
     static let iconInset: CGFloat = 3
+    static let markSize: CGFloat = 8
+    /// Set by the browser's delegate just before the cell draws.
+    var liveMark: LiveMark?
     static let gap: CGFloat = 5
     static let chevronInset: CGFloat = 8
 
@@ -577,6 +595,7 @@ final class CenteredBrowserCell: NSBrowserCell {
         if let image {
             let rect = NSRect(x: x, y: cellFrame.midY - Self.iconSize / 2, width: Self.iconSize, height: Self.iconSize)
             image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            liveMark?.draw(in: LiveMark.rect(on: rect, size: Self.markSize, flipped: controlView.isFlipped))
             x += Self.iconSize + Self.gap
         }
         // The browser draws the branch chevron itself; the title only needs to stop short of it.

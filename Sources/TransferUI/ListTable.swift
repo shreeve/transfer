@@ -80,6 +80,8 @@ struct ListTable: NSViewRepresentable {
         weak var table: NSTableView?
         weak var nameHeader: NameHeaderCell?
         private(set) var items: [RemoteItem] = []
+        /// The Live markers the rows were drawn with, from the model at the last `sync`.
+        private(set) var marks: [RemotePath: LiveMark] = [:]
         private var syncing = false
         private var autosaveConnection: ConnectionID?
         private let drag = RowDrag()
@@ -110,9 +112,18 @@ struct ListTable: NSViewRepresentable {
                 table.sortDescriptors = [descriptor]
             }
             let fresh = model.displayedItems
+            let freshMarks = model.liveMarks
             if fresh != items {
                 items = fresh
+                marks = freshMarks
                 table.reloadData()
+            } else if freshMarks != marks {
+                // Only the rows whose marker changed, in the Name column, are drawn again.
+                let changed = IndexSet(items.indices.filter { freshMarks[items[$0].path] != marks[items[$0].path] })
+                marks = freshMarks
+                if let name = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == "name" }), !changed.isEmpty {
+                    table.reloadData(forRowIndexes: changed, columnIndexes: [name])
+                }
             }
             let wanted = IndexSet(items.indices.filter { model.snapshot.selection.contains(items[$0].path) })
             if wanted != table.selectedRowIndexes {
@@ -133,6 +144,7 @@ struct ListTable: NSViewRepresentable {
             case "name":
                 cell.imageView?.image = ItemIcon.image(for: item)
                 cell.textField?.stringValue = item.name
+                (cell as? NameCellView)?.markView.mark = marks[item.path]
             case "mtime":
                 cell.textField?.stringValue = item.mtime.map(Format.date) ?? ""
             case "size":
@@ -146,7 +158,7 @@ struct ListTable: NSViewRepresentable {
         func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { FirstMouseRowView() }
 
         private func makeCell(_ id: NSUserInterfaceItemIdentifier) -> NSTableCellView {
-            let cell = NSTableCellView()
+            let cell = id.rawValue == "name" ? NameCellView() : NSTableCellView()
             cell.identifier = id
             let text = NSTextField(labelWithString: "")
             text.lineBreakMode = .byTruncatingMiddle
@@ -166,6 +178,16 @@ struct ListTable: NSViewRepresentable {
                 image.translatesAutoresizingMaskIntoConstraints = false
                 cell.addSubview(image)
                 cell.imageView = image
+                if let mark = (cell as? NameCellView)?.markView {
+                    mark.translatesAutoresizingMaskIntoConstraints = false
+                    cell.addSubview(mark)
+                    NSLayoutConstraint.activate([
+                        mark.widthAnchor.constraint(equalToConstant: NameCellView.markSize),
+                        mark.heightAnchor.constraint(equalToConstant: NameCellView.markSize),
+                        mark.trailingAnchor.constraint(equalTo: image.trailingAnchor, constant: 1),
+                        mark.bottomAnchor.constraint(equalTo: image.bottomAnchor, constant: 1),
+                    ])
+                }
                 NSLayoutConstraint.activate([
                     image.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 3),
                     image.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
@@ -467,4 +489,10 @@ final class ListHeaderView: NSTableHeaderView {
         }
         super.mouseDown(with: event)
     }
+}
+
+/// The Name column's cell: icon and name, and the Live marker over the icon's lower right.
+final class NameCellView: NSTableCellView {
+    static let markSize: CGFloat = 8
+    let markView = LiveMarkView()
 }

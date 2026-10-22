@@ -197,6 +197,15 @@ public enum LiveDecision {
         force || !isUnsynced(state, change) ? .forget : .conflict(.removed)
     }
 
+    /// Stop Live Editing on a batch of files, `unsynced` being those holding bytes the server
+    /// lacks. While one of them is not in `warned` (the files the user's confirmation named),
+    /// nothing stops and the user is asked, naming every unsynced file of the batch; otherwise
+    /// every file stops, the warned ones discarding their edits. A file whose edits arrive after
+    /// the question is never discarded unasked: it is not in `warned`, so the batch asks again.
+    public static func stopPlan<ID: Hashable>(unsynced: [ID], warned: Set<ID>) -> LiveStopPlan<ID> {
+        unsynced.allSatisfy(warned.contains) ? .stop : .ask(unsynced)
+    }
+
     /// The user opens a Live file again: a working copy holding the synced bytes, touched since
     /// or not, takes the server's newer file, unless a conflict waits for an answer. A pass never
     /// refreshes, since an editor may hold unsaved text.
@@ -251,4 +260,12 @@ public enum LiveDecision {
             return conflictKind(for: server).map(LiveAction.conflict) ?? .needServer
         }
     }
+}
+
+/// What Stop Live Editing does with a batch (`LiveDecision.stopPlan`).
+public enum LiveStopPlan<ID: Hashable>: Equatable {
+    /// Every file stops; its record and working copy go.
+    case stop
+    /// Nothing stops: the user is asked first, naming these files, whose edits would be lost.
+    case ask([ID])
 }

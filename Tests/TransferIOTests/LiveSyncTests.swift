@@ -455,6 +455,36 @@ struct LiveSyncTests {
         }
     }
 
+    /// Stop Live Editing: a batch holding an edit nobody was warned about stops nothing and names
+    /// it; a synced file stops at once, with no login, its record and copy gone as Discard's are;
+    /// the warned edit then stops too. The library's observers hear of it.
+    @Test func stopAsksBeforeDiscardingAndStopsOnceWarned() async throws {
+        try await withLive("stop") { h in
+            let other = RemotePath(string: "/srv/other.txt")
+            let (local, id) = try await openLive(h, note, "first")
+            let (otherLocal, otherID) = try await openLive(h, other, "second")
+            await h.live.setPaused(note, on: h.connection, paused: true)
+            try await edit(h, local, id, "unsynced")
+            #expect(await settled(h))
+            #expect(await h.live.stop([otherID, id], warned: []) == [id])
+            #expect(await h.files().count == 2)
+
+            let changes = await h.live.changes()
+            await h.live.disconnected(h.connection, server: h.fake)
+            #expect(await h.live.stop([otherID], warned: []) == [])
+            #expect(await h.files().map(\.id) == [id])
+            #expect(!FileManager.default.fileExists(atPath: otherLocal.deletingLastPathComponent().path))
+            var heard = changes.makeAsyncIterator()
+            #expect(await heard.next() != nil)
+
+            #expect(await h.live.stop([id], warned: [id]) == [])
+            #expect(await h.files().isEmpty)
+            #expect(h.store.liveFiles(connection: h.connection).isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: local.deletingLastPathComponent().path))
+            #expect(await h.fake.saves == 0)
+        }
+    }
+
     @Test func renameMovesTheRecordAndKeepsTheWorkingCopy() async throws {
         try await withLive("rename") { h in
             let path = RemotePath(string: "/srv/dir/note.txt")
