@@ -5,16 +5,19 @@ import TransferCore
 /// The toolbar's Live badge: what it says and what VoiceOver reads, for `count` Live files in
 /// the library. Hidden at zero.
 enum LiveBadge {
-    static func title(count: Int) -> String { count > 1 ? "Live \(count)" : "Live" }
+    static func title(count: Int) -> String { count > 1 ? "LIVE \(count)" : "LIVE" }
     static func accessibilityLabel(count: Int) -> String { "Live files: \(count)" }
     static let help = "Files open Live: every save uploads. Click to see them or stop editing them Live."
 }
 
-/// The badge itself: bold white text on a red capsule, drawn here so it reads the same in every
-/// appearance. A click, or VoiceOver's press, sends its action.
+/// The badge itself: heavy white capitals on a red capsule, drawn here so it reads the same in
+/// every appearance. A click, or VoiceOver's press, sends its action. Its toolbar item is
+/// unbordered, so the capsule is all there is: no Liquid Glass bezel around it (see Traps).
 final class LiveBadgeView: NSControl {
-    static let font = NSFont.boldSystemFont(ofSize: 12)
-    static let height: CGFloat = 22
+    static let font = NSFont.systemFont(ofSize: 10, weight: .heavy)
+    static let kern: CGFloat = 0.6
+    static let height: CGFloat = 18
+    static let padding: CGFloat = 7
     private var pressed = false {
         didSet { needsDisplay = true }
     }
@@ -41,11 +44,14 @@ final class LiveBadgeView: NSControl {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     private var attributedTitle: NSAttributedString {
-        NSAttributedString(string: title, attributes: [.font: Self.font, .foregroundColor: NSColor.white])
+        NSAttributedString(string: title, attributes: [.font: Self.font, .kern: Self.kern, .foregroundColor: NSColor.white])
     }
 
+    /// The text's width, less the kern AppKit adds after the last letter, so it centers.
+    private var textWidth: CGFloat { attributedTitle.size().width - Self.kern }
+
     override var intrinsicContentSize: NSSize {
-        NSSize(width: ceil(attributedTitle.size().width) + 20, height: Self.height)
+        NSSize(width: ceil(textWidth) + 2 * Self.padding, height: Self.height)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -54,7 +60,7 @@ final class LiveBadgeView: NSControl {
         NSBezierPath(roundedRect: capsule, xRadius: Self.height / 2, yRadius: Self.height / 2).fill()
         let text = attributedTitle
         let size = text.size()
-        text.draw(at: NSPoint(x: capsule.midX - size.width / 2, y: capsule.midY - size.height / 2))
+        text.draw(at: NSPoint(x: capsule.midX - textWidth / 2, y: capsule.midY - size.height / 2))
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -78,15 +84,18 @@ final class LiveBadgeView: NSControl {
     }
 }
 
-/// The small capsule the inspector's header shows for a Live file, in the badge's colors: "Live",
-/// or "Conflict" for one waiting for an answer.
+/// The small capsule the inspector's header shows for a Live file, in the badge's colors and
+/// capitals: "LIVE", or "CONFLICT" for one waiting for an answer.
 struct LiveCapsule: View {
     let text: String
     static let height: CGFloat = 14
 
+    static func title(conflict: Bool) -> String { conflict ? "CONFLICT" : "LIVE" }
+
     var body: some View {
         Text(text)
-            .font(.system(size: 9, weight: .bold))
+            .font(.system(size: 8.5, weight: .heavy))
+            .kerning(0.4)
             .foregroundStyle(.white)
             .lineLimit(1)
             .padding(.horizontal, 5)

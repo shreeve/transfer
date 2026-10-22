@@ -73,7 +73,7 @@ struct LiveBadgeTests {
 
     // MARK: The toolbar badge
 
-    /// The badge is hidden while no Live file exists, reads "Live" for one and "Live 4" for four,
+    /// The badge is hidden while no Live file exists, reads "LIVE" for one and "LIVE 4" for four,
     /// counting every server's, and VoiceOver reads the count. It sits left of the view switcher.
     @Test func theBadgeCountsEveryServersLiveFilesAndHidesAtZero() async throws {
         let sessionA = FakeSession(a), sessionB = FakeSession(b)
@@ -93,7 +93,7 @@ struct LiveBadgeTests {
 
         sessionA.live.value = [live("one.txt")]
         provider.liveDidChange()
-        #expect(await eventually { badge().map { !$0.hidden && $0.title == "Live" && $0.label == "Live files: 1" } == true },
+        #expect(await eventually { badge().map { !$0.hidden && $0.title == "LIVE" && $0.label == "Live files: 1" } == true },
                 "\(model.libraryLive.count) \(String(describing: badge()))")
         let view = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.live }?.view as? LiveBadgeView)
         #expect(view.accessibilityRole() == .button)
@@ -102,12 +102,39 @@ struct LiveBadgeTests {
         sessionA.live.value += [live("two.txt", dirty: true)]
         sessionB.live.value = [live("three.txt"), live("four.txt", conflict: true)]
         provider.liveDidChange()
-        #expect(await eventually { badge().map { !$0.hidden && $0.title == "Live 4" && $0.label == "Live files: 4" } == true })
+        #expect(await eventually { badge().map { !$0.hidden && $0.title == "LIVE 4" && $0.label == "Live files: 4" } == true })
 
         sessionA.live.value = []
         sessionB.live.value = []
         provider.liveDidChange()
         #expect(await eventually { badge()?.hidden == true })
+    }
+
+    /// The badge is exactly its red capsule: its item is unbordered, so no Liquid Glass bezel is
+    /// among its ancestors, while the toolbar's bordered items keep theirs. Its frame is its own
+    /// size, 18 points tall.
+    @Test func theBadgeHasNoGlassBezel() async throws {
+        let session = FakeSession(a)
+        session.live.value = [live("one.txt")]
+        let model = TransferModel(provider: FakeProvider([session]), defaults: Defaults().store)
+        let window = await window(ContentView(model: model), style: [.titled, .resizable])
+        defer { window.close() }
+        let item = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.live })
+        let badge = try #require(item.view as? LiveBadgeView)
+        #expect(await eventually { !item.isHidden && badge.title == "LIVE" && badge.superview != nil })
+        #expect(!item.isBordered)
+        func ancestors(_ view: NSView) -> [NSView] { view.superview.map { [$0] + ancestors($0) } ?? [] }
+        func glass(in view: NSView) -> [NSGlassEffectView] {
+            ((view as? NSGlassEffectView).map { [$0] } ?? []) + view.subviews.flatMap { glass(in: $0) }
+        }
+        let chain = ancestors(badge)
+        #expect(!chain.contains { $0 is NSGlassEffectView }, "\(chain.map { String(describing: type(of: $0)) })")
+        // The probe is real: the view switcher and the other bordered items still sit in glass.
+        let frame = try #require(window.contentView?.superview)
+        #expect(!glass(in: frame).isEmpty)
+        #expect(LiveBadgeView.height == 18)
+        #expect(badge.intrinsicContentSize.height == 18)
+        #expect(await eventually { badge.frame.height == LiveBadgeView.height })
     }
 
     /// The badge draws its words in bold white on red, in both appearances.
@@ -132,7 +159,8 @@ struct LiveBadgeTests {
         }
     }
 
-    /// Clicking the badge opens the list of every Live file; VoiceOver's press does the same.
+    /// Clicking the badge opens the list of every Live file, and a second click closes it;
+    /// VoiceOver's press opens it too.
     @Test func theBadgeOpensTheList() async throws {
         let session = FakeSession(a)
         session.live.value = [live("one.txt")]
@@ -141,9 +169,28 @@ struct LiveBadgeTests {
         defer { window.close() }
         let item = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.live })
         let badge = try #require(item.view as? LiveBadgeView)
-        #expect(await eventually { badge.title == "Live" })
-        #expect(badge.accessibilityPerformPress())
+        #expect(await eventually { badge.title == "LIVE" && !item.isHidden && badge.superview != nil })
         let coordinator = try #require(badge.target as? WindowChrome<SidebarColumn, DetailColumn, InspectorColumn>.Coordinator)
+        // A real click, through the window, at the badge's middle in the titlebar, once the
+        // toolbar has laid the shown badge out there.
+        let frame = try #require(window.contentView?.superview)
+        func middle() -> NSPoint { badge.convert(NSPoint(x: badge.bounds.midX, y: badge.bounds.midY), to: nil) }
+        func hit() -> NSView? { frame.hitTest(frame.convert(middle(), from: nil)) }
+        #expect(await eventually { badge.frame.width > 0 && hit() === badge },
+                "\(badge.frame) \(String(describing: hit().map { type(of: $0) }))")
+        let point = middle()
+        func event(_ type: NSEvent.EventType) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)!
+        }
+        inOwnRun {
+            window.sendEvent(event(.leftMouseDown))
+            window.sendEvent(event(.leftMouseUp))
+        }
+        #expect(coordinator.livePopover?.isShown == true)
+        #expect(coordinator.livePopover?.contentViewController is NSHostingController<LiveFilesList>)
+        coordinator.livePopover?.close()
+        #expect(badge.accessibilityPerformPress())
         #expect(coordinator.livePopover?.contentViewController is NSHostingController<LiveFilesList>)
         coordinator.livePopover?.close()
     }
@@ -254,8 +301,8 @@ struct LiveBadgeTests {
 
     // MARK: The inspector's capsule
 
-    /// The header's capsule reads Live and stops the file when clicked; a conflict's reads
-    /// Conflict and opens the conflict sheet. The header stays one line, the capsule inside it.
+    /// The header's capsule reads LIVE and stops the file when clicked; a conflict's reads
+    /// CONFLICT and opens the conflict sheet. The header stays one line, the capsule inside it.
     @Test func theInspectorCapsuleStopsOrResolves() async throws {
         let one = live("one.txt"), clash = live("clash.txt", conflict: true)
         let items = [RemoteItem(path: one.path, kind: .file, size: 10), RemoteItem(path: clash.path, kind: .file, size: 10)]
@@ -273,6 +320,7 @@ struct LiveBadgeTests {
         model.selectionChanged()
         #expect(await eventually { slots.frames["live capsule"] != nil })
         window.contentView?.layoutSubtreeIfNeeded()
+        #expect(LiveCapsule.title(conflict: true) == "CONFLICT" && LiveCapsule.title(conflict: false) == "LIVE")
         let header = try #require(slots.frames["header"]), capsule = try #require(slots.frames["live capsule"])
         #expect(header.height == InspectorColumn.headerHeight)
         #expect(header.contains(capsule) && capsule.height == LiveCapsule.height)
