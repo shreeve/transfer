@@ -151,6 +151,28 @@ struct ServerTests {
         }
     }
 
+    /// A file of a type the Mac does not know, or with no extension, is previewed from its head:
+    /// the inspector fetches only the first 64 KB, and Quick Look highlights it when those are
+    /// text, else fetches the whole file as before. It never opens Live.
+    @Test func aFileOfUnknownTypeIsPreviewedFromItsHead() async throws {
+        try await withHarness("unknown", connected: true) { h in
+            let head = EditableFile.previewHead
+            try Data(String(repeating: "const a = 1;\n", count: 20_000).utf8).write(to: h.remote.appendingPathComponent("big.xqz"))
+            try (Data([0x7F, 0x45, 0x4C, 0x46, 0]) + Data(count: 99_995)).write(to: h.remote.appendingPathComponent("blob"))
+            let text = h.remotePath.appending("big.xqz"), blob = h.remotePath.appending("blob")
+            #expect(await h.session.openKind(fileName: "big.xqz") == .view)
+
+            #expect(try Data(contentsOf: try await h.session.prepareInspectorPreview(text)).count == head)
+            #expect(try Data(contentsOf: try await h.session.prepareInspectorPreview(blob)).count == head)
+            let page = try await h.session.preparePreview(text)
+            #expect(page.lastPathComponent == "big.xqz.html")
+            #expect(try String(contentsOf: page, encoding: .utf8).contains("const"))
+            let whole = try await h.session.preparePreview(blob)
+            #expect(whole.lastPathComponent == "blob")
+            #expect(try Data(contentsOf: whole).count == 100_000)
+        }
+    }
+
     /// Quick Look's head of a UTF-8 text file that ended inside a character was not UTF-8, so the
     /// whole file was fetched instead (XFR-03). The inspector's limit (10 MB) for a file that is not text
     /// was checked only against the listing the window had (SEC2-03): IO holds it too.

@@ -101,7 +101,7 @@ final class Store: @unchecked Sendable {
     // MARK: Schema
 
     /// The newest schema this build knows; `migrate(from:)` has a step for each one before it.
-    static let schemaVersion = 3
+    static let schemaVersion = 4
 
     /// Runs inside a write transaction, so the version it reads is not stale: another process may
     /// have migrated while this one waited for the lock. False once the library is current.
@@ -131,6 +131,11 @@ final class Store: @unchecked Sendable {
             // Every path an older Transfer stored is UTF-8 text, so no row changes; a blob would
             // not match the text an older Transfer compares with, and its Unstar would fail.
             break
+        case 3:
+            // 2.0.0's built-in list gained source types macOS does not know; a library's own
+            // `config.json` gets those it lacks, once, so one the user removes later stays removed.
+            // No row changes.
+            ConfigLoader.add(TransferConfig.addedIn2, root: root)
         default:
             preconditionFailure("No migration from library schema \(version)")
         }

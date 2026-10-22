@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import UniformTypeIdentifiers
 @testable import TransferCore
 
 /// The saved inspector column is rewritten to the preference's state before the split reads it.
@@ -87,6 +88,72 @@ import Testing
     }
 }
 
+/// 2.0.0's built-in list adds source and config files macOS does not reliably know, after the list
+/// every earlier release wrote, in its order. Each opens Live, by extension or by whole name, and
+/// none is one the Mac reads as a picture, audio, video, or an archive (`mts`, AVCHD video, was
+/// left out; `ts`, an MPEG-2 transport stream to the Mac, is the first list's own).
+@Test func theBuiltInListAddsCommonSourceTypes() {
+    let builtIn = TransferConfig.builtIn
+    #expect(Array(builtIn.editableExtensions.prefix(18)) == TransferConfig.releasedBuiltIn)
+    #expect(builtIn.editableExtensions == TransferConfig.releasedBuiltIn + TransferConfig.addedIn2)
+    #expect(Set(builtIn.editableExtensions).count == builtIn.editableExtensions.count, "no entry twice")
+    #expect(builtIn.editableExtensions.allSatisfy { $0 == $0.lowercased() && !$0.hasPrefix(".") && !$0.isEmpty })
+    let required = ["zig", "go", "rb", "java", "kt", "kts", "lua", "sql", "ini", "conf", "cfg", "env", "cpp", "cc", "hpp", "h",
+                    "m", "mm", "cs", "php", "pl", "r", "scala", "ex", "exs", "erl", "hs", "ml", "nim", "v", "dart", "gradle",
+                    "cmake", "mk", "makefile", "dockerfile", "gitignore", "editorconfig"]
+    #expect(Set(required).isSubset(of: builtIn.extensionSet))
+    #expect(!builtIn.extensionSet.contains("mts"))
+    for ext in TransferConfig.addedIn2 {
+        if let type = EditableFile.declaredType(fileName: "a.\(ext)") {
+            #expect(![UTType.image, .audiovisualContent, .archive].contains(where: type.conforms), "\(ext): \(type.identifier)")
+        }
+    }
+    for name in ["build.zig", "main.go", "App.kt", "settings.gradle.kts", "Makefile", "Dockerfile", ".gitignore", ".env",
+                 ".editorconfig", "lib.ex", "setup.cfg", "php.ini", "Gemfile"] {
+        #expect(EditableFile.openKind(fileName: name, extensions: builtIn.extensionSet) == .live, "\(name)")
+    }
+}
+
+/// A library's own list gets each new entry it lacks, after its own, which keep their order; an
+/// entry it already has in any case is not added twice, and adding again changes nothing.
+@Test func addingKeepsTheUsersListAndAppendsWhatItLacks() {
+    let mine = TransferConfig(editableExtensions: ["log", "TXT", "zig", "md"])
+    let added = mine.adding(["txt", "go", "zig", "rb", "go"])
+    #expect(added.editableExtensions == ["log", "TXT", "zig", "md", "go", "rb"])
+    #expect(added.adding(["txt", "go", "zig", "rb"]) == added)
+    #expect(TransferConfig(editableExtensions: []).adding(["a", "b"]).editableExtensions == ["a", "b"])
+    #expect(TransferConfig(editableExtensions: TransferConfig.releasedBuiltIn).adding(TransferConfig.addedIn2) == .builtIn)
+}
+
+/// A file of a type the Mac does not know previews as text when its first 64 KB are UTF-8 with
+/// no NUL. A head cut short may end inside one character, which is left off; anything else
+/// that is not UTF-8 is not text.
+@Test func aHeadIsTextOnlyWhenItIsUTF8WithoutANul() throws {
+    let length = TextHead.length
+    #expect(length == 64 << 10)
+    #expect(TextHead.text(Data("const std = @import(\"std\");\n".utf8), whole: true) == "const std = @import(\"std\");\n")
+    #expect(TextHead.text(Data("café ✓ 日本".utf8), whole: true) == "café ✓ 日本")
+    #expect(TextHead.text(Data(), whole: true) == "")
+    #expect(TextHead.text(Data("a\u{0}b".utf8), whole: true) == nil)
+    #expect(TextHead.text(Data([0xFF, 0xFE, 0x41, 0x00]), whole: true) == nil, "UTF-16 holds NULs")
+    #expect(TextHead.text(Data([0x41, 0xC3, 0x28]), whole: true) == nil)
+    #expect(TextHead.text(Data([0x41, 0x80]), whole: false) == nil, "a stray continuation byte is not a cut character")
+    #expect(TextHead.text(Data([0x41, 0xC0, 0x80]), whole: false) == nil, "an overlong lead is not one either")
+    // Cut inside "日" (E6 97 A5): left off only when the head may be cut.
+    let cut = Data("ab".utf8) + Data([0xE6, 0x97])
+    #expect(TextHead.text(cut, whole: false) == "ab")
+    #expect(TextHead.text(cut, whole: true) == nil)
+    #expect(TextHead.text(Data("ab".utf8) + Data([0xF0, 0x9F, 0x98]), whole: false) == "ab")
+    #expect(TextHead.text(Data("ab".utf8) + Data([0xE6, 0x97, 0xA5]), whole: false) == "ab日")
+
+    // Only the first 64 KB count: what follows them may be anything, and a character they cut
+    // is left off.
+    let ascii = Data(repeating: 0x61, count: length - 1)
+    let long = ascii + Data([0xE6, 0x97, 0xA5]) + Data([0, 0xFF])
+    #expect(try #require(TextHead.text(long, whole: true)).utf8.count == length - 1)
+    #expect(TextHead.text(ascii + Data([0]) + Data(repeating: 0x61, count: 10), whole: true) == nil)
+}
+
 @Test func documentsOpenForViewing() {
     for name in ["photo.jpg", "scan.png", "book.pdf", "movie.mp4", "archive.zip"] {
         #expect(EditableFile.openKind(fileName: name, extensions: TransferConfig.builtIn.extensionSet) == .view)
@@ -105,16 +172,18 @@ import Testing
 }
 
 /// Only what follows the last dot is the extension (COR-1), and a trailing dot leaves none. A name
-/// with no dot matches the list by its whole name, so a user's "makefile" entry opens Makefile
-/// Live (FR-2); the built-in list holds no such name, and an empty entry matches nothing.
+/// with no dot matches the list by its whole name, so a "makefile" entry opens Makefile Live
+/// (FR-2), as the built-in list's does since 2.0.0; an empty entry matches nothing.
 @Test func anExtensionIsWhatFollowsTheLastDot() {
     func kind(_ name: String, _ extensions: Set<String>) -> OpenKind { EditableFile.openKind(fileName: name, extensions: extensions) }
     // Names whose outcome cannot depend on the apps installed: none of these has a type the system
     // could know (`.bashrc` does once an app such as Syntax Highlight declares one, so it is checked
     // against a list of its own below).
-    for name in ["README", "Makefile", "LICENSE", "notes.", "..", "a.tar.gz"] {
+    for name in ["README", "LICENSE", "notes.", "..", "a.tar.gz"] {
         #expect(kind(name, TransferConfig.builtIn.extensionSet) == .view, "\(name)")
     }
+    #expect(kind("Makefile", TransferConfig(editableExtensions: TransferConfig.releasedBuiltIn).extensionSet) == .view)
+    #expect(kind("Makefile", TransferConfig.builtIn.extensionSet) == .live)
     #expect(kind(".bashrc", ["bashrc"]) == .live)
     #expect(kind("README", ["readme"]) == .live)
     #expect(kind("Makefile", ["makefile"]) == .live)
@@ -504,32 +573,49 @@ import Testing
     #expect(drop([file], from: there, copy: false, move: true) == nil)
 }
 
-/// The inspector fetches a picture or other previewable file up to 10 MB and a text file's head at
-/// any size; anything it could only show as an icon, or that is too large or listed without a
-/// size, is never fetched.
+/// The inspector fetches a picture or any other file up to 10 MB for the selection, since a Quick
+/// Look extension may draw it, and a text file's head at any size; a file of a type the Mac does
+/// not know has its head read and shown if it is text. A neighbor fetched ahead goes to Quick Look
+/// only when its type draws as more than an icon without an extension. Anything too large or
+/// listed without a size is never fetched whole.
 @Test func theInspectorFetchesOnlyWhatItCanShow() {
     let limit = InspectorPreviewPlan.limit
     #expect(limit == 10 << 20)
-    func plan(_ name: String, _ size: UInt64?, text: Bool = false) -> InspectorPreviewPlan {
-        InspectorPreviewPlan.plan(fileName: name, size: size, isText: text)
+    func plan(_ name: String, _ size: UInt64?, text: Bool = false, prefetch: Bool = false) -> InspectorPreviewPlan {
+        InspectorPreviewPlan.plan(fileName: name, size: size, isText: text, prefetch: prefetch)
     }
-    #expect(plan("photo.png", limit) == .picture)
-    #expect(plan("photo.JPG", 1) == .picture)
-    #expect(plan("photo.png", limit + 1) == .icon)
-    #expect(plan("photo.png", nil) == .icon)
-    #expect(plan("notes.txt", 1 << 30, text: true) == .text)
-    #expect(plan("notes.txt", nil, text: true) == .text)
-    for name in ["paper.pdf", "clip.mov", "song.mp3", "deck.key", "sheet.xlsx", "letter.docx", "table.csv"] {
+    for prefetch in [false, true] {
+        #expect(plan("photo.png", limit, prefetch: prefetch) == .picture)
+        #expect(plan("photo.JPG", 1, prefetch: prefetch) == .picture)
+        #expect(plan("photo.png", limit + 1, prefetch: prefetch) == .icon)
+        #expect(plan("photo.png", nil, prefetch: prefetch) == .icon)
+        #expect(plan("notes.txt", 1 << 30, text: true, prefetch: prefetch) == .text)
+        #expect(plan("notes.txt", nil, text: true, prefetch: prefetch) == .text)
+        #expect(plan("photo.png", 1, text: true, prefetch: prefetch) == .text, "the user's list wins")
+        for name in ["paper.pdf", "clip.mov", "song.mp3", "deck.key", "sheet.xlsx", "letter.docx", "table.csv"] {
+            #expect(plan(name, 1000, prefetch: prefetch) == .quickLook, "\(name)")
+        }
+        #expect(plan("paper.pdf", limit + 1, prefetch: prefetch) == .icon)
+        // No type to go by: the head, at any size.
+        for name in ["blob.xyz", "README", "LICENSE", "Makefile", "notes.", "data.qqzz"] {
+            #expect(plan(name, 1000, prefetch: prefetch) == .textIfText, "\(name)")
+            #expect(plan(name, limit + 1, prefetch: prefetch) == .textIfText, "\(name)")
+            #expect(plan(name, nil, prefetch: prefetch) == .textIfText, "\(name)")
+        }
+    }
+    // Known types Quick Look draws only through an extension, if one is installed: the selection
+    // goes to Quick Look, a neighbor is not fetched.
+    for name in ["archive.zip", "a.tar.gz", "lib.dylib", "tool.bin"] {
         #expect(plan(name, 1000) == .quickLook, "\(name)")
+        #expect(plan(name, 1000, prefetch: true) == .icon, "\(name)")
+        #expect(plan(name, limit + 1) == .icon, "\(name)")
     }
-    #expect(plan("paper.pdf", limit + 1) == .icon)
-    for name in ["blob.xyz", "archive.zip", "a.tar.gz", "lib.dylib", "notes."] {
-        #expect(plan(name, 1000) == .icon, "\(name)")
+    #expect(InspectorPreviewPlan.text.readsHead && InspectorPreviewPlan.textIfText.readsHead)
+    for plan in [InspectorPreviewPlan.picture, .quickLook, .icon] { #expect(!plan.readsHead) }
+    #expect(EditableFile.declaredType(fileName: "a.png") == .png)
+    for name in ["README", "notes.", "blob.xyz", ".."] {
+        #expect(EditableFile.declaredType(fileName: name) == nil, "\(name)")
     }
-    for name in ["README", "LICENSE", "Makefile"] {
-        #expect(plan(name, 1000) == .quickLook, "\(name)")
-    }
-    #expect(plan("README", limit + 1) == .icon)
 }
 
 @Test func quickLookFetchesFilesUpTo256MBAndNothingElse() {

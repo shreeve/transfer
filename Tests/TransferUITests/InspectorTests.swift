@@ -52,9 +52,9 @@ struct InspectorTests {
     }
 
     /// Every kind of selection keeps the header line and the preview area in one place: a
-    /// picture, a text file, a file of a type it cannot show, one over the limit, one still
-    /// loading, a folder, two items, and a link. The header is one line; the area runs from under
-    /// it to the Wrap lines strip at the panel's foot. Text and the list of several items draw on
+    /// picture, a text file, a file it cannot fetch (listed with no size), one over the limit,
+    /// one still loading, a folder, two items, and a link. The header is one line; the area runs
+    /// from under it to the Wrap lines strip at the panel's foot. Text and the list of several items draw on
     /// the document background, the rest on gray. A missing fact reads "—".
     @Test func theHeaderAndThePreviewAreaHoldStillWhateverIsSelected() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "TransferUITests-\(UUID().uuidString)")
@@ -74,8 +74,9 @@ struct InspectorTests {
             file("notes.txt", size: 16),
             file("slow.png", size: 1000),
             file("huge.png", size: InspectorPreviewPlan.limit + 1),
-            // Listed with no size, time, mode, or owner.
-            RemoteItem(path: path("blob.xyz"), kind: .file),
+            // Listed with no size, time, mode, or owner: a file of a known type that is not text
+            // is fetched whole, so with no size it is not fetched at all.
+            RemoteItem(path: path("blob.zip"), kind: .file),
             RemoteItem(path: path("link"), kind: .symlink),
         ]
         let session = FakeSession(server, folders: [home: items, docs.path: []])
@@ -126,7 +127,7 @@ struct InspectorTests {
         seen["text"] = await frames()
         surfaces["text"] = slots.surface
 
-        select("blob.xyz")
+        select("blob.zip")
         #expect(await eventually { model.inspectorPreview == nil && model.inspectorWait == .icon })
         seen["unsupported"] = await frames()
         surfaces["unsupported"] = slots.surface
@@ -172,7 +173,7 @@ struct InspectorTests {
 
         // Neither a server nor the inspector fetched anything it could not show.
         let fetched = session.calls.value.filter { $0.hasPrefix("inspector ") }
-        #expect(!fetched.contains { $0.hasSuffix("blob.xyz") || $0.hasSuffix("huge.png") })
+        #expect(!fetched.contains { $0.hasSuffix("blob.zip") || $0.hasSuffix("huge.png") })
 
         #expect(surfaces == ["picture": "gray", "text": "document", "unsupported": "gray", "folder": "gray", "two items": "document"])
         let reference = try #require(seen["picture"])
