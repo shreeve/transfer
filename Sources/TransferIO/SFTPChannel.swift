@@ -132,12 +132,11 @@ actor SFTPChannel {
                         for page in inFlight { page.cancel() }
                         closeSoon([handle])
                     }
-                    var finished = false
                     var pages = 0
-                    while !finished || !inFlight.isEmpty {
+                    while true {
                         // Four pages at first, so a small folder asks for at most three past
                         // its end; sixteen once four have come, a round trip per 1,600 names.
-                        while !finished, inFlight.count < (pages < 4 ? 4 : 16) {
+                        while inFlight.count < (pages < 4 ? 4 : 16) {
                             inFlight.append(Task { try await self.readDirectory(handle, parent: path) })
                         }
                         let next = inFlight.removeFirst()
@@ -146,10 +145,10 @@ actor SFTPChannel {
                         } onCancel: {
                             next.cancel()
                         }
-                        guard let page else {
-                            finished = true
-                            continue
-                        }
+                        // The server answers a handle's requests in order, so every page asked
+                        // for after the one that ended the folder ends it too: they are dropped,
+                        // not waited for, which was a round trip at the end of every listing.
+                        guard let page else { break }
                         pages += 1
                         for item in page { continuation.yield(item) }
                         try Task.checkCancellation()
