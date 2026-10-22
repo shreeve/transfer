@@ -265,6 +265,24 @@ final class ChromeController: NSSplitViewController {
     private var windowObservers: [any NSObjectProtocol] = []
     private var separatorObservation: NSKeyValueObservation?
 
+    /// Sets the inspector's largest width from the split view's current width
+    /// (`InspectorWidth`), and pulls in an inspector that is now wider. Only a changed value is
+    /// written, so layout does not loop; a collapsed inspector has no width to pull in.
+    func fitInspectorMaximum() {
+        guard splitViewItems.count == 3 else { return }
+        let sidebar = splitViewItems[0]
+        let inspector = splitViewItems[2]
+        let width = Double(splitView.bounds.width)
+        guard width > 0 else { return }
+        let side = sidebar.isCollapsed ? 0 : Double(sidebar.viewController.view.frame.width)
+        let limit = CGFloat(InspectorWidth.maximum(splitWidth: width, sidebar: side))
+        guard inspector.maximumThickness != limit else { return }
+        inspector.maximumThickness = limit
+        if !inspector.isCollapsed, inspector.viewController.view.frame.width > limit {
+            splitView.setPosition(splitView.bounds.width - limit - splitView.dividerThickness, ofDividerAt: 1)
+        }
+    }
+
     /// `inspectorShown` is the model's: a window opens with the inspector as the last one left it
     /// (`Preferences.showsInspector`), whatever the split view's autosave holds.
     func install(sidebar: NSHostingController<AnyView>, detail: NSHostingController<AnyView>, inspector: NSHostingController<AnyView>,
@@ -301,7 +319,7 @@ final class ChromeController: NSSplitViewController {
         detailItem.automaticallyAdjustsSafeAreaInsets = true
         let inspectorItem = NSSplitViewItem(inspectorWithViewController: BelowToolbarController(hosting: inspector))
         inspectorItem.minimumThickness = 240
-        inspectorItem.maximumThickness = 480
+        inspectorItem.maximumThickness = CGFloat(InspectorWidth.minimum)
         inspectorItem.canCollapse = true
         inspectorItem.isCollapsed = true
         inspectorItem.titlebarSeparatorStyle = .none
@@ -331,6 +349,7 @@ final class ChromeController: NSSplitViewController {
 
     override func viewDidLayout() {
         super.viewDidLayout()
+        fitInspectorMaximum()
         keepSeparatorOff()
         hideContentScrollPockets()
         let top = placeHoverLine()
@@ -598,6 +617,7 @@ final class ChromeController: NSSplitViewController {
             if model.sidebarCollapsed != collapsed { model.sidebarCollapsed = collapsed }
             if model.showsInspector != shown { model.showsInspector = shown }
         }
+        fitInspectorMaximum()
         keepSeparatorOff()
         hideContentScrollPockets()
         refreshHoverLine(animated: true)

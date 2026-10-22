@@ -389,7 +389,8 @@ struct InspectorTests {
         let controller = try #require(chrome(in: window))
         let inspector = controller.splitViewItems[2]
         #expect(inspector.isCollapsed)
-        #expect(inspector.maximumThickness == 480)
+        let side = controller.splitViewItems[0].isCollapsed ? 0 : Double(controller.splitViewItems[0].viewController.view.frame.width)
+        #expect(inspector.maximumThickness == CGFloat(InspectorWidth.maximum(splitWidth: Double(controller.splitView.bounds.width), sidebar: side)))
         let item = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.inspector })
         let identifiers = window.toolbar?.items.map(\.itemIdentifier) ?? []
         #expect(identifiers.firstIndex(of: ChromeItem.inspector) == identifiers.firstIndex(of: ChromeItem.transfers).map { $0 + 1 })
@@ -428,6 +429,51 @@ struct InspectorTests {
         let item = try #require(window.toolbar?.items.first { $0.itemIdentifier == ChromeItem.inspector })
         #expect(NSApp.sendAction(try #require(item.action), to: item.target, from: item))
         #expect(await eventually { !inspector.isCollapsed })
+    }
+
+    /// The inspector grows to 60% of the split view and no further, and a narrower window pulls
+    /// it in while the content pane keeps its 260.
+    @Test func theInspectorStopsAtSixtyPercentAndShrinksWithTheWindow() async throws {
+        UserDefaults.standard.removeObject(forKey: Self.splitFrames)
+        defer { UserDefaults.standard.removeObject(forKey: Self.splitFrames) }
+        let defaults = Defaults()
+        defaults.store.set(true, forKey: Preferences.showsInspector)
+        let model = TransferModel(provider: FakeProvider([FakeSession(server)]), defaults: defaults.store)
+        let window = await window(ContentView(model: model), style: [.titled, .resizable])
+        defer { window.close() }
+        let controller = try #require(chrome(in: window))
+        let inspector = controller.splitViewItems[2]
+        let content = controller.splitViewItems[1]
+        let split = controller.splitView
+        func settle() async { try? await Task.sleep(for: .milliseconds(400)) }
+        func resize(_ width: CGFloat) async {
+            var frame = window.frame
+            frame.size.width = width
+            window.setFrame(frame, display: true)
+            await settle()
+        }
+        func drag(to width: CGFloat) async {
+            split.setPosition(split.bounds.width - width, ofDividerAt: 1)
+            split.layoutSubtreeIfNeeded()
+            await settle()
+        }
+        await resize(1600)
+        #expect(await eventually { !inspector.isCollapsed })
+        await drag(to: 2000)
+        let widest = inspector.viewController.view.frame.width
+        let side = controller.splitViewItems[0].viewController.view.frame.width
+        let limit = CGFloat(InspectorWidth.maximum(splitWidth: Double(split.bounds.width), sidebar: Double(side)))
+        #expect(inspector.maximumThickness == limit)
+        #expect(abs(widest - 960) <= 20 && widest <= limit)
+        await drag(to: 300)
+        #expect(abs(inspector.viewController.view.frame.width - 300) <= 2)
+
+        await drag(to: 2000)
+        await resize(900)
+        let narrowed = inspector.viewController.view.frame.width
+        #expect(narrowed <= CGFloat(InspectorWidth.maximum(splitWidth: Double(split.bounds.width), sidebar: Double(side))))
+        #expect(narrowed < widest)
+        #expect(content.viewController.view.frame.width >= 260)
     }
 
     /// Back and Forward are dim until the history has somewhere to go, and follow it.

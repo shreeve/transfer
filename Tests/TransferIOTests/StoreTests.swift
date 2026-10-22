@@ -298,9 +298,17 @@ struct StoreTests {
         let store = try Store(root: root)
         let other = try Raw(root)
         other.run("BEGIN IMMEDIATE; INSERT INTO pins VALUES ('\(Self.beta)', '/held')")
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { other.run("COMMIT") }
+        // Its own thread, not a global queue: under a loaded parallel run the queue's threads can all
+        // be held by blocked tests, so the release came after the store's 5 s wait, and after the test.
+        let released = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.3)
+            other.run("COMMIT")
+            released.signal()
+        }
 
         store.star(connection: ConnectionID(rawValue: Self.alpha), path: RemotePath(string: "/waited"), on: true)
+        released.wait()
 
         #expect(stars(store, Self.alpha) == ["/waited"])
         #expect(stars(store, Self.beta) == ["/held"])

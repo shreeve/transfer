@@ -12,7 +12,7 @@ What changed in each release of Transfer. `Scripts/release.sh <version>` publish
 - An Inspector button beside Transfers in the toolbar shows and hides the inspector, as View → Show Inspector (Command-I) does.
 - The inspector stays open or closed as you left it, in new windows and after relaunching.
 - Pictures and other files preview in the inspector up to 10 MB (was 8 MB); text still shows its first 64 KB at any size. A file of a type the inspector cannot preview is no longer downloaded for it.
-- The inspector can be widened to 480 points (was 320).
+- The inspector can be widened to 60% of the window's width (at least 240 points; was 320), and a window made narrower pulls a too-wide inspector in; the content pane keeps its 260 points.
 - Closing a window while its inspector was still closing no longer leaves every later window unable to show the inspector.
 - View → Show Path Bar (Option-Command-P) shows a path bar at the foot of the window, as in Finder: the server, each folder down to where you are, and the selected item. Click a folder in it to go there (Back returns), or drop files onto one to copy or move them into it. It stays shown or hidden as you left it.
 - A running transfer on the shelf shows its speed and time left, as Finder words them: " 12MB/s · about 2 minutes left". The speed averages the last five seconds, so it holds steady; a transfer that receives nothing for five seconds reads Stalled. The inspector shows the same.
