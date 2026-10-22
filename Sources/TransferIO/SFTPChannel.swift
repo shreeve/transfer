@@ -132,12 +132,13 @@ actor SFTPChannel {
                         for page in inFlight { page.cancel() }
                         closeSoon([handle])
                     }
-                    var finished = false
                     var pages = 0
-                    while !finished || !inFlight.isEmpty {
+                    // A server that answers with empty pages and never the end is not listed forever.
+                    var empty = 0
+                    while true {
                         // Four pages at first, so a small folder asks for at most three past
                         // its end; sixteen once four have come, a round trip per 1,600 names.
-                        while !finished, inFlight.count < (pages < 4 ? 4 : 16) {
+                        while inFlight.count < (pages < 4 ? 4 : 16) {
                             inFlight.append(Task { try await self.readDirectory(handle, parent: path) })
                         }
                         let next = inFlight.removeFirst()
@@ -146,10 +147,13 @@ actor SFTPChannel {
                         } onCancel: {
                             next.cancel()
                         }
-                        guard let page else {
-                            finished = true
-                            continue
-                        }
+                        // Pages are taken in the order they were asked for, and the server answers
+                        // a handle's requests in order, so every page asked for after the one that
+                        // ended the folder ends it too: they are dropped, not waited for, which was
+                        // a round trip at the end of every listing.
+                        guard let page else { break }
+                        empty = page.isEmpty ? empty + 1 : 0
+                        if empty >= Self.emptyPageLimit { throw TransferError.failed("The server sent page after empty page for “\(path.name)” without ending the listing") }
                         pages += 1
                         for item in page { continuation.yield(item) }
                         try Task.checkCancellation()
@@ -509,6 +513,11 @@ actor SFTPChannel {
     /// server sends is used as a path component, so anything that is not exactly one is dropped:
     /// `.` and `..`, an empty name, and a name with a slash or NUL, which a hostile server could
     /// send to reach outside the folder. A page of only such names is empty, not the end.
+    /// Empty pages in a row that end a listing as a failure.
+    static let emptyPageLimit = 64
+
+    /// One READDIR reply: its names, or nil for the end-of-folder status. An empty page is not the
+    /// end: only the status says the folder is done.
     private func readDirectory(_ handle: Data, parent: RemotePath) async throws -> [RemoteItem]? {
         let names: [(filename: Data, attrs: SFTPAttrs)]
         do {
@@ -516,7 +525,6 @@ actor SFTPChannel {
         } catch is EndOfFile {
             return nil
         }
-        guard !names.isEmpty else { return nil }
         return names.compactMap { name in
             guard RemotePath.isSingleName(bytes: name.filename) else { return nil }
             return item(path: parent.appending(name: Array(name.filename)), attrs: name.attrs)

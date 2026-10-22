@@ -39,7 +39,7 @@ extension SSHConnection {
     private struct ChangedDuringMove: Error {}
 
     /// The walker passenger, else the browse one.
-    private func walkerLink() async throws -> SFTPChannel {
+    func walkerLink() async throws -> SFTPChannel {
         if let walker = await liveLink(.walker) { return walker }
         return try await metadataLink()
     }
@@ -78,11 +78,80 @@ extension SSHConnection {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let link = try await walkerLink()
         let tally = CopyTally(progress)
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            try await placeDown(item, named: destination.lastPathComponent, in: folder, link: link, group: &group, tally: tally)
-            try await group.waitForAll()
+        // Small files of a folder go in tar batches; a single file is never worth a stream. The
+        // probe, once per login, runs while the walk lists the first folders.
+        let batch = item.kind == .directory && tarCommand != nil ? TarBatcher(self) : nil
+        if batch != nil { Task { _ = await self.tarReady() } }
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                try await placeDown(item, named: destination.lastPathComponent, in: folder, link: link, batch: batch, group: &group, tally: tally)
+                if let batch {
+                    let rest = batch.drain()
+                    if !rest.jobs.isEmpty {
+                        if tally.addingJob() { _ = try await group.next() }
+                        group.addTask { try await self.receiveBatch(rest.jobs, in: rest.stream ? batch.feeds : nil, tally: tally) }
+                    }
+                    batch.feeds.finish()
+                }
+                try await group.waitForAll()
+            }
+            // A stream that reported an error after it had placed files may have padded one with
+            // zeros: what it placed comes again over SFTP.
+            if let batch { try await refetch(await batch.feeds.placedByFaultedStreams(), tally: tally) }
+        } catch {
+            batch?.feeds.cancel()
+            throw error
         }
         try tally.check()
+    }
+
+    /// Fetches `jobs`, files a faulted stream placed, again over SFTP over what it placed.
+    private func refetch(_ jobs: [TarJob], tally: CopyTally) async throws {
+        guard !jobs.isEmpty else { return }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for job in jobs {
+                group.addTask {
+                    do {
+                        try await self.fetch(job.item.path, info: job.item, to: job.destination, replacing: true) { _ in }
+                    } catch {
+                        try tally.failed(job.destination.lastPathComponent, error)
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    /// One batch, sent down one of `feeds`' streams: what it does not land goes over SFTP, each
+    /// file on its own, and a file that fails is the copy's failure as any other is.
+    private func receiveBatch(_ jobs: [TarJob], in feeds: TarFeeds?, tally: CopyTally) async throws {
+        var left = jobs
+        if let ticket = await feeds?.submit(jobs, store: store) {
+            let written = await withTaskCancellationHandler { await ticket.written() } onCancel: { ticket.feed.cancel() }
+            left = []
+            for (job, outcome) in zip(jobs, try await landTarBatch(jobs, temps: ticket.temps, written: written, from: ticket.feed)) {
+                switch outcome {
+                case .landed:
+                    tarLanded += 1
+                    tally.finished(bytes: job.item.size ?? 0)
+                case .sftp: left.append(job)
+                case .failed(let error): try tally.failed(job.destination.lastPathComponent, error)
+                }
+            }
+        }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for job in left {
+                group.addTask {
+                    do {
+                        try await self.fetch(job.item.path, info: job.item, to: job.destination, replacing: job.replacing, progress: tally.file())
+                        tally.finished()
+                    } catch {
+                        try tally.failed(job.destination.lastPathComponent, error)
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
     }
 
     /// Temp-and-rename into `destination`'s folder, which the caller made. No collision check, but
@@ -110,23 +179,29 @@ extension SSHConnection {
         if recorded { store.rememberTemp(local: temp) }
         do {
             try await receive(path, info: info, into: temp, interactive: interactive, progress: progress)
-            // Marked first: a file without write bits takes no extended attribute. The channel
-            // created it with 0o666 under the umask, which no mode listed keeps.
-            if !live || EditableFile.quarantinesLiveCopy(fileName: path.name) { LocalPlacement.quarantine(temp) }
-            let mode = live ? 0o600 : (info.mode ?? 0o666) & (readOnly ? 0o555 : 0o777) & ~Self.fileMask
-            var attributes: [FileAttributeKey: Any] = [.posixPermissions: Int(mode)]
-            if let mtime = info.mtime { attributes[.modificationDate] = Date(timeIntervalSince1970: TimeInterval(mtime)) }
-            try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path)
-            // One rename replaces the destination, so a watched Live copy is never briefly missing.
-            let placed = replacing ? Darwin.rename(temp.path, destination.path) : renamex_np(temp.path, destination.path, UInt32(RENAME_EXCL))
-            guard placed == 0 else {
-                throw TransferError.failed("Could not place \(destination.lastPathComponent): \(String(cString: strerror(errno)))")
-            }
+            try Self.land(temp, as: destination, info: info, replacing: replacing, readOnly: readOnly, live: live)
             if recorded { store.forgetTemp(local: temp) }
         } catch {
             // A temp that cannot be removed now stays recorded, and the next launch removes it.
             if unlink(temp.path) == 0 || errno == ENOENT, recorded { store.forgetTemp(local: temp) }
             throw error
+        }
+    }
+
+    /// Puts the finished `temp`, the server's file `info`, in place as `destination`: quarantined,
+    /// given its mode and time, and renamed, replacing what holds the name only when `replacing`.
+    nonisolated static func land(_ temp: URL, as destination: URL, info: RemoteItem, replacing: Bool, readOnly: Bool = false, live: Bool = false) throws {
+        // Marked first: a file without write bits takes no extended attribute. The channel
+        // created it with 0o666 under the umask, which no mode listed keeps.
+        if !live || EditableFile.quarantinesLiveCopy(fileName: info.path.name) { LocalPlacement.quarantine(temp) }
+        let mode = live ? 0o600 : (info.mode ?? 0o666) & (readOnly ? 0o555 : 0o777) & ~Self.fileMask
+        var attributes: [FileAttributeKey: Any] = [.posixPermissions: Int(mode)]
+        if let mtime = info.mtime { attributes[.modificationDate] = Date(timeIntervalSince1970: TimeInterval(mtime)) }
+        try? FileManager.default.setAttributes(attributes, ofItemAtPath: temp.path)
+        // One rename replaces the destination, so a watched Live copy is never briefly missing.
+        let placed = replacing ? Darwin.rename(temp.path, destination.path) : renamex_np(temp.path, destination.path, UInt32(RENAME_EXCL))
+        guard placed == 0 else {
+            throw TransferError.failed("Could not place \(destination.lastPathComponent): \(String(cString: strerror(errno)))")
         }
     }
 
@@ -277,6 +352,8 @@ extension SSHConnection {
         in folder: URL,
         taken: Bool = false,
         link: SFTPChannel,
+        listed: [RemoteItem]? = nil,
+        batch: TarBatcher? = nil,
         group: inout ThrowingTaskGroup<Void, Error>,
         tally: CopyTally
     ) async throws {
@@ -290,13 +367,76 @@ extension SSHConnection {
             // Names this listing already used. A later one that folds the same (a duplicate, or two
             // names this Mac's disk takes for one) collides even before the first has landed.
             var used: Set<String> = []
-            for try await child in await link.list(item.path) {
+            // Folders wait until the rest of the listing is placed, so they can be listed ahead.
+            var folders: [(item: RemoteItem, taken: Bool)] = []
+            // In a download that may stream, how many small files a folder holds decides whether
+            // they stream (`TarBatchFill`). A folder listed ahead is counted before its first file
+            // is placed; one listed as it is walked sends its first `sftpFirst` over SFTP as names
+            // arrive, and the rest wait for the end of its listing. Everything else is placed as
+            // names arrive.
+            let streams = batch != nil && !tarMissing
+            if streams, let listed, let batch { beginTar(batch, small: Self.smallFiles(listed)) }
+            if streams, batch?.streaming == true { await Task.yield() }
+            var unheld = streams && listed == nil && batch?.streaming != true ? TarBatching.sftpFirst : Int.max
+            var small: [(item: RemoteItem, taken: Bool)] = []
+            let children: AsyncThrowingStream<RemoteItem, Error> = if let listed { Self.stream(listed) } else { await link.list(item.path) }
+            for try await child in children {
                 try Task.checkCancellation()
                 let taken = !used.insert(child.name.diskFolded).inserted
+                if child.kind == .directory {
+                    folders.append((child, taken))
+                    continue
+                }
+                if streams, listed == nil, Self.isSmallFile(child) {
+                    if unheld > 0 {
+                        unheld -= 1
+                    } else {
+                        small.append((child, taken))
+                        continue
+                    }
+                }
                 do {
-                    try await placeDown(child, named: child.name, in: local.url, taken: taken, link: link, group: &group, tally: tally)
+                    try await placeDown(child, named: child.name, in: local.url, taken: taken, link: link, batch: batch, group: &group, tally: tally)
                 } catch {
                     try tally.failed(child.name, error)
+                }
+            }
+            if !small.isEmpty, let batch {
+                beginTar(batch, small: small.count)
+                if batch.streaming { await Task.yield() }
+            }
+            for (child, taken) in small {
+                try Task.checkCancellation()
+                do {
+                    try await placeDown(child, named: child.name, in: local.url, taken: taken, link: link, batch: batch, group: &group, tally: tally)
+                } catch {
+                    try tally.failed(child.name, error)
+                }
+            }
+            // Each folder is listed while those before it are placed, up to `walkWidth` at once
+            // across every walk (`listings`): one at a time, each folder's listing cost its own
+            // round trips before a byte of it moved.
+            var ahead: [Task<[RemoteItem], Error>] = []
+            defer { for listing in ahead { listing.cancel() } }
+            for (index, folder) in folders.enumerated() {
+                while ahead.count < min(folders.count, index + Self.walkWidth) {
+                    let path = folders[ahead.count].item.path
+                    let tarMissing = tarMissing
+                    ahead.append(Task { [listings] in
+                        await listings.enter()
+                        defer { listings.leave() }
+                        var items: [RemoteItem] = []
+                        for try await child in await link.list(path) { items.append(child) }
+                        if !tarMissing { batch?.foresee(Self.smallFiles(items)) }
+                        return items
+                    })
+                }
+                do {
+                    let listed = try await ahead[index].value
+                    if !tarMissing { batch?.consume(Self.smallFiles(listed)) }
+                    try await placeDown(folder.item, named: folder.item.name, in: local.url, taken: folder.taken, link: link, listed: listed, batch: batch, group: &group, tally: tally)
+                } catch {
+                    try tally.failed(folder.item.name, error)
                 }
             }
         case .symlink:
@@ -308,6 +448,13 @@ extension SSHConnection {
         case .file:
             guard let placed = try await settleLocally(.file(Fingerprint(item: item)), named: name, in: folder, taken: taken) else {
                 return tally.finished()
+            }
+            if let batch, !tarMissing, TarBatching.takes(size: item.size, mtime: item.mtime),
+               let full = batch.add(TarJob(item: item, destination: placed.url, replacing: placed.found != nil)) {
+                guard !full.isEmpty else { return }
+                if tally.addingJob() { _ = try await group.next() }
+                group.addTask { try await self.receiveBatch(full, in: batch.feeds, tally: tally) }
+                return
             }
             if tally.addingJob() { _ = try await group.next() }
             group.addTask {
@@ -323,13 +470,43 @@ extension SSHConnection {
         }
     }
 
+    /// A listing already in, as the stream `SFTPChannel.list` gives one.
+    private static func stream(_ listed: [RemoteItem]) -> AsyncThrowingStream<RemoteItem, Error> {
+        AsyncThrowingStream { continuation in
+            for item in listed { continuation.yield(item) }
+            continuation.finish()
+        }
+    }
+
+    /// A folder of `small` small files is about to be placed: when that makes the download one to
+    /// stream, the streams' places are kept and the streams start. Listings read ahead are often
+    /// in by then, so the walk would hold this actor to its end: it yields to the streams' starts,
+    /// queued on it.
+    private func beginTar(_ batch: TarBatcher, small: Int) {
+        guard batch.begin(small) else { return }
+        keepTarPlaces(batch.feeds)
+        batch.feeds.start()
+    }
+
+    /// Whether a tar batch may take `item`.
+    private static func isSmallFile(_ item: RemoteItem) -> Bool {
+        item.kind == .file && TarBatching.takes(size: item.size, mtime: item.mtime)
+    }
+
+    /// The files of `items` a tar batch may take.
+    private static func smallFiles(_ items: [RemoteItem]) -> Int {
+        items.count(where: isSmallFile)
+    }
+
     /// Where `incoming` lands as `name` in `folder`, and what holds that spot now; nil to skip it.
     /// What holds the name is read without following a link. `taken` says an earlier entry of the
     /// same listing claimed the name and may not have landed yet.
     private func settleLocally(_ incoming: PlacedItem, named name: String, in folder: URL, taken: Bool) async throws -> (url: URL, found: PlacedItem?)? {
         let url = try LocalPlacement.child(folder, name: name)
         var found = try LocalPlacement.occupant(url)
-        if taken, found == nil { found = .other }
+        // A name an earlier entry claimed collides whatever is there: once that entry has landed,
+        // a file of the same size and time would read as this one and be skipped unasked.
+        if taken, found == nil || incoming != .folder { found = .other }
         switch try await settle(incoming, onto: found, named: name, shown: name) {
         case .skip: return nil
         case .replace: return (url, found)

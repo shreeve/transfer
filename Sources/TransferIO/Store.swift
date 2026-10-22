@@ -264,6 +264,29 @@ final class Store: @unchecked Sendable {
         write("DELETE FROM temps WHERE CAST(path AS BLOB) = ?", Array(url.path.utf8))
     }
 
+    /// `rememberTemp(local:)` for each of `urls`, in one transaction: a tar batch records its
+    /// temps before the stream starts, one commit, not one per file.
+    func rememberTemps(local urls: [URL]) {
+        queue.sync {
+            report("write the library") {
+                try transaction {
+                    for url in urls { try run("INSERT OR REPLACE INTO temps (path, connection_id) VALUES (?,?)", [StoredPath(bytes: Array(url.path.utf8)), ""]) }
+                }
+            }
+        }
+    }
+
+    func forgetTemps(local urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        queue.sync {
+            report("write the library") {
+                try transaction {
+                    for url in urls { try run("DELETE FROM temps WHERE CAST(path AS BLOB) = ?", [Array(url.path.utf8)]) }
+                }
+            }
+        }
+    }
+
     func localTemps() -> [URL] {
         paths("SELECT DISTINCT CAST(path AS BLOB) FROM temps WHERE connection_id IS NULL OR connection_id = '' ORDER BY 1")
             .map { URL(fileURLWithPath: String(decoding: $0, as: UTF8.self)) }

@@ -551,3 +551,247 @@ private func bindSocket(at url: URL) throws -> Int32 {
 private func quarantined(_ url: URL) -> Bool {
     getxattr(url.path, "com.apple.quarantine", nil, 0, 0, XATTR_NOFOLLOW) > 0
 }
+
+/// Folder downloads whose small files come down in tar streams (`SSHConnection+Tar.swift`). What
+/// the stream does not deliver whole and unchanged goes over SFTP: whatever the server's tar
+/// sends, the download lands the server's bytes or nothing, and leaves no temp behind.
+extension TransferServerTests {
+    /// Two folders of small files, each enough alone for a download to stream.
+    private func smallTree(_ h: ServerHarness, files: Int = 2 * TarBatching.minimumFiles) throws -> RemotePath {
+        let tree = h.remote.appendingPathComponent("tree")
+        for index in 0..<files {
+            let folder = tree.appendingPathComponent("f\(index % 2)")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            var data = Data(count: 512 + index * 7 % 2048)
+            data.withUnsafeMutableBytes { arc4random_buf($0.baseAddress!, $0.count) }
+            try data.write(to: folder.appendingPathComponent("file-\(index).txt"))
+        }
+        return h.remotePath.appending(name: Array("tree".utf8))
+    }
+
+    /// Every file under `remote` is under `local` with the same bytes and time (whole seconds, as
+    /// SFTP has it), and `local` holds nothing else.
+    private func expectSame(_ remote: URL, _ local: URL, sourceLocation: SourceLocation = #_sourceLocation) throws {
+        func files(_ root: URL) throws -> [String: (Data, Int?)] {
+            var found: [String: (Data, Int?)] = [:]
+            for path in FileManager.default.subpaths(atPath: root.path) ?? [] {
+                let url = root.appendingPathComponent(path)
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                guard attributes[.type] as? FileAttributeType == .typeRegular else { continue }
+                found[path] = (try Data(contentsOf: url), (attributes[.modificationDate] as? Date).map { Int($0.timeIntervalSince1970) })
+            }
+            return found
+        }
+        let there = try files(remote)
+        let here = try files(local)
+        #expect(Set(here.keys) == Set(there.keys), sourceLocation: sourceLocation)
+        for (path, (data, time)) in there {
+            #expect(here[path]?.0 == data, "\(path)", sourceLocation: sourceLocation)
+            #expect(here[path]?.1 == time, "\(path)", sourceLocation: sourceLocation)
+        }
+    }
+
+    private func expectNoTemps(_ h: ServerHarness, sourceLocation: SourceLocation = #_sourceLocation) async {
+        let temps = (FileManager.default.subpaths(atPath: h.staging.path) ?? []).filter { $0.contains(".transfer-") }
+        #expect(temps.isEmpty, sourceLocation: sourceLocation)
+        #expect(await h.session.store.localTemps().isEmpty, sourceLocation: sourceLocation)
+    }
+
+    /// A stand-in for the server's tar that answers the probe as tar does, then misbehaves for
+    /// real batches as `mode` says.
+    private func fakeTar(_ h: ServerHarness, _ mode: String) throws -> String {
+        let script = h.base.appendingPathComponent("fake-tar.sh")
+        try """
+        #!/bin/sh
+        names=$(tr '\\000' '\\n')
+        echo TRANSFER-TAR-1
+        [ -z "$names" ] && exec env COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T /dev/null
+        list() { printf '%s\\n' "$names" | tr '\\n' '\\000'; }
+        gnu() { tar --version 2>/dev/null | grep -q GNU; }
+        case "$1" in
+        garbled) head -c 200000 /dev/urandom ;;
+        renamed)
+            if gnu; then rename="--transform=s,^,elsewhere/,"; else rename="-s,^,elsewhere/,"; fi
+            list | COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T - "$rename" ;;
+        short) list | COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T - | head -c 30000 ;;
+        slow) sleep 10 ;;
+        padded)
+            # Every file as zeros of its size and time, as tar sends one it could not read, and
+            # the read error on standard error once the archive is out.
+            zero=$(mktemp -d)
+            printf '%s\\n' "$names" | while IFS= read -r name; do
+                mkdir -p "$zero$(dirname "$name")"
+                head -c "$(wc -c < "$name")" /dev/zero > "$zero$name"
+                touch -r "$name" "$zero$name"
+            done
+            if gnu; then rename="--transform=s,^$zero,,"; else rename="-s,^$zero,,"; fi
+            printf '%s\\n' "$names" | sed "s,^,$zero," | tr '\\n' '\\000' | COPYFILE_DISABLE=1 tar -cf - -P --no-recursion --null -T - "$rename"
+            echo "tar: $(printf '%s\\n' "$names" | head -1): Read error at byte 0: Input/output error" >&2
+            rm -rf "$zero" ;;
+        esac
+
+        """.write(to: script, atomically: true, encoding: .utf8)
+        return "/bin/sh \(script.path) \(mode)"
+    }
+
+    @Test func aTreeOfSmallFilesComesDownInTarStreams() async throws {
+        try await withHarness("tbatch", connected: true) { h in
+            let tree = try smallTree(h)
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            // Files came down a stream, quarantined as any download is.
+            let streamed = await h.session.tarLanded
+            #expect(streamed > 0)
+            #expect(quarantined(local.appendingPathComponent("f0/file-298.txt")))
+            await expectNoTemps(h)
+
+            // Again into the same folder: the same files are there, so nothing is asked or moved.
+            try await h.session.download(tree, to: local) { _ in }
+            #expect(await h.session.tarLanded == streamed)
+            #expect(h.prompts.collisions == 0)
+        }
+    }
+
+    /// Paths past ustar's 100 bytes: GNU tar sends them as long-name entries, bsdtar in pax headers.
+    @Test func longNamesComeDownInTarStreams() async throws {
+        try await withHarness("tlong", connected: true) { h in
+            let folder = h.remote.appendingPathComponent("tree/" + String(repeating: "deep", count: 30), isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            for index in 0..<150 {
+                try Data("file \(index)".utf8).write(to: folder.appendingPathComponent(String(repeating: "n", count: 180) + "-\(index).txt"))
+            }
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(h.remotePath.appending(name: Array("tree".utf8)), to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            // One folder read ahead, counted before its first file: every file streams.
+            #expect(await h.session.tarLanded == 150)
+            await expectNoTemps(h)
+        }
+    }
+
+    @Test func aGarbledStreamFallsBackToSFTP() async throws {
+        try await withHarness("tgarb", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand(try fakeTar(h, "garbled"))
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            #expect(await h.session.tarLanded == 0)
+            await expectNoTemps(h)
+        }
+    }
+
+    @Test func aStreamOfOtherNamesFallsBackToSFTP() async throws {
+        try await withHarness("tname", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand(try fakeTar(h, "renamed"))
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            #expect(await h.session.tarLanded == 0)
+            await expectNoTemps(h)
+        }
+    }
+
+    /// The stream ends inside an entry: what came whole may land, the rest comes over SFTP.
+    @Test func aStreamCutShortFallsBackForWhatItCut() async throws {
+        try await withHarness("tshort", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand(try fakeTar(h, "short"))
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            #expect(await h.session.tarLanded < 2 * TarBatching.minimumFiles)
+            await expectNoTemps(h)
+        }
+    }
+
+    /// tar sends the second name of a hard-linked file as a link entry, with no bytes.
+    @Test func hardLinkedFilesStillLandWhole() async throws {
+        try await withHarness("thard", connected: true) { h in
+            let tree = try smallTree(h)
+            let folder = h.remote.appendingPathComponent("tree/f1")
+            for index in 0..<8 {
+                try FileManager.default.linkItem(at: folder.appendingPathComponent("file-\(2 * index + 101).txt"), to: folder.appendingPathComponent("twin-\(index).txt"))
+            }
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            #expect(await h.session.tarLanded > 0)
+            await expectNoTemps(h)
+        }
+    }
+
+    @Test func aCancelWhileAStreamRunsLeavesNoTemps() async throws {
+        try await withHarness("tcancel", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand(try fakeTar(h, "slow"))
+            let local = h.staging.appendingPathComponent("tree")
+            let download = Task { try await h.session.download(tree, to: local) { _ in } }
+            // A stream waits on the server, its batches' temps recorded.
+            #expect(await waitUntil { await !h.session.store.localTemps().isEmpty })
+            download.cancel()
+            await #expect(throws: (any Error).self) { try await download.value }
+            await expectNoTemps(h)
+            #expect(await waitUntil { (try? await processes(h, "fake-tar.sh"))?.isEmpty == true })
+        }
+    }
+
+    /// A stream that sends its marker and then nothing holds the download only until the stall
+    /// limit: its files then come over SFTP.
+    @Test func aSilentStreamFallsBackToSFTP() async throws {
+        try await withHarness("tstall", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand(try fakeTar(h, "slow"))
+            await h.session.useTarStallLimit(.seconds(1))
+            let local = h.staging.appendingPathComponent("tree")
+            let started = ContinuousClock.now
+            try await h.session.download(tree, to: local) { _ in }
+            #expect(ContinuousClock.now - started < .seconds(8))
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            #expect(await h.session.tarLanded == 0)
+            await expectNoTemps(h)
+        }
+    }
+
+    /// tar pads a file it cannot read with zeros and says so only on standard error: whatever the
+    /// stream placed before the error came, and whatever it would place after, is the server's
+    /// bytes in the end.
+    @Test func aReadErrorOnStandardErrorNeverLeavesZeros() async throws {
+        try await withHarness("tpadded", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand(try fakeTar(h, "padded"))
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            await expectNoTemps(h)
+        }
+    }
+
+    @Test func aServerWithoutTarGetsSFTP() async throws {
+        try await withHarness("tnone", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand("echo TRANSFER-TAR-1; exec env COPYFILE_DISABLE=1 tar-is-not-here -cf - --no-recursion --null -T -")
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            #expect(await h.session.tarLanded == 0)
+            #expect(await h.session.tarMissing)
+            await expectNoTemps(h)
+        }
+    }
+
+    /// A startup file that prints for every command would come before the archive.
+    @Test func aServerWhoseShellPrintsGetsSFTP() async throws {
+        try await withHarness("tbanner", connected: true) { h in
+            let tree = try smallTree(h)
+            await h.session.useTarCommand("echo Welcome to the server; " + SSHConnection.tarCommandLine)
+            let local = h.staging.appendingPathComponent("tree")
+            try await h.session.download(tree, to: local) { _ in }
+            try expectSame(h.remote.appendingPathComponent("tree"), local)
+            #expect(await h.session.tarLanded == 0)
+            await expectNoTemps(h)
+        }
+    }
+}
