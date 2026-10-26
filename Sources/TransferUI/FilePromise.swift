@@ -362,7 +362,9 @@ final class IconGridBackgroundView: DropTargetView {
 /// stays in front while it is dropped on. The drag-source views delay the window's ordering on
 /// mouse-down (`shouldDelayWindowOrdering(for:)`) and `begin` cancels it once a drag starts, so
 /// only a plain click orders the window forward, on mouse-up. `end` brings the window forward
-/// when the drop lands on it, since nothing else would.
+/// when the drop lands on it, since nothing else would: on it, not merely inside its frame. A
+/// drop on another window in front of it, as often another Transfer window overlapping it, lands
+/// inside its frame too, and raised it over the window just dropped on.
 @MainActor
 enum DragOrdering {
     static func begin(in window: NSWindow?) {
@@ -371,7 +373,14 @@ enum DragOrdering {
     }
 
     static func end(in window: NSWindow?, at screenPoint: NSPoint) {
-        guard let window, !window.isKeyWindow, window.frame.contains(screenPoint) else { return }
+        guard let window, !window.isKeyWindow, landsOn(window, at: screenPoint) else { return }
         window.makeKeyAndOrderFront(nil)
+    }
+
+    /// Whether a drop at `screenPoint` landed on `window`: inside its frame with no window over it
+    /// there. `frontmost` names the window on top at a screen point, every app's counted.
+    static func landsOn(_ window: NSWindow, at screenPoint: NSPoint,
+                        frontmost: (NSPoint) -> Int = { NSWindow.windowNumber(at: $0, belowWindowWithWindowNumber: 0) }) -> Bool {
+        window.frame.contains(screenPoint) && frontmost(screenPoint) == window.windowNumber
     }
 }

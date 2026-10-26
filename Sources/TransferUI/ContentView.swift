@@ -532,7 +532,8 @@ struct InspectorColumn: View {
     /// The model's phase, the one coming in.
     @State private var shown = PreviewPhase()
     /// What the area draws. It follows `shown` at once, with each change's own animation, except
-    /// that incoming text waits for its page (`pageShown`): a web view is empty until it loads.
+    /// that incoming text and Quick Look wait until they have drawn (`drawn`): a web view is empty
+    /// until its page is presented, and a Quick Look view until its remote view is in.
     @State private var onScreen = PreviewPhase()
     /// That wait, which puts the icon up when the old preview's time (`PreviewTiming.icon`) is up
     /// at `waitEnd`.
@@ -569,14 +570,16 @@ struct InspectorColumn: View {
         .onChange(of: phase, initial: true) { _, new in arrive(new) }
     }
 
-    /// A new phase from the model. Text arriving over anything but text loads hidden while what
-    /// is on screen, a preview of another kind, the icon, or nothing, stays; the page then takes
-    /// its place in one step, or, if it is still loading when the old preview's time is up, the
-    /// icon does until it lands. Everything else goes on screen at once.
+    /// A new phase from the model. Text arriving over anything but text, and Quick Look over
+    /// anything but Quick Look, load hidden while what is on screen, a preview of another kind,
+    /// the icon, or nothing, stays; the new one then takes its place in one step once it has
+    /// drawn, or, if it is still drawing when the old preview's time is up, the icon does until
+    /// it has. Everything else goes on screen at once: a picture arrives drawn, and text over
+    /// text and Quick Look over Quick Look change in place.
     private func arrive(_ new: PreviewPhase) {
         pageWait?.cancel()
         pageWait = nil
-        guard case .text = new.preview, !onScreen.isText else {
+        guard new.isText && !onScreen.isText || new.isQuickLook && !onScreen.isQuickLook else {
             waitEnd = nil
             withAnimation(animation(from: onScreen, to: new)) {
                 shown = new
@@ -592,16 +595,21 @@ struct InspectorColumn: View {
         let clock = model.previewClock
         pageWait = Task { @MainActor in
             try? await clock.sleep(end)
-            guard !Task.isCancelled, !onScreen.isText else { return }
+            guard !Task.isCancelled, onScreen.preview != shown.preview else { return }
             let icon = PreviewPhase(preview: nil, wait: .icon)
             withAnimation(animation(from: onScreen, to: icon)) { put(icon) }
         }
     }
 
-    /// The hidden web view has loaded `text`: if it is still the one coming in, it goes on
-    /// screen in one step.
-    private func pageShown(_ text: String) {
-        guard case .text(text)? = shown.preview, !onScreen.isText else { return }
+    /// The hidden web view's page or Quick Look view has drawn `preview`: if it is still the one
+    /// coming in, it goes on screen in one step.
+    private func drawn(_ preview: InspectorPreview) {
+        guard shown.preview == preview, onScreen.preview != preview else { return }
+        switch preview {
+        case .text: guard !onScreen.isText else { return }
+        case .file: guard !onScreen.isQuickLook else { return }
+        case .picture: return
+        }
         pageWait?.cancel()
         pageWait = nil
         waitEnd = nil
@@ -619,9 +627,14 @@ struct InspectorColumn: View {
     /// `PreviewTiming.icon`. The content keeps its identity while the kind of preview does, so
     /// moving from one text file to the next reuses the web view, and Quick Look and pictures
     /// change in place, instead of building a view that draws blank until it loads. Incoming text
-    /// loads under what is on screen, transparent, until its page is in.
+    /// and Quick Look load under what is on screen, transparent, until they have drawn; each has
+    /// a layer of its own, so the view that drew hidden is the one that goes on screen.
     private func area(_ facts: InspectorFacts) -> some View {
         let document = facts.file != nil && onScreen.isText || facts.several != nil
+        // Each layer shows what is coming in, else what is on screen: text stays up while Quick
+        // Look draws under it, and the reverse.
+        let quickLook = shown.quickLookURL ?? onScreen.quickLookURL
+        let text = shown.text ?? onScreen.text
         return ZStack {
             // Text and the list of several items draw on the document background, as a page
             // does; everything else on the panel's quiet gray.
@@ -630,10 +643,16 @@ struct InspectorColumn: View {
             if let several = facts.several {
                 SelectionList(rows: several)
             }
-            if facts.file != nil, case .text(let text)? = shown.preview {
-                SourcePreview(text: text, wraps: wrapsPreview, shown: pageShown)
+            if facts.file != nil, let text {
+                SourcePreview(text: text, wraps: wrapsPreview, shown: { drawn(.text($0)) })
                     .opacity(onScreen.isText ? 1 : 0)
                     .allowsHitTesting(onScreen.isText)
+                    .transition(.opacity)
+            }
+            if facts.file != nil, let quickLook {
+                QuickLookPreview(url: quickLook, drawn: { drawn(.file($0)) })
+                    .opacity(onScreen.isQuickLook ? 1 : 0)
+                    .allowsHitTesting(onScreen.isQuickLook)
                     .transition(.opacity)
             }
             if !onScreen.isText {
@@ -701,8 +720,8 @@ struct InspectorColumn: View {
         return nil
     }
 
-    /// A picture scales to fit and centers in the area; Quick Look fills it and scrolls inside it.
-    /// Text has its own layer in `area`.
+    /// A picture scales to fit and centers in the area. Text and Quick Look have layers of their
+    /// own in `area`, where Quick Look fills it and scrolls inside it.
     @ViewBuilder private func content(_ preview: InspectorPreview) -> some View {
         switch preview {
         case .picture(let picture):
@@ -710,9 +729,7 @@ struct InspectorColumn: View {
                 .clipShape(RoundedRectangle(cornerRadius: 4))
                 .padding(Self.pictureMargin)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .file(let url):
-            QuickLookPreview(url: url)
-        case .text:
+        case .file, .text:
             EmptyView()
         }
     }
@@ -1272,26 +1289,69 @@ private struct RenameBar: View {
     }
 }
 
-/// Quick Look's preview of a local file, inline.
+/// Quick Look's preview of a local file, inline. `QLPreviewView` has no callback for having
+/// drawn: it shows an empty container until its preview service's remote view is in (about
+/// 100 to 200 ms cold, measured offscreen on macOS 27), so `drawn` is told once a view has appeared
+/// inside the container and had `PreviewTiming.drawSettle` to draw, or at the latest
+/// `PreviewTiming.quickLookDraw` after the file was set, whichever comes first.
 struct QuickLookPreview: NSViewRepresentable {
     let url: URL
+    var drawn: (URL) -> Void = { _ in }
+
+    @MainActor final class Coordinator {
+        var drawn: (URL) -> Void = { _ in }
+        var watch: Task<Void, Never>?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> QLPreviewView {
         let view = QLPreviewView(frame: .zero, style: .compact) ?? QLPreviewView()
         view.autostarts = true
         view.shouldCloseWithWindow = false
         view.previewItem = url as NSURL
+        context.coordinator.drawn = drawn
+        Self.watch(view, for: url, coordinator: context.coordinator)
         return view
     }
 
     func updateNSView(_ view: QLPreviewView, context: Context) {
-        if (view.previewItem as? NSURL) as URL? != url { view.previewItem = url as NSURL }
+        context.coordinator.drawn = drawn
+        if (view.previewItem as? NSURL) as URL? != url {
+            view.previewItem = url as NSURL
+            Self.watch(view, for: url, coordinator: context.coordinator)
+        }
     }
 
     /// A view that does not close with its window must be closed by hand, or each preview the
     /// inspector drops keeps its Quick Look resources.
-    static func dismantleNSView(_ view: QLPreviewView, coordinator: ()) {
+    static func dismantleNSView(_ view: QLPreviewView, coordinator: Coordinator) {
+        coordinator.watch?.cancel()
         view.close()
+    }
+
+    /// Whether the view holds more than its empty container: the remote view the preview
+    /// service draws into.
+    static func hasContent(_ view: NSView) -> Bool {
+        view.subviews.contains { !$0.subviews.isEmpty }
+    }
+
+    /// Tells `drawn` once `view` has drawn `url`, never from inside a SwiftUI update.
+    private static func watch(_ view: QLPreviewView, for url: URL, coordinator: Coordinator) {
+        coordinator.watch?.cancel()
+        coordinator.watch = Task { @MainActor [weak view, weak coordinator] in
+            let limit = ContinuousClock.now + PreviewTiming.quickLookDraw
+            while ContinuousClock.now < limit {
+                guard let view, !Task.isCancelled else { return }
+                if hasContent(view) {
+                    try? await Task.sleep(for: PreviewTiming.drawSettle)
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+            guard !Task.isCancelled else { return }
+            coordinator?.drawn(url)
+        }
     }
 }
 
@@ -1359,15 +1419,20 @@ struct PageSwap<Page: Equatable> {
 }
 
 /// Two web views in one place, taking turns (`PageSwap`): the next page loads in the one behind,
-/// transparent, and they trade places when its navigation ends, so moving between text files
-/// keeps the last page up instead of a web view that is empty until it loads. Only the one in
-/// front takes the mouse.
+/// transparent, and they trade places once its navigation has ended and its page has been
+/// presented, so moving between text files keeps the last page up instead of a web view that is
+/// empty until it draws. A navigation ends before its page is on screen: a cold web view showed
+/// one empty frame there. Only the one in front takes the mouse.
 final class SourcePreviewView: NSView, WKNavigationDelegate {
     private(set) var buffers: [WKWebView] = []
     private(set) var swap = PageSwap<SourcePage>()
     private var navigation: (step: WKNavigation, load: Int)?
     /// Told each time a page comes to the front, never from inside `show`.
     var onShow: (SourcePage) -> Void = { _ in }
+    /// Calls its second argument once the web view's page is presented: a snapshot taken after
+    /// its pending screen updates, then `PreviewTiming.drawSettle`, or at the latest
+    /// `PreviewTiming.pageDraw`. A test holds it.
+    var afterPresentation: @MainActor (WKWebView, @escaping @MainActor () -> Void) -> Void = SourcePreviewView.presented
 
     init() {
         super.init(frame: .zero)
@@ -1406,7 +1471,7 @@ final class SourcePreviewView: NSView, WKNavigationDelegate {
     }
 
     private func finish(_ load: Int) {
-        navigation = nil
+        if navigation?.load == load { navigation = nil }
         guard swap.finished(load) else { return }
         showFront()
         if let page = swap.shown { onShow(page) }
@@ -1422,7 +1487,9 @@ final class SourcePreviewView: NSView, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        ended(navigation)
+        guard let current = self.navigation, current.step === navigation else { return }
+        let load = current.load
+        afterPresentation(webView) { [weak self] in self?.finish(load) }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: any Error) {
@@ -1439,6 +1506,36 @@ final class SourcePreviewView: NSView, WKNavigationDelegate {
         guard let navigation, navigation.step === step else { return }
         finish(navigation.load)
     }
+
+    /// WebKit has no public callback for a page drawn; a snapshot with `afterScreenUpdates`
+    /// returns once the updates pending at the call are presented. The snapshot is one point.
+    static func presented(_ view: WKWebView, _ done: @escaping @MainActor () -> Void) {
+        let once = Once(done)
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = CGRect(x: 0, y: 0, width: 1, height: 1)
+        configuration.afterScreenUpdates = true
+        view.takeSnapshot(with: configuration) { _, _ in
+            Task { @MainActor in
+                try? await Task.sleep(for: PreviewTiming.drawSettle)
+                once.run()
+            }
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: PreviewTiming.pageDraw)
+            once.run()
+        }
+    }
+
+    /// A callback run at most once, by whichever path gets there first.
+    @MainActor private final class Once {
+        private var body: (@MainActor () -> Void)?
+        init(_ body: @escaping @MainActor () -> Void) { self.body = body }
+        func run() {
+            let body = body
+            self.body = nil
+            body?()
+        }
+    }
 }
 
 /// What the inspector's box shows: content, or a wait state while none is up.
@@ -1448,6 +1545,16 @@ struct PreviewPhase: Equatable {
 
     var isText: Bool {
         if case .text? = preview { true } else { false }
+    }
+
+    var isQuickLook: Bool { quickLookURL != nil }
+
+    var text: String? {
+        if case .text(let text)? = preview { text } else { nil }
+    }
+
+    var quickLookURL: URL? {
+        if case .file(let url)? = preview { url } else { nil }
     }
 
     /// The phase in a word, for `InspectorSlots.screens`.

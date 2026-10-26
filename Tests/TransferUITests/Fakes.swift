@@ -74,8 +74,17 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     func mkdir(_ path: RemotePath) async throws { record("mkdir \(path.display)") }
     func rename(_ source: RemotePath, to destination: RemotePath) async throws {}
     func remove(_ path: RemotePath, force: Bool) async throws { record("remove \(path.display)") }
+    /// Each download's progress callback, for a test to drive; a download then waits until
+    /// `downloadsEnd`, which is true unless a test holds it.
+    let downloadReports = Locked<[@Sendable (TransferProgress) -> Void]>([])
+    let downloadsEnd = Locked(true)
+    /// What `walkTree` yields under a folder, by its path.
+    let trees = Locked<[RemotePath: [(TreeKey, TreeEntry)]]>([:])
+
     func download(_ path: RemotePath, to destination: URL, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {
         record("download \(path.display)")
+        downloadReports.withLock { $0.append(progress) }
+        while !downloadsEnd.value { try await Task.sleep(for: .milliseconds(5)) }
     }
     func openKind(fileName: String) async -> OpenKind {
         EditableFile.openKind(fileName: fileName, extensions: liveExtensions.value) == .live && !liveExtensions.value.isEmpty ? .live : .view
@@ -108,7 +117,13 @@ final class FakeSession: RemoteSession, @unchecked Sendable {
     func stars() async -> [RemotePath] { starred.value }
     func star(_ path: RemotePath, on: Bool) async {}
     func copy(_ source: RemotePath, to destination: RemotePath, progress: @escaping @Sendable (TransferProgress) -> Void) async throws {}
-    func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, TreeEntry), Error> { AsyncThrowingStream { $0.finish() } }
+    func walkTree(_ root: RemotePath) -> AsyncThrowingStream<(TreeKey, TreeEntry), Error> {
+        let entries = [(TreeKey(bytes: []), TreeEntry.directory)] + (trees.value[root] ?? [])
+        return AsyncThrowingStream { continuation in
+            for entry in entries { continuation.yield(entry) }
+            continuation.finish()
+        }
+    }
     func resolveLive(_ path: RemotePath, choice: LiveConflictChoice) async throws {}
     func terminalCommand(directory: RemotePath) async -> String? { nil }
 }

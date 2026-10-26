@@ -692,6 +692,14 @@ public enum InspectorWidth {
         let room = splitWidth - sidebar - contentMinimum
         return max(minimum, min((splitWidth * share).rounded(.down), room))
     }
+
+    /// The width an inspector opens at from the width the split saved for it, kept within
+    /// `minimum` and `maximum` (`maximum(splitWidth:sidebar:)`); nil when nothing useful was saved,
+    /// so the split's own minimum stands.
+    public static func reopening(saved: Double, maximum: Double) -> Double? {
+        guard saved.isFinite, saved >= minimum else { return nil }
+        return max(minimum, min(saved, maximum))
+    }
 }
 
 /// The split view's saved frames, one string per column ("x, y, width, height, collapsed,

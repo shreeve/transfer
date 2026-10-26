@@ -60,7 +60,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
 
     /// Toolbar delegate and action target. It reads the model and never owns state.
     @MainActor
-    final class Coordinator: NSObject, NSToolbarDelegate, NSSearchFieldDelegate {
+    final class Coordinator: NSObject, NSToolbarDelegate, NSSearchFieldDelegate, NSToolbarItemValidation {
         var model: TransferModel
         weak var controller: ChromeController?
         var searchTick = 0
@@ -91,6 +91,11 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 let group = makeGroup(identifier, "Back/Forward", symbols: ["chevron.backward", "chevron.forward"],
                                       labels: ["Back", "Forward"], mode: .momentary, action: #selector(navigate(_:)))
                 group.isNavigational = true
+                // The toolbar validates its items on every window update, and a subitem left to
+                // autovalidate is enabled again because this target answers its action; the
+                // Go menu dimmed Back and Forward while the toolbar's stayed lit.
+                group.autovalidates = false
+                for item in group.subitems { item.autovalidates = false }
                 navigationGroup = group
                 enableNavigation(back: model.canGoBack, forward: model.canGoForward)
                 return group
@@ -196,6 +201,15 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             guard let items = navigationGroup?.subitems, items.count == 2 else { return }
             if items[0].isEnabled != back { items[0].isEnabled = back }
             if items[1].isEnabled != forward { items[1].isEnabled = forward }
+        }
+
+        /// Any validation that still reaches Back or Forward (a toolbar asked directly) answers
+        /// from the history, as the Go menu does; every other item of this target stays enabled.
+        func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+            guard let items = navigationGroup?.subitems, items.count == 2 else { return true }
+            if item === items[0] { return model.canGoBack }
+            if item === items[1] { return model.canGoForward }
+            return true
         }
 
         /// The badge observes the library's Live files itself, as the hosted columns observe the
@@ -588,8 +602,23 @@ final class ChromeController: NSSplitViewController {
     func setInspectorShown(_ shown: Bool) {
         let item = splitViewItems[2]
         guard item.isCollapsed == shown else { return }
+        if shown { sizeUnshownInspector() }
         animateCollapse { item.animator().isCollapsed = !shown }
         refreshHoverLine(animated: true)
+    }
+
+    /// An inspector this window has never shown has no width of its own, and the split opens it
+    /// at its minimum, though the split restored the column's saved width (open or hidden) on the
+    /// view that holds it. That width, clamped (`InspectorWidth.reopening`), goes to the inspector
+    /// before it opens, so a window that closed with it hidden opens it as wide as it was.
+    private func sizeUnshownInspector() {
+        guard splitViewItems.count == 3, splitView.arrangedSubviews.count == 3 else { return }
+        let view = splitViewItems[2].viewController.view
+        guard view.frame.width < 1 else { return }
+        let holder = splitView.arrangedSubviews[2].frame
+        let limit = Double(splitViewItems[2].maximumThickness)
+        guard let width = InspectorWidth.reopening(saved: Double(holder.width), maximum: limit) else { return }
+        view.setFrameSize(NSSize(width: CGFloat(width), height: holder.height))
     }
 
     /// `TRANSFER_ANIMATION_SCALE=6` stretches the sidebar and inspector animations for watching.

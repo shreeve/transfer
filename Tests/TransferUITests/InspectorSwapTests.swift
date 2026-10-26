@@ -1,4 +1,5 @@
 import AppKit
+import Quartz
 import SwiftUI
 import Testing
 import TransferCore
@@ -274,6 +275,8 @@ extension InspectorTests {
             select(name)
             for _ in 0..<5000 where slots.screens.last != "text" {
                 #expect(slots.screens.last == before)
+                // The document background comes with the page, never ahead of it.
+                #expect(slots.surface == "gray")
                 if case .text? = model.inspectorPreview, sourcePreview(in: window.contentView) != nil { held = true }
                 try? await Task.sleep(for: .milliseconds(2))
             }
@@ -290,5 +293,147 @@ extension InspectorTests {
         select("docs")
         #expect(await eventually { slots.screens.last == "icon" })
         await replace("icon", with: "notes.txt")
+    }
+    /// A navigation ends before its page is on screen, so the page goes to the front only once
+    /// it has been presented (held here), and a load superseded meanwhile changes nothing and
+    /// leaves the newer one's end to swap.
+    @Test func aPageComesToTheFrontOnlyOnceItIsPresented() async throws {
+        let view = SourcePreviewView()
+        view.frame = NSRect(x: 0, y: 0, width: 288, height: 400)
+        let window = await window(EmptyView(), width: 288, height: 400)
+        defer { window.close() }
+        window.contentView?.addSubview(view)
+        var held: [(WKWebView, @MainActor () -> Void)] = []
+        view.afterPresentation = { held.append(($0, $1)) }
+        let alpha = SourcePage(text: "let alpha = 1", wraps: false)
+        let beta = SourcePage(text: "let beta = 2", wraps: false)
+        let gamma = SourcePage(text: "let gamma = 3", wraps: false)
+
+        view.show(alpha)
+        #expect(await eventually(seconds: 10) { held.count == 1 })
+        // Loaded, not yet presented: nothing is on show.
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(view.swap.shown == nil)
+        held[0].1()
+        #expect(view.swap.shown == alpha)
+        let first = view.front
+        #expect(first.alphaValue == 1)
+
+        view.show(beta)
+        #expect(await eventually(seconds: 10) { held.count == 2 })
+        #expect(held[1].0 !== first)
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(view.swap.shown == alpha && view.front === first && first.alphaValue == 1)
+        // Superseded before it is presented: its presentation changes nothing.
+        view.show(gamma)
+        held[1].1()
+        #expect(view.swap.shown == alpha && view.front === first)
+        #expect(await eventually(seconds: 10) { held.count == 3 })
+        held[2].1()
+        #expect(view.swap.shown == gamma && view.front !== first)
+    }
+
+    /// The real presentation wait ends, through the snapshot or its limit, so a page always
+    /// comes in.
+    @Test func thePresentationWaitEnds() async throws {
+        let view = SourcePreviewView()
+        view.frame = NSRect(x: 0, y: 0, width: 288, height: 400)
+        let window = await window(EmptyView(), width: 288, height: 400)
+        defer { window.close() }
+        window.contentView?.addSubview(view)
+        let alpha = SourcePage(text: "let alpha = 1", wraps: false)
+        view.show(alpha)
+        #expect(await eventually(seconds: 10) { view.swap.shown == alpha })
+    }
+
+    /// The Quick Look view in `view`, if one is there.
+    func quickLookView(in view: NSView?) -> QLPreviewView? {
+        guard let view else { return nil }
+        return (view as? QLPreviewView) ?? view.subviews.lazy.compactMap { quickLookView(in: $0) }.first
+    }
+
+    /// Quick Look arriving over a picture, text, or the icon loads hidden: what was on screen
+    /// stays until the Quick Look view has drawn (its remote view is in) or its wait is up, then
+    /// that same view replaces it in one step. It used to go up at once, an empty gray box until
+    /// Quick Look drew.
+    @Test func aPictureStaysUntilTheQuickLookReplacingItHasDrawn() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "TransferUITests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let png = try picture(in: folder)
+        let pdf = folder.appending(path: "paper.pdf")
+        var box = CGRect(x: 0, y: 0, width: 200, height: 200)
+        let page = try #require(CGContext(pdf as CFURL, mediaBox: &box, nil))
+        page.beginPDFPage(nil)
+        page.setFillColor(CGColor(red: 0, green: 0, blue: 1, alpha: 1))
+        page.fill(CGRect(x: 20, y: 20, width: 100, height: 100))
+        page.endPDFPage()
+        page.closePDF()
+        let size = UInt64(try #require(try FileManager.default.attributesOfItem(atPath: pdf.path)[.size] as? Int))
+        let items = [
+            RemoteItem(path: path("docs"), kind: .directory),
+            RemoteItem(path: path("photo.png"), kind: .file, size: 1000),
+            RemoteItem(path: path("paper.pdf"), kind: .file, size: size),
+            RemoteItem(path: path("notes.txt"), kind: .file, size: 14),
+        ]
+        let notes = folder.appending(path: "notes.txt")
+        try Data("let notes = 1\n".utf8).write(to: notes)
+        let session = FakeSession(server, folders: [home: items, path("docs"): []])
+        session.liveExtensions.value = ["txt"]
+        session.inspectorCopies.value = [path("photo.png"): png, path("paper.pdf"): pdf, path("notes.txt"): notes]
+        let defaults = Defaults()
+        defaults.store.set(true, forKey: Preferences.showsInspector)
+        let model = TransferModel(provider: FakeProvider([session]), defaults: defaults.store)
+        // Time moves only between selections, so the old preview's 500 ms never runs out.
+        let time = ManualClock()
+        model.previewClock = time.clock
+        let slots = InspectorSlots()
+        let window = await window(InspectorColumn(model: model).environment(\.inspectorSlots, slots).frame(width: 320, height: 640), width: 320)
+        defer { window.close() }
+        await model.connect(server)
+        #expect(await eventually { model.items.count == items.count })
+        func select(_ name: String) {
+            time.advance(to: time.now + .seconds(1))
+            model.snapshot.selection = [path(name)]
+            model.selectionChanged()
+        }
+        func replace(_ before: String) async {
+            let mark = slots.screens.count
+            var hidden: QLPreviewView?
+            var since: ContinuousClock.Instant?
+            select("paper.pdf")
+            for _ in 0..<5000 where slots.screens.last != "quickLook" {
+                #expect(slots.screens.last == before)
+                // Text on screen keeps its page up meanwhile.
+                if before == "text" { #expect(sourcePreview(in: window.contentView)?.swap.shown?.text == "let notes = 1\n") }
+                if hidden == nil, let view = quickLookView(in: window.contentView) {
+                    hidden = view
+                    since = .now
+                }
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+            #expect(Array(slots.screens[mark...]) == ["quickLook"])
+            // The view that drew hidden is the one on screen, and it had drawn or had its wait.
+            let shown = quickLookView(in: window.contentView)
+            #expect(hidden != nil && shown === hidden)
+            if let shown, let since {
+                #expect(QuickLookPreview.hasContent(shown) || since.duration(to: .now) >= PreviewTiming.quickLookDraw - .milliseconds(20))
+            }
+        }
+
+        select("photo.png")
+        #expect(await eventually { slots.screens.last == "picture" })
+        await replace("picture")
+
+        select("docs")
+        #expect(await eventually { slots.screens.last == "icon" })
+        #expect(await eventually { quickLookView(in: window.contentView) == nil })
+        await replace("icon")
+
+        select("notes.txt")
+        #expect(await eventually(seconds: 10) { slots.screens.last == "text" })
+        #expect(await eventually { quickLookView(in: window.contentView) == nil })
+        await replace("text")
+        #expect(await eventually { sourcePreview(in: window.contentView) == nil })
     }
 }
