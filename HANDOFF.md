@@ -1,6 +1,6 @@
 # Handoff
 
-How the code works now, why it is built this way, and the traps that already cost a day. `docs/SPEC.md` is what the product does; `AGENTS.md` is the rule list; `docs/RELEASING.md` is releases and updates. The package builds on Apple-silicon macOS 27 with the Xcode 27 toolchain with no warnings, and `swift test` passes.
+How the code works now, why it is built this way, and the traps that already cost a day. `docs/SPEC.md` is what the product does; `AGENTS.md` is the rule list; `docs/RELEASING.md` is releases and updates. The website, https://shreeve.github.io/transfer/, is one Rip page in `website/` (its README says how it is built), deployed from the committed `website/dist` by the Website workflow; after a release, rebuild and commit it (RELEASING). The package builds on Apple-silicon macOS 27 with the Xcode 27 toolchain with no warnings, and `swift test` passes.
 
 ## The seam
 

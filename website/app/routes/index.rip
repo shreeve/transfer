@@ -1,0 +1,295 @@
+import { Icon } from '../components/icon.rip'
+import { Command, Feature, Heading, Kbd, Point, SideHeading, ThemeToggle } from '../components/parts.rip'
+import { Conflict, Connection, Dragging, Hero, LiveFiles, Shelf } from '../components/mockups.rip'
+import { VERSION } from '../version.rip'
+
+REPO =! 'https://github.com/shreeve/transfer'
+DOWNLOAD =! 'https://github.com/shreeve/transfer/releases/latest/download/Transfer.zip'
+INSTALL =! 'curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash'
+BREW =! 'brew install --cask shreeve/tap/transfer-sftp'
+
+# The four things a file does, as the spec's table has them.
+ACTIONS =! [
+  { icon: 'upload', title: 'Double-click a text file', text: 'It opens Live in its usual editor, and every completed save uploads.' }
+  { icon: 'file', title: 'Double-click anything else', text: 'It opens to view, from the preview cache. Nothing is uploaded.' }
+  { icon: 'eye', title: 'Press Space', text: 'Quick Look, as in Finder, with the arrow keys moving the selection behind it.' }
+  { icon: 'download', title: 'Drag it to the Finder', text: 'A real copy on your Mac. The file on the server stays where it is.' }
+]
+
+SSH =! [
+  { icon: 'route', title: 'Your config, as ssh reads it', text: 'Host aliases, users, ports, identity files, ProxyJump: Transfer runs /usr/bin/ssh, so whatever ~/.ssh/config says applies. Leave a field blank and it decides.' }
+  { icon: 'key', title: 'Your agent and your keys', text: 'Keys in your agent just work. A password or passphrase prompt comes up as a sheet naming its server, and saving it in the Keychain is your choice, off by default.' }
+  { icon: 'window', title: 'One login per server', text: 'Every window and tab showing a server shares one ssh login. Listing, previewing, and copying run on separate channels, so a download never stalls the file list.' }
+  { icon: 'shield', title: 'Host keys checked by ssh', text: 'Against your own known_hosts. A new or changed key shows its SHA-256 fingerprint and waits for your answer, with Cancel the default.' }
+]
+
+BROWSE =! [
+  { icon: 'grid', title: 'Icons, list, and columns', text: 'Three views share one location and one selection, with tabs, a sidebar of servers and starred places, and Finder’s keys throughout.' }
+  { icon: 'eye', title: 'Quick Look and a preview panel', text: 'Space for Quick Look. The panel shows text and source highlighted, pictures scaled to fit, and anything your installed Quick Look extensions can draw, as in Finder.' }
+  { icon: 'folder', title: 'A path bar, like Finder’s', text: 'Every folder from the server down to where you are. Click one to go there, or drop files on it to copy them in.' }
+  { icon: 'search', title: 'Filter without the network', text: 'Command-F narrows the names already listed. Whatever it hides is never copied, dragged, or deleted unseen.' }
+  { icon: 'link', title: 'sftp:// links', text: 'Transfer opens sftp:// links from other apps. Put the small xfer script on a server, Command-click what it prints in your terminal, and that folder opens in Transfer.' }
+  { icon: 'terminal', title: 'Open in Terminal', text: 'Go → Open in Terminal opens the folder you are in, in Terminal, iTerm2, or Ghostty, riding the same login.' }
+]
+
+KEYS =! [
+  ['Space', 'Quick Look'], ['⌘1 ⌘2 ⌘3', 'Icons, list, columns'], ['⌘K', 'New Connection'], ['⌘L', 'Go to Remote Folder']
+  ['⌥⌘P', 'Path bar'], ['⌘I', 'Preview panel'], ['⌘F', 'Filter'], ['⌘C ⌘V', 'Copy and paste'], ['⌥⌘V', 'Move here']
+]
+
+LIVE =! [
+  { icon: 'upload', title: 'Every save uploads', text: 'Once the file holds still after a save. A touch without a change is not uploaded, and the server’s file keeps its permissions.' }
+  { icon: 'compare', title: 'Never over someone else’s change', text: 'If the server’s copy changed since yours was based on it, nothing is overwritten: you choose Compare, Keep Local, Keep Remote, or Keep Both.' }
+  { icon: 'eye', title: 'Changes on the server, flagged', text: 'While you are logged in, each Live file is checked about once a minute, and you hear when the server’s copy has changed.' }
+  { icon: 'server', title: 'Offline is fine', text: 'A save made while the server cannot be reached waits for the next login and uploads then.' }
+]
+
+COPY =! [
+  'Dragging to the Finder writes real files and folders, never a placeholder'
+  'A name already taken asks: Skip, Keep Both, or Replace, with Apply to All'
+  'A move removes an original only after checking that its copy is complete'
+  'Each file lands under a hidden temp name and is renamed into place, with its mode and time'
+  'Downloads are quarantined, as a browser’s are, so Gatekeeper checks an app before it runs'
+]
+
+# From the 2.0.0 release notes: seconds in 0.3.1, and in 2.0.0.
+SPEED =! [
+  { title: 'Download 2,000 small files in ten folders, 20 ms away', before: 1.14, after: 0.42 }
+  { title: 'The same download, 80 ms away', before: 3.7, after: 0.93 }
+  { title: 'Paste 2,000 small files from one server to another, 20 ms away', before: 3.1, after: 1.6 }
+  { title: 'Paste 50 files of 8 MB from one server to another, 20 ms away', before: 2.7, after: 1.6 }
+]
+
+FAST =! [
+  { icon: 'zap', title: 'The server’s own tar', text: 'A folder of 150 or more small files comes down in a few tar streams over the same login. Every name is still listed and checked over SFTP, and a file a stream does not deliver whole comes over SFTP.' }
+  { icon: 'arrow-up-down', title: 'Pipelined between servers', text: 'Files come down from one server while earlier ones go up to the other, with at most 256 MB waiting on your Mac at once.' }
+  { icon: 'folder', title: 'Listings that stream', text: 'A large folder shows its first names while the rest arrive, and a folder you visited before shows its last listing at once.' }
+]
+
+SAFETY =! [
+  { icon: 'shield', title: 'Nothing overwritten unasked', text: 'A copy lands under a hidden temp name and is renamed into place. A name already taken asks, with Skip the default; with nobody to ask, the copy fails rather than guess.' }
+  { icon: 'move', title: 'Moves that check first', text: 'A move removes an original only once it has checked that this move wrote a complete copy of it. Whatever it keeps, it names, with the reason, and a Finder original goes to the Trash.' }
+  { icon: 'lock', title: 'A server is never trusted', text: 'Every name a server sends that reaches your disk must be a single path component, is never followed through a link on your Mac, and removes nothing there without your answer.' }
+  { icon: 'key', title: 'Secrets stay in the Keychain', text: 'Passwords and passphrases you choose to save live in the Keychain, never in Transfer’s database, on a command line, in the environment, or in a log.' }
+  { icon: 'badge-check', title: 'Signed, notarized, updated safely', text: 'Signed with a Developer ID and notarized by Apple. Updates come through Sparkle and must carry Transfer’s EdDSA signature; the installer refuses anything Gatekeeper rejects.' }
+  { icon: 'eye-off', title: 'Nothing behind your back', text: 'No background helper, login item, mounted disk, or telemetry, and Transfer never installs anything on a server.' }
+]
+
+export Home = component
+  render
+    div class: 'relative overflow-x-clip'
+      # A soft wash of the icon's colors behind the top of the page.
+      div class: 'pointer-events-none absolute inset-x-0 -top-40 -z-10 h-[46rem] bg-[radial-gradient(60%_50%_at_50%_30%,var(--glow),transparent)]'
+
+      # The bar along the top.
+      header class: 'sticky top-0 z-20 border-b border-surface/70 bg-background/80 backdrop-blur-xl'
+        nav class: 'mx-auto flex h-16 max-w-6xl items-center gap-6 px-4 sm:px-6'
+          a href: '#top', class: 'flex items-center gap-2.5 font-display text-lg font-semibold'
+            img src: 'icon.svg', alt: '', class: 'size-8'
+            'Transfer'
+          div class: 'hidden items-center gap-6 text-sm font-medium text-secondary md:flex'
+            a href: '#ssh', class: 'hover:text-primary', 'SSH'
+            a href: '#browse', class: 'hover:text-primary', 'Browsing'
+            a href: '#live', class: 'hover:text-primary', 'Live files'
+            a href: '#copy', class: 'hover:text-primary', 'Copy and drag'
+            a href: '#speed', class: 'hover:text-primary', 'Speed'
+            a href: '#safety', class: 'hover:text-primary', 'Safety'
+          div class: 'ml-auto flex items-center gap-1'
+            a href: REPO, class: 'flex size-9 items-center justify-center rounded-lg text-tertiary transition hover:bg-muted hover:text-primary', aria-label: 'Transfer on GitHub'
+              Icon name: 'github', class: 'size-4.5'
+            ThemeToggle
+            a href: DOWNLOAD, class: 'ml-2 hidden items-center gap-2 rounded-lg bg-accent px-3.5 py-2 text-sm font-semibold text-on-accent shadow-sm transition hover:bg-accent-hover sm:flex'
+              Icon name: 'download', class: 'size-4'
+              'Download'
+
+      main id: 'top'
+        # The hero.
+        section class: 'mx-auto max-w-6xl px-4 pt-16 pb-20 text-center sm:px-6 sm:pt-24'
+          img src: 'icon.svg', alt: 'The Transfer icon: a page with a yellow badge on a blue tile', class: 'mx-auto size-24 drop-shadow-xl sm:size-28'
+          p class: 'mt-8 inline-flex items-center gap-2 rounded-full border border-surface bg-surface px-3 py-1 text-xs font-medium text-secondary shadow-xs'
+            span class: 'size-1.5 rounded-full bg-[#28c840]'
+            "Free and open source · Version #{VERSION}"
+          h1 class: 'mx-auto mt-6 max-w-4xl font-display text-5xl font-bold tracking-tight text-balance sm:text-7xl'
+            'The SFTP browser '
+            span class: 'brand-text', 'Apple forgot to ship.'
+          p class: 'mx-auto mt-6 max-w-2xl text-lg text-pretty text-secondary sm:text-xl'
+            'Transfer browses a server the way Finder browses your disk. Press '
+            Kbd 'Space'
+            ' to preview a file, open it in your editor and every save uploads, and drag, copy, and paste between servers and the Finder. It uses the ssh already on your Mac, so your ~/.ssh/config, agent, and ProxyJump just work.'
+          div class: 'mt-10 flex flex-col items-center justify-center gap-4 sm:flex-row'
+            a href: DOWNLOAD, class: 'flex shrink-0 items-center gap-2.5 rounded-xl bg-accent px-6 py-3.5 font-semibold text-on-accent shadow-lg shadow-blue-brand/25 transition hover:-translate-y-0.5 hover:bg-accent-hover'
+              Icon name: 'download', class: 'size-5'
+              "Download #{VERSION}"
+            div class: 'w-full max-w-md min-w-0 text-left'
+              Command text: INSTALL
+          p class: 'mt-5 text-sm text-tertiary', 'macOS 27 or later on Apple silicon · Signed and notarized by Apple · Updates itself'
+
+          div class: 'mx-auto mt-16 max-w-5xl'
+            Hero
+
+        # What a file does.
+        section class: 'border-y border-surface bg-surface'
+          ol class: 'mx-auto grid max-w-6xl sm:grid-cols-2 lg:grid-cols-4'
+            for action in ACTIONS
+              li class: 'px-4 py-7 sm:px-6 sm:py-10'
+                div class: 'flex items-center gap-3'
+                  span class: 'flex size-8 items-center justify-center rounded-full bg-accent-soft text-accent'
+                    Icon name: action.icon, class: 'size-4'
+                  h3 class: 'font-semibold', action.title
+                p class: 'mt-3 text-sm/6 text-secondary', action.text
+
+        # SSH.
+        section id: 'ssh', class: 'mx-auto grid max-w-6xl items-center gap-14 px-4 py-24 sm:px-6 lg:grid-cols-2'
+          div
+            SideHeading eyebrow: 'Your ssh, not ours', title: 'It rides the Mac’s own /usr/bin/ssh'
+            p class: 'mt-4 text-lg text-secondary', 'There is no SSH stack of Transfer’s own to configure. The servers you reach from Terminal, Transfer reaches the same way, with the same config, the same agent, and the same jump hosts.'
+            div class: 'mt-10 grid gap-6 sm:grid-cols-2'
+              for item in SSH
+                Point icon: item.icon, title: item.title, text: item.text
+          div class: 'mx-auto flex w-full max-w-xl flex-col gap-5'
+            div class: 'overflow-hidden rounded-2xl border border-white/10 bg-code font-mono text-sm shadow-2xl'
+              div class: 'flex items-center gap-2 border-b border-white/10 px-4 py-3'
+                span class: 'size-3 rounded-full bg-[#ff5f57]'
+                span class: 'size-3 rounded-full bg-[#febc2e]'
+                span class: 'size-3 rounded-full bg-[#28c840]'
+                span class: 'ml-3 text-xs text-white/50', '~/.ssh/config'
+              pre class: 'overflow-x-auto p-5 leading-7 text-white/85'
+                code
+                  span class: 'text-cyan-brand', 'Host'
+                  ' live'
+                  "\n  "
+                  span class: 'text-cyan-brand', 'HostName'
+                  ' web-01.internal'
+                  "\n  "
+                  span class: 'text-cyan-brand', 'User'
+                  ' deploy'
+                  "\n  "
+                  span class: 'text-cyan-brand', 'ProxyJump'
+                  ' bastion.example.com'
+            div class: 'mx-auto w-full max-w-md'
+              Connection
+            p class: 'text-center text-sm text-tertiary', 'No password field, proxy field, or protocol picker: ssh asks for what it needs.'
+
+        # Browsing.
+        section id: 'browse', class: 'border-y border-surface bg-surface'
+          div class: 'mx-auto max-w-6xl px-4 py-24 sm:px-6'
+            Heading eyebrow: 'Finder, for your servers', title: 'It browses like the Finder, because it follows it', lead: 'Standard Mac controls, Finder’s keys and conventions, and no custom chrome. If you know the Finder, you already know Transfer.'
+            div class: 'mt-14 grid gap-5 sm:grid-cols-2 lg:grid-cols-3'
+              for feature in BROWSE
+                Feature icon: feature.icon, title: feature.title, text: feature.text
+            div class: 'mt-12 flex flex-wrap justify-center gap-2'
+              for key in KEYS
+                span class: 'flex items-center gap-2 rounded-full border border-surface bg-background px-3.5 py-1.5 text-sm text-secondary'
+                  span class: 'font-semibold text-primary', key[0]
+                  key[1]
+
+        # Live files.
+        section id: 'live', class: 'mx-auto grid max-w-6xl items-center gap-14 px-4 py-24 sm:px-6 lg:grid-cols-2'
+          div
+            SideHeading eyebrow: 'Live files', title: 'Edit on the server, in the editor you already use'
+            p class: 'mt-4 text-lg text-secondary'
+              'Open a text or source file and it opens in its usual editor; every completed save uploads. While any file is Live, a red '
+              span class: 'rounded-full bg-live px-1.5 py-0.5 text-xs font-bold tracking-wide text-white', 'LIVE'
+              ' capsule in the toolbar counts them, on every server, and lists them with Stop.'
+            div class: 'mt-10 grid gap-6 sm:grid-cols-2'
+              for item in LIVE
+                Point icon: item.icon, title: item.title, text: item.text
+            p class: 'mt-8 text-sm/6 text-tertiary', 'Zig, Go, Ruby, Kotlin, Lua, SQL, C and C++, Makefile, Dockerfile, and dozens more open Live and preview as highlighted text. Settings → Extensions decides the list.'
+          div class: 'mx-auto flex w-full max-w-xl flex-col gap-5'
+            LiveFiles
+            div class: 'mx-auto w-full max-w-md'
+              Conflict
+
+        # Copy, paste, and drag.
+        section id: 'copy', class: 'border-y border-surface bg-surface'
+          div class: 'mx-auto grid max-w-6xl items-center gap-14 px-4 py-24 sm:px-6 lg:grid-cols-2'
+            div class: 'lg:order-2'
+              SideHeading eyebrow: 'Copy, paste, and drag', title: 'Between folders, servers, and the Finder'
+              p class: 'mt-4 text-lg text-secondary'
+                Kbd '⌘C'
+                ' and '
+                Kbd '⌘V'
+                ' copy files and folders to another folder, another server, or the Finder, and back; '
+                Kbd '⌥⌘V'
+                ' moves them. A bar at the foot of every window names what is copied, and '
+                Kbd 'Esc'
+                ' clears it.'
+              ul class: 'mt-8 space-y-3 text-secondary'
+                for line in COPY
+                  li class: 'flex items-start gap-3'
+                    Icon name: 'check', class: 'mt-1 size-4.5 shrink-0 text-accent'
+                    span line
+            div class: 'mx-auto w-full max-w-xl'
+              Dragging
+
+        # Speed.
+        section id: 'speed', class: 'mx-auto max-w-6xl px-4 py-24 sm:px-6'
+          Heading eyebrow: 'Fast', title: 'Two to four times faster with many small files', lead: 'Transfer 2.0.0 downloads a folder of many small files through the server’s own tar and pastes between servers as a pipeline. Nothing is installed on the server.'
+          div class: 'mx-auto mt-14 grid max-w-5xl gap-5 md:grid-cols-2'
+            for row in SPEED
+              div class: 'rounded-2xl border border-surface bg-surface p-6'
+                div class: 'flex items-start justify-between gap-4'
+                  p class: 'text-sm/6 font-medium', row.title
+                  span class: 'shrink-0 rounded-full bg-accent-soft px-2.5 py-0.5 text-sm font-semibold text-accent tabular-nums', "#{(row.before / row.after).toFixed(1)}×"
+                div class: 'mt-5 space-y-2.5'
+                  div class: 'flex items-center gap-3'
+                    span class: 'w-11 shrink-0 text-xs text-tertiary', '0.3.1'
+                    div class: 'h-2.5 flex-1 overflow-hidden rounded-full bg-muted'
+                      div class: 'h-full w-full rounded-full bg-tertiary/45'
+                    span class: 'w-14 shrink-0 text-right text-sm text-secondary tabular-nums', "#{row.before} s"
+                  div class: 'flex items-center gap-3'
+                    span class: 'w-11 shrink-0 text-xs font-semibold text-accent', '2.0.0'
+                    div class: 'h-2.5 flex-1 overflow-hidden rounded-full bg-muted'
+                      div class: 'h-full rounded-full brand-gradient', style: "width: #{Math.round(row.after / row.before * 100)}%"
+                    span class: 'w-14 shrink-0 text-right text-sm font-semibold tabular-nums', "#{row.after} s"
+          p class: 'mx-auto mt-5 max-w-5xl text-center text-sm text-tertiary', 'Seconds, from the 2.0.0 release notes, at the round-trip latency shown. Shorter is faster.'
+          div class: 'mx-auto mt-16 grid max-w-5xl items-center gap-12 lg:grid-cols-2'
+            div class: 'grid gap-6'
+              for item in FAST
+                Point icon: item.icon, title: item.title, text: item.text
+            div class: 'mx-auto w-full max-w-lg'
+              Shelf
+              p class: 'mt-4 text-center text-sm text-tertiary', 'Each transfer’s speed averages the last five seconds, so it holds steady; the time left reads as Finder words it.'
+
+        # Safety.
+        section id: 'safety', class: 'border-y border-surface bg-surface'
+          div class: 'mx-auto max-w-6xl px-4 py-24 sm:px-6'
+            Heading eyebrow: 'Safe with your data', title: 'It never loses or silently overwrites your files', lead: 'Not on your Mac and not on the server. Every rule in Transfer serves that, and no server is trusted with your disk.'
+            div class: 'mt-14 grid gap-5 sm:grid-cols-2 lg:grid-cols-3'
+              for item in SAFETY
+                Feature icon: item.icon, title: item.title, text: item.text
+
+        # Install.
+        section id: 'download', class: 'px-4 py-24 sm:px-6'
+          div class: 'relative mx-auto max-w-4xl overflow-hidden rounded-3xl brand-gradient px-5 py-16 text-center text-white shadow-2xl sm:px-16'
+            div class: 'absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgb(255_255_255/0.25),transparent_65%)]'
+            div class: 'relative'
+              img src: 'icon.svg', alt: '', class: 'mx-auto size-20 drop-shadow-xl'
+              h2 class: 'mt-6 font-display text-3xl font-bold tracking-tight sm:text-4xl', 'Get Transfer. It’s free.'
+              p class: 'mx-auto mt-4 max-w-xl text-lg text-balance text-white/85', 'Free and open source under the MIT license. Download it, run the installer, or use Homebrew; however it arrives, it keeps itself up to date.'
+              div class: 'mx-auto mt-10 flex max-w-xl flex-col items-center gap-4'
+                div class: 'flex flex-col items-center gap-3 sm:flex-row'
+                  a href: DOWNLOAD, class: 'flex items-center gap-2.5 rounded-xl bg-yellow-brand px-6 py-3.5 font-semibold text-deep-brand shadow-lg transition hover:-translate-y-0.5'
+                    Icon name: 'download', class: 'size-5'
+                    "Download Transfer #{VERSION}"
+                  a href: REPO, class: 'flex items-center gap-2.5 rounded-xl border border-white/35 px-6 py-3.5 font-semibold text-white transition hover:bg-white/10'
+                    Icon name: 'github', class: 'size-5'
+                    'Source on GitHub'
+                div class: 'w-full min-w-0 text-left'
+                  Command text: INSTALL
+                div class: 'w-full min-w-0 text-left'
+                  Command text: BREW
+              p class: 'mt-6 text-sm text-white/75', 'macOS 27 or later · Apple silicon'
+
+      # The foot of the page.
+      footer class: 'border-t border-surface'
+        div class: 'mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 px-4 py-10 text-sm text-tertiary sm:flex-row sm:px-6'
+          div class: 'flex items-center gap-2.5'
+            img src: 'icon.svg', alt: '', class: 'size-6'
+            span "Transfer #{VERSION} · MIT License"
+          div class: 'flex flex-wrap justify-center gap-x-6 gap-y-2'
+            a href: REPO, class: 'hover:text-primary', 'GitHub'
+            a href: "#{REPO}/releases", class: 'hover:text-primary', 'Releases'
+            a href: "#{REPO}/blob/main/CHANGELOG.md", class: 'hover:text-primary', 'Changelog'
+            a href: "#{REPO}/blob/main/docs/SPEC.md", class: 'hover:text-primary', 'What it does'
+            a href: "#{REPO}/issues", class: 'hover:text-primary', 'Report an issue'

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Transfer — The SFTP browser Apple forgot to ship</title>
+    <meta name="description" content="Transfer is a free, open-source SFTP browser for the Mac that feels like Finder. It rides your own ssh, so ~/.ssh/config, the agent and ProxyJump just work. Preview with Space, edit files Live so every save uploads, and drag, copy and paste between servers and the Finder.">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Transfer — The SFTP browser Apple forgot to ship">
+    <meta property="og:description" content="Browse a server the way Finder browses your disk. Free and open source for macOS 27 on Apple silicon.">
+    <meta property="og:url" content="https://shreeve.github.io/transfer/">
+    <meta property="og:image" content="https://shreeve.github.io/transfer/icon.png">
+    <meta name="twitter:card" content="summary">
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="icon.png">
+    <meta name="theme-color" content="#fbfcfe" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#13161c" media="(prefers-color-scheme: dark)">
+
+    <!-- The theme before anything draws: the visitor's own choice, else the system's. -->
+    <script>
+      try {
+        const saved = localStorage.getItem('theme')
+        document.documentElement.dataset.theme = saved ?? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+      } catch { document.documentElement.dataset.theme = 'light' }
+    </script>
+
+    <!-- While Rip compiles the page in the browser, only the icon shows, on the theme's background. -->
+    <style>
+      html { background: #fbfcfe; }
+      html[data-theme="dark"] { background: #13161c; }
+      #boot { position: fixed; inset: 0; display: grid; place-items: center; transition: opacity .35s ease; }
+      #boot img { width: 88px; height: 88px; animation: pulse 1.4s ease-in-out infinite; }
+      @keyframes pulse { 50% { transform: scale(.94); opacity: .7; } }
+      body:not(.booting) #boot { opacity: 0; pointer-events: none; }
+      body.booting #app { opacity: 0; }
+      #app { transition: opacity .35s ease; }
+    </style>
+
+    <script src="@rip/tailwind.min.js"></script>
+    <script>
+      fetch('index.css').then((r) => r.text()).then((css) => {
+        document.head.appendChild(Object.assign(document.createElement('style'), { type: 'text/tailwindcss', textContent: css }))
+      })
+    </script>
+  </head>
+  <body class="booting">
+    <div id="boot" aria-hidden="true"><img src="icon.svg" alt=""></div>
+    <noscript>
+      <style>#boot { display: none; } body { font: 16px/1.5 -apple-system, system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; color: #222; } code { word-break: break-all; }</style>
+      <h1>Transfer</h1>
+      <p>The SFTP browser Apple forgot to ship. Transfer browses a server the way Finder browses your disk: press Space to preview a file, open an editable file and every save uploads, and drag, copy and paste between servers and the Finder. It uses the ssh already on your Mac, so your ~/.ssh/config, agent and ProxyJump just work.</p>
+      <p>Free and open source, for macOS 27 or later on Apple silicon.</p>
+      <p><code>curl -fsSL https://raw.githubusercontent.com/shreeve/transfer/main/Scripts/install.sh | bash</code></p>
+      <p><code>brew install --cask shreeve/tap/transfer-sftp</code></p>
+      <p><a href="https://github.com/shreeve/transfer/releases/latest/download/Transfer.zip">Download Transfer</a> · <a href="https://github.com/shreeve/transfer">Source on GitHub</a></p>
+    </noscript>
+    <div id="app"></div>
+    <script type="module">
+      import { bootApp } from './@rip/rip.min.js'
+      // Served from a project's own path on GitHub Pages (/transfer/), or from a folder's root locally.
+      const base = location.pathname.startsWith('/transfer') ? '/transfer' : ''
+      try {
+        await bootApp({ url: new URL('bundle.json', document.baseURI).href, base })
+      } finally {
+        // A moment for Tailwind's runtime to style what was just rendered.
+        setTimeout(() => document.body.classList.remove('booting'), 30)
+      }
+    </script>
+  </body>
+</html>
