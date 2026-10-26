@@ -60,7 +60,7 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
 
     /// Toolbar delegate and action target. It reads the model and never owns state.
     @MainActor
-    final class Coordinator: NSObject, NSToolbarDelegate, NSSearchFieldDelegate {
+    final class Coordinator: NSObject, NSToolbarDelegate, NSSearchFieldDelegate, NSToolbarItemValidation {
         var model: TransferModel
         weak var controller: ChromeController?
         var searchTick = 0
@@ -91,6 +91,11 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
                 let group = makeGroup(identifier, "Back/Forward", symbols: ["chevron.backward", "chevron.forward"],
                                       labels: ["Back", "Forward"], mode: .momentary, action: #selector(navigate(_:)))
                 group.isNavigational = true
+                // The toolbar validates its items on every window update, and a subitem left to
+                // autovalidate is enabled again because this target answers its action; the
+                // Go menu dimmed Back and Forward while the toolbar's stayed lit.
+                group.autovalidates = false
+                for item in group.subitems { item.autovalidates = false }
                 navigationGroup = group
                 enableNavigation(back: model.canGoBack, forward: model.canGoForward)
                 return group
@@ -196,6 +201,15 @@ struct WindowChrome<Sidebar: View, Detail: View, Inspector: View>: NSViewReprese
             guard let items = navigationGroup?.subitems, items.count == 2 else { return }
             if items[0].isEnabled != back { items[0].isEnabled = back }
             if items[1].isEnabled != forward { items[1].isEnabled = forward }
+        }
+
+        /// Any validation that still reaches Back or Forward (a toolbar asked directly) answers
+        /// from the history, as the Go menu does; every other item of this target stays enabled.
+        func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+            guard let items = navigationGroup?.subitems, items.count == 2 else { return true }
+            if item === items[0] { return model.canGoBack }
+            if item === items[1] { return model.canGoForward }
+            return true
         }
 
         /// The badge observes the library's Live files itself, as the hosted columns observe the

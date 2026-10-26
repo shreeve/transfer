@@ -4,6 +4,7 @@ What changed in each release of Transfer. `Scripts/release.sh <version>` publish
 
 ## Unreleased
 
+- The toolbar's Back and Forward are dimmed when there is nowhere to go, as the Go menu's are, also in a window showing no server; they stayed lit.
 - The inspector opens at the width it last had, also after a window closed with it hidden; it used to come back at its narrowest.
 - A window whose saved split had the inspector open while the preference said closed (or the reverse) stopped following the model: the toolbar's view switcher and inspector toggle did nothing. The saved split is now brought to the preference's state before the window sets up.
 - Many more source and config files open Live and preview as text: Zig, Go, Ruby, Java, Kotlin (and `.kts`), Lua, SQL, C and C++ and their headers, Objective-C, C#, PHP, Perl, R, Scala, Elixir, Erlang, Haskell, OCaml, Nim, Verilog/V, Dart, Gradle, CMake, `.mk`, Vue, Svelte, GraphQL, Terraform and HCL, `.ini`, `.conf`, `.cfg`, `.env`, `Makefile`, `Dockerfile`, `Gemfile`, `Rakefile`, `Justfile`, `.gitignore`, `.gitattributes`, `.dockerignore`, and `.editorconfig`. macOS has no type for many of these, so they showed only an icon and opened View. Your list in Settings → Extensions gets the new entries once, after your own, which keep their order; one you remove afterwards stays removed. `.mts` is left out because the Mac reads it as video. Transfer 0.2.0 to 0.3.1 cannot open the library afterwards (0.1.7 still can).
