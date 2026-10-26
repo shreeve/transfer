@@ -22,12 +22,13 @@ It uses the `ssh` already on your Mac, so your `~/.ssh/config`, agent, and `Prox
 
 ## Features
 
-- **Finder's views.** Icons, list, and columns share one location and one selection. Tabs, a sidebar of servers and starred places, an inspector with a preview, and Finder's keys throughout. In column view, Shift with the mouse wheel, or a sideways swipe, reaches the columns off the left edge.
-- **Live editing.** An editable file opens in its usual editor, and every completed save uploads. A save never overwrites a change someone made on the server: that becomes a conflict you settle with Compare, Keep Local, Keep Remote, or Keep Both. Edits made while offline upload after the next login.
+- **Finder's views.** Icons, list, and columns share one location and one selection. Tabs, a sidebar of servers and starred places, an optional path bar, and Finder's keys throughout. In column view, Shift with the mouse wheel, or a sideways swipe, reaches the columns off the left edge.
+- **Live editing.** An editable file opens in its usual editor, and every completed save uploads. A red LIVE capsule in the toolbar shows while any file is Live, and lists them with a Stop button each. A file changed on the server is flagged within about a minute. A save never overwrites a change someone made on the server: that becomes a conflict you settle with Compare, Keep Local, Keep Remote, or Keep Both. Edits made while offline upload after the next login.
 - **Copy, paste, drag, and move** between folders, between servers, and to and from the Finder. A move removes an original only once it has checked that the copy is complete.
+- **Preview panel.** The inspector (Command-I) previews the selected file in place: highlighted text and source, pictures, and anything else Quick Look can draw, including the Quick Look extensions you have installed. Several selected items are listed with their sizes and total.
 - **Quick Look** with Space, syntax-colored previews of text and source files, and View for everything else.
 - **One login per server.** Every window and tab showing a server shares one ssh login. Listing, previewing, and copying run on separate channels, so a download never stalls the file list.
-- **Fast.** Thousands of small files copy at over a thousand a second at 20 ms round trip, and a large file uses several channels at once.
+- **Fast.** Thousands of small files copy at over a thousand a second at 20 ms round trip, a large file uses several channels at once, and a folder of many small files comes down in a few streams of the server's own `tar`. A copy between servers uploads files while later ones are still downloading. The shelf shows each transfer's speed and time left.
 - **`sftp://` links.** Command-click a link that `xfer` prints on a server, and the folder opens in Transfer.
 - **Safe to install.** Signed with a Developer ID, notarized by Apple, and it updates itself.
 
@@ -114,7 +115,7 @@ The ones you will reach for most; [`docs/SPEC.md`](docs/SPEC.md#menus-and-keys) 
 | Parent folder, Back, Forward | Command-Up, Command-[, Command-] |
 | Icons, List, Columns | Command-1, Command-2, Command-3 |
 | New Connection…, New Window, New Tab | Command-K, Command-N, Command-T |
-| Sidebar, Inspector | Command-B, Command-I |
+| Sidebar, Inspector, Path Bar | Command-B, Command-I, Option-Command-P |
 
 ## Open a server folder from its terminal
 
@@ -130,7 +131,7 @@ ssh live 'mkdir -p ~/bin ~/.config/transfer && cat > ~/bin/xfer && chmod 755 ~/b
 
 ## How a connection works
 
-Transfer uses the `ssh` already on the Mac, so your `~/.ssh/config`, agent, and `ProxyJump` apply. One login is shared by every window for that server. Listing, the file you are previewing, and copying run on separate SSH channels, so a download does not block the file list, and many files copy at once.
+Transfer uses the `ssh` already on the Mac, so your `~/.ssh/config`, agent, and `ProxyJump` apply. One login is shared by every window for that server. Listing, the file you are previewing, and copying run on separate SSH channels, so a download does not block the file list, and many files copy at once. When a folder download has many small files, the server's own `tar` sends their bytes over the same login; nothing is installed on the server, and a server without `tar` is browsed and copied by SFTP alone.
 
 Which files open for editing is `editableExtensions` in `config.json`. The first launch writes the built-in list there, and Settings → Extensions edits it. Transfer 2.0.0 adds common source types to an existing list once (Zig, Go, Kotlin, `Makefile`, …), keeping your own entries; one you remove afterwards stays removed.
 
@@ -146,7 +147,7 @@ Which files open for editing is `editableExtensions` in `config.json`. The first
 | Copy and paste staging | `~/Library/Caches/com.github.shreeve.transfer/` |
 | Preferences | `defaults read com.github.shreeve.transfer` |
 
-A library written by a newer Transfer is left alone: an older version says so and quits rather than guess. A library from 0.1.7 or earlier is upgraded in place on first launch, and 0.1.7 can still open it afterwards.
+A library written by a newer Transfer is left alone: an older version says so and quits rather than guess. A library from 0.1.7 or earlier is upgraded in place on first launch, and 0.1.7 can still open it afterwards. Transfer 2.0.0 changes the format once more, to add the new source types to your list of editable extensions: Transfer 0.2.0 to 0.3.1 cannot open the library afterwards, and 0.1.7 still can.
 
 To remove everything after uninstalling, delete `~/Library/Application Support/Transfer`, `~/Library/Caches/Transfer`, and `~/Library/Caches/com.github.shreeve.transfer`, run `defaults delete com.github.shreeve.transfer`, and remove the "Transfer" items in Keychain Access. Check first that no Live file has unsynced edits.
 
