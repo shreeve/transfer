@@ -4,6 +4,7 @@ What changed in each release of Transfer. `Scripts/release.sh <version>` publish
 
 ## Unreleased
 
+- Download Copy's row on the shelf has a progress bar and a time left, like a paste's: a file's size is known at once, and a folder's once its files are counted, which happens while it comes down.
 - The toolbar's Back and Forward are dimmed when there is nowhere to go, as the Go menu's are, also in a window showing no server; they stayed lit.
 - The inspector opens at the width it last had, also after a window closed with it hidden; it used to come back at its narrowest.
 - A window whose saved split had the inspector open while the preference said closed (or the reverse) stopped following the model: the toolbar's view switcher and inspector toggle did nothing. The saved split is now brought to the preference's state before the window sets up.

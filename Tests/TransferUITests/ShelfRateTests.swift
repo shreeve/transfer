@@ -111,6 +111,35 @@ struct ShelfRateTests {
         #expect(model.inspectorStatus(live) == "Active")
     }
 
+    /// Download Copy's rows carry a total, as a paste's do, so they show a bar and a time left
+    /// though the download reports bytes only: a file's listed size, a folder's counted files.
+    @Test func aDownloadCopyRowHasATotalAndATimeLeft() async throws {
+        let time = Locked(0.0)
+        let (model, session) = await connected(time)
+        let file = RemoteItem(path: RemotePath(string: "/home/big.iso"), kind: .file, size: total)
+        let folder = RemoteItem(path: RemotePath(string: "/home/disc"), kind: .directory)
+        session.trees.value[folder.path] = [("a.bin", .file(size: 600_000_000)), ("sub", .directory),
+                                            ("sub/b.bin", .file(size: 400_000_000)), ("link", .link)]
+        session.downloadsEnd.value = false
+        model.download([file, folder], into: FileManager.default.temporaryDirectory)
+        #expect(await eventually { session.downloadReports.value.count == 2 })
+        let reports = session.downloadReports.value
+        func drive(at: Double, _ bytes: UInt64) async {
+            time.value = at
+            for report in reports { report(TransferProgress(completed: bytes)) }
+            #expect(await eventually { model.operations.allSatisfy { $0.progress.completed == bytes } })
+        }
+        await drive(at: 0, 10_000_000)
+        await drive(at: 3, 40_000_000)
+        #expect(model.operations.count == 2)
+        for operation in model.operations {
+            #expect(operation.progress.total == total)
+            #expect(model.rateText(for: operation) == " 10MB/s · about 2 minutes left")
+        }
+        session.downloadsEnd.value = true
+        #expect(await eventually { model.operations.isEmpty })
+    }
+
     /// The row is as tall with its rate as without it, and the rate's slot as wide whatever it
     /// reads, so the shelf never moves as the numbers change.
     @Test func theRateNeverMovesOrGrowsTheRow() async throws {

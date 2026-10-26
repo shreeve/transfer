@@ -1298,11 +1298,33 @@ public final class TransferModel {
         panel.canCreateDirectories = true
         panel.prompt = "Download"
         guard panel.runModal() == .OK, let directory = panel.url, stillShows(context) else { return }
+        download(items, into: directory, on: context)
+    }
+
+    /// One shelf row per item, each with a total as a paste's has, so the row shows its bar and
+    /// time left: a file's listed size, or a folder's files counted on the walker while it comes
+    /// down (the total arrives with the first report after the count; a count that fails leaves
+    /// the row without one, as before).
+    func download(_ items: [RemoteItem], into directory: URL, on context: ServerContext? = nil) {
+        guard let context = context ?? self.context else { return }
         for item in items {
             let destination = directory.appendingPathComponent(item.name)
             let path = item.path
+            let isFolder = item.kind == .directory
+            let listed: UInt64? = item.kind == .file ? item.size : nil
             enqueue(title: "Download \(item.name)", path: path, on: context) { session, progress in
-                try await session.download(path, to: destination, progress: progress)
+                let total = Locked<UInt64?>(listed)
+                let count = isFolder ? Task {
+                    var tally = ClipTally()
+                    for try await (key, entry) in session.walkTree(path) where !key.bytes.isEmpty { tally.add(inside: entry) }
+                    if !Task.isCancelled { total.value = tally.bytes }
+                } : nil
+                defer { count?.cancel() }
+                try await session.download(path, to: destination) { report in
+                    var report = report
+                    if report.total == nil, let known = total.value, known > 0 { report.total = known }
+                    progress(report)
+                }
             }
         }
     }
