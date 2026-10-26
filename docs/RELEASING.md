@@ -65,6 +65,8 @@ rebuilds it and committing `website/dist` to `main` publishes it: the Website wo
 that folder to GitHub Pages. It is built on a Mac and committed, as it needs a Rip checkout
 (`website/README.md`).
 
+The Homebrew cask, `transfer-sftp` in https://github.com/shreeve/homebrew-tap (`Casks/transfer-sftp.rb`), names the version and the zip's SHA-256, so after a release set `version` to X.Y.Z and `sha256` to the output of `curl -sL https://github.com/shreeve/transfer/releases/download/vX.Y.Z/Transfer-X.Y.Z.zip | shasum -a 256`, and push it to the tap's `main` as "Update transfer-sftp to X.Y.Z". Sparkle updates a Homebrew install either way (`auto_updates true`), but a new install gets the cask's version first.
+
 Versions are `major.minor.patch` and must go up: Sparkle orders updates by `CFBundleVersion`, which the script sets to the version, as it does `CFBundleShortVersionString`.
 
 The script:
