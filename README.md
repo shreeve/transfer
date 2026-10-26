@@ -12,7 +12,7 @@
 ![Signed and notarized](https://img.shields.io/badge/Developer%20ID-notarized-2E8B57)
 [![MIT license](https://img.shields.io/github/license/shreeve/transfer?color=555)](LICENSE)
 
-[Install](#install) · [Features](#features) · [Keys](#keys) · [Links from a terminal](#open-a-server-folder-from-its-terminal) · [Changelog](CHANGELOG.md)
+[Website](https://shreeve.github.io/transfer/) · [Install](#install) · [Features](#features) · [Keys](#keys) · [Links from a terminal](#open-a-server-folder-from-its-terminal) · [Changelog](CHANGELOG.md)
 
 </div>
 
