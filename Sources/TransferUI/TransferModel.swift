@@ -2587,6 +2587,13 @@ public enum PreviewTiming {
     /// often the selection has moved since.
     public static let icon: Duration = .milliseconds(500)
     public static let spinner: Duration = .seconds(1)
+    /// How long incoming text or Quick Look may stay hidden after loading while it draws: a web
+    /// view's page once its navigation ends (`SourcePreviewView`), a Quick Look view once its file
+    /// is set (`QuickLookPreview`). The old preview stays on screen meanwhile, within `icon`.
+    public static let pageDraw: Duration = .milliseconds(300)
+    public static let quickLookDraw: Duration = .milliseconds(300)
+    /// A frame or two for a view that has its content to put it on screen.
+    public static let drawSettle: Duration = .milliseconds(34)
     /// The old preview leaving, and the icon or a picture arriving over what was there.
     public static let swap: TimeInterval = 0.12
     public static let reveal: TimeInterval = 0.2

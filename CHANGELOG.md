@@ -4,6 +4,7 @@ What changed in each release of Transfer. `Scripts/release.sh <version>` publish
 
 ## Unreleased
 
+- The inspector no longer flashes an empty box the first time text or a Quick Look preview (a PDF, say) appears: the previous preview, or the icon, stays until the new one has drawn, and a text file's white page appears with its text.
 - Dragging from a background Transfer window onto another Transfer window in front of it (icon and list view) no longer brings the background window over the one you dropped on.
 - Download Copy's row on the shelf has a progress bar and a time left, like a paste's: a file's size is known at once, and a folder's once its files are counted, which happens while it comes down.
 - The toolbar's Back and Forward are dimmed when there is nowhere to go, as the Go menu's are, also in a window showing no server; they stayed lit.
