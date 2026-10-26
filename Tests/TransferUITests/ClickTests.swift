@@ -216,4 +216,28 @@ struct ClickTests {
         #expect(model.snapshot.selection == paths("a", "b"))
         #expect(Set(model.selectedItems.map(\.path)) == paths("a", "b"))
     }
+    /// A drag from window A, behind, dropped on window B in front where the two overlap, leaves
+    /// B in front: the drop is inside A's frame but not on A, which used to raise A over B. A
+    /// drop on A's own visible part lands on A, which then comes forward. List and icon view end
+    /// their drags here; column view's tables are AppKit's own and do not. The ordering itself
+    /// needs a packaged build: an inactive test process does not reorder its windows.
+    @Test func aDropOnTheWindowInFrontLeavesTheSourceBehind() async throws {
+        let behind = window(showing: NSView(frame: NSRect(x: 0, y: 0, width: 960, height: 640)))
+        // The main loop's guard starts on the runner's next pass (see `MainLoopGuard`).
+        try? await Task.sleep(for: .milliseconds(100))
+        let front = window(showing: NSView(frame: NSRect(x: 0, y: 0, width: 960, height: 640)))
+        defer { inOwnRun { behind.close(); front.close() } }
+        front.setFrameOrigin(NSPoint(x: behind.frame.minX + 300, y: behind.frame.minY))
+        let overlap = NSPoint(x: front.frame.minX + 10, y: front.frame.midY)
+        let own = NSPoint(x: behind.frame.minX + 10, y: behind.frame.midY)
+        #expect(behind.frame.contains(overlap) && front.frame.contains(overlap) && !front.frame.contains(own))
+        func onTop(_ point: NSPoint) -> Int { front.frame.contains(point) ? front.windowNumber : behind.windowNumber }
+        #expect(!DragOrdering.landsOn(behind, at: overlap, frontmost: onTop))
+        #expect(DragOrdering.landsOn(front, at: overlap, frontmost: onTop))
+        #expect(DragOrdering.landsOn(behind, at: own, frontmost: onTop))
+        // Outside its frame it never lands, whatever is on top there.
+        #expect(!DragOrdering.landsOn(behind, at: NSPoint(x: behind.frame.maxX + 50, y: behind.frame.midY)) { _ in behind.windowNumber })
+        // With no lookup injected, a point on no window lands on none.
+        #expect(!DragOrdering.landsOn(behind, at: NSPoint(x: -100_000, y: -100_000)))
+    }
 }
