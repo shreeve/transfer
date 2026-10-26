@@ -1,0 +1,184 @@
+@import "tailwindcss";
+
+/* Light and dark are one set of tokens, swapped by `data-theme` on <html>, which the page's head
+   sets before anything draws: the visitor's own choice if they made one, else the system's. */
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *));
+
+:root {
+  color-scheme: light;
+
+  /* The icon's colors: its tile runs from cyan to deep blue, and its badge is yellow. */
+  --brand-cyan:   #00aadd;
+  --brand-blue:   #0346a6;
+  --brand-deep:   #004499;
+  --brand-yellow: #ffd61f;
+  --live-red:     #ff3b30;
+
+  --color-accent:        #0a5bc9;
+  --color-accent-hover:  oklch(from var(--color-accent) calc(l - 0.06) c h);
+  --color-accent-soft:   color-mix(in oklab, var(--brand-cyan) 12%, transparent);
+
+  --color-text-primary:   oklch(0.21 0.02 255);
+  --color-text-secondary: oklch(0.40 0.02 255);
+  --color-text-tertiary:  oklch(0.55 0.02 255);
+  --color-text-on-accent: white;
+
+  --color-bg-background: oklch(0.99 0.004 255);
+  --color-bg-surface:    white;
+  --color-bg-muted:      oklch(0.965 0.008 255);
+  --color-bg-code:       oklch(0.18 0.02 255);
+  /* A document's page in the preview panel: white, or near-black in dark mode. */
+  --color-bg-page:       white;
+
+  --color-border-surface: oklch(0.91 0.01 255);
+  --color-border-strong:  oklch(0.84 0.015 255);
+
+  /* Syntax colors, as the preview panel draws text. */
+  --syntax-keyword: #9b2393;
+  --syntax-string:  #c41a16;
+  --syntax-comment: #5d6c79;
+  --syntax-type:    #0b4f79;
+  --syntax-number:  #1c00cf;
+
+  --text-from: var(--brand-cyan);
+  --text-to:   var(--brand-blue);
+
+  --glow: color-mix(in oklab, var(--brand-cyan) 26%, transparent);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-accent:        #2f86f0;
+  --color-accent-hover:  oklch(from var(--color-accent) calc(l + 0.06) c h);
+  --color-accent-soft:   color-mix(in oklab, var(--brand-cyan) 20%, transparent);
+
+  --color-text-primary:   oklch(0.97 0.005 255);
+  --color-text-secondary: oklch(0.80 0.01 255);
+  --color-text-tertiary:  oklch(0.65 0.015 255);
+
+  --color-bg-background: oklch(0.15 0.012 255);
+  --color-bg-surface:    oklch(0.19 0.014 255);
+  --color-bg-muted:      oklch(0.22 0.016 255);
+  --color-bg-code:       oklch(0.12 0.012 255);
+  --color-bg-page:       oklch(0.14 0.008 255);
+
+  --color-border-surface: oklch(0.28 0.016 255);
+  --color-border-strong:  oklch(0.36 0.02 255);
+
+  --syntax-keyword: #fc5fa3;
+  --syntax-string:  #fc6a5d;
+  --syntax-comment: #7f8c98;
+  --syntax-type:    #5dd8ff;
+  --syntax-number:  #d0bf69;
+
+  --text-from: #5fd3ff;
+  --text-to:   #4c95ff;
+
+  --glow: color-mix(in oklab, var(--brand-cyan) 30%, transparent);
+}
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+
+  --color-accent:       var(--color-accent);
+  --color-accent-hover: var(--color-accent-hover);
+  --color-accent-soft:  var(--color-accent-soft);
+  --color-cyan-brand:   var(--brand-cyan);
+  --color-blue-brand:   var(--brand-blue);
+  --color-deep-brand:   var(--brand-deep);
+  --color-yellow-brand: var(--brand-yellow);
+  --color-live:         var(--live-red);
+
+  /* The text's colors as colors too, for shapes drawn in them (the pictures' lines of "text"). */
+  --color-primary:   var(--color-text-primary);
+  --color-secondary: var(--color-text-secondary);
+  --color-tertiary:  var(--color-text-tertiary);
+
+  --color-keyword: var(--syntax-keyword);
+  --color-string:  var(--syntax-string);
+  --color-comment: var(--syntax-comment);
+  --color-type:    var(--syntax-type);
+  --color-number:  var(--syntax-number);
+
+  --text-color-primary:   var(--color-text-primary);
+  --text-color-secondary: var(--color-text-secondary);
+  --text-color-tertiary:  var(--color-text-tertiary);
+  --text-color-on-accent: var(--color-text-on-accent);
+
+  --background-color-background: var(--color-bg-background);
+  --background-color-surface:    var(--color-bg-surface);
+  --background-color-muted:      var(--color-bg-muted);
+  --background-color-code:       var(--color-bg-code);
+  --background-color-page:       var(--color-bg-page);
+
+  --border-color-surface: var(--color-border-surface);
+  --border-color-strong:  var(--color-border-strong);
+
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 5rem;
+  }
+
+  body {
+    @apply bg-background font-sans text-primary antialiased;
+  }
+
+  button:not(:disabled) {
+    @apply cursor-pointer;
+  }
+
+  *:focus-visible {
+    @apply rounded-md outline-2 outline-offset-2 outline-accent;
+  }
+
+  ::selection {
+    background: var(--color-accent-soft);
+  }
+}
+
+@utility brand-gradient {
+  background-image: linear-gradient(160deg, var(--brand-cyan), var(--brand-blue) 62%, var(--brand-deep));
+}
+
+@utility brand-text {
+  background-image: linear-gradient(120deg, var(--text-from), var(--text-to));
+  background-clip: text;
+  color: transparent;
+}
+
+@utility glow {
+  box-shadow: 0 30px 80px -20px var(--glow), 0 12px 32px -12px rgb(0 0 0 / 0.25);
+}
+
+/* A transfer's bar on the shelf, filling and starting over. */
+@keyframes fill {
+  0% { width: 18%; }
+  85%, 100% { width: 86%; }
+}
+
+/* The drag between the Finder and Transfer: the dragged files glide from one window to the other. */
+@keyframes drag {
+  0%, 12% { transform: translate(0, 0); opacity: 0; }
+  20% { opacity: 1; }
+  70%, 82% { transform: translate(-125%, 22%); opacity: 1; }
+  92%, 100% { transform: translate(-125%, 22%); opacity: 0; }
+}
+
+/* A save's arrow going up to the server. */
+@keyframes rise {
+  0%, 20% { transform: translateY(40%); opacity: 0; }
+  45% { opacity: 1; }
+  80%, 100% { transform: translateY(-60%); opacity: 0; }
+}
+
+/* The pictures hold still for anyone who asked for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after { animation: none !important; }
+}

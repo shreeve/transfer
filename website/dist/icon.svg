@@ -1,0 +1,58 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+<!--
+  Transfer's icon, the design Support/render-icon.swift draws. The 824-point tile sits at (100, 100)
+  on Apple's 1024 grid, with room around it for the badge's shadow; everything inside the group is
+  in the tile's own points. Edit here, then mirror the change in render-icon.swift and run it.
+-->
+<g transform="translate(100 100)">
+<path d="M638.6 0H185.4C83.0064 0 0 83.0064 0 185.4V638.6C0 740.994 83.0064 824 185.4 824H638.6C740.994 824 824 740.994 824 638.6V185.4C824 83.0064 740.994 0 638.6 0Z" fill="url(#paint0_linear_2183_40)"/>
+<mask id="mask0_2183_40" style="mask-type:luminance" maskUnits="userSpaceOnUse" x="0" y="0" width="824" height="824">
+<path d="M638.6 0H185.4C83.0064 0 0 83.0064 0 185.4V638.6C0 740.994 83.0064 824 185.4 824H638.6C740.994 824 824 740.994 824 638.6V185.4C824 83.0064 740.994 0 638.6 0Z" fill="white"/>
+</mask>
+<g mask="url(#mask0_2183_40)">
+<path d="M824 0H0V412H824V0Z" fill="url(#paint1_linear_2183_40)"/>
+</g>
+<g filter="url(#filter0_d_2183_40)">
+<path d="M245.64 157H490.86L609.52 275.66V636.24C609.52 644.631 606.187 652.679 600.253 658.613C594.319 664.546 586.271 667.88 577.88 667.88H245.64C237.249 667.88 229.201 664.546 223.267 658.613C217.333 652.679 214 644.631 214 636.24V188.64C214 180.249 217.333 172.201 223.267 166.267C229.201 160.333 237.249 157 245.64 157Z" fill="#F6F8FA"/>
+<path d="M490.86 157V275.66H609.52L490.86 157Z" fill="#C3D3E4"/>
+<path d="M484.72 312.82H291.33C283.57 312.82 277.28 319.11 277.28 326.87C277.28 334.629 283.57 340.92 291.33 340.92H484.72C492.479 340.92 498.77 334.629 498.77 326.87C498.77 319.11 492.479 312.82 484.72 312.82Z" fill="#AFC2D8"/>
+<path d="M484.72 384.34H291.33C283.57 384.34 277.28 390.63 277.28 398.39C277.28 406.149 283.57 412.44 291.33 412.44H484.72C492.479 412.44 498.77 406.149 498.77 398.39C498.77 390.63 492.479 384.34 484.72 384.34Z" fill="#AFC2D8"/>
+<path d="M413.53 455.86H291.33C283.57 455.86 277.28 462.15 277.28 469.91C277.28 477.669 283.57 483.96 291.33 483.96H413.53C421.289 483.96 427.58 477.669 427.58 469.91C427.58 462.15 421.289 455.86 413.53 455.86Z" fill="#AFC2D8"/>
+</g>
+<g filter="url(#filter1_d_2183_40)">
+<path d="M609.76 756.32C700.776 756.32 774.56 682.537 774.56 591.52C774.56 500.504 700.776 426.72 609.76 426.72C518.743 426.72 444.96 500.504 444.96 591.52C444.96 682.537 518.743 756.32 609.76 756.32Z" fill="#FFD61F"/>
+<path d="M537.253 664.027L635.003 566.276" stroke="#0346A6" stroke-width="42.85" stroke-linecap="round"/>
+<path d="M685.901 515.379L561.825 518.568L682.712 639.455L685.901 515.379Z" fill="#0346A6" stroke="#0346A6" stroke-width="15" stroke-linejoin="round"/>
+</g>
+<defs>
+<filter id="filter0_d_2183_40" x="184" y="137" width="455.52" height="570.88" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+<feOffset dy="10"/>
+<feGaussianBlur stdDeviation="15"/>
+<feComposite in2="hardAlpha" operator="out"/>
+<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0"/>
+<feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_2183_40"/>
+<feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_2183_40" result="shape"/>
+</filter>
+<filter id="filter1_d_2183_40" x="344.96" y="346.72" width="529.6" height="529.6" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+<feOffset dy="20"/>
+<feGaussianBlur stdDeviation="50"/>
+<feComposite in2="hardAlpha" operator="out"/>
+<feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0"/>
+<feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_2183_40"/>
+<feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_2183_40" result="shape"/>
+</filter>
+<linearGradient id="paint0_linear_2183_40" x1="0" y1="0" x2="0" y2="824" gradientUnits="userSpaceOnUse">
+<stop stop-color="#00AADD"/>
+<stop offset="1" stop-color="#004499"/>
+</linearGradient>
+<linearGradient id="paint1_linear_2183_40" x1="0" y1="0" x2="0" y2="412" gradientUnits="userSpaceOnUse">
+<stop stop-color="white" stop-opacity="0.08"/>
+<stop offset="1" stop-color="white" stop-opacity="0"/>
+</linearGradient>
+</defs>
+</g>
+</svg>

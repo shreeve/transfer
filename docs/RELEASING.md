@@ -56,7 +56,14 @@ First add the version's section to `CHANGELOG.md`, under a heading `## X.Y.Z —
 Scripts/release.sh X.Y.Z --notes     # prints the notes it would publish, and nothing else
 Scripts/release.sh X.Y.Z --dry-run
 Scripts/release.sh X.Y.Z
+website/build.sh                     # the website names the new release; commit website/dist
 ```
+
+The website (https://shreeve.github.io/transfer/) names the latest release by its tag and its
+download buttons fetch the latest release's `Transfer.zip`, so after a release `website/build.sh`
+rebuilds it and committing `website/dist` to `main` publishes it: the Website workflow deploys
+that folder to GitHub Pages. It is built on a Mac and committed, as it needs a Rip checkout
+(`website/README.md`).
 
 Versions are `major.minor.patch` and must go up: Sparkle orders updates by `CFBundleVersion`, which the script sets to the version, as it does `CFBundleShortVersionString`.
 
