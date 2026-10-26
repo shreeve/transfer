@@ -588,8 +588,23 @@ final class ChromeController: NSSplitViewController {
     func setInspectorShown(_ shown: Bool) {
         let item = splitViewItems[2]
         guard item.isCollapsed == shown else { return }
+        if shown { sizeUnshownInspector() }
         animateCollapse { item.animator().isCollapsed = !shown }
         refreshHoverLine(animated: true)
+    }
+
+    /// An inspector this window has never shown has no width of its own, and the split opens it
+    /// at its minimum, though the split restored the column's saved width (open or hidden) on the
+    /// view that holds it. That width, clamped (`InspectorWidth.reopening`), goes to the inspector
+    /// before it opens, so a window that closed with it hidden opens it as wide as it was.
+    private func sizeUnshownInspector() {
+        guard splitViewItems.count == 3, splitView.arrangedSubviews.count == 3 else { return }
+        let view = splitViewItems[2].viewController.view
+        guard view.frame.width < 1 else { return }
+        let holder = splitView.arrangedSubviews[2].frame
+        let limit = Double(splitViewItems[2].maximumThickness)
+        guard let width = InspectorWidth.reopening(saved: Double(holder.width), maximum: limit) else { return }
+        view.setFrameSize(NSSize(width: CGFloat(width), height: holder.height))
     }
 
     /// `TRANSFER_ANIMATION_SCALE=6` stretches the sidebar and inspector animations for watching.

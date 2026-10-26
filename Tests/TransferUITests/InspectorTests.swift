@@ -509,6 +509,44 @@ struct InspectorTests {
         #expect(content.viewController.view.frame.width >= 260)
     }
 
+    /// The inspector comes back at the width it last had open, after a window that closed with
+    /// it hidden: the split saves a collapsed column at no useful width.
+    @Test func theInspectorReopensAtItsLastWidthAfterAHiddenClose() async throws {
+        UserDefaults.standard.removeObject(forKey: Self.splitFrames)
+        defer { UserDefaults.standard.removeObject(forKey: Self.splitFrames) }
+        let defaults = Defaults()
+        defaults.store.set(true, forKey: Preferences.showsInspector)
+        func settle() async { try? await Task.sleep(for: .milliseconds(400)) }
+        do {
+            let model = TransferModel(provider: FakeProvider([FakeSession(server)]), defaults: defaults.store)
+            let window = await window(ContentView(model: model), width: 1400, style: [.titled, .resizable])
+            let controller = try #require(chrome(in: window))
+            let inspector = controller.splitViewItems[2]
+            #expect(await eventually { !inspector.isCollapsed })
+            await settle()
+            let split = controller.splitView
+            split.setPosition(split.bounds.width - 420, ofDividerAt: 1)
+            split.layoutSubtreeIfNeeded()
+            await settle()
+            #expect(abs(inspector.viewController.view.frame.width - 420) <= 2)
+            model.showsInspector = false
+            #expect(await eventually { inspector.isCollapsed })
+            await settle()
+            window.close()
+        }
+        let model = TransferModel(provider: FakeProvider([FakeSession(server)]), defaults: defaults.store)
+        #expect(!model.showsInspector)
+        let window = await window(ContentView(model: model), width: 1400, style: [.titled, .resizable])
+        defer { window.close() }
+        let controller = try #require(chrome(in: window))
+        let inspector = controller.splitViewItems[2]
+        #expect(inspector.isCollapsed)
+        model.showsInspector = true
+        #expect(await eventually { !inspector.isCollapsed })
+        await settle()
+        #expect(abs(inspector.viewController.view.frame.width - 420) <= 2)
+    }
+
     /// Back and Forward are dim until the history has somewhere to go, and follow it.
     @Test func backAndForwardFollowTheHistory() async throws {
         let home = RemotePath(string: "/home")

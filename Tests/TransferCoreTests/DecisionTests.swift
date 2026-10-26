@@ -629,6 +629,17 @@ import UniformTypeIdentifiers
 
 
 @Suite struct InspectorWidthTests {
+    /// A saved width comes back within the limits; nothing under the minimum is a width.
+    @Test func aSavedWidthReopensWithinTheLimits() {
+        #expect(InspectorWidth.reopening(saved: 420, maximum: 840) == 420)
+        #expect(InspectorWidth.reopening(saved: 900, maximum: 840) == 840)
+        #expect(InspectorWidth.reopening(saved: 420, maximum: 100) == 240)
+        #expect(InspectorWidth.reopening(saved: 240, maximum: 840) == 240)
+        #expect(InspectorWidth.reopening(saved: 0, maximum: 840) == nil)
+        #expect(InspectorWidth.reopening(saved: 239, maximum: 840) == nil)
+        #expect(InspectorWidth.reopening(saved: .nan, maximum: 840) == nil)
+    }
+
     @Test func sixtyPercentOfTheSplitWithinTheContentMinimum() {
         #expect(InspectorWidth.maximum(splitWidth: 1200, sidebar: 200) == 720)
         #expect(InspectorWidth.maximum(splitWidth: 1200, sidebar: 0) == 720)
